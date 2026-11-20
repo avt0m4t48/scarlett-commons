@@ -1,0 +1,158 @@
+"""Export textures found by tex_headers.py as standard DDS files (top mip, slice 0), detiled from AMD SW_4K_S.
+
+For each texture:
+  - element size from the DXGI format (BC: 8/16 bytes per 4x4 block; uncompressed: bytes per pixel)
+  - the top mip is either at the data offset or at the end of the mip chain (GFX10 stores mips smallest first);
+    both are detiled and the smoother one wins (scored on the decoded image where Pillow can decode the format,
+    otherwise on raw element bytes)
+  - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json
+
+Usage:
+    python -I tex_export.py <textures_index.json> <carve dir> <out dir> [--limit N] [--png]
+"""
+import argparse
+import io
+import json
+import os
+import struct
+import sys
+from collections import Counter
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(__file__))
+from amd_swizzle import _parity, equation, load  # noqa: E402
+
+# DXGI format -> (bytes per element, block dimension)
+FMT = {71: (8, 4), 72: (8, 4), 80: (8, 4), 81: (8, 4), 74: (16, 4), 77: (16, 4), 78: (16, 4), 83: (16, 4),
+       84: (16, 4), 95: (16, 4), 96: (16, 4), 98: (16, 4), 99: (16, 4), 28: (4, 1), 29: (4, 1), 87: (4, 1),
+       91: (4, 1), 24: (4, 1), 26: (4, 1), 41: (4, 1), 34: (4, 1), 10: (8, 1), 2: (16, 1), 56: (2, 1), 54: (2, 1),
+       49: (2, 1), 61: (1, 1)}
+PILLOW_OK = {71, 72, 74, 77, 78, 80, 81, 83, 84, 98, 99, 28, 29, 87, 91}
+# Pillow can't open sRGB DXGI codes; the bytes are identical to the UNORM twin, so decode with that for scoring.
+DECODE_AS = {72: 71, 78: 77, 99: 98, 29: 28, 91: 87}
+
+_NIB, _TAB = load()
+_EQ = {}
+
+
+def eq4k(bpe):
+    if bpe not in _EQ:
+        e = [e for e in _TAB["GFX10_SW_4K_S_PATINFO"] if f" {bpe} bpe" in e[5]][0]
+        _EQ[bpe] = equation(_NIB, e, 12)
+    return _EQ[bpe]
+
+
+def detile_offsets(bpe, we, he):
+    eq = eq4k(bpe)
+    elems = 4096 // bpe
+    lb = elems.bit_length() - 1
+    bw = 1 << ((lb + 1) // 2)
+    bh = elems // bw
+    y, x = np.mgrid[0:he, 0:we].astype(np.int64)
+    o = np.zeros_like(x)
+    for bit, (mx, my) in enumerate(eq):
+        if mx or my:
+            o |= (_parity(x & mx) ^ _parity(y & my)) << bit
+    nbx = (we + bw - 1) // bw
+    return ((o + ((y // bh) * nbx + x // bw) * 4096) // bpe).reshape(-1), bw, bh
+
+
+def level_bytes(we, he, bpe, bw, bh):
+    return ((we + bw - 1) // bw) * ((he + bh - 1) // bh) * 4096
+
+
+def dds_bytes(w, h, fmt, payload):
+    hdr = bytearray(128)
+    hdr[0:4] = b"DDS "
+    struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007 | 0x80000, h, w, len(payload), 0, 1)
+    struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
+    struct.pack_into("<I", hdr, 108, 0x1000)
+    return bytes(hdr) + struct.pack("<IIIII", fmt, 3, 0, 1, 0) + payload
+
+
+def score_image(w, h, fmt, payload, bpe):
+    if fmt in PILLOW_OK:
+        from PIL import Image
+        im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
+        a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
+    else:
+        a = np.frombuffer(payload, np.uint8).reshape(-1, bpe)[:, :4].astype(np.float32)
+        a = a.reshape(-1, max(1, (w + 3) // 4 if bpe >= 8 and FMT[fmt][1] == 4 else w), 4)
+    d = np.abs(np.diff(a, axis=0)).mean() + np.abs(np.diff(a, axis=1)).mean()
+    return float(d / (a.std() + 1e-6))
+
+
+def export_one(t, carve, out, blob_cache):
+    fmt = t["fmt"]
+    if fmt not in FMT:
+        return "unsupported format"
+    bpe, blk = FMT[fmt]
+    w, h = t["w"], t["h"]
+    we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
+    key = (t["archive"], t["gpu"])
+    if key not in blob_cache:
+        blob_cache.clear()
+        parts = []
+        for off, _ in t.get("gpu_chain") or [[t["gpu"], t["gpu_size"]]]:
+            with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
+                parts.append(f.read())
+        blob_cache[key] = b"".join(parts)
+    G = blob_cache[key]
+    offs, bw, bh = detile_offsets(bpe, we, he)
+    need = (int(offs.max()) + 1) * bpe
+    top = level_bytes(we, he, bpe, bw, bh)
+    chain = sum(level_bytes(max(1, (max(1, w >> i) + blk - 1) // blk), max(1, (max(1, h >> i) + blk - 1) // blk), bpe, bw, bh)
+                for i in range(max(1, t["mips"])))
+    cands = []
+    for place, start in (("first", t["data_off"]), ("last", t["data_off"] + chain - top)):
+        if start < 0 or start + need > len(G):
+            continue
+        raw = np.frombuffer(G[start:start + need], np.uint8).reshape(-1, bpe)
+        payload = raw[offs].tobytes()
+        try:
+            s = score_image(w, h, fmt, payload, bpe)
+        except Exception:  # noqa: BLE001
+            s = 9e9
+        cands.append((s, place, payload))
+    if not cands:
+        return "data outside GPU blob"
+    cands.sort(key=lambda c: c[0])
+    s, place, payload = cands[0]
+    name = f"{t['cpu']:012x}_{t['q_index']}_{w}x{h}_{t['fmt_name']}.dds"
+    d = os.path.join(out, t["archive"])
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, name), "wb") as f:
+        f.write(dds_bytes(w, h, fmt, payload))
+    t["export"] = {"file": name, "place": place, "score": round(s, 4)}
+    return "ok:" + place
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("index")
+    ap.add_argument("carve")
+    ap.add_argument("out")
+    ap.add_argument("--limit", type=int)
+    a = ap.parse_args()
+    texs = json.load(open(a.index, encoding="utf-8"))
+    texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    if a.limit:
+        texs = texs[: a.limit]
+    os.makedirs(a.out, exist_ok=True)
+    res, cache = Counter(), {}
+    for i, t in enumerate(texs, 1):
+        try:
+            r = export_one(t, a.carve, a.out, cache)
+        except Exception as e:  # noqa: BLE001
+            r = "error:" + type(e).__name__
+        res[r] += 1
+        if i % 2000 == 0:
+            print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
+    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8") as f:
+        json.dump(texs, f)
+    print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,111 @@
+"""Search for the in-tile swizzle of a GPU texture by brute force.
+
+Within a tile of 2^B blocks, each address bit maps to one x or one y bit. Every ordering with the right
+x/y split is tried (bit k goes to the next free x or y bit), tiles are laid out row-major, and the ordering
+whose block-endpoint image is smoothest wins.
+
+Usage:
+    python -I swizzle_search.py <blob> --bpe 8 --tile 65536 [--widths 1024,2048] [--tiles 48] [--out preview.png]
+"""
+import argparse
+import itertools
+import sys
+
+import numpy as np
+
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+from tile_probe import block_feature, score  # noqa: E402
+
+
+def positions(seq, nblocks, tw, th, wblocks):
+    idx = np.arange(nblocks, dtype=np.int64)
+    per = tw * th
+    tile, inner = idx // per, idx % per
+    x = np.zeros_like(idx)
+    y = np.zeros_like(idx)
+    xi = yi = 0
+    for k, c in enumerate(seq):
+        bit = (inner >> k) & 1
+        if c == "x":
+            x |= bit << xi
+            xi += 1
+        else:
+            y |= bit << yi
+            yi += 1
+    tiles_x = wblocks // tw
+    return ((tile // tiles_x) * th + y) * wblocks + (tile % tiles_x) * tw + x
+
+
+def search(data, bpe, tile_bytes, widths, ntiles):
+    raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
+    feat = block_feature(raw, bpe)
+    bits = int(np.log2(tile_bytes // bpe))
+    results = []
+    for xbits in sorted({bits // 2, (bits + 1) // 2}):
+        tw, th = 1 << xbits, 1 << (bits - xbits)
+        for wpx in widths:
+            wb = wpx // 4
+            if wb % tw:
+                continue
+            tiles_x = wb // tw
+            rows = max(1, ntiles // tiles_x)
+            n = tiles_x * rows * tw * th
+            if n > len(raw):
+                continue
+            for xs in itertools.combinations(range(bits), xbits):
+                seq = ["x" if k in xs else "y" for k in range(bits)]
+                pos = positions(seq, n, tw, th, wb)
+                img = np.zeros((n, 3), np.float32)
+                img[pos] = feat[:n]
+                results.append((score(img.reshape(-1, wb, 3)), wpx, "".join(seq)))
+    results.sort()
+    return results
+
+
+def render(data, bpe, tile_bytes, wpx, seq, out):
+    import io
+    import struct
+    from PIL import Image
+    raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
+    bits = len(seq)
+    xbits = seq.count("x")
+    tw, th = 1 << xbits, 1 << (bits - xbits)
+    wb = wpx // 4
+    hb = min(len(raw) // wb // th * th, wb // th * th or th)
+    n = wb * hb
+    pos = positions(list(seq), n, tw, th, wb)
+    lin = np.zeros((n, bpe), np.uint8)
+    lin[pos] = raw[:n]
+    hdr = bytearray(128)
+    hdr[0:4] = b"DDS "
+    struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, hb * 4, wb * 4, n * bpe, 0, 1)
+    struct.pack_into("<I", hdr, 108, 0x1000)
+    if bpe == 8:
+        struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
+        body = bytes(hdr)
+    else:
+        struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
+        body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)
+    Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB").save(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("blob")
+    ap.add_argument("--bpe", type=int, default=8)
+    ap.add_argument("--tile", type=int, default=65536)
+    ap.add_argument("--widths", default="1024,2048")
+    ap.add_argument("--tiles", type=int, default=48)
+    ap.add_argument("--out")
+    a = ap.parse_args()
+    data = open(a.blob, "rb").read()
+    res = search(data, a.bpe, a.tile, [int(w) for w in a.widths.split(",")], a.tiles)
+    for s, w, seq in res[:8]:
+        print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
+    if a.out:
+        render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+        print("preview ->", a.out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

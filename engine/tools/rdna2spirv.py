@@ -147,6 +147,8 @@ class Gen:
             self.emit(f"{v} = OpLoad %uint %vcc")
         else:
             raise Unsupported(f"operand {a.get('t', k)}")
+        if "sdwa_sel" in a:
+            v = self.sdwa_src(v, a)
         return self.modify(v, a)
 
     def modify(self, v, a):
@@ -248,6 +250,8 @@ class Gen:
         self.uses_active = True
 
     def dst(self, a, val):
+        if a.get("sdwa_dst") and a["k"] == "vgpr":
+            val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
@@ -975,7 +979,54 @@ class Gen:
         return self.tof(self.cu(bits))
 
     # ---- instructions ----
+    SDWA_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
+                "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
+
     def insn(self, ins):
+        """SDWA (sub-dword addressing): each source is narrowed to src<i>_sel (zero-extended, or sign-extended
+        under sext()) before the op and its neg/abs, and a VGPR result is placed at dst_sel with dst_unused
+        deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
+        dst_sel; v_cmpx (GFX10) has no written destination operand."""
+        if not ins["op"].endswith("_sdwa"):
+            return self._insn(ins)
+        op, mods = base_op(ins["op"]), ins["mods"]
+        kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
+        args = [dict(x) for x in ins["args"]]
+        first = 0 if op.startswith("v_cmpx") else 1
+        for i, key in enumerate(("src0_sel", "src1_sel")):
+            j = first + i
+            if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
+                args[j]["sdwa_sel"] = kv.get(key, "DWORD")
+        if not op.startswith("v_cmp") and args and (kv.get("dst_sel", "DWORD") != "DWORD"):
+            args[0]["sdwa_dst"] = (kv["dst_sel"], kv.get("dst_unused", "UNUSED_PAD"))
+        return self._insn({**ins, "args": args})
+
+    def sdwa_src(self, v, a):
+        off, width = self.SDWA_SEL[a["sdwa_sel"]]
+        if width == 32:
+            return v
+        r = self.tmp()
+        f = "OpBitFieldSExtract" if a.get("sext") else "OpBitFieldUExtract"
+        self.emit(f"{r} = {f} %uint {v} {self.cu(off)} {self.cu(width)}")
+        return r
+
+    def sdwa_dst(self, d, val):
+        sel, unused = d["sdwa_dst"]
+        off, width = self.SDWA_SEL[sel]
+        if width == 32:
+            return val
+        r = self.tmp()
+        if unused == "UNUSED_PRESERVE":
+            self.emit(f"{r} = OpBitFieldInsert %uint {self.load_reg('vgpr', d['r'])} {val} {self.cu(off)} {self.cu(width)}")
+            return r
+        lo = self.tmp()
+        ext = "OpBitFieldSExtract" if unused == "UNUSED_SEXT" else "OpBitFieldUExtract"
+        self.emit(f"{lo} = {ext} %uint {val} {self.cu(0)} {self.cu(width)}")
+        # SEXT: the sign-extended field shifted up leaves sign copies above it; bits below stay zero.
+        self.emit(f"{r} = OpShiftLeftLogical %uint {lo} {self.cu(off)}")
+        return r
+
+    def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
@@ -1484,17 +1535,18 @@ class Gen:
             self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
             self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
             self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
-        elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16"):
+        elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
             # Packed f16x2 (VOP3P). Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by
             # neg_lo[i]. Result hi: half from op_sel_hi[i], negated by neg_hi[i]. Defaults: op_sel [0,0],
             # op_sel_hi [1,1], no negation.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
-            sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
-            nlo, nhi = bits("neg_lo", [0, 0]), bits("neg_hi", [0, 0])
+            ns = 3 if op == "v_pk_fma_f16" else 2
+            sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
+            nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
             srcs = []
-            for i in range(2):
+            for i in range(ns):
                 u = self.src_u({**a[1 + i], "neg": False, "abs": False})
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
@@ -1510,9 +1562,11 @@ class Gen:
                 vv = self.tmp()
                 self.emit(f"{vv} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
                 srcs.append(vv)
-            vx, vy = srcs
+            vx, vy = srcs[:2]
             r, p = self.tmp(), self.tmp()
-            if op in ("v_pk_add_f16", "v_pk_mul_f16"):
+            if op == "v_pk_fma_f16":
+                self.emit(f"{r} = OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}")
+            elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
                 self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
             else:
                 self.emit(f"{r} = OpExtInst %v2float %glsl {'FMax' if 'max' in op else 'FMin'} {vx} {vy}")
@@ -1749,6 +1803,13 @@ class Gen:
             self.emit(f"{sel} = OpSelect %float {either} %f0 {m}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
+            x, y, z = (self.src_u(t) for t in a[1:4])
+            f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
+            m, r = self.tmp(), self.tmp()
+            self.emit(f"{m} = OpExtInst %uint %glsl {f} {x} {y}")
+            self.emit(f"{r} = OpExtInst %uint %glsl {f} {m} {z}")
+            self.dst(a[0], r)
         elif op in ("v_med3_i32", "v_med3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             s = "S" if op.endswith("i32") else "U"
@@ -2204,12 +2265,14 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
             self.emit(f"{r} = {SHIFT_REV[op]} %uint {x} {m}")
             self.dst(a[0], r)
-        elif op == "v_bfe_u32":
+        elif op in ("v_bfe_u32", "v_bfe_i32"):
+            # offset and width are taken mod 32 (a width of 0 gives 0)
             x, o, w = (self.src_u(t) for t in a[1:4])
             om, wm, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
             self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
-            self.emit(f"{r} = OpBitFieldUExtract %uint {x} {om} {wm}")
+            f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"
+            self.emit(f"{r} = {f} %uint {x} {om} {wm}")
             self.dst(a[0], r)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])

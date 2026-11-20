@@ -27,6 +27,12 @@ def operand(tok):
     absm = core.startswith("|") and core.endswith("|")
     if absm:
         core = core[1:-1]
+    m = re.fullmatch(r"sext\((.+)\)", core)
+    if m:  # SDWA integer sign-extension of the selected source bits
+        inner = operand(m.group(1))
+        inner["sext"] = True
+        inner["neg"] = inner.get("neg", False) or neg
+        return inner
     m = re.fullmatch(r"([sv])(\d+)", core)
     if m:
         return {"k": m.group(1) + "gpr", "r": int(m.group(2)), "n": 1, "neg": neg, "abs": absm}

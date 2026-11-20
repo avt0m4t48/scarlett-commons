@@ -17,7 +17,7 @@ import sys
 
 import numpy as np
 
-HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"G:\ref\mesa-addrlib\gfx10SwizzlePattern.h")
+HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"<ref>\mesa-addrlib\gfx10SwizzlePattern.h")
 BPE_INDEX = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
 
 

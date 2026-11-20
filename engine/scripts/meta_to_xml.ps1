@@ -1,11 +1,11 @@
 # Converts carved PSO ('PSIN') and RBF ('RBF0') metadata blobs to XML with CodeWalker.Core's parsers.
 # Run in Windows PowerShell 5.1.
-#   .\meta_to_xml.ps1 -Carve G:\gta6-work\carve -Out G:\gta6-work\meta [-Limit N]
+#   .\meta_to_xml.ps1 -Carve <work>\carve -Out <work>\meta [-Limit N]
 # Each blob becomes <Out>\<archive>\<offset>.xml. Failures go to <Out>\failures.txt with the parser's message.
 param(
-    [string]$Carve = "G:\gta6-work\carve",
-    [string]$Out = "G:\gta6-work\meta",
-    [string]$CodeWalker = "G:\ref\codewalker-gen9",
+    [string]$Carve = "<work>\carve",
+    [string]$Out = "<work>\meta",
+    [string]$CodeWalker = "<ref>\codewalker-gen9",
     [int]$Limit = 0
 )
 $ErrorActionPreference = "Stop"

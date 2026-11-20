@@ -8,7 +8,7 @@ Classes:
   other:<hex>  anything else, keyed by its first 4 bytes
 
 Usage:
-    python -I classify_carve.py G:\\gta6-work\\carve
+    python -I classify_carve.py <work>\\carve
 Writes types.json (per archive and overall counts/bytes per class, plus size stats) and prints a summary.
 """
 import json

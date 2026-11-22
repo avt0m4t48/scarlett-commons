@@ -683,12 +683,13 @@ public:
         if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
-            return false;
+            return !closed_;  // D3D12 accepts empty/inverted source boxes; emit no zero-extent Vulkan region.
         return append(copy);
     }
 
     bool copy_resource(const CopyResource& copy) {
-        if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src) return !closed_;  // A self-copy is a legal no-op, not a failed command list.
         return append(copy);
     }
 

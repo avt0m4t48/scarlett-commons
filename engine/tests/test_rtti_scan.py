@@ -385,17 +385,35 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertTrue(by_name["Derived"]["multiple"])
         self.assertEqual(by_name["Derived"]["bases"], ["Base"])
 
+    def test_nonnull_chd_with_bad_signature_or_null_base_array_is_refused(self):
+        for name, signature, array_rva in (("bad signature", 7, 0x20A0), ("null array", 0, 0)):
+            with self.subTest(name=name):
+                rdata = bytearray(0x1000)
+                mangled = b".?AVInvalidHierarchy@@\0"
+                rdata[0x10:0x10 + len(mangled)] = mangled
+                rdata[0x40:0x58] = struct.pack("<6I", 1, 0, 0, 0x2000, 0x2080, 0x2040)
+                # A non-null CHD isolates signature validation from the null-RVA guard.
+                # nbase=1 also ensures a null array cannot be rejected accidentally by an out-of-bounds read.
+                rdata[0x80:0x90] = struct.pack("<4I", signature, 3, 1, array_rva)
+                rdata[0xA0:0xA4] = struct.pack("<I", 0x20B0)
+                rdata[0xB0:0xCC] = struct.pack("<IIiiiII", 0x2000, 0, 0, 0, 0, 0, 0)
+                pe = make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata))
+                got = rtti_scan.scan_pe64_rtti(pe)
+                self.assertEqual(len(got["classes"]), 1)
+                cls_info = got["classes"][0]
+                self.assertEqual(cls_info["bases"], [])
+                self.assertFalse(cls_info["multiple"])
+                self.assertFalse(cls_info["virtual"])
+
     def test_unaligned_section_start_does_not_scan_before_section_for_vtables(self):
         rdata = bytearray(0x1000)
         rdata[0x010:0x020] = b".?AVAligned@@\x00\x00\x00"
         # Valid COL at 0x2040
         rdata[0x040:0x058] = struct.pack("<6I", 1, 0, 0, 0x2000, 0, 0x2040)
-        # Put a COL pointer at RVA 0x2100 and a code pointer at 0x2108, then shift .rdata's VirtualAddress
-        # to 0x2104 (with RawPtr shifted +0x104) so RVA 0x2100 lies 4 bytes BEFORE .rdata starts.
+        # Put a COL pointer at RVA 0x2100 and a code pointer at 0x2108. A third section will start at 0x2104,
+        # so the COL pointer begins four bytes before that section.
         rdata[0x100:0x110] = struct.pack("<2Q", self.image_base + 0x2040, self.image_base + 0x1000)
         pe = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
-        # Keep the COL pointer at RVA 0x2100 in the image (inside .text's tail if .text is extended to 0x1104),
-        # or place a third non-exec section starting at unaligned RVA 0x2104 where RVA 0x2100 is outside it.
         sec2_off = 0x80 + 24 + 240 + 40
         # Shrink .rdata VirtualSize to 0x100 (covers 0x2000..0x2100, excluding 0x2100) and add a 3rd section at 0x2104
         struct.pack_into("<I", pe, sec2_off + 8, 0x100)

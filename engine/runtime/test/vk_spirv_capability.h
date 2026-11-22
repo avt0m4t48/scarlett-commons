@@ -7,6 +7,7 @@
 namespace leonida::vk_test {
 
 inline constexpr std::uint32_t spv_sampled_image_array_dynamic_indexing = 29;
+inline constexpr std::uint32_t spv_storage_image_array_dynamic_indexing = 31;
 
 // OpCapability (opcode 17, two words) comes first, after the five-word SPIR-V header.
 inline bool spirv_declares_capability(const void* code, std::size_t bytes, std::uint32_t capability) {

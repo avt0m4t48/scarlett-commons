@@ -1,4 +1,4 @@
-"""The declaration and Vulkan device feature follow dynamic sampled descriptor accesses."""
+"""Each declaration and Vulkan device feature follows its own dynamic descriptor accesses."""
 from pathlib import Path
 import re
 import unittest
@@ -9,6 +9,8 @@ import rdna2spirv
 
 CAPABILITY = "SampledImageArrayDynamicIndexing"
 FEATURE = "shaderSampledImageArrayDynamicIndexing"
+STORAGE_CAPABILITY = "StorageImageArrayDynamicIndexing"
+STORAGE_FEATURE = "shaderStorageImageArrayDynamicIndexing"
 EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 
 
@@ -31,7 +33,11 @@ class SampledDynamicIndex(unittest.TestCase):
         meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, asm)
         self.assertEqual(sum(line.strip() == f"OpCapability {CAPABILITY}" for line in asm.splitlines()), bool(sampled))
         self.assertEqual(FEATURE in meta["features"], bool(sampled))
+        self.assertEqual(sum(line.strip() == f"OpCapability {STORAGE_CAPABILITY}" for line in asm.splitlines()),
+                         bool(storage))
+        self.assertEqual(STORAGE_FEATURE in meta["features"], bool(storage))
         self.assertNotIn("SampledImageArrayNonUniformIndexing", meta["capabilities"])
+        self.assertNotIn("StorageImageArrayNonUniformIndexing", meta["capabilities"])
 
     def test_sample_with_literal_sampler_still_indexes_both_arrays_dynamically(self):
         fixture = Path(__file__).with_name("fixtures") / "sampled_dynamic_index.asm"
@@ -74,3 +80,34 @@ class SampledDynamicIndex(unittest.TestCase):
                 self.check_accesses(asm, (), bindings)
                 if bindings:
                     self.assertIn("OpCapability RuntimeDescriptorArray", asm)
+
+    def test_literal_storage_descriptor_and_mixed_sampled_load(self):
+        fixture = Path(__file__).with_name("fixtures") / "storage_dynamic_index.asm"
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+        self.check_accesses(support.translate_lines("ps_storage_index", lines), (), (8, 9, 10))
+        load = "image_load v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"
+        asm = support.translate_lines("ps_mixed_index", lines[:-2] + [load, "s_waitcnt vmcnt(0)"] + lines[-2:])
+        self.check_accesses(asm, (0,), (8, 9, 10))
+        self.assertIn("OpImageFetch", asm)
+        self.assertIn("OpImageWrite", asm)
+
+    def test_storage_aliases_in_every_dimension(self):
+        for dim, coords, first_binding in (("2D", "v[4:5]", 8), ("2D_ARRAY", "v[4:6]", 11),
+                                           ("3D", "v[4:6]", 14), ("1D", "v4", 17)):
+            for op, mods, expected in (("image_load", "glc dlc d16", "OpImageRead"),
+                                        ("image_store", "", "OpImageWrite")):
+                with self.subTest(dim=dim, op=op):
+                    asm = translate(f"{op} v0, {coords}, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_{dim} unorm {mods}")
+                    self.check_accesses(asm, (), range(first_binding, first_binding + 3))
+                    self.assertIn(expected, asm)
+
+    def test_atomic_texel_pointers_use_storage_indices(self):
+        for dim, coords, binding in (("2D", "v[4:5]", 4), ("3D", "v[4:6]", 7)):
+            for op, data, expected in (("image_atomic_add", "v0", "OpAtomicIAdd"),
+                                        ("image_atomic_cmpswap", "v[0:1]", "OpAtomicCompareExchange")):
+                with self.subTest(dim=dim, op=op):
+                    asm = translate(f"{op} {data}, {coords}, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_{dim} glc")
+                    self.check_accesses(asm, (), (binding,))
+                    (texel, image), = re.findall(r"(%\w+) = OpImageTexelPointer %_ptr_Image_uint (%\w+)", asm)
+                    self.assertIn(f"{expected} %uint {texel} ", asm)
+                    self.assertIn(f"{image} = OpAccessChain %_ptr_UC_simg", asm)

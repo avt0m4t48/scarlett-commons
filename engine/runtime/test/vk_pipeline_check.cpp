@@ -921,6 +921,8 @@ int main(int argc, char** argv) {
         for (const auto& feat : meta.features) {
             if (feat == "shaderSampledImageArrayDynamicIndexing" && !f2.features.shaderSampledImageArrayDynamicIndexing)
                 return "no " + feat;
+            if (feat == "shaderStorageImageArrayDynamicIndexing" && !f2.features.shaderStorageImageArrayDynamicIndexing)
+                return "no " + feat;
         }
         return {};
     };

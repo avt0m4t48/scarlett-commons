@@ -3,8 +3,10 @@
 The lane graph (tools/world_lights_paths.py, levels.rpf) gives every road node a world position. A navmesh tile
 (tools/navmesh_decode.py, navmeshes.rpf) gives polygons with two flag words whose bits are mostly unnamed. This
 tool puts the two together: for each node it finds the polygon of the node's 128 m tile that contains the node in
-plan view and is closest in height, and counts the bits of that polygon's `+0x18` and `+0x28` words. Next to it,
-it sums the plan area of the polygons that carry each bit, over the tiles that hold at least one node. A bit that
+plan view and is closest in height, and counts the bits of that polygon's `+0x18` and `+0x28` words. A polygon's
+height is the mean of its vertex heights, not the surface height under the node, so on a slope the two differ. Next
+to it, it sums the plan area of the polygons that carry each bit, over the tiles that hold at least one node;
+surfaces that lie above one another (a bridge over a road, stacked tiles of one sector) each add their area. A bit that
 most nodes sit on while it covers a small share of the area is tied to the roads. Two bits of `+0x18` do that,
 8 and 13, so the summary also says how they combine (both, only one, neither) for the nodes and for the area; see
 docs/navmesh.md, "Polygon flags under the lane graph".
@@ -34,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import navmesh_decode as nd  # noqa: E402
 import world_lights_paths as wlp  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 TILE = 128.0
 CELL = 8.0               # bucket size of the per-tile lookup grid, metres
@@ -189,7 +192,10 @@ def navmesh_resources(path):
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
             if m[1:4] != b"FPR" or m[0:1] not in (b"7", b"8", b"9"):
                 raise ValueError("%s: not an RPF7/8/9 archive" % path)
-            stream = nd.walk(m, struct.unpack_from("<I", m, 4)[0], size)
+            data_start = struct.unpack_from("<I", m, 4)[0]
+            if not 8 <= data_start <= size:
+                raise ValueError("%s: the data area starts at %d, outside the %d-byte file" % (path, data_start, size))
+            stream = nd.walk(m, data_start, size)
             pending = next(stream, None)
             while pending is not None:
                 head = pending[2]
@@ -270,13 +276,6 @@ def summarize(tally, n_nodes, n_sectors, max_dz):
     }
 
 
-def _same_file(first, second):
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("navmeshes", help="navmeshes.rpf")
@@ -293,7 +292,7 @@ def main(argv=None):
     for path in (a.navmeshes, a.levels):
         if not os.path.isfile(path):
             ap.error("%s: no such file" % path)
-    if a.out and (os.path.isdir(a.out) or any(_same_file(a.out, p) for p in (a.navmeshes, a.levels))):
+    if a.out and (os.path.isdir(a.out) or any(same_report_path(a.out, p) for p in (a.navmeshes, a.levels))):
         ap.error("--out must be a file other than the two archives")
     try:
         nodes, read = node_positions(a.levels, a.jobs)

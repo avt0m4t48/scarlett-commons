@@ -226,6 +226,7 @@ class ArchiveTest(unittest.TestCase):
             [self.navmeshes, self.levels, "--max-dz", "nan"],
             [self.navmeshes, self.levels, "--out", self.levels],
             [self.navmeshes, self.levels, "--out", self.navmeshes],
+            [self.navmeshes, self.levels, "--out", os.path.join(self.tmp.name, ".", "levels.rpf")],
             [self.navmeshes, self.levels, "--out", self.tmp.name],
         )
         before = (os.path.getsize(self.navmeshes), os.path.getsize(self.levels))
@@ -235,6 +236,19 @@ class ArchiveTest(unittest.TestCase):
                 self.assertEqual(cp.returncode, 2, cp.stderr)
                 self.assertNotIn("Traceback", cp.stderr)
         self.assertEqual((os.path.getsize(self.navmeshes), os.path.getsize(self.levels)), before)
+
+    def test_cli_refuses_a_data_start_outside_the_archive(self):
+        # An 8-byte archive whose data area would start at byte 64 was scanned as an empty archive (exit 0).
+        for start in (64, 4):
+            with self.subTest(start=start):
+                with open(self.navmeshes, "wb") as f:
+                    f.write(b"9FPR" + struct.pack("<I", start))
+                cp = subprocess.run([sys.executable, "-I", TOOL, self.navmeshes, self.levels],
+                                    capture_output=True, text=True)
+                self.assertEqual(cp.returncode, 2, cp.stdout)
+                self.assertIn("data area starts at %d" % start, cp.stderr)
+                self.assertNotIn("Traceback", cp.stderr)
+                self.assertEqual(cp.stdout, "")
 
     def test_cli_reports_a_file_that_is_not_an_archive(self):
         junk = os.path.join(self.tmp.name, "junk.rpf")

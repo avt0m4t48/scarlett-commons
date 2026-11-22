@@ -57,6 +57,7 @@ LIMBO = joaat("limbo")
 ROOM_KEY = 0xA261E0A9  # a room's hash member that holds an interior key's joaat
 OVERLAP = 64 << 20  # a worker reads this far past its window so a resource that straddles the edge is whole
 THRESHOLDS = (0, 1, 2, 5, 10, 25, 100)
+ROOM_EPS = 1e-6  # metres; a point on a room face stays inside despite the rounding of the inverse rotation
 
 
 def _vec3(b, base, member):
@@ -289,7 +290,7 @@ def resolve(names, found, duplicate_keys=0):
             for q in positions:
                 locs = [(_local(q, p["position"], r), p) for p, r in placed]
                 out.append(min(_outside(v, *_scaled(lo, hi, p)) for v, p in locs))
-                if any(rn != LIMBO and rlo and rhi and _outside(v, *_scaled(rlo, rhi, p)) == 0.0
+                if any(rn != LIMBO and rlo and rhi and _outside(v, *_scaled(rlo, rhi, p)) <= ROOM_EPS
                        for v, p in locs for rn, rlo, rhi, _ in d["rooms"]):
                     summary["positions_in_a_room_box"][tag] += 1
             row["outside_box_m_" + tag] = [round(x, 3) for x in out]

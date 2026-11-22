@@ -211,6 +211,17 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(rows[KEY_A]["outside_box_m_conjugate"], [0.0, 0.5])
         self.assertEqual(s["positions_in_a_room_box"], {"stored": 1, "conjugate": 1})
 
+    def test_room_face_after_rotation_counts(self):
+        # Review case on fcfed39: +90 degrees about X stored as float32, scale XY 1.5 and Z -2. The room's upper
+        # world Z face is 30.75; the inverse rotation puts a point on it at local Y 0.7500000000000003.
+        q = struct.unpack("<4f", struct.pack("<4f", S, 0.0, 0.0, S))
+        d = {"name": HA, "keys": {}, "bb_min": [1.0, -2.0, 0.0], "bb_max": [4.0, 1.0, 3.0],
+             "rooms": [[J("a"), [2.0, -1.0, 0.5], [3.0, 0.5, 2.0], 0]]}
+        p = {"archetype": HA, "position": [10.0, 20.0, 30.0], "rotation": list(q), "scale_xy": 1.5, "scale_z": -2.0}
+        for z, hits in ((30.749, 1), (30.75, 1), (30.751, 0)):
+            s, _ = T.resolve({KEY_A: [[13.75, 22.5, z]]}, {0: ([d], [p])})
+            self.assertEqual(s["positions_in_a_room_box"]["stored"], hits, z)
+
     def test_scaled_box_negative_and_missing_scale(self):
         lo, hi = [-1.0, -2.0, 0.0], [3.0, 2.0, 4.0]
         self.assertEqual(T._scaled(lo, hi, {"scale_xy": -2.0, "scale_z": 0.5}), ([-6.0, -4.0, 0.0], [2.0, 4.0, 2.0]))

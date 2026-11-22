@@ -59,14 +59,21 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 def joaat(text: str, *, case_sensitive: bool = False) -> int:
-    """Jenkins one-at-a-time joaat over the UTF-8 bytes.
+    """Jenkins one-at-a-time joaat over the engine's name bytes.
 
-    The engine lower-cases the name for the normal 32-bit hash. Pass
-    ``case_sensitive=True`` for the field/struct-name variant.
+    The engine lower-cases the name for the normal 32-bit hash, and hashes it as 8-bit bytes: the default
+    form is ``joaat`` of the lowercased Latin-1 bytes, the rule ``tools/hashdict.py`` (the pinned name
+    dictionary) and ``tools/awc_names.py`` use, so a name hashes alike in every tool. A character outside
+    Latin-1 cannot occur in a name and becomes ``?``. Encoding to UTF-8 first and lower-casing the bytes
+    afterwards gave a different hash for any non-ASCII name, since bytes.lower() only folds ASCII.
+
+    Pass ``case_sensitive=True`` for the field/struct-name variant, which keeps the exact bytes (UTF-8).
+    Every field name measured so far is ASCII, where both encodings agree.
     """
-    data = text.encode("utf-8")
-    if not case_sensitive:
-        data = data.lower()
+    if case_sensitive:
+        data = text.encode("utf-8")
+    else:
+        data = text.lower().encode("latin-1", "replace")
     h = 0
     for c in data:
         h = (h + c) & MASK32
@@ -215,6 +222,10 @@ class NameDictionary:
         if not name or len(name) > 512:
             return False
         if any(ord(ch) < 0x20 for ch in name):
+            return False
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:   # a lone surrogate (JSON \ud800 escape, XML &#xD800;) has no UTF-8 form to hash
             return False
         table = self.derived if derived else self.names
         h = joaat(name)
@@ -476,12 +487,12 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
 
 def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
     if not isinstance(data, dict):
-        return {}
+        raise ValueError("expected an archetype report object")
     raw = data.get("archetypes")
     if not isinstance(raw, dict):
         raw = data.get("hashes")
     if not isinstance(raw, dict):
-        return {}
+        raise ValueError("expected an archetypes or hashes table")
     keys = data.get("keys") if isinstance(data.get("keys"), dict) else data.get("key64")
     if not isinstance(keys, dict):
         keys = {}
@@ -581,8 +592,11 @@ def _resolve(args) -> int:
         report["maps"] = dict(maps)
     archetypes = collections.Counter()
     for path in args.archetypes:
-        data = _load_json(path)
-        stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        try:
+            data = _load_json(path)
+            stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from None
         for key, value in stats.items():
             archetypes[key] += value
     if args.archetypes:

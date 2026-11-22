@@ -127,7 +127,7 @@ def build_bank(streams):
     return bytes(out)
 
 
-def build_music_bank(block_tocs, samples, rate=48000):
+def build_music_bank(block_tocs, samples, rate=48000, last_size=None):
     """One TOC per channel group in each block, with one 2048-byte subblock per group."""
     channels = len(block_tocs[0])
     chunk = 2048 * (1 + channels)
@@ -145,12 +145,36 @@ def build_music_bank(block_tocs, samples, rate=48000):
             struct.pack_into("<I", data, at + 24 * i + 4, 1)
             packet = at + 2048 * (1 + i)
             struct.pack_into("<HB", data, packet, 1, toc)
+    if last_size is not None:
+        del data[(len(block_tocs) - 1) * chunk + last_size:]
     header = 16 + 4 + 2 * 8
     out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
     out += struct.pack("<I", 0x20 | (2 << 29))
     out += struct.pack("<Q", tag(0x48, header, len(desc)))
     out += struct.pack("<Q", tag(0x55, header + len(desc), len(data)))
     return bytes(out + desc + data)
+
+
+def build_repeating_music_bank(chunks, group_samples=None):
+    """Each chunk lists (skip samples, packets) for each channel group."""
+    channels = len(chunks[0])
+    chunk_size = 2048 * (channels + 1)
+    bank = bytearray(build_music_bank([[0xF8] * channels for _ in chunks], 2880))
+    _, music = awc.parse_awc(bank)
+    (descriptor_offset, _), (data_offset, _) = music[0]
+    if group_samples is not None:
+        for group, samples in enumerate(group_samples):
+            struct.pack_into("<I", bank, descriptor_offset + 12 + 16 * group + 4, samples)
+    for block, groups in enumerate(chunks):
+        at = data_offset + block * chunk_size
+        for group, (skip, packets) in enumerate(groups):
+            struct.pack_into("<I", bank, at + group * 24 + 8, skip)
+            start = at + (group + 1) * 2048
+            payload = b"".join(struct.pack("<H", len(packet)) + packet for packet in packets)
+            if len(payload) > 2048:
+                raise AssertionError("synthetic packets do not fit their subblock")
+            bank[start:start + 2048] = payload.ljust(2048, b"\x00")
+    return bytes(bank)
 
 
 def build_music_pcm_bank(blocks=1, count=1, pcm=None):
@@ -310,6 +334,24 @@ class ExportBankTest(unittest.TestCase):
                 for stem, sample in samples.items():
                     self.assertEqual(read_wav(out / stem / "00000001.wav")["pcm"], struct.pack("<h", sample))
                 self.assertEqual(previous.read_bytes(), b"previous export")
+
+    def test_cli_fails_when_bank_enumeration_is_incomplete(self):
+        src = Path(self.tmp.name) / "banks"
+        src.mkdir()
+        blocked = src / "blocked"
+
+        def walk(root, onerror=None):
+            yield root, ["blocked"], ["valid.awc"]
+            if onerror:
+                onerror(PermissionError(13, "Permission denied", blocked))
+
+        totals = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
+        with mock.patch.object(awc.os, "walk", walk), mock.patch.object(awc, "export_bank", return_value=totals) as export, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc.main([str(src), self.out, "--jobs", "1"]), 1)
+        self.assertIn("blocked", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        export.assert_not_called()
 
     def test_cli_bank_limits(self):
         src = Path(self.tmp.name) / "banks"
@@ -576,6 +618,61 @@ class StreamedMusicTest(unittest.TestCase):
         self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 312, 48000, 0, 0))
         self.assertEqual(pages[-1]["granule"], 312 + 960)
 
+    def test_short_final_block_keeps_its_music(self):
+        # With two groups, a chunk normally occupies 6144 bytes. The last group in the second
+        # chunk has no subblocks, so the bank only stores the 4096 bytes that chunk needs.
+        bank = bytearray(build_music_bank([[0x78, 0x78], [0x78, 0x78]], 1920, last_size=4096))
+        _, music = awc.parse_awc(bank)
+        _, (offset, _) = music[0]
+        struct.pack_into("<I", bank, offset + 6144 + 24 + 4, 0)
+        channels = awc.music_channels(bank, *music[0])
+        self.assertEqual([len(channel[4]) for channel in channels], [2, 1])
+        path = Path(self.tmp.name) / "short-final.awc"
+        path.write_bytes(bank)
+        self.assertEqual(awc.export_bank(str(path), self.out)["music"], 2)
+        for sid, granule in (("00000100", 1920), ("00000101", 960)):
+            output = Path(self.out, "short-final", sid + ".ogg")
+            self.assertEqual(parse_ogg_pages(output.read_bytes())[-1]["granule"], granule)
+
+    def test_removes_only_verified_packet_repeats_from_each_group(self):
+        a, b, c = b"\xf8a", b"\xf0b", b"\xf8c"   # 960, 480, 960 samples
+        x, y, z = b"\xfcx", b"\xfcy", b"\xfcz"   # stereo, 960 each
+        bank = build_repeating_music_bank([
+            [(0, [a, b]), (0, [x, y])],
+            [(1440, [a, b, c]), (960, [y, z])],
+        ], group_samples=[2400, 2 * 2880])
+        _, music = awc.parse_awc(bank)
+        channels = awc.music_channels(bank, *music[0])
+        self.assertEqual([group[4] for group in channels], [[a, b, c], [x, y, z]])
+        metadata = awc.music_channels(bank, *music[0], collect_packets=False)
+        self.assertEqual([(group[4], group[5]) for group in metadata], [([], 1), ([], 2)])
+
+        path = Path(self.tmp.name) / "repeated.awc"
+        path.write_bytes(bank)
+        self.assertEqual(awc.export_bank(str(path), self.out, pre_skip=0)["music"], 2)
+        for sid, expected, frames in (("00000100", a + b + c, 2400), ("00000101", x + y + z, 2880)):
+            pages = parse_ogg_pages(Path(self.out, "repeated", sid + ".ogg").read_bytes())
+            self.assertEqual(b"".join(page["body"] for page in pages[2:]), expected)
+            self.assertEqual(pages[-1]["granule"], frames)
+
+    def test_rejects_inconsistent_repeats_in_both_parse_modes(self):
+        a, b = b"\xf8a", b"\xf8b"
+        cases = {
+            "repeat in first chunk": [[(960, [a])]],
+            "partial packet": [[(0, [a])], [(959, [a, b])]],
+            "different tail": [[(0, [a, b])], [(960, [a])]],
+            "beyond the current payload": [[(0, [a])], [(1920, [a])]],
+            "beyond the previous payload": [[(0, [a])], [(1920, [a, b])]],
+            "empty chunk claims a repeat": [[(0, [a])], [(960, [])]],
+            "repeat from the other group": [[(0, [a]), (0, [b])], [(960, [b]), (0, [b])]],
+        }
+        for name, chunks in cases.items():
+            with self.subTest(name=name):
+                bank = build_repeating_music_bank(chunks)
+                _, music = awc.parse_awc(bank)
+                for collect in (True, False):
+                    self.assertEqual(awc.music_channels(bank, *music[0], collect_packets=collect), [])
+
     def test_two_mono_groups_export_two_mono_oggs(self):
         counts, od = self.export([[0x78, 0x78], [0x78, 0x78]], 960)
         self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 2})
@@ -665,6 +762,16 @@ class MalformedMusicGeometryTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))
         self.assertFalse(os.path.exists(os.path.join(od, "00000100.ogg")))
 
+    def test_short_descriptor_at_bank_end_keeps_sibling_streams(self):
+        bank = bytearray(build_music_pcm_bank())
+        struct.pack_into("<Q", bank, 24, tag(0x48, len(bank), 4))
+        bank += bytes(4)  # the descriptor tag fits, but its fixed header does not
+        path = Path(self.tmp.name) / "short-descriptor.awc"
+        path.write_bytes(bank)
+        counts = awc.export_bank(str(path), self.out)
+        self.assertEqual((counts["pcm"], counts["music"]), (1, 0))
+        self.assertTrue(Path(self.out, "short-descriptor", "00000021.wav").is_file())
+
     def test_overread_into_sibling_payload_exports_no_music(self):
         # The bytes right after the one real chunk are the PCM stream's payload, crafted to
         # look like a second chunk. Before the fix its 'packet' was exported as music audio.
@@ -689,6 +796,19 @@ class MalformedMusicGeometryTest(unittest.TestCase):
         self.assertEqual(awc.music_channels(d, *music[0]), [])
         counts = awc.export_bank(path, self.out)
         self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+
+    def test_subblocks_cannot_cross_into_the_next_chunk(self):
+        bank = bytearray(build_music_bank([[0x78], [0x78]], 1920))
+        _, music = awc.parse_awc(bank)
+        _, (offset, _) = music[0]
+        struct.pack_into("<I", bank, offset + 4, 2)  # first chunk only has room for one subblock
+        self.assertEqual(awc.music_channels(bank, *music[0]), [])
+        self.assertEqual(awc.music_channels(bank, *music[0], collect_packets=False), [])
+
+    def test_short_last_chunk_cannot_read_a_partial_channel_table(self):
+        bank = build_music_bank([[0x78], [0x78]], 1920, last_size=8)
+        _, music = awc.parse_awc(bank)
+        self.assertEqual(awc.music_channels(bank, *music[0]), [])
 
     def test_cli_exports_the_sibling_stream_without_skipping_the_bank(self):
         path = self.write_bank(blocks=3)
@@ -762,6 +882,50 @@ class ShortLastMusicBlockTest(unittest.TestCase):
         (m_at, _), _ = music[0]
         struct.pack_into("<I", d, m_at, 3)           # declare a third block starting past the tag
         self.assertEqual(self.channels(bytes(d)), [])
+
+
+class AwcIndexTableTest(unittest.TestCase):
+    """The optional index table stores the tag count before each stream, as AwcRecovery.cs checks."""
+
+    @staticmethod
+    def bank(indices, tag_counts=(2,)):
+        n = len(indices)
+        header_size = 16 + n * 2 + n * 4 + sum(tag_counts) * 8
+        body = bytearray()
+        entries = []
+        for count in tag_counts:
+            fmt_at = header_size + len(body)
+            body += format_block(2, 48000, 0, 1)
+            data_at = header_size + len(body)
+            body += b"\x01\x00\x02\x00"
+            entries.append((fmt_at, data_at, count))
+        out = bytearray(b"ADAT" + struct.pack("<III", 0x10000, n, header_size))
+        for index in indices:
+            out += struct.pack("<H", index)
+        for i, (_fmt, _data, count) in enumerate(entries):
+            out += struct.pack("<I", (i + 1) | (count << 29))
+        for fmt_at, data_at, _count in entries:
+            out += struct.pack("<Q", tag(0x76, fmt_at, 32))
+            out += struct.pack("<Q", tag(0x55, data_at, 4))
+        if len(out) != header_size:
+            raise AssertionError("index-table fixture layout does not match header_size")
+        return bytes(out + body)
+
+    def test_valid_index_table_is_accepted(self):
+        streams, music = awc.parse_awc(self.bank([0]))
+        self.assertEqual([s["id"] for s in streams], [1])
+        self.assertEqual((streams[0]["samples"], streams[0]["rate"]), (2, 48000))
+        self.assertEqual(music, [])
+
+    def test_bogus_index_entry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "index"):
+            awc.parse_awc(self.bank([0x1234]))
+
+    def test_index_tracks_cumulative_tag_count(self):
+        with self.assertRaisesRegex(ValueError, "index"):
+            awc.parse_awc(self.bank([0, 1], (2, 2)))
+        streams, _music = awc.parse_awc(self.bank([0, 2], (2, 2)))
+        self.assertEqual([s["id"] for s in streams], [1, 2])
 
 
 class MalformedBankTest(unittest.TestCase):

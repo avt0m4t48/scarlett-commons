@@ -363,6 +363,17 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "OK")
 
+    def test_cli_verify_refuses_an_empty_manifest_for_a_folder_with_files(self):
+        # A create that was cut short, or a mistyped --manifest, used to print OK without checking a file.
+        empty = os.path.join(self.tmp.name, "empty.json")
+        with open(empty, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"files": {}}\n')
+        result = self.run_cli("verify", self.pkg, "--manifest", empty)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("lists no files", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_cli_verify_failure_exit_code(self):
         self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
 
@@ -665,6 +676,30 @@ class ManifestDigestCaseTest(unittest.TestCase):
                     self.assert_files_unchanged(self.payloads)
                     with open(self.out, "rb") as f:
                         self.assertEqual(f.read(), before)
+
+
+class ManifestPosixBackslashTest(unittest.TestCase):
+    @unittest.skipIf(os.sep == "\\", "backslashes are path separators on Windows")
+    def test_posix_literal_backslash_does_not_collide_with_subdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = os.path.join(tmp, "pkg")
+            os.makedirs(os.path.join(pkg, "sub"))
+            with open(os.path.join(pkg, "sub", "a.dat"), "wb") as f:
+                f.write(b"nested")
+            with open(os.path.join(pkg, "sub\\a.dat"), "wb") as f:
+                f.write(b"literal-backslash")
+            out = os.path.join(tmp, "manifest.json")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(manifest.create(pkg, out, jobs=1), 0)
+            entries = manifest.load_manifest(out)
+            self.assertEqual(sorted(entries), ["sub/a.dat", "sub\\a.dat"])
+            self.assertEqual(entries["sub/a.dat"]["size"], len(b"nested"))
+            self.assertEqual(entries["sub\\a.dat"]["size"], len(b"literal-backslash"))
+            verify_out = io.StringIO()
+            with contextlib.redirect_stdout(verify_out):
+                self.assertEqual(manifest.verify(pkg, out, jobs=1), 0)
+            self.assertEqual(verify_out.getvalue(), "OK\n")
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

@@ -144,7 +144,10 @@ def docs_only_patterns(root):
             "with the workflow")
     # The step ends at the next line indented no deeper than its own "- name:": another step, or another job.
     end = re.compile(r"^ {0,6}\S", re.M).search(text, text.index("\n", start))
-    return re.findall(r"tests/[\w*./-]+\.py", text[start:end.start() if end else len(text)])
+    # A commented-out command is the usual way a test stops running: shell comments don't count. (`#` starts one
+    # at the beginning of a line or after a space, as in bash.)
+    lines = [re.sub(r"(^|\s)#.*", "", line) for line in text[start:end.start() if end else len(text)].splitlines()]
+    return re.findall(r"tests/[\w*./-]+\.py", "\n".join(lines))
 
 
 def document_tests_not_run_for_docs_only(root, files):
@@ -368,6 +371,12 @@ class RepositoryRegistrationTest(unittest.TestCase):
                               ["tests/test_docs_gone.py"]))
             # The step is read up to the next step or job, not to the end of the file.
             self.assertNotIn("tests/test_other.py", docs_only_patterns(tmp))
+            # A commented-out command does not run: neither a whole line nor the rest of a line after ` #`.
+            workflow(["# for t in tests/test_docs_*.py tests/test_i18n_index.py; do", "echo skipped",
+                      "python3 -I tests/test_docs_links.py  # python3 -I tests/test_i18n_index.py"])
+            self.assertEqual(docs_only_patterns(tmp), ["tests/test_docs_links.py"])
+            self.assertEqual(document_tests_not_run_for_docs_only(tmp, files),
+                             (["tests/test_docs_design_rows.py", "tests/test_i18n_index.py"], []))
 
     def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
         with tempfile.TemporaryDirectory() as tmp:

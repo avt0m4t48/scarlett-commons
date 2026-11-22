@@ -104,6 +104,94 @@ class SpirvOptTests(unittest.TestCase):
         _validate(opt)
         self.assertEqual(support.mrt0_words(opt), support.mrt0_words(raw))
         self.assertEqual(support.mrt0_words(opt), [30, 35, 10, 20])
+        # Non-divergent scalar-branch shader never stores %active: cross-block read-only propagation eliminates
+        # every OpLoad %bool %active and the dead %active OpVariable across all blocks.
+        self.assertNotIn("OpLoad %bool %active", opt)
+        self.assertNotIn("%active = OpVariable", opt)
+
+    def test_cross_block_constant_folding_and_dead_func_vars(self):
+        # Constant integer/bit folding + algebraic identities across straight-line ALU.
+        lines = [
+            "v_mov_b32_e32 v1, 2",
+            "v_lshlrev_b32_e32 v2, 2, v1",      # 2 << (2 & 0x1f) -> folds (2 & 0x1f) and shift
+            "v_add_nc_u32_e32 v3, v2, 0",       # + 0 identity
+            "v_xor_b32_e32 v4, v3, v3",         # x ^ x -> 0
+            "v_or_b32_e32 v5, v3, 0",           # | 0 identity
+            "exp mrt0 v2, v3, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        raw = support.translate_lines("ps_opt_fold", lines)
+        opt = spirv_opt.optimize(raw)
+        _validate(opt)
+        self.assertEqual(support.mrt0_words(opt), [8, 8, 0, 8])
+        self.assertNotIn("OpBitwiseXor", opt)
+        self.assertNotIn("OpIAdd", opt)
+        # Unused Function-scope variables (%m0, %scc, %active, etc.) should be removed.
+        self.assertNotIn("%m0 = OpVariable", opt)
+        self.assertNotIn("%active = OpVariable", opt)
+
+    def test_trivial_phi_and_dominator_cse_in_loop(self):
+        # Hand-crafted SPIR-V module exercising trivial OpPhi (identical incoming + self-loop) and
+        # dominator-tree OpAccessChain + Input OpLoad CSE across a structured loop.
+        spvasm = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %in0 %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %in0 Location 0
+               OpDecorate %in0 Flat
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_In = OpTypePointer Input %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+   %_ptr_Fun = OpTypePointer Function %uint
+        %c0  = OpConstant %uint 0
+        %c1  = OpConstant %uint 1
+        %c4  = OpConstant %uint 4
+       %true = OpConstantTrue %bool
+      %false = OpConstantFalse %bool
+        %in0 = OpVariable %_ptr_In Input
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %local = OpVariable %_ptr_Fun Function %c0
+         %v0 = OpLoad %uint %in0
+               OpStore %local %v0
+               OpBranch %head
+       %head = OpLabel
+        %phi = OpPhi %uint %v0 %entry %phi %cont
+          %i = OpPhi %uint %c0 %entry %inext %cont
+               OpLoopMerge %exit %cont None
+               OpBranch %body
+       %body = OpLabel
+         %v1 = OpLoad %uint %in0
+        %sum = OpIAdd %uint %phi %v1
+       %cond = OpULessThan %bool %i %c4
+               OpSelectionMerge %merge None
+               OpBranchConditional %cond %cont %exit
+      %merge = OpLabel
+               OpUnreachable
+       %cont = OpLabel
+      %inext = OpIAdd %uint %i %c1
+               OpBranch %head
+       %exit = OpLabel
+        %res = OpCompositeConstruct %v4uint %phi %v0 %c0 %c1
+               OpStore %out0 %res
+               OpReturn
+               OpFunctionEnd
+"""
+        _validate(spvasm)
+        opt = spirv_opt.optimize(spvasm)
+        _validate(opt)
+        # Trivial self-referential %phi must collapse to %v0, duplicate %v1 = OpLoad %in0 CSEs to %v0,
+        # dead %sum and dead %local OpVariable are eliminated.
+        self.assertNotIn("%phi = OpPhi", opt)
+        self.assertEqual(opt.count("OpLoad %uint %in0"), 1)
+        self.assertNotIn("%local = OpVariable", opt)
+        self.assertNotIn("%sum = OpIAdd", opt)
 
     def test_wave64_emulated_compute_validates_and_shrinks(self):
         cs_lines = [

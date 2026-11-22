@@ -209,15 +209,26 @@ class BufferAtomicFminmax(unittest.TestCase):
 
     def test_no_float_atomic_capability_and_rejected_forms(self):
         for kind, glsl_op in (("fmin", "NMin"), ("fmax", "NMax")):
-            spv = translate(buf_rsrc_lines(0, 0, 0x100, RAW_W3) + [
-                "v_mov_b32_e32 v1, 0",
-                "v_mov_b32_e32 v2, 0x3f800000",
-                f"buffer_atomic_{kind} v2, v1, s[8:11], 0 offen glc",
-            ])
-            self.assertIn("OpAtomicCompareExchange", spv)
-            self.assertIn(glsl_op, spv)
-            self.assertNotIn("AtomicFloat", spv)
-            self.assertNotIn("SPV_EXT_shader_atomic_float", spv)
+            for body in (
+                buf_rsrc_lines(0, 0, 0x100, RAW_W3) + [
+                    "v_mov_b32_e32 v1, 0",
+                    "v_mov_b32_e32 v2, 0x3f800000",
+                    f"buffer_atomic_{kind} v2, v1, s[8:11], 0 offen glc",
+                ],
+                [
+                    "v_mov_b32_e32 v1, 0x2000",
+                    "v_mov_b32_e32 v2, 0x3f800000",
+                    f"global_atomic_{kind} v5, v1, v2, s[0:1] glc",
+                ],
+            ):
+                with self.subTest(insn=body[-1]):
+                    spv = translate(body)
+                    self.assertIn("OpAtomicLoad %uint", spv)
+                    self.assertIn("OpAtomicCompareExchange", spv)
+                    self.assertNotIn("Aligned 4", spv)  # no plain non-atomic PSB OpLoad on atomic addr
+                    self.assertIn(glsl_op, spv)
+                    self.assertNotIn("AtomicFloat", spv)
+                    self.assertNotIn("SPV_EXT_shader_atomic_float", spv)
 
         for bad in ("buffer_atomic_fmin v[2:3], v1, s[8:11], 0 offen glc",
                     "buffer_atomic_fmax v2, v1, s[8:11], 0 offen lds"):

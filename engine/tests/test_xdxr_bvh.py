@@ -515,6 +515,26 @@ class Cli(unittest.TestCase):
             self.assertIn("no 'address' key", text)
             self.assertNotIn("good.json", text)
 
+    def test_check_build_instance_without_a_transform_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": [], "instances": [{"blas": 0, "mask": 1}]}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("instance 0 has no 'transform' key", text)
+
+    def test_check_build_unknown_blas_name_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": ["missing_bvh"], "instances": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("BLAS 'missing_bvh' is not a case in this folder", text)
+
     def test_check_build_tlas_without_its_instances_names_its_json(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:

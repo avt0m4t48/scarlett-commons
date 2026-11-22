@@ -763,6 +763,17 @@ def _load_case(directory, name):
         for key in ("address",) + (("blas", "instances") if kind == "tlas" else ()):
             if key not in desc:
                 raise CaseError(f"{js}: the case has no {key!r} key")
+        if kind == "tlas":
+            if not isinstance(desc["blas"], list) or not all(isinstance(b, str) and b for b in desc["blas"]):
+                raise CaseError(f"{js}: 'blas' is not a list of case names")
+            if not isinstance(desc["instances"], list):
+                raise CaseError(f"{js}: 'instances' is not a list")
+            for i, inst in enumerate(desc["instances"]):
+                if not isinstance(inst, dict):
+                    raise CaseError(f"{js}: instance {i} is not an object")
+                for key in ("transform", "blas", "mask"):
+                    if key not in inst:
+                        raise CaseError(f"{js}: instance {i} has no {key!r} key")
     except KeyError as error:
         raise CaseError(f"{js}: the case has no {error} key") from None
     except (OSError, ValueError, TypeError, IndexError) as error:
@@ -777,6 +788,19 @@ def check_build(directory, rays=300, seed=1):
         return [f"no cases in {directory}"]
     problems = []
     cases = {n: _load_case(directory, n) for n in names}
+    for n, (desc, _) in cases.items():
+        if desc["kind"] != "tlas":
+            continue
+        js = f"{directory}/{n}.json"
+        for b in desc["blas"]:
+            if b not in cases:
+                raise CaseError(f"{js}: BLAS {b!r} is not a case in this folder")
+            if cases[b][0]["kind"] != "blas":
+                raise CaseError(f"{js}: {b!r} is a {cases[b][0]['kind']}, not a blas")
+        for i, inst in enumerate(desc["instances"]):
+            index = inst["blas"]
+            if not isinstance(index, int) or not 0 <= index < len(desc["blas"]):
+                raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not 0..{len(desc['blas']) - 1}")
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
         # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,

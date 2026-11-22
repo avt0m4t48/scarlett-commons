@@ -1446,6 +1446,7 @@ public:
         auto& vk = context_.vk;
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
+        context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1602,10 +1603,14 @@ public:
     // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
     // `pin` returns what keeps the fence object alive until then (a D3D12 queue holds its fences).
     void wait(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
-        std::lock_guard state(state_mutex_);
-        waits_.push_back(fence);
-        wait_values_.push_back(value);
-        if (pin) wait_pins_.push_back(pin());
+        std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
+        {
+            std::lock_guard state(state_mutex_);
+            waits_.push_back(fence);
+            wait_values_.push_back(value);
+            if (pin) wait_pins_.push_back(pin());
+            drain_pins(retired);
+        }
     }
 
     // The first failure of a held ExecuteCommandLists since the last call (what the call would have returned had it
@@ -1618,7 +1623,9 @@ public:
     // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
     // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
     void marker(DebugMarker::Kind kind, const char* label) {
+        std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
+        drain_pins(retired);  // destroyed after the lock (reverse declaration order)
         if (!held_.empty()) {  // behind the held work, so behind it in the queue's labels too
             Deferred op;
             op.kind = Deferred::Kind::marker;
@@ -2077,8 +2084,8 @@ private:
         case Deferred::Kind::batch: {
             std::vector<const CommandList*> lists;
             for (const CommandList& list : op.lists) lists.push_back(&list);
-            // The pipeline states and root signatures of the lists are in wait_pins_ too (see execute()): they live
-            // until here, and are released once the batch has been recorded.
+            // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
+            // the batch has been recorded and then, with the fences, until its submission has completed (below).
             const ReplayResult result = execute_now(lists);
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
@@ -2350,10 +2357,12 @@ private:
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
-            // Claimed under the submit lock, so the order of the claims is the order of the submissions. A Signal
+            // Decided under the submit lock, so the order of the checks is the order of the submissions. A Signal
             // that is not above what was already submitted for this fence (a held Signal(F, 2) released after an
             // unheld Signal(F, 3)) leaves the Vulkan signal out: the timeline cannot go down, and waits for 2 pass.
-            if (fence && context_.holds().claim_signal(fence, value)) {
+            // The value counts as submitted only after the submit succeeded (below).
+            const bool signals_fence = fence && context_.holds().would_signal(fence, value);
+            if (signals_fence) {
                 signals[signal_count] = fence;
                 signal_values[signal_count] = value;
                 ++signal_count;
@@ -2372,7 +2381,10 @@ private:
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
-            if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
+            if (res == VK_SUCCESS) {
+                context_.record_submit_locked(progress_, ticket);
+                if (signals_fence) context_.holds().signaled(fence, value);
+            }
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();

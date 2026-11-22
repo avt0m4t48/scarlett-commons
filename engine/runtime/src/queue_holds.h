@@ -81,18 +81,16 @@ public:
         if (it != fences_.end() && it->second < value) it->second = value;
     }
 
-    // A queue is about to submit a Signal of `value`; call inside the device submit lock, so the order of the
-    // calls is the order of the vkQueueSubmits. False when a Signal of at least `value` was already submitted: the
-    // timeline cannot go down or stay (VUID-VkSubmitInfo-pSignalSemaphores-03242 and the timeline rules), and a wait
-    // for `value` is already satisfied, so the Vulkan signal is left out. This happens when a held Signal(F, 2) is
-    // released after an unheld Signal(F, 3). Unknown semaphores are always signaled.
-    bool claim_signal(Semaphore semaphore, std::uint64_t value) {
+    // A queue is about to submit a Signal of `value`; call inside the device submit lock, and record the value with
+    // signaled() only once the vkQueueSubmit succeeded (a failed submit signals nothing: waiters must stay held and a
+    // retry must go through). False when a Signal of at least `value` was already submitted: the timeline cannot go
+    // down or stay (VUID-VkSubmitInfo-pSignalSemaphores-03242 and the timeline rules), and a wait for `value` is
+    // already satisfied, so the Vulkan signal is left out. This happens when a held Signal(F, 2) is released after an
+    // unheld Signal(F, 3). Unknown semaphores are always signaled.
+    bool would_signal(Semaphore semaphore, std::uint64_t value) const {
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
-        if (it == fences_.end()) return true;
-        if (it->second >= value) return false;
-        it->second = value;
-        return true;
+        return it == fences_.end() || it->second < value;
     }
 
     // true when no submitted Signal reaches `value` yet. Unknown semaphores are satisfied.

@@ -785,11 +785,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
         return 1;
     }
-    if (two_queues || shared_queue) {
-        deadline = 0;
-        return 0;
-    }
-
+    // Every mode ends with the same cases on the host runtime: the expected data is the CPU's pattern in all of
+    // them, so the host run shows the cases are valid D3D12 and the layer's modes are held to the same bar.
     std::wstring name;
     if (auto host = native_device(name)) {
         arm("host runtime", 300000);

@@ -331,6 +331,33 @@ int main() {
             std::printf("queue/query sync: failed held batch reported, its wait kept for the retry, Signal behind it ran\n");
         }
 
+        // 3c. A Signal whose vkQueueSubmit fails signals nothing: a queue waiting for it stays held (the value is not
+        //     counted as submitted), and the application's retry of the Signal goes through and releases it.
+        {
+            VulkanFence fence(context, 0);
+            EXPECT(fence.semaphore() != VK_NULL_HANDLE);
+            const std::uint64_t pattern = 0x5ca1ab1e0ddba11ULL;
+            std::memcpy(src_ptr, &pattern, sizeof(pattern));
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            CommandList copy_list;
+            EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(pattern)}));
+            EXPECT(copy_list.close());
+            const CommandList* ptr = &copy_list;
+            queue_b.wait(fence.semaphore(), 1);
+            EXPECT(queue_b.execute({&ptr, 1}) == ReplayResult::success);  // held for the Signal
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(!queue_a.signal(fence.semaphore(), 1));                     // the submit fails
+            EXPECT(queue_b.idle() && fence.completed() == 0);
+            std::uint64_t got = 1;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == 0);                                                  // the waiter did not run
+            EXPECT(queue_a.signal(fence.semaphore(), 1));                      // the retry signals, and releases it
+            EXPECT(queue_b.idle() && queue_a.idle() && fence.completed() == 1);
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+            std::printf("queue/query sync: a failed Signal does not release its waiters; the retry does\n");
+        }
+
         // 4. Concurrent multi-queue EndQuery + ResolveQueries + temporary query pool add/remove stress.
         //    Each iteration uses a distinct query slot so no slot is reset while another submission resolves it.
         {

@@ -512,11 +512,17 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
                     markers_exact = false;
                     continue;
                 }
-                std::error_code ec;
-                const bool dir = (m.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                if (!dir || std::filesystem::is_regular_file(marks / m.cFileName / kRemovedDirMarker, ec))
+                if (!(m.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                     deleted_here.insert(ascii_key(m.cFileName));
-                if (ec) markers_exact = false;  // the folder's marker could not be checked: ask deleted() per entry
+                    continue;
+                }
+                // A marker folder is a removed folder only with kRemovedDirMarker in it; without one it just holds the
+                // markers of a nested delete. A missing sentinel is that ordinary answer (status() reports not_found
+                // with an error code set); any other error leaves the decision to deleted() per entry.
+                std::error_code ec;
+                const auto st = std::filesystem::status(marks / m.cFileName / kRemovedDirMarker, ec);
+                if (st.type() == std::filesystem::file_type::regular) deleted_here.insert(ascii_key(m.cFileName));
+                else if (st.type() != std::filesystem::file_type::not_found && ec) markers_exact = false;
             } while (::FindNextFileW(mh, &m));
             if (::GetLastError() != ERROR_NO_MORE_FILES) markers_exact = false;  // an incomplete scan
             ::FindClose(mh);

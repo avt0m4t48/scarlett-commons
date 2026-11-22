@@ -44,6 +44,9 @@ class MaskChannelTests(unittest.TestCase):
         self.assertEqual(mc.blobs(mask, 3, 3), [3, 1])
         row_end = bytearray([0, 0, 1, 1, 0, 0])                         # 3 wide: (2,0) and (0,1) don't touch
         self.assertEqual(mc.blobs(row_end, 3, 2), [1, 1])
+        row_start = bytearray([0, 0, 0, 1, 0, 1, 0, 0, 1])               # (0,1) only reaches (2,0) by wrapping
+        self.assertEqual(mc.blobs(bytearray([0, 0, 1, 1, 0, 0]), 3, 2), [1, 1])
+        self.assertEqual(mc.blobs(row_start, 3, 3), [2, 1])             # (2,1)-(2,2) join; (0,1) stays alone
 
     def test_channel_counts(self):
         c = mc.channel_counts(W, H, image(), (128,))

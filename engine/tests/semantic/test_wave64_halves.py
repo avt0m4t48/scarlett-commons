@@ -721,6 +721,16 @@ class UniformVote(unittest.TestCase):
         self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
         self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
 
+    def test_c_half_of_a_uniform_mask_rewritten(self):
+        # s15 (the high half of the uniform mask) is rewritten before the mask becomes VCC: the wave still sees the low
+        # half's bits and votes yes, the second half sees s15 = 0 and votes no
+        name = "vs_uv_half_rewritten"
+        body = vs(["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_mov_b32 s15, 0",
+                   "s_mov_b64 vcc, s[14:15]"] + VCCZ_SIDES)
+        (t, reasons, _), _ = meta_of(name, body)
+        self.assertEqual(t, "C", name)
+        self.assertIn("unsafe-vote-branch", reasons, name)
+
     def test_c_readfirstlane_of_a_varying_value(self):
         # the first lane is vertex 0 in the wave and vertex 32 in the second half
         self.differs("vs_uv_rfl_varying", ["v_readfirstlane_b32 s21, v0", "v_mov_b32_e32 v1, s21",

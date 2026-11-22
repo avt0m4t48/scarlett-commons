@@ -1337,6 +1337,19 @@ int main() {
         factory->UnregisterOcclusionStatus(cookie1);
         factory->UnregisterOcclusionStatus(cookie2);
         CloseHandle(ev);
+
+        // 4. Stereo status registration (Microsoft: IDXGIFactory2::RegisterStereoStatusWindow / RegisterStereoStatusEvent
+        // return S_OK with a cookie for UnregisterStereoStatus; stereo is never enabled, so nothing is notified).
+        DWORD stereo_window = 0, stereo_event = 0;
+        HANDLE stereo_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (factory->RegisterStereoStatusWindow(hwnd, WM_USER, &stereo_window) != S_OK || stereo_window == 0)
+            return fail("RegisterStereoStatusWindow should return S_OK with a cookie");
+        if (factory->RegisterStereoStatusEvent(stereo_ev, &stereo_event) != S_OK || stereo_event == 0 ||
+            stereo_event == stereo_window)
+            return fail("RegisterStereoStatusEvent should return S_OK with a cookie of its own");
+        factory->UnregisterStereoStatus(stereo_window);
+        factory->UnregisterStereoStatus(stereo_event);
+        CloseHandle(stereo_ev);
     }
 
     // Classic IDXGIFactory::CreateSwapChain delegation

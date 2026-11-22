@@ -925,8 +925,19 @@ public:
         return CreateSwapChainForHwnd(device, hwnd, desc, nullptr, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
+    // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the
+    // Windows 7 Platform Update). Stereo is never enabled here, so the window or event is never notified.
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
+        (void)msg;
+        if (!hwnd || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_stereo_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_stereo_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
     void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD) override {}
     HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
         (void)msg;
@@ -1061,6 +1072,7 @@ private:
     std::mutex adapters_changed_mutex_;
     std::map<DWORD, HANDLE> adapters_changed_events_;
     DWORD next_adapters_changed_cookie_ = 1;
+    std::atomic<DWORD> next_stereo_cookie_{1};
 };
 
 }  // namespace

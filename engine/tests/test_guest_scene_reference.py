@@ -1,7 +1,11 @@
 """Fixed reference points for the synthetic guest's renderer and input trace (no GPU)."""
 import importlib.util
+import json
 from pathlib import Path
 import struct
+import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -35,6 +39,39 @@ class GuestSceneReferenceTest(unittest.TestCase):
         self.assertEqual(samples[500:550], (9000,) * 50)
         self.assertEqual(samples[550:600], (-9000,) * 50)
         self.assertEqual(samples[-1], 0)
+
+
+    def test_redirected_cli_preserves_unicode_paths_and_guest_diagnostic(self):
+        # Force strict redirected text streams even on UTF-8 hosts. Invoke the real CLI with a
+        # small stand-in loader that produces a diagnostic and exits before rendering.
+        entry = (
+            "import runpy, sys; "
+            "encoding, script = sys.argv[1:3]; del sys.argv[1:3]; "
+            "sys.stdout.reconfigure(encoding=encoding, errors='strict'); "
+            "sys.stderr.reconfigure(encoding=encoding, errors='strict'); "
+            "runpy.run_path(script, run_name='__main__')"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "spirv").mkdir()
+            loader = root / "loader.py"
+            diagnostic = "guest diagnostic: 測試"
+            loader.write_text(f"import os\nos.write(2, {diagnostic.encode()!r})\nraise SystemExit(7)\n",
+                              encoding="ascii")
+            for encoding in ("cp1252", "utf-8"):
+                with self.subTest(encoding=encoding):
+                    out = root / f"測試 café {encoding}"
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-c", entry, encoding, str(path), "--wine", sys.executable,
+                         "--loader", str(loader), "--guest", str(loader), "--shaders", str(root), "--out", str(out)],
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    report = out / "report.json"
+                    self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["error"], "full: exit code 7")
+                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
+                    self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
 
 if __name__ == "__main__":

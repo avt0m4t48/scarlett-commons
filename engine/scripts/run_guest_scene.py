@@ -340,4 +340,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Redirected Windows streams may use a code page that cannot encode a path in the report.
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
     sys.exit(main())

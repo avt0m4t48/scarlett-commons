@@ -66,7 +66,9 @@ void play(const char* what, GameInputRumbleParams p) {
 // A constant force at full magnitude on the pad's first motor, held for a second: the effect a wheel feels as a
 // steady pull. A pad SDL did not open as a haptic device reports no motor, and the step says so and moves on.
 void constant_force() {
-    for (IGameInputDevice* d : g_devices) {
+    // g_devices is in connection order, which is what output_state indexes; the SDL outcome is read back per pad.
+    for (size_t n = 0; n < g_devices.size(); ++n) {
+        IGameInputDevice* d = g_devices[n];
         const GameInputDeviceInfo* i = d->GetDeviceInfo();
         if (i->forceFeedbackMotorCount == 0) {
             std::printf("force feedback: %s reports no force-feedback motor; skipped\n",
@@ -88,7 +90,21 @@ void constant_force() {
         }
         std::printf("force feedback: constant linearX 1.0 on motor 0, 1 s\n");
         e->SetState(GameInputFeedbackRunning);
-        Sleep(1000);
+        Sleep(1000);  // the poll thread creates and runs the effect
+        char seen[256] = "no output state";
+        rt::gameinput::OutputState out{};
+        if (rt::gameinput::output_state(static_cast<int>(n), &out)) {
+            if (out.effect_id < 0) {
+                std::snprintf(seen, sizeof seen, "SDL did not create the effect (%s)",
+                              out.effect_error[0] ? out.effect_error : "no error text");
+            } else if (!out.effect_ran) {
+                std::snprintf(seen, sizeof seen, "SDL created effect %d but did not run it (%s)", out.effect_id,
+                              out.effect_error[0] ? out.effect_error : "no error text");
+            } else {
+                std::snprintf(seen, sizeof seen, "SDL created effect %d and is running it", out.effect_id);
+            }
+        }
+        std::printf("force feedback: %s\n", seen);
         e->SetState(GameInputFeedbackStopped);
         e->Release();  // the poll thread destroys the SDL effect
         Sleep(300);

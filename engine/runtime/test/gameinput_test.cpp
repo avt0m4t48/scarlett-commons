@@ -998,6 +998,7 @@ struct FakeHaptic {
                         SDL_HAPTIC_SAWTOOTHUP | SDL_HAPTIC_SAWTOOTHDOWN | SDL_HAPTIC_RAMP | SDL_HAPTIC_SPRING |
                         SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER | SDL_HAPTIC_INERTIA;
     int max_effects = 8;
+    int create_result = 1;  // what create returns; negative is SDL refusing the effect
     int opens = 0, closes = 0, creates = 0, updates = 0, runs = 0, stops = 0, destroys = 0;
     int gain_calls = 0, last_gain = -1;
     uint32_t last_iterations = 0;
@@ -1017,8 +1018,12 @@ int fake_max_effects(void* h) { return static_cast<FakeHaptic*>(h)->max_effects;
 int fake_create(void* h, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
     ++f->creates;
+    if (f->create_result < 0) {
+        SDL_SetError("fake: refused");
+        return -1;
+    }
     f->last = *static_cast<const SDL_HapticEffect*>(e);
-    return 1;
+    return f->create_result;
 }
 bool fake_update(void* h, int, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
@@ -1114,12 +1119,31 @@ void test_force_feedback(IGameInput* input) {
     const int runs0 = g_fake.runs;
     rt::gameinput::poll();
     check(g_fake.creates == 1 && g_fake.runs == runs0 + 1, "force feedback: the poll thread creates and runs the effect");
+    rt::gameinput::OutputState sent{};
+    check(rt::gameinput::output_state(0, &sent) && sent.effect_id == 1 && sent.effect_ran && !sent.effect_error[0],
+          "force feedback: the output state reports the effect SDL created and is running");
     check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
           "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
     check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
           "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
     rt::gameinput::poll();
     check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
+
+    // SDL refusing an effect is visible, not swallowed: the output state carries the failure and SDL's error.
+    g_fake.create_result = -1;
+    IGameInputForceFeedbackEffect* refused = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&refused)) == S_OK && refused,
+          "force feedback: GameInput accepts an effect SDL will refuse");
+    if (refused) {
+        rt::gameinput::poll();
+        rt::gameinput::OutputState refused_out{};
+        check(rt::gameinput::output_state(0, &refused_out) && refused_out.effect_id < 0 && !refused_out.effect_ran &&
+                  std::strstr(refused_out.effect_error, "fake: refused"),
+              "force feedback: SDL refusing the effect is recorded with its error");
+        refused->Release();
+        rt::gameinput::poll();  // the released effect leaves the device
+    }
+    g_fake.create_result = 1;
 
     params.data.constant.magnitude.linearX = -1.0f;
     check(effect->SetParams(&params), "force feedback: SetParams");

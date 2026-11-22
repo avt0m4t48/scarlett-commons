@@ -10707,6 +10707,15 @@ def exec_changes_after_vm(blocks, succ):
     return False
 
 
+def vgpr_dest_registers(ins: dict, extra: int = 0) -> range | tuple[int, ...]:
+    """Register numbers written by a VGPR-destination instruction, after filtering stores and compares."""
+    args = ins["args"]
+    if base_op(ins["op"]) == "v_swap_b32":
+        return tuple(a["r"] for a in args[:2] if a["k"] == "vgpr")
+    dst = args[0]
+    return range(dst["r"], dst["r"] + dst.get("n", 1) + extra)
+
+
 def read_before_write_vgprs(insns):
     """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
     written, first = set(), []
@@ -10723,14 +10732,14 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
+        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
                 first.append(r)
         if not reads_all and a[0]["k"] == "vgpr":
-            written.update(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+            written.update(vgpr_dest_registers(ins))
     return set(first)
 
 def interp_ij_analysis(insns, g):
@@ -10776,7 +10785,7 @@ def interp_ij_analysis(insns, g):
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
                                    "global_store"))
         if not reads_all and a[0]["k"] == "vgpr":
-            for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
+            for r in vgpr_dest_registers(ins):
                 writes[r].append(n)
     sites = []
     for n, ins in enumerate(insns):
@@ -10929,6 +10938,10 @@ def interp_ij_analysis(insns, g):
         p1, p2 = (s, m) if s["op"] in P1 else (m, s)
         s["ins"]["ij"] = ("p1" if s["op"] in P1 else "p2", (p1["vdst"], p1["attr"], p1["chan"]),
                           p1["src"], p2["src"])
+        # A computed pair loads both weights from the VGPR file, including a hardware weight
+        # whose only use is v_interp. Initialize it even if some paths replace it before this site.
+        if s["src"] in (0, 1):
+            g.frag_inputs[s["src"]] = ("bary_i", "bary_j")[s["src"]]
         attrs.add(s["attr"])
     if attrs and BARY_FALLBACK:
         raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
@@ -10953,11 +10966,11 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
-            ww.update(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+            ww.update(vgpr_dest_registers(ins))
     return rr, ww
 
 
@@ -11659,7 +11672,7 @@ def interp_copy_sources(insns):
         if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
                 ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
             continue
-        for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1) + (1 if "tfe" in ins["mods"] else 0)):
+        for r in vgpr_dest_registers(ins, extra=int("tfe" in ins["mods"])):
             writes.setdefault(r, []).append(ins)
     copies = {}
     grew = True

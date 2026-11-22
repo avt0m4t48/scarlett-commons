@@ -200,7 +200,7 @@ class F64ConstModifierStructureTests(unittest.TestCase):
 
         # frexp uses integer words alone. Execute the mantissa and exponent paths and read both destination words.
         for spelling, expected in (("0x40180000", [0, 0x3fe80000, 3]), ("2.0", [0, 0x3fe00000, 2]),
-                                   ("1", [0, 0, 0])):
+                                   ("1", [0, 0x3fe00000, (-1073) & 0xffffffff])):  # 2^-1074 = 0.5 * 2^-1073
             with self.subTest(spelling=spelling):
                 lines = [op.replace("0x40180000", spelling) for op in unary[3:]]
                 got = run(lines, export="v8, v9, v7, v7")

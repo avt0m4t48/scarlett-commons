@@ -10,7 +10,8 @@
 //   - WinHttpSendRequest fails with ERROR_WINHTTP_CANNOT_CONNECT. On a session opened with WINHTTP_FLAG_ASYNC it
 //     returns TRUE and reports the failure the way WinHTTP does, through the status callback:
 //     WINHTTP_CALLBACK_STATUS_REQUEST_ERROR with WINHTTP_ASYNC_RESULT { API_SEND_REQUEST, ERROR_WINHTTP_CANNOT_CONNECT },
-//     from a thread-pool thread, with the context the request was sent with.
+//     from a thread-pool thread, with the context the request was sent with (a context of 0 keeps the one set with
+//     WINHTTP_OPTION_CONTEXT_VALUE).
 //   - Reading a response (WinHttpReceiveResponse, WinHttpQueryHeaders, WinHttpQueryDataAvailable, WinHttpReadData) and
 //     WinHttpWriteData fail with ERROR_WINHTTP_INCORRECT_HANDLE_STATE: no request ever got that far.
 //   - Options, timeouts and request headers are accepted. WINHTTP_OPTION_CONTEXT_VALUE is kept per handle and
@@ -217,9 +218,11 @@ BOOL WINAPI send_request(HINTERNET request, LPCWSTR, DWORD, LPVOID, DWORD, DWORD
     DWORD error = 0;
     Handle* r = acquire(request, false, false, true, error);
     if (!r) return fail(error);
-    {
+    if (context) {
+        // The context this request's callbacks carry. 0 keeps the one set with WINHTTP_OPTION_CONTEXT_VALUE, as the
+        // host's winhttp.dll does (measured on Windows 11: WinHttpQueryOption and every callback still give it).
         std::lock_guard lock(r->mutex);
-        r->context = context;  // the context this request's callbacks carry
+        r->context = context;
     }
     log_refused(r);
     if (!r->async) {

@@ -227,7 +227,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 make_game.preflight(["shaders", "assets"], self.work_dir, wav=False)
             self.assertEqual(ctx.exception.code, 1)
-            self.assertIn("330 GB is needed", stderr_buf.getvalue())
+            self.assertIn("400 GB is needed", stderr_buf.getvalue())
 
         with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "tool_available", return_value=True), \

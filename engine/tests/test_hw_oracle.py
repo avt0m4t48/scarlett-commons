@@ -316,10 +316,18 @@ class Unavailable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
             self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
-            script = Path(argv[3]).read_text(encoding="ascii")
+            script = Path(argv[3]).read_text(encoding="oem" if os.name == "nt" else "ascii")
             self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
             self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
             self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
+            # A work folder with non-ASCII letters (a user profile named in Cyrillic): the script is still written,
+            # and on Windows the folder goes in as a spelling cmd.exe can read back (until 2026-11-22: UnicodeEncodeError).
+            work = os.path.join(tmp, "Пользователь")
+            os.mkdir(work)
+            argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", os.path.join(work, "o.exe"), work)
+            script = Path(argv[3]).read_text(encoding="oem" if os.name == "nt" else "utf-8")
+            fo = next(arg for arg in script.split() if arg.startswith("/Fo"))[3:]
+            self.assertTrue(os.path.isdir(fo), script)                        # the folder cl writes objects to exists
 
     def test_salu_diff_exits_77_without_the_tools(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"))

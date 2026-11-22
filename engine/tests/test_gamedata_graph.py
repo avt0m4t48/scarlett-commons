@@ -95,7 +95,7 @@ class GamedataGraphTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+                              capture_output=True, text=True, errors="replace")
 
     def test_cli_reports_unwritable_graph_report(self):
         self.finish()

@@ -264,6 +264,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
         codec = d[base + 12]
+        # The field is u16 (max 65535), so the 192000 half of the reference bound cannot fire here.
         if not (1000 <= rate <= 192000) or codec != 0x0B:
             return []
         info.append([cid, samples, rate, codec, [], 0])
@@ -283,8 +284,6 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B:
-                continue
             packets = opus_packets(d, start, count * 2048)
             repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
             if repeated is None:

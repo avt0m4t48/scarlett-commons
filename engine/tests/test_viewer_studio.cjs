@@ -17,6 +17,7 @@ function fakeElement() {
 }
 
 class Vector3 { set() { return this; } sub() { return this; } }
+class Disposable { disposed = false; dispose() { this.disposed = true; } }
 
 function loadStudio() {
     const elements = new Map(), loads = [], alerts = [];
@@ -29,7 +30,7 @@ function loadStudio() {
         document, localStorage: { getItem: () => null }, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
-            MeshStandardMaterial: class {}, MeshNormalMaterial: class {}, Vector3,
+            MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
             Box3: class { setFromObject() { return this; } getCenter(v) { return v; } getSize(v) { return v; } },
             GLTFLoader: class { load(url, onLoad, onProgress, onError) { loads.push({ url, onLoad, onError }); } },
         },
@@ -43,9 +44,12 @@ function loadStudio() {
 }
 
 function fakeModel() {
-    const geometry = { attributes: { position: { count: 3 } }, index: null };
-    const mesh = { isMesh: true, geometry, material: {}, userData: {} };
-    return { position: new Vector3(), traverse(visit) { visit(this); visit(mesh); } };
+    const geometry = Object.assign(new Disposable(), { attributes: { position: { count: 3 } }, index: null });
+    const texture = Object.assign(new Disposable(), { isTexture: true });
+    const material = Object.assign(new Disposable(), { map: texture });
+    const mesh = { isMesh: true, geometry, material, userData: {} };
+    return { position: new Vector3(), userData: {}, parts: [geometry, material, texture],
+        traverse(visit) { visit(this); visit(mesh); } };
 }
 
 const HOSTILE = '"><img src=x onerror=alert(1)>';
@@ -96,4 +100,16 @@ test('a download that finishes or fails after a later click does not replace the
     assert.deepEqual([...studio.run('scene.objects')], [modelC]);
     assert.equal(studio.elements.get('stat-name').innerText, 'c.glb');
     assert.deepEqual(studio.alerts, []);
+});
+
+test('switching models in clay mode disposes the old model\'s geometry, material and texture, not the clay', () => {
+    const studio = loadStudio();
+    const [modelA, modelB] = [fakeModel(), fakeModel()];
+    studio.run(`setShadingMode('clay'); loadModel('/models/a.glb', 'a.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: modelA });
+    studio.run(`loadModel('/models/b.glb', 'b.glb', '', 1);`);
+    studio.loads[1].onLoad({ scene: modelB });
+    assert.deepEqual(modelA.parts.map(part => part.disposed), [true, true, true]);
+    assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
+    assert.equal(studio.run('clayMaterial.disposed'), false);
 });

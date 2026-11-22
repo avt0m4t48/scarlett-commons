@@ -26,12 +26,17 @@
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
 // first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
 // reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
+// (PresentX, SuspendX, ResumeX) will show up; the sibling-layer measurement puts them at queue slot 30 or 32 by
+// runtime layout (docs/d3d12_xs_console_abi.md §4, unverified here) and they stay refused until wired, and that
+// the console keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
+// (46) and EnqueueMakeResident (50). Command lists come back from device slot 12 behind a console-shaped list
+// proxy: console vtable order (PC order through slot 26, four console-only extras at 27-30, the PC chain shifted
+// +4 through console 59, measured tail slots at 60/61/146), the write cursor pinned at the record limits so a
+// title's inline writers always take the vtable path, unmodelled slots recorded and refused. Queue
+// ExecuteCommandLists unwraps the list array; the list's own Reset, ExecuteBundle and SetDescriptorHeaps unwrap
+// allocator, list and heap proxies. QueryInterface answers only the
 // modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
 #pragma once
 
@@ -101,6 +106,11 @@ bool command_object_tables_guarded();
 inline constexpr GUID kLeonidaCommandAllocatorTag{
     0x7d0e6b51, 0x34a2, 0x4f0c, {0x9a, 0x61, 0x0c, 0x5b, 0x2e, 0x8f, 0x4a, 0x10}};
 bool is_allocator_proxy(const void* allocator);
+// Command-list proxies (device slot 12): the console-shaped object. is_list_proxy / list_proxy_real_list give the
+// same access as the queue, fence and allocator helpers; list_slot_hits counts calls per console slot.
+bool is_list_proxy(const void* list);
+ID3D12CommandList* list_proxy_real_list(const void* list);
+std::uint64_t list_slot_hits(unsigned slot);
 // The wrapped allocator (no reference added), or null when `allocator` is not an allocator proxy.
 ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator);
 unsigned allocator_proxy_slot_count(const void* allocator);

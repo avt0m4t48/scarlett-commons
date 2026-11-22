@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -470,7 +471,10 @@ int main(int argc, char** argv) {
         }
         // RTVs through a castable-format list in another channel order or family, or a typed BGRA8 texture's sRGB
         // view: the clear is stored in the view's channel order and encoding, as WARP and AMD's D3D12 driver store
-        // it. An X8 view leaves its X byte undefined (WARP and AMD's driver differ), so it isn't compared.
+        // it. An X8 view leaves its X byte undefined (WARP and AMD's driver differ), so it isn't compared. The bytes
+        // are compared within 1: drivers round the 0.5 tie differently (WARP 128, NVIDIA 127), and Intel's encodes
+        // sRGB 1 off WARP in places (its own D3D12 driver stores the same bytes as the layer there); a wrong channel
+        // order or a missing sRGB encoding is many steps off.
         struct CastFormat { DXGI_FORMAT resource, view; const char* name; };
         const CastFormat cast_formats[] = {
             {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "R8G8B8A8_UNORM{B8G8R8A8_UNORM}"},
@@ -496,14 +500,16 @@ int main(int argc, char** argv) {
                 if (cf.view == DXGI_FORMAT_B8G8R8X8_UNORM) {
                     for (std::size_t b = 3; b < actual.size() && b < expected.size(); b += 4) actual[b] = expected[b] = 0;
                 }
-                if (actual != expected) {
-                    for (std::size_t b = 0; b < actual.size(); ++b) {
-                        if (actual[b] != expected[b]) {
-                            std::fprintf(stderr, "%s case %u byte %zu: Vulkan %02x, WARP %02x\n",
-                                cf.name, i, b, unsigned(actual[b]), unsigned(expected[b]));
-                            break;
-                        }
-                    }
+                bool close = actual.size() == expected.size();
+                std::size_t off = 0;
+                for (; close && off < actual.size(); ++off)
+                    if (std::abs(int(actual[off]) - int(expected[off])) > 1) { close = false; break; }
+                if (!close) {
+                    if (actual.size() == expected.size())
+                        std::fprintf(stderr, "%s case %u byte %zu: Vulkan %02x, WARP %02x\n",
+                            cf.name, i, off, unsigned(actual[off]), unsigned(expected[off]));
+                    else
+                        std::fprintf(stderr, "%s case %u: readback sizes differ\n", cf.name, i);
                     ++format_failures;
                     break;
                 }

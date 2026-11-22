@@ -534,15 +534,15 @@ class PackIndexValidationTest(unittest.TestCase):
                 self.assertIn("invalid JSON", str(error.exception))
 
     def test_excessive_json_nesting_names_the_index(self):
-        # The decoder's recursion limit can differ from sys.getrecursionlimit().
-        write(self.index_path, b"[" * 6000 + b"0" + b"]" * 6000)
+        # The C decoder's limit differs by platform; Linux CPython 3.12 accepts 6,000 levels.
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
         with self.assertRaises(ValueError) as error:
             saves.pack_from_dir(self.extracted)
         self.assertIn(self.index_path, str(error.exception))
         self.assertIn("invalid JSON", str(error.exception))
 
     def test_cli_excessive_json_nesting_preserves_existing_output(self):
-        write(self.index_path, b"[" * 6000 + b"0" + b"]" * 6000)
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
         out = os.path.join(self.tmp.name, "packed.jsav")
         write(out, b"previous complete output")
         result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],

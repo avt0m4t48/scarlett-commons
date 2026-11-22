@@ -6,7 +6,8 @@
 //   - GameInputCreate succeeds from mapped code, and the library answers GetCurrentTimestamp;
 //   - GetCurrentReading says either "reading" or "no reading found": no crash, no other error. With a gamepad attached
 //     GetGamepadState must succeed on the reading; the test passes with or without one.
-// Skips (exit 77) where there is no GameInput.dll (the import is then unimplemented). No game files.
+// Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW).
+// When the DLL is there, an import that binds to nothing is a failure, not a skip. No game files.
 #include <windows.h>
 
 #include <cstdio>
@@ -37,6 +38,19 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::filesystem::path fixture = argv[1];
+
+    // Decide the skip from the machine, not from the loader's answer: a broken host binding must fail the test.
+    HMODULE const host_gameinput = LoadLibraryExW(L"GameInput.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!host_gameinput) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_MOD_NOT_FOUND || error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            std::printf("SKIP: no GameInput.dll on this machine\n");
+            return 77;
+        }
+        std::printf("FAIL GameInput.dll is present but does not load (error %lu)\n", static_cast<unsigned long>(error));
+        return 1;
+    }
+
     try {
         rt::Loader loader(fixture.parent_path());
         rt::Module& m = loader.load(fixture);
@@ -49,10 +63,6 @@ int main(int argc, char** argv) {
                 binding = r.binding;
                 ++seen;
             }
-        if (seen == 1 && binding == rt::Binding::Unimplemented) {
-            std::printf("SKIP: no GameInput.dll on this machine\n");
-            return 77;
-        }
         check(seen == 1 && binding == rt::Binding::Host, "the GameInput.dll import binds to the host's copy");
 
         loader.initialise();
@@ -65,7 +75,7 @@ int main(int argc, char** argv) {
                     timestamp, static_cast<unsigned long>(reading_hr));
         check(created == 1 && create_hr == 0, "GameInputCreate succeeds from mapped code");
         check(timestamp != 0, "GetCurrentTimestamp returns a time");
-        const bool pad = reading_hr == 0;
+        const bool pad = created == 1 && reading_hr == 0;
         check(pad || static_cast<unsigned long>(reading_hr) == kReadingNotFound,
               "GetCurrentReading says either 'reading' or 'no reading found'");
         std::printf("     gamepad reading: %s\n", pad ? "yes (a gamepad is attached)" : "none (no gamepad attached)");
@@ -74,6 +84,7 @@ int main(int argc, char** argv) {
         std::printf("FAIL unexpected exception: %s\n", e.what());
         ++g_failures;
     }
+    FreeLibrary(host_gameinput);
     std::printf("gameinput_host_test: %s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -20,12 +20,30 @@ def f32(x):
         return math.copysign(math.inf, x)
 
 
+class _F32(float):
+    """A binary32 value made from a bit pattern (OpBitcast) that keeps that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (sets bit 22, issue #509), so the float alone
+    cannot give the word back. Copies, selects, composites, loads and stores pass the value on unchanged and keep
+    `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V leaves the bits of a NaN result
+    open). The same fix as spirv_mini_interp (#533)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f2u(x):
+    if isinstance(x, _F32):
+        return x.bits
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def u2f(u):
-    return struct.unpack("<f", struct.pack("<I", u & M32))[0]
+    return _F32(u & M32)
 
 
 def s32(u):
@@ -128,6 +146,7 @@ def run(spvasm):
         "OpSLessThanEqual": lambda a, b: a <= b, "OpSGreaterThanEqual": lambda a, b: a >= b,
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
+        "OpFUnordNotEqual": lambda a, b: a != b,          # true when either is NaN, as Python's != is
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
@@ -147,6 +166,16 @@ def run(spvasm):
         simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
                   "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
                   "Log2": math.log2}
+        if fn in ("NMin", "NMax"):
+            # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
+            def pick(x, y):
+                if math.isnan(x) or math.isnan(y):
+                    return y if math.isnan(x) else x
+                kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+                return y if (ky < kx if fn == "NMin" else ky > kx) else x
+            if isinstance(a[0], tuple):
+                return tuple(pick(x, y) for x, y in zip(a[0], a[1]))
+            return pick(a[0], a[1])
         if fn in simple:
             return f32(float(simple[fn](*a)))
         if fn == "Fract":

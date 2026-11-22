@@ -46,12 +46,23 @@ def offsets_for(eq, bb, bpe, wb, hb):
     return (o + ((y // bh) * nbx + x // bw) * (1 << bb)) // bpe
 
 
+def positive_int(text):
+    """--n: 0 probed nothing and printed an empty ranking as a result; a negative N dropped the last N textures."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("--fmt", default="BC1", help="BC1, BC2, or BC3, optionally with a DXGI suffix")
-    ap.add_argument("--n", type=int, default=12)
+    ap.add_argument("--n", type=positive_int, default=12, help="probe the first N matching textures (N >= 1)")
     a = ap.parse_args()
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
@@ -91,8 +102,9 @@ def main():
         if res:
             lin_raw = np.frombuffer(G[t["data_off"]:t["data_off"] + wb * hb * bpe], np.uint8)
             lin = smoothness(block_average(lin_raw.reshape(-1, bpe), bpe).reshape(hb, wb, 3)) if len(lin_raw) == wb * hb * bpe else -1
+            second = f"{res[1][0]:.4f} {res[1][1]} [{res[1][2]}]" if len(res) > 1 else "n/a"
             print(f"{t['w']}x{t['h']} {t['fmt_name']} mips={mips} gpu={t['gpu_size']}  best {res[0][0]:.4f} {res[0][1]} [{res[0][2]}]"
-                  f"  2nd {res[1][0]:.4f} {res[1][1]} [{res[1][2]}]  linear {lin:.4f}")
+                  f"  2nd {second}  linear {lin:.4f}")
             wins[(res[0][1].split(' ')[0], res[0][2])] += 1
     print("winners:", wins.most_common())
 

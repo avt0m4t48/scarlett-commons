@@ -12,6 +12,9 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
 
     python -I tools/crosslane_fuzz.py --programs 200 --seed 1 [--wave 32|64|both] [--modes native,emulate]
     python -I tools/crosslane_fuzz.py --self-test        # the model against hand-computed values, no GPU
+    python -I tools/crosslane_fuzz.py --oracle hw        # model vs the AMD GPU natively (wave32 and wave64); exit 77
+                                                         # when tools/hw_oracle's tools are missing. --oracle translator,hw
+                                                         # does both. No llvm-mc, Vulkan or vk_compute_test for hw alone.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
@@ -28,7 +31,8 @@ Reference semantics (AMD "RDNA 2" ISA reference guide; Mesa ACO and LLVM where t
   * v_permlane16_b32 vD, vS, s1, s2: lane l reads lane (l & ~15) | sel[l & 15], sel = nibbles of {s2, s1};
     v_permlanex16_b32 reads lane (l & ~31) | ((l & 16) ^ 16) | sel[l & 15]. Only written in active lanes.
     A source lane that is off in EXEC (op_sel FI = 0) is the DPP "invalid source" case: with BOUND_CTRL = 0 the
-    lane keeps its old vD. That case is a hypothesis here (not measured on AMD hardware) and is reported apart.
+    lane keeps its old vD. That was measured on RDNA2 and RDNA3.5 (docs/shader_validation.md, #374), but the
+    translator models it only with #580, so programs that reach it are still reported apart.
   * VALU results are written only in active lanes; SALU is wave-uniform.
 """
 import argparse
@@ -435,7 +439,7 @@ class Gen:
                 if w.active(sl) or PERMLANE_FETCH_INACTIVE:
                     vals[lane] = src[sl]
                 if not w.active(sl):
-                    hyp = not PERMLANE_FETCH_INACTIVE   # FI = 0, BOUND_CTRL = 0: keeps vD (hypothesis)
+                    hyp = not PERMLANE_FETCH_INACTIVE   # FI = 0, BOUND_CTRL = 0: keeps vD (measured; translator: #580)
             w.vwrite(d, vals)
             return hyp
         return Op(text, fn, "permlane")
@@ -635,13 +639,15 @@ def prologue(rng, wave):
     return lines, init
 
 
-def epilogue(wave):
+def epilogue(wave, hw=False):
+    """hw=True stores with global_store_b32 through the output pointer in s[2:3] (hw_oracle) instead of a buffer."""
     k = len(OUT_REGS)
     lines = [f"s_mov_b64 exec, s[{ENTRY}:{ENTRY + 1}]" if wave == 64 else f"s_mov_b32 exec_lo, s{ENTRY}",
              f"v_mul_u32_u24_e32 v22, {4 * k}, v0"]
     for j, (kind, r) in enumerate(OUT_REGS):
         lines.append(f"v_mov_b32_e32 v20, {kind}{r}")
-        lines.append(f"buffer_store_dword v20, v22, s[0:3], 0 offen offset:{4 * j}")
+        lines.append(f"global_store_b32 v22, v20, s[2:3] offset:{4 * j}" if hw else
+                     f"buffer_store_dword v20, v22, s[0:3], 0 offen offset:{4 * j}")
     lines.append("s_endpgm")
     return lines
 
@@ -657,6 +663,25 @@ class Program:
                 f"; group: {self.group},1,1", f"; mattr: {mattr}"]
         body = self.pro + [o.text for o in ops] + epilogue(self.wave)
         return "\n".join(head + body) + "\n"
+
+    def hw_lines(self, ops=None, guard=True):
+        """The program as a native kernel body for tools/hw_oracle: branch placeholders become labels, the stores go
+        through the output pointer, and with guard each instruction is followed by s_nop 7. The ISA model has no
+        hazards; the real unit needs wait states after some VALU writes of SGPRs, VCC and EXEC (GFX10 and GFX11
+        both), and compiled code gets them from the compiler."""
+        ops = self.ops if ops is None else ops
+        out = []
+        for text in self.pro + [o.text for o in ops] + epilogue(self.wave, hw=True):
+            for ln in (x.strip() for x in text.split("\n")):
+                m = re.fullmatch(r";@END(\d+)", ln)
+                if m:
+                    out.append(f".L{self.name}_{m.group(1)}:")
+                    continue
+                ln = re.sub(r"^(s_cbranch_\w+) @(\d+)$", lambda b: f"{b.group(1)} .L{self.name}_{b.group(2)}", ln)
+                out.append(ln)
+                if guard and ln != "s_endpgm":
+                    out.append("s_nop 7")
+        return out
 
     def expected(self, ops=None):
         """{(thread, word): value}, plus the set of ops whose result depends on a hypothesis."""
@@ -746,13 +771,24 @@ def translate(work, emulate):
     return out, r.stdout + r.stderr
 
 
-def run_gpu(exe, spv, prog, work):
-    words = prog.group * len(OUT_REGS)
+def gpu_env(prog, emulate, dump, base=None):
+    """vk_compute_test's environment (FUZZ-6, tools/lds_fuzz.py): VKC_OUT_WORDS sizes the buffer, VKC_DUMP gets its
+    raw bytes. A wave32 program, or a wave64 one translated with --wave64-emulate, is written for 32-wide subgroups,
+    so it asks for them with VKC_SUBGROUP_SIZE=32, as lds_fuzz.py and valu_fuzz.py do (FUZZ-13): on AMD, whose
+    compute default is 64, a group over 32 would otherwise run as one 64-wide subgroup and mismatch in wave 1.
+    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has)."""
+    env = dict(os.environ if base is None else base, VKC_OUT_WORDS=str(max(prog.group * len(OUT_REGS), 64)),
+               VKC_DUMP=dump)
+    if prog.wave == 32 or emulate:
+        env["VKC_SUBGROUP_SIZE"] = "32"
+    return env
+
+
+def run_gpu(exe, spv, prog, work, emulate):
     dump = os.path.join(work, "dump.bin")
     if os.path.exists(dump):
         os.remove(dump)                 # never compare a stale dump
-    # vk_compute_test (FUZZ-6, tools/lds_fuzz.py): VKC_OUT_WORDS sizes the buffer, VKC_DUMP gets its raw bytes.
-    env = dict(os.environ, VKC_OUT_WORDS=str(max(words, 64)), VKC_DUMP=dump)
+    env = gpu_env(prog, emulate, dump)
     r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=60)
     if not os.path.exists(dump):
         raise RuntimeError(f"vk_compute_test gave no dump for {prog.name}: {r.stdout}{r.stderr}")
@@ -807,8 +843,28 @@ def still_fails(prog, ops, mode, ctx):
         spv = os.path.join(spdir, prog.name + ".spv")
         if not os.path.exists(spv):
             return False
-        bad, hyp = compare(prog, run_gpu(exe, spv, prog, work), ops)
+        bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
         return bool(bad) and not hyp
+
+
+MODES = ("native", "emulate")
+
+
+def parse_modes(text):
+    """--modes: a comma list of native and emulate, or both. Any other word is an error: the run loop only knows
+    these two, and an unknown one used to run every program natively, wave64 included."""
+    modes = []
+    for word in (w.strip() for w in text.split(",")):
+        if not word:
+            continue
+        for mode in MODES if word == "both" else (word,):
+            if mode not in MODES:
+                raise argparse.ArgumentTypeError(f"unknown mode {word!r} (use native, emulate or both)")
+            if mode not in modes:
+                modes.append(mode)
+    if not modes:
+        raise argparse.ArgumentTypeError("no mode given (use native, emulate or both)")
+    return modes
 
 
 def main():
@@ -817,7 +873,8 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ops", type=int, default=24, help="ops per program")
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
-    ap.add_argument("--modes", default="native,emulate", help="native, emulate (wave64 only), or both")
+    ap.add_argument("--modes", type=parse_modes, default="native,emulate",
+                    help="native, emulate (wave64 only), or both (the default)")
     ap.add_argument("--w64-native", action="store_true",
                     help="also run wave64 programs without --wave64-emulate (on a 32-wide subgroup that is the "
                          "documented cross-half approximation, so mismatches are expected there)")
@@ -830,19 +887,41 @@ def main():
     ap.add_argument("--permlane-fetch-inactive", action="store_true",
                     help="model an inactive permlane source as read (FI = 1) instead of the hypothesis")
     ap.add_argument("--dpp", action="store_true", help="also generate DPP16 / DPP8 ops")
+    ap.add_argument("--oracle", default="translator",
+                    help="comma-separated: translator (default; needs llvm-mc, the Vulkan SDK and vk_compute_test), hw "
+                         "(natively on the AMD GPU, wave32 and native wave64; tools/hw_oracle/), or translator,hw")
+    ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--no-hw-guard", action="store_true",
+                    help="no s_nop 7 after each instruction in the native kernels (hazards then show up as mismatches)")
     ap.add_argument("--translator", help="rdna2spirv.py to test (default: the one next to this file)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    if not os.path.isfile(args.exe):   # a Visual Studio build puts it in a configuration subfolder
+        folder, name = os.path.split(args.exe)
+        for config in ("RelWithDebInfo", "Release"):
+            if os.path.isfile(os.path.join(folder, config, name)):
+                args.exe = os.path.join(folder, config, name)
+                break
     global PERMLANE_FETCH_INACTIVE
     PERMLANE_FETCH_INACTIVE = args.permlane_fetch_inactive
     if args.translator:
         TRANSLATOR[0] = os.path.abspath(args.translator)
     if args.self_test:
         return self_test()
-    import mc_command
-    mc = mc_command.mc_command()
+    backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
+    if not backends or any(t not in ("translator", "hw") for t in backends):
+        ap.error("--oracle takes translator, hw or translator,hw")
+    oracle = None
+    if "hw" in backends:
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle(arch=args.hw_arch)
+        except runner.Unavailable as e:
+            print(f"hardware oracle unavailable: {e}")
+            return 77
+        print(f"hardware oracle: {oracle.device}")
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    modes = args.modes
     progs = []
     for i in range(args.programs):
         wave = waves[i % len(waves)]
@@ -850,6 +929,124 @@ def main():
                                   wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp))
     stats = {}
     fails = []
+    try:
+        if oracle:
+            run_hw(oracle, progs, stats, fails, guard=not args.no_hw_guard)
+        mc = None
+        if "translator" in backends:
+            import mc_command
+            mc = mc_command.mc_command()
+            run_translator(args, mc, progs, waves, modes, stats, fails)
+        tr_status = {}
+        for p, mode, what, bad in fails:
+            if mode != "hw":
+                tr_status.setdefault(p.name, []).append(f"{mode}: {what}")
+        for p, mode, what, bad in fails:
+            if mode == "hw" and bad and "translator" in backends:
+                print(f"{p.name}: hardware and reference differ; translator: " +
+                      ("; ".join(tr_status.get(p.name, [])) or "matches the reference"))
+        for p, mode, what, bad in fails:
+            tags = sorted({t for o in p.ops for t in getattr(o, 'tags', {o.tag})})
+            print(f"{p.name} [{mode}] {what}; group {p.group}; ops: {', '.join(tags)}")
+            if bad:
+                print(describe(p, bad))
+            if args.keep:
+                os.makedirs(args.keep, exist_ok=True)
+                with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8") as f:
+                    f.write(kept_source(p, mode, None, not args.no_hw_guard))
+            if args.minimize and bad and what.startswith("mismatch"):
+                if mode == "hw":
+                    ops = minimize_hw(p, oracle, not args.no_hw_guard)
+                elif mc is not None:
+                    ops = minimize(p, mode, (mc, args.exe))
+                else:
+                    continue
+                hyp_ops = p.expected(ops)[1]
+                print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
+                                                         for i, o in enumerate(ops)))
+                if args.keep:
+                    with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8") as f:
+                        f.write(kept_source(p, mode, ops, not args.no_hw_guard))
+    finally:
+        if oracle:
+            oracle.close()
+    print("summary:")
+    for key, st in sorted(stats.items()):
+        print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
+    return 1 if any(st["mismatch"] or st["rejected"] for st in stats.values()) else 0
+
+
+def kept_source(prog, mode, ops, guard):
+    """What --keep writes: for a hardware failure the kernel body that actually ran, else the translator input."""
+    if mode == "hw":
+        return "\n".join(prog.hw_lines(ops, guard)) + "\n"
+    return prog.source(ops)
+
+
+def hw_skip_reason(prog, arch):
+    """Why a program cannot be compared on this GPU, or None. Nothing the generator emits differs between GFX10 and
+    GFX11 in a way that changes a result (checked by running it; docs/shader_validation.md lists what was looked
+    at), so the only skips are assembler rejections, which the runner reports."""
+    return None
+
+
+def run_hw(oracle, progs, stats, fails, guard=True):
+    """Run every program natively (wave32 or wave64 as the program is, its real group size, one thread per lane)
+    and compare all stored words with the model."""
+    from hw_oracle import asm
+    kernels, which = [], []
+    for p in progs:
+        st = stats.setdefault(f"wave{p.wave} hw", {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
+                                                    "hyp_confirmed": 0, "rejected": 0})
+        st["programs"] += 1
+        why = hw_skip_reason(p, oracle.arch)
+        if why:
+            st["rejected"] += 1
+            fails.append((p, "hw", f"skipped: {why}", None))
+            continue
+        kernels.append(asm.Kernel(p.hw_lines(guard=guard), p.wave, p.group, p.group * len(OUT_REGS), raw=True))
+        which.append(p)
+    for p, got in zip(which, oracle.run(kernels)):
+        st = stats[f"wave{p.wave} hw"]
+        if isinstance(got, str):
+            st["rejected"] += 1
+            fails.append((p, "hw", got, None))
+            continue
+        bad, hyp = compare(p, got)
+        if not bad:
+            st["match"] += 1
+            st["hyp_confirmed"] += bool(hyp)
+            for kind in sorted({t for i in hyp for t in getattr(p.ops[i], "tags", {p.ops[i].tag})
+                                if t in ("permlane", "dpp")}):
+                st["hyp_" + kind] = st.get("hyp_" + kind, 0) + 1
+        else:
+            # On the hardware a failing hypothesis is a falsified claim, and it could hide a model bug elsewhere in
+            # the program, so it is a mismatch like any other (hyp_only counts the ones that had a hypothesis op).
+            st["mismatch"] += 1
+            if hyp:
+                st["hyp_only"] += 1
+            fails.append((p, "hw", "mismatch" + (" (program has a hypothesis op)" if hyp else ""), bad))
+
+
+def minimize_hw(prog, oracle, guard=True):
+    """Drop ops while the program still differs on the hardware."""
+    from hw_oracle import asm
+
+    def fails_with(ops):
+        got = oracle.run([asm.Kernel(prog.hw_lines(ops, guard), prog.wave, prog.group,
+                                     prog.group * len(OUT_REGS), raw=True)])[0]
+        if isinstance(got, str):
+            return False
+        return bool(compare(prog, got, ops)[0])
+    ops = list(prog.ops)
+    for i in range(len(ops) - 1, -1, -1):
+        trial = ops[:i] + ops[i + 1:]
+        if fails_with(trial):
+            ops = trial
+    return ops
+
+
+def run_translator(args, mc, progs, waves, modes, stats, fails):
     with tempfile.TemporaryDirectory(prefix="crosslane-") as work:
         disasm, fssm = os.path.join(work, "disasm"), os.path.join(work, "fssm")
         os.mkdir(disasm)
@@ -874,7 +1071,7 @@ def main():
                     st["rejected"] += 1
                     fails.append((p, mode, "not translated", None))
                     continue
-                bad, hyp = compare(p, run_gpu(args.exe, spv, p, work))
+                bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
                 if not bad:
                     st["match"] += 1
                 elif hyp:
@@ -883,25 +1080,6 @@ def main():
                 else:
                     st["mismatch"] += 1
                     fails.append((p, mode, "mismatch", bad))
-    for p, mode, what, bad in fails:
-        tags = sorted({t for o in p.ops for t in getattr(o, 'tags', {o.tag})})
-        print(f"{p.name} [{mode}] {what}; group {p.group}; ops: {', '.join(tags)}")
-        if bad:
-            print(describe(p, bad))
-        if args.keep:
-            os.makedirs(args.keep, exist_ok=True)
-            with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8") as f:
-                f.write(p.source())
-        if args.minimize and bad and what == "mismatch":
-            ops = minimize(p, mode, (mc, args.exe))
-            print("  minimized:\n\t" + "\n\t".join(o.text for o in ops))
-            if args.keep:
-                with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8") as f:
-                    f.write(p.source(ops))
-    print("summary:")
-    for key, st in sorted(stats.items()):
-        print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
-    return 1 if any(st["mismatch"] or st["rejected"] for st in stats.values()) else 0
 
 
 def self_test():

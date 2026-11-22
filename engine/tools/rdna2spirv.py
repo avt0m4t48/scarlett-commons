@@ -293,6 +293,7 @@ class Gen:
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
+        self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
@@ -6384,6 +6385,12 @@ class Gen:
                 # the bit of the one lane the mask was parked in.
                 self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
                 return
+            if slot and slot[1:] in self.w64_scalar_spills:
+                # SHADER-10: wave64_halves proved this VGPR is pure scalar-spill storage (never read as a vector
+                # operand), so spills across all 64 lanes (including 32..63) reload from the parked scalar slot
+                # instead of shuffling from an out-of-range lane on a 32-wide subgroup.
+                self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
+                return
             self.uses_subgroup = True
             v, ln = self.src_u(a[1]), self.src_u(a[2])
             m, r = self.tmp(), self.tmp()
@@ -6394,9 +6401,12 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
+            slot = lane_masks.lane_slot(a[0], a[2])
+            if slot and slot[1:] in self.w64_scalar_spills:
+                self.store_reg("sgpr", self.parked[slot[1:]], self.src_u(a[1]))
+                return
             self.uses_subgroup = True
             val, ln = self.src_u(a[1]), self.src_u(a[2])
-            slot = lane_masks.lane_slot(a[0], a[2])
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
             me, m, eq, old, r = (self.tmp() for _ in range(5))
@@ -12881,7 +12891,11 @@ def halves_analysis(g, blocks, succ):
         g.w64g = wave64_halves.analyse(blocks, succ, g.lane_masks, g.stage)
     except Exception as e:      # the analysis must never cost a translation; what it could not decide is tier C
         g.w64g = {"tier": "C", "reasons": ["analysis-error"], "idioms": [], "uniform_readlane": set(),
-                  "sites": [("analysis-error", None, type(e).__name__)]}
+                  "scalar_spills": [], "sites": [("analysis-error", None, type(e).__name__)]}
+    for slot in g.w64g.get("scalar_spills", ()):
+        if slot not in g.parked:
+            g.parked[slot] = g.SGPRS + len(g.parked)
+        g.w64_scalar_spills.add(slot)
     W64G_COUNTS[g.w64g["tier"]] += 1
     if g.w64g["tier"] == "C" and WAVE64_GRAPHICS == "error":
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))

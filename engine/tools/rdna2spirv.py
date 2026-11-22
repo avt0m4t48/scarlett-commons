@@ -5236,8 +5236,25 @@ class Gen:
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                if m is None:
+                    return default
+                try:
+                    body = m.split("[", 1)[1]
+                    if not body.endswith("]"):
+                        raise Unsupported(op + " modifiers")
+                    return [int(v) for v in body[:-1].split(",")]
+                except (IndexError, ValueError):
+                    raise Unsupported(op + " modifiers") from None
+            if "clamp" in mods:
+                raise Unsupported(op + " clamp")
+            if (any(not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
+                    or any(s.get("neg") or s.get("abs") for s in a)):
+                raise Unsupported(op + " modifiers")
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
+            neg_lo, neg_hi = bits("neg_lo", [0, 0]), bits("neg_hi", [0, 0])
+            if (len(sel) != 2 or len(selhi) != 2 or len(neg_lo) != 2 or len(neg_hi) != 2
+                    or any(b not in (0, 1) for b in sel + selhi) or any(neg_lo) or any(neg_hi)):
+                raise Unsupported(op + " modifiers")
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
             halves = []
             for h, sl in ((0, sel), (1, selhi)):

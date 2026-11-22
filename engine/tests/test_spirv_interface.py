@@ -820,19 +820,33 @@ class EntryPointSelectionTest(unittest.TestCase):
                 with self.assertRaisesRegex(spv.InterfaceError, f"is {model}, expected vs"):
                     b_unsup.reflect(stage="vs")
 
-        # Duplicate interface ID in OpEntryPoint.
-        b_dup_id = SpirvBuilder("vs")
-        v = b_dup_id.variable(spv.STORAGE_OUTPUT, b_dup_id.numeric("f", 32), location=0, add_to_interface=False)
-        b_dup_id.entry_point("main", [v, v])
-        with self.assertRaisesRegex(spv.InterfaceError, "duplicate entry-point interface ID"):
-            spv.Module(b_dup_id.build())
-
         # Entry point referencing a missing OpVariable.
         b_missing_var = SpirvBuilder("vs")
         ghost = b_missing_var.alloc()
         b_missing_var.entry_point("main", [ghost])
         with self.assertRaisesRegex(spv.InterfaceError, f"missing variable %{ghost}"):
             b_missing_var.reflect()
+
+    def test_accepts_repeated_interface_ids_before_spirv_1_4(self):
+        for version in (0x00010000, 0x00010300):
+            with self.subTest(version=hex(version)):
+                builder = SpirvBuilder("vs", version=version)
+                scalar = builder.numeric("f", 32)
+                first = builder.variable(spv.STORAGE_OUTPUT, scalar, location=0)
+                second = builder.variable(spv.STORAGE_OUTPUT, scalar, location=1)
+                builder.entry_point("main", [second, first, second, first])
+                module = spv.Module(builder.build())
+                self.assertEqual(module.entry_points[0].interface_ids, (second, first))
+                self.assertEqual([d.symbol for d in builder.reflect().outputs], [first, second])
+
+    def test_rejects_repeated_interface_ids_from_spirv_1_4(self):
+        for version in (0x00010400, 0x00010500):
+            with self.subTest(version=hex(version)):
+                builder = SpirvBuilder("vs", version=version)
+                output = builder.variable(spv.STORAGE_OUTPUT, builder.numeric("f", 32), location=0)
+                builder.entry_point("main", [output, output])
+                with self.assertRaisesRegex(spv.InterfaceError, "duplicate entry-point interface ID"):
+                    builder.reflect()
 
     def test_ignores_resource_storage_classes_with_descriptor_bindings(self):
         b = SpirvBuilder("ps")

@@ -246,7 +246,8 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
     The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
     subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
-    previous data. Reject malformed descriptors without hiding other bank streams."""
+    previous data. Channel rates outside 1000..192000 and non-Opus codecs are rejected as AwcRecovery.cs does.
+    Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
     if m_size < 12:
         return []
@@ -262,7 +263,10 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         cid = struct.unpack_from("<I", d, base)[0] & 0x1FFFFFFF
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
-        info.append([cid, samples, rate, d[base + 12], [], 0])
+        codec = d[base + 12]
+        if not (1000 <= rate <= 192000) or codec != 0x0B:
+            return []
+        info.append([cid, samples, rate, codec, [], 0])
     previous = [[] for _ in range(channels)]
     for b in range(blocks):
         offset = b * chunk

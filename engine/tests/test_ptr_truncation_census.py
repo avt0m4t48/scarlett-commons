@@ -36,6 +36,9 @@ LISTINGS = {
     # A pointer built from a constant (not a user SGPR) with the high dword zero: not a truncated pointer,
     # but counted as a site the classifier cannot attribute.
     "ps_const_base": ["s_mov_b32 s4, 0x1000", "s_mov_b32 s5, 0", "s_load_dwordx4 s[8:11], s[4:5], 0x0"] + TAIL,
+    # A global_load addressed through a VGPR pair: not a pointer to shader_meta, counted as unseen.
+    "ps_global_vgpr": ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "global_load_dword v2, v[0:1], off",
+                       "s_waitcnt vmcnt(0)", "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
     # No pointer at all.
     "ps_nopointer": ["v_mov_b32_e32 v0, s2", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"],
 }
@@ -97,17 +100,19 @@ class ScanTests(unittest.TestCase):
 
     def test_summary(self):
         s = P.summarise(list(self.records.values()))
-        self.assertEqual(s["total"], 6)
+        self.assertEqual(s["total"], 7)
         self.assertEqual(s["truncating_shaders"], {"ps": 3})
         self.assertEqual(s["pointer_mode"]["ps"], {"all truncated": 2, "some truncated": 1, "none truncated": 1,
-                                                   "no pointer": 2})
+                                                   "no pointer": 3})
         self.assertEqual(s["truncated_pointers_per_shader"]["ps"], {"1": 2, "2": 1})
         self.assertEqual(s["truncated_pointer_access"]["ps"], {"scalar": 1, "table": 3})
         self.assertEqual(s["truncated_pointer_low_half"]["ps"], {"user": 3, "user_off": 1})
         self.assertEqual(s["truncated_pointer_sgpr"]["ps"], {"s2": 2, "s4": 1, "s6": 1})
         self.assertEqual(s["truncated_pointer_kind_in_index"]["ps"], {"ptr32_lo": 4})
-        self.assertEqual(s["untruncated_site_high_half"]["ps"], {"user": 2})
-        self.assertEqual(s["not_seen"]["ps"], {"shaders with lo not a user SGPR, hi zero (table)": 1})
+        self.assertEqual(s["untruncated_site_high_half"]["ps"], {"user (global)": 1, "user (table)": 1})
+        self.assertEqual(s["not_seen"]["ps"], {"shaders with lo not a user SGPR, hi zero (table)": 1,
+                                             "shaders with a VGPR-addressed global_*": 1,
+                                             "VGPR-addressed global_* instructions": 1})
         self.assertEqual(s["flag_mismatches"], 0)
         out = io.StringIO()
         P.print_summary(s, out)

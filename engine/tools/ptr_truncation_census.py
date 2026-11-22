@@ -26,8 +26,9 @@ What it cannot see (the classifier's limits, printed with the table):
   * a pointer that is not rooted in a user SGPR (loaded from memory, built from s_getpc_b64 or computed) and then
     truncated: counted separately as `lo not a user SGPR`, never as a truncated pointer;
   * a high half that is 0 on some paths only (shader_meta keeps a tag only when every path agrees): `hi unknown`;
-  * base addresses inside a V# (buffer_*/tbuffer_*) or T#, and flat_*/scratch_* addresses (shader_meta does not track
-    them): the shaders using flat_*/scratch_* are counted so the size of that gap is visible;
+  * base addresses inside a V# (buffer_*/tbuffer_*) or T#, global_* addresses held in VGPRs (saddr `off`), and
+    flat_*/scratch_* addresses (shader_meta does not track them): the shaders using each are counted so the size
+    of that gap is visible;
   * which root parameter feeds the SGPR: no game shader carries its root signature (section 3.5), so the finest
     role is the physical user SGPR, reported per stage.
 
@@ -113,6 +114,16 @@ def pointer_sites(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     return result, sites
 
 
+def global_without_sgpr_base(ins):
+    """A global_* instruction whose address is a VGPR pair (saddr `off`): shader_meta never looks at it."""
+    op = shader_meta.base_op(ins["op"])
+    if not op.startswith("global_"):
+        return False
+    a = ins["args"]
+    k = 3 if op.startswith("global_atomic_") and "glc" in ins.get("mods", ()) else 2
+    return not (len(a) > k and shader_meta._sgpr_slots(a[k], 2) is not None)
+
+
 def scan_one(path):
     """Per-shader record (no name): stage, whether translate() reached the metadata call, and the sites."""
     real = shader_meta.collect
@@ -147,6 +158,8 @@ def scan_one(path):
         "flat": any(o.startswith("flat_") for o in ops),
         "scratch": any(o.startswith("scratch_") for o in ops),
         "vsharp_memory": any(o.startswith(("buffer_", "tbuffer_", "s_buffer_")) for o in ops),
+        "getpc": "s_getpc_b64" in ops,
+        "global_vgpr_address": sum(1 for b in blocks for i in b if global_without_sgpr_base(i)),
     })
     return out
 
@@ -186,6 +199,11 @@ def summarise(records):
             blind[st]["shaders using flat_*"] += 1
         if r.get("scratch"):
             blind[st]["shaders using scratch_*"] += 1
+        if r.get("global_vgpr_address"):
+            blind[st]["shaders with a VGPR-addressed global_*"] += 1
+            blind[st]["VGPR-addressed global_* instructions"] += r["global_vgpr_address"]
+        if r.get("getpc"):
+            blind[st]["shaders using s_getpc_b64"] += 1
         if r.get("vsharp_memory"):
             blind[st]["shaders using a V# (buffer_*, tbuffer_*, s_buffer_*)"] += 1
         pointers = set(trunc) | set(other)
@@ -200,8 +218,8 @@ def summarise(records):
             mode[st]["all truncated"] += 1
         if not trunc:
             for sites in other.values():
-                for _, high, _ in sites:
-                    untrunc_high[st][high] += 1
+                for _, high, access in sites:
+                    untrunc_high[st][f"{high} ({access})"] += 1
             continue
         trunc_shaders[st] += 1
         per_shader[st][len(trunc)] += 1
@@ -215,8 +233,8 @@ def summarise(records):
             if sgpr in other:
                 both_ways[st] += 1
         for sgpr, sites in other.items():
-            for _, high, _ in sites:
-                untrunc_high[st][high] += 1
+            for _, high, access in sites:
+                untrunc_high[st][f"{high} ({access})"] += 1
     stages = [s for s in STAGES if shaders[s]] + sorted(s for s in shaders if s not in STAGES)
 
     def per(d):

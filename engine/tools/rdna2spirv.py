@@ -238,6 +238,7 @@ class Gen:
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
+        self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
@@ -2497,6 +2498,64 @@ class Gen:
             return addr, d3, in_b, (check if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
+    def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic):
+        """The 4 words of the element a typed store writes, per the run-time FORMAT, and its size in bytes (0 for a code
+        outside FORMATS: nothing is stored). One function per module like the decode (format_decode_call): inlined, every
+        store site carried every format's encode, three times the module of the older table (cs_store 169 KB -> 503 KB).
+        The five lists are 4 uint ids each: the raw float bits, the same with NaN -> 0 (NORM stores), the B/R-swapped
+        view for 50 and 56, the integers and the sign-extended d16 integers; a component the instruction does not give is 0."""
+        if self.fmt_enc_fn is None:
+            names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)]
+            saved, self.body = self.body, []
+            params = names[1:]
+            lists = [params[4 * g:4 * g + 4] for g in range(5)]
+            for code, (size, kind, widths) in self.FORMATS.items():
+                e = self.tmp()
+                self.emit(f"{e} = OpIEqual %bool {names[0]} {self.cu(code)}")
+                ld, le = self.tmp() + "_s", self.tmp() + "_se"
+                self.emit(f"OpSelectionMerge {le} None")
+                self.emit(f"OpBranchConditional {e} {ld} {le}")
+                self.emit(f"{ld} = OpLabel")
+                source = lists[1] if kind in ("unorm", "snorm", "uscaled", "sscaled") else lists[0]
+                if code in (50, 56):
+                    source = lists[2]
+                integer_source = lists[4] if kind in ("i32", "sint") else lists[3]
+                words = self.encode_format(source[:len(widths)] + [self.cu(0)] * 4,
+                                           integer_source[:len(widths)] + [self.cu(0)] * 4, code)
+                words = (words + [self.cu(0)] * 4)[:4]
+                res = self.tmp()
+                self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(words))
+                self.emit(f"OpReturnValue {res}")
+                self.emit(f"{le} = OpLabel")
+            zero = self.tmp()
+            self.emit(f"{zero} = OpCompositeConstruct %v4uint_fmt " + " ".join([self.cu(0)] * 4))
+            self.emit(f"OpReturnValue {zero}")
+            lines, self.body = self.body, saved
+            size_lines = []
+            outer, self.body = self.body, []
+            sz = self.cu(0)
+            for code, (size, _, _) in self.FORMATS.items():
+                e, n2 = self.tmp(), self.tmp()
+                self.emit(f"{e} = OpIEqual %bool %fs_fmt {self.cu(code)}")
+                self.emit(f"{n2} = OpSelect %uint {e} {self.cu(size)} {sz}")
+                sz = n2
+            size_lines, self.body = self.body, outer
+            self.fmt_enc_fn = (["%fmt_encode_fn = OpFunction %v4uint_fmt None %fn_fmt_encode"] +
+                               [f"{q} = OpFunctionParameter %uint" for q in names] + ["%fe_entry = OpLabel"] + lines +
+                               ["OpFunctionEnd", "%fmt_size_fn = OpFunction %uint Pure %fn_tbuffer_norm",
+                                "%fs_fmt = OpFunctionParameter %uint", "%fs_entry = OpLabel"] + size_lines +
+                               [f"OpReturnValue {sz}", "OpFunctionEnd"])
+        r, size = self.tmp(), self.tmp()
+        args = [fmt] + fc + normalized + unorm_view + ic + signed_ic
+        self.emit(f"{r} = OpFunctionCall %v4uint_fmt %fmt_encode_fn " + " ".join(args))
+        self.emit(f"{size} = OpFunctionCall %uint %fmt_size_fn {fmt}")
+        words = []
+        for c in range(4):
+            x = self.tmp()
+            self.emit(f"{x} = OpCompositeExtract %uint {r} {c}")
+            words.append(x)
+        return words, size
+
     def mtbuf_format(self, op, mods):
         """The format code an MTBUF instruction (tbuffer_load/store_format_*) encodes for itself, which replaces the
         V#'s. LLVM omits the modifier for GFX10's default, BUF_FMT_8_UNORM (code 1)."""
@@ -2621,52 +2680,89 @@ class Gen:
                     extended = self.tmp()
                     self.emit(f"{extended} = OpBitFieldSExtract %int {self.as_int(component)} {self.cu(0)} {self.cu(16)}")
                     signed_ic.append(self.tou(extended))
-            formats = self.FORMATS.items() if fmt is not None else [(fixed_fmt, self.FORMATS[fixed_fmt])]
-            for code, (size, kind, widths) in formats:
-                if fmt is not None:
-                    e = self.tmp()
-                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-                    ld, le = self.tmp() + "_s", self.tmp() + "_se"
+            if fmt is None:     # tbuffer_store: its own format, encoded in line
+                code = fixed_fmt
+                size, kind, widths = self.FORMATS[code]
+                if True:
+                    ncomp = min(len(widths), n)
+                    source = normalized if kind in ("unorm", "snorm", "uscaled", "sscaled") else fc
+                    fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                    if code in (50, 56):
+                        fcs = unorm_view
+                    integer_source = signed_ic if kind in ("i32", "sint") else ic
+                    ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                    words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
+                    if size >= 4:
+                        for k, w in enumerate(words[:size // 4]):
+                            pp = self.buf_dword_ptr(ptr, host, step, k)
+                            self.emit(f"OpStore {pp} {w} Aligned 4")
+                    else:
+                        # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
+                        al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(11))
+                        self.emit(f"{sh} = OpUConvert %uint {addr}")
+                        lo3, lo64 = self.tmp(), self.tmp()
+                        self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
+                        self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
+                        self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
+                        self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
+                        sh24 = self.tmp()
+                        self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
+                        # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
+                        dword_arr = self.tmp()
+                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                        self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
+                        self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
+                        self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
+                        self.emit(f"{inv} = OpNot %uint {mks}")
+                        self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
+                        self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
+                        self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
+                        self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+            else:
+                pad = lambda xs: (list(xs) + [self.cu(0)] * 4)[:4]      # noqa: E731
+                words, size = self.format_encode_call(fmt, pad(fc), pad(normalized), pad(unorm_view), pad(ic), pad(signed_ic))
+                # whole dwords: dword k is stored when the element has more than 4k bytes
+                for k in range(4):
+                    big, lk, le = self.tmp(), self.tmp() + "_s", self.tmp() + "_se"
+                    self.emit(f"{big} = OpUGreaterThanEqual %bool {size} {self.cu(4 * (k + 1))}")
                     self.emit(f"OpSelectionMerge {le} None")
-                    self.emit(f"OpBranchConditional {e} {ld} {le}")
-                    self.emit(f"{ld} = OpLabel")
-                ncomp = min(len(widths), n)
-                source = normalized if kind in ("unorm", "snorm", "uscaled", "sscaled") else fc
-                fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
-                if code in (50, 56):
-                    fcs = unorm_view
-                integer_source = signed_ic if kind in ("i32", "sint") else ic
-                ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
-                words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
-                if size >= 4:
-                    for k, w in enumerate(words[:size // 4]):
-                        pp = self.buf_dword_ptr(ptr, host, step, k)
-                        self.emit(f"OpStore {pp} {w} Aligned 4")
-                else:
-                    # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
-                    al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(11))
-                    self.emit(f"{sh} = OpUConvert %uint {addr}")
-                    lo3, lo64 = self.tmp(), self.tmp()
-                    self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
-                    self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
-                    self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
-                    self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
-                    sh24 = self.tmp()
-                    self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
-                    # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                    dword_arr = self.tmp()
-                    self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
-                    self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
-                    self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
-                    self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
-                    self.emit(f"{inv} = OpNot %uint {mks}")
-                    self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
-                    self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
-                    self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
-                    self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
-                if fmt is not None:
+                    self.emit(f"OpBranchConditional {big} {lk} {le}")
+                    self.emit(f"{lk} = OpLabel")
+                    pp = self.buf_dword_ptr(ptr, host, step, k)
+                    self.emit(f"OpStore {pp} {words[k]} Aligned 4")
                     self.emit(f"OpBranch {le}")
                     self.emit(f"{le} = OpLabel")
+                # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
+                small, ld, le = self.tmp(), self.tmp() + "_s", self.tmp() + "_se"
+                sm1 = self.tmp()
+                self.emit(f"{sm1} = OpISub %uint {size} {self.cu(1)}")
+                self.emit(f"{small} = OpULessThan %bool {sm1} {self.cu(2)}")      # size 1 or 2 (0 wraps to a large value)
+                self.emit(f"OpSelectionMerge {le} None")
+                self.emit(f"OpBranchConditional {small} {ld} {le}")
+                self.emit(f"{ld} = OpLabel")
+                al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2, one = (self.tmp() for _ in range(12))
+                self.emit(f"{sh} = OpUConvert %uint {addr}")
+                lo3, lo64 = self.tmp(), self.tmp()
+                self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
+                self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
+                self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
+                self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
+                sh24 = self.tmp()
+                self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
+                # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
+                dword_arr = self.tmp()
+                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
+                self.emit(f"{one} = OpIEqual %bool {size} {self.cu(1)}")
+                self.emit(f"{mk} = OpSelect %uint {one} {self.cu(0xFF)} {self.cu(0xFFFF)}")
+                self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
+                self.emit(f"{inv} = OpNot %uint {mks}")
+                self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
+                self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
+                self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
+                self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+                self.emit(f"OpBranch {le}")
+                self.emit(f"{le} = OpLabel")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
@@ -9553,11 +9649,14 @@ def assemble(gen):
         types.append(f"{name} = OpConstant %uint {v}")
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
-    if gen.tbuffer_norm_fns:
-        types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
-    if gen.fmt_fn:
+    if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
+        types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")      # also the element-size function's type
+    if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
+    if gen.fmt_fn:
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
+    if gen.fmt_enc_fn:
+        types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 21))
     if gen.uses_ballot:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -9872,7 +9971,7 @@ def assemble(gen):
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
+    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     out = hdr + dec + types + gvars + helpers + fn

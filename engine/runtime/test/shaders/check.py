@@ -366,6 +366,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              # far branches: s_getpc/s_add|s_sub/s_addc|s_subb/s_setpc forward, backward loops, conditional (.asm header)
+              "ps_far_branch": (0x00000007, 0x00000013, 0x00000051, 0x0000000b),
               # 16-bit float v_cmp, all 16 predicates, e32 and e64 with swapped operands (.asm headers)
               "ps_vcmp_f16": (0x48a12080, 0x4ce9b1a2, 0x4ba72c98, 0x4fefbdba),
               "ps_vcmp_f16_e64": (0x44c11100, 0x4cf171c1, 0x47c71d18, 0x4ff77dd9),

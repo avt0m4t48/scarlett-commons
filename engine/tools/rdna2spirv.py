@@ -13027,7 +13027,7 @@ def fold_far_branches(insns):
     while i < len(insns):
         w = insns[i:i + 4]
         ops4 = [base_op(x["op"]) for x in w]
-        if len(w) == 4 and ops4 in (["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
+        if len(w) == 4 and all(x.get("enc") for x in w) and ops4 in (["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
                                     ["s_getpc_b64", "s_sub_u32", "s_subb_u32", "s_setpc_b64"]):
             g, ad, ac, sp = w
             r = g["args"][0].get("r") if g["args"] and g["args"][0]["k"] == "sgpr" else None

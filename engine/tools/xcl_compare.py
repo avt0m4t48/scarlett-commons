@@ -442,8 +442,6 @@ def main():
     ap.add_argument("--out", help="report path (default: <work>/report.json)")
     ap.add_argument("--gui", action="store_true", help="show the checks live in a window")
     args = ap.parse_args()
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(errors="replace")
     if sys.platform != "win32":
         raise SystemExit("Windows only: both runtimes run Windows executables")
     if args.gui:
@@ -469,4 +467,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     sys.exit(main())

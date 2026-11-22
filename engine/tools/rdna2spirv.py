@@ -1269,7 +1269,7 @@ class Gen:
     # Full-width SINT and UINT preserve the same raw dwords. Keep separate kinds for signed D16 conversion.
     # Kinds: unorm/snorm/uint (the first entries), uscaled/sscaled (the integer converted to float, not divided), sint
     # (sign-extended), ufloat (the unsigned 5-bit-exponent 10/11-bit float). 10_11_11 and 11_11_10 are the FLOAT ones
-    # only: GFX10's UNORM/SNORM/USCALED/SSCALED/UINT/SINT codes of those two (30-35, 37-42) are not in the table.
+    # only on GFX11; GFX10's own UNORM/SNORM/USCALED/SSCALED/UINT/SINT codes of those two (30-35, 37-42) are in the table.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
                72: (12, "u32", (32, 32, 32)), 75: (16, "u32", (32, 32, 32, 32)),
@@ -1296,12 +1296,17 @@ class Gen:
                53: (4, "sscaled", (10, 10, 10, 2)), 54: (4, "uint", (10, 10, 10, 2)), 55: (4, "sint", (10, 10, 10, 2)),
                58: (4, "uscaled", (8, 8, 8, 8)), 59: (4, "sscaled", (8, 8, 8, 8)), 61: (4, "sint", (8, 8, 8, 8)),
                67: (8, "uscaled", (16, 16, 16, 16)), 68: (8, "sscaled", (16, 16, 16, 16)),
-               70: (8, "sint", (16, 16, 16, 16))}
+               70: (8, "sint", (16, 16, 16, 16)),
+               # 10_11_11 (x 11 bits, y 11, z 10) and 11_11_10 (x 10, y 11, z 11) with the other numeric formats: GFX11 has none
+               # of them, a real RDNA2 (gfx1036, @AwkGrep256, #2022) validated the layout and conversions of all twelve.
+               30: (4, "unorm", (11, 11, 10)), 31: (4, "snorm", (11, 11, 10)), 32: (4, "uscaled", (11, 11, 10)),
+               33: (4, "sscaled", (11, 11, 10)), 34: (4, "uint", (11, 11, 10)), 35: (4, "sint", (11, 11, 10)),
+               37: (4, "unorm", (10, 11, 11)), 38: (4, "snorm", (10, 11, 11)), 39: (4, "uscaled", (10, 11, 11)),
+               40: (4, "sscaled", (10, 11, 11)), 41: (4, "uint", (10, 11, 11)), 42: (4, "sint", (10, 11, 11))}
 
-    # Formats whose float -> NORM store rounds the exact product x * max (the hardware does, gfx1150): the f32 product of
-    # the older entries rounds twice (0.3 * 65535 = 19660.5008 is 19660.5 in f32, a tie that goes to 19660; the hardware
-    # stores 19661) and stays as it is. A SCALED store converts as its NORM format.
-    EXACT_NORM_CODES = frozenset((3, 4, 9, 10, 16, 17, 25, 26, 45, 46, 47, 51, 52, 53, 58, 59, 67, 68))
+    # A float -> NORM store rounds the exact product x * max once (gfx1150 and gfx1036 both: 0.3 * 65535 stores 19661). The f32
+    # product of an earlier version rounds twice (0.3 * 65535 = 19660.5008 is 19660.5 in f32, a tie that goes to 19660).
+    # A SCALED store converts as its NORM format.
 
     def norm_encode_exact(self, x, maxval, signed):
         """The field of a NORM store of the f32 bits x (NaN already 0): round-to-nearest-even of x * maxval, exact
@@ -1365,33 +1370,21 @@ class Gen:
         bit = 0
         for c, w in enumerate(widths):
             if kind == "f16":
-                field = self.f16_bits(self.tof(fcomps[c]))
-            elif kind in ("unorm", "uscaled") and code in self.EXACT_NORM_CODES:   # a SCALED store: its NORM format
+                # round toward zero, a value too large gives 65504, a NaN stays a NaN (gfx1150 and gfx1036)
+                field = self.ufloat_encode_bits(fcomps[c], 16, signed=True)
+            elif kind in ("unorm", "uscaled"):      # a SCALED store: its NORM format
                 field = self.norm_encode_exact(fcomps[c], (1 << w) - 1, False)
-            elif kind in ("unorm", "uscaled"):
-                cl, sc, rd, u = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} %f0 %f1")
-                self.emit(f"{sc} = OpFMul %float {cl} {self.fconst(float((1 << w) - 1))}")
-                self.emit(f"{rd} = OpExtInst %float %glsl RoundEven {sc}")
-                self.emit(f"{u} = OpConvertFToU %uint {rd}")
-                field = u
-            elif kind in ("snorm", "sscaled") and w > 2 and code in self.EXACT_NORM_CODES:
+            elif kind in ("snorm", "sscaled") and w > 2:
                 field = self.norm_encode_exact(fcomps[c], (1 << (w - 1)) - 1, True)
             elif kind in ("snorm", "sscaled"):
-                cl, sc, rd, i, u = self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                cl, u = self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} {self.fconst(-1.0)} %f1")
-                if w == 2:
-                    # {-1, 0, 1}: a half rounds away from zero here (gfx1150), where RoundEven would give 0
-                    hi, lo, one, neg = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{hi} = OpFOrdGreaterThanEqual %bool {cl} {self.fconst(0.5)}")
-                    self.emit(f"{lo} = OpFOrdLessThanEqual %bool {cl} {self.fconst(-0.5)}")
-                    self.emit(f"{one} = OpSelect %uint {hi} {self.cu(1)} {self.cu(0)}")
-                    self.emit(f"{u} = OpSelect %uint {lo} {self.cu(0xFFFFFFFF)} {one}")
-                else:
-                    self.emit(f"{sc} = OpFMul %float {cl} {self.fconst(float((1 << (w - 1)) - 1))}")
-                    self.emit(f"{rd} = OpExtInst %float %glsl RoundEven {sc}")
-                    self.emit(f"{i} = OpConvertFToS %int {rd}")
-                    self.emit(f"{u} = OpBitcast %uint {i}")
+                # {-1, 0, 1}: a half rounds away from zero in a 2-bit field, where nearest even would give 0
+                hi, lo, one = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{hi} = OpFOrdGreaterThanEqual %bool {cl} {self.fconst(0.5)}")
+                self.emit(f"{lo} = OpFOrdLessThanEqual %bool {cl} {self.fconst(-0.5)}")
+                self.emit(f"{one} = OpSelect %uint {hi} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"{u} = OpSelect %uint {lo} {self.cu(0xFFFFFFFF)} {one}")
                 field = u
             elif kind == "sint":   # Narrow SINT stores clamp the signed value to the field's range.
                 clamped, field = self.tmp(), self.tmp()
@@ -1410,12 +1403,13 @@ class Gen:
             bit += w
         return words
 
-    def ufloat_encode_bits(self, x, w):
-        """The w-bit unsigned float (5 exponent bits, bias 15, w - 5 mantissa bits) of the f32 bits x, integer ops only.
-        Round toward zero; a value past the largest finite one gives that largest finite value; +-0 and every negative
-        number except a NaN give 0; +inf gives infinity; a NaN keeps the top mantissa bits of its payload, or 1 when they
-        are all zero, so it stays a NaN (all measured on gfx1150, tools/buffer_format_fuzz.py)."""
-        mb = w - 5
+    def ufloat_encode_bits(self, x, w, signed=False):
+        """The w-bit float (5 exponent bits, bias 15, w - 5 mantissa bits; signed: a sign bit on top and w - 6) of the f32
+        bits x, integer ops only. Round toward zero; a value past the largest finite one gives that largest finite value;
+        +inf gives infinity; a NaN keeps the top mantissa bits of its payload, or 1 when they are all zero, so it stays a
+        NaN. Unsigned: +-0 and every negative number except a NaN give 0. Signed (the 16-bit half): the sign is kept,
+        -0 and -inf included, and a NaN keeps its sign (measured on gfx1150 and gfx1036, tools/buffer_format_fuzz.py)."""
+        mb = w - 6 if signed else w - 5
         (a, ex, sg, sig, hid, sh0, sh, shc, dn, nr0, nr, nm, nm1, nz, nmant, nanb, isnan, isinf, big, norm,
          r0, r1, r2, neg, ng, r3, snan) = (self.tmp() for _ in range(27))
         self.emit(f"{a} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
@@ -1442,9 +1436,14 @@ class Gen:
         self.emit(f"{r2} = OpSelect %uint {isinf} {self.cu(31 << mb)} {r1}")
         self.emit(f"{r3} = OpSelect %uint {isnan} {nanb} {r2}")
         self.emit(f"{neg} = OpINotEqual %bool {sg} {self.cu(0)}")
+        res = self.tmp()
+        if signed:
+            sbit = self.tmp()
+            self.emit(f"{sbit} = OpShiftLeftLogical %uint {sg} {self.cu(15)}")
+            self.emit(f"{res} = OpBitwiseOr %uint {r3} {sbit}")
+            return res
         self.emit(f"{snan} = OpLogicalNot %bool {isnan}")
         self.emit(f"{ng} = OpLogicalAnd %bool {neg} {snan}")
-        res = self.tmp()
         self.emit(f"{res} = OpSelect %uint {ng} {self.cu(0)} {r3}")
         return res
 
@@ -2498,16 +2497,16 @@ class Gen:
             return addr, d3, in_b, (check if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
-    def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic):
+    def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic, y_route):
         """The 4 words of the element a typed store writes, per the run-time FORMAT, and its size in bytes (0 for a code
         outside FORMATS: nothing is stored). One function per module like the decode (format_decode_call): inlined, every
         store site carried every format's encode, three times the module of the older table (cs_store 169 KB -> 503 KB).
         The five lists are 4 uint ids each: the raw float bits, the same with NaN -> 0 (NORM stores), the B/R-swapped
         view for 50 and 56, the integers and the sign-extended d16 integers; a component the instruction does not give is 0."""
         if self.fmt_enc_fn is None:
-            names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)]
+            names = ["%fe_fmt"] + [f"%fe_{g}{i}" for g in "fnvis" for i in range(4)] + ["%fe_yroute"]
             saved, self.body = self.body, []
-            params = names[1:]
+            params = names[1:21]
             lists = [params[4 * g:4 * g + 4] for g in range(5)]
             for code, (size, kind, widths) in self.FORMATS.items():
                 e = self.tmp()
@@ -2520,6 +2519,17 @@ class Gen:
                 if code in (50, 56):
                     source = lists[2]
                 integer_source = lists[4] if kind in ("i32", "sint") else lists[3]
+                if len(widths) == 2:
+                    # Through a V# the second component of a two-component format is channel y when DST_SEL_Y is Y and
+                    # DST_SEL_Z a constant (the runtime's XY01), channel w otherwise (identity XYZW: `_xy` and `_xyz` then
+                    # give w = 0). Measured on gfx1150 for sixteen selector sets, gfx1036 for XYZW (#2022) and XY01.
+                    # tbuffer takes (x, y) and is encoded in line, not here.
+                    sy, iy = self.tmp(), self.tmp()
+                    yr = self.tmp()
+                    self.emit(f"{yr} = OpINotEqual %bool {names[21]} {self.cu(0)}")
+                    self.emit(f"{sy} = OpSelect %uint {yr} {source[1]} {source[3]}")
+                    self.emit(f"{iy} = OpSelect %uint {yr} {integer_source[1]} {integer_source[3]}")
+                    source, integer_source = [source[0], sy], [integer_source[0], iy]
                 words = self.encode_format(source[:len(widths)] + [self.cu(0)] * 4,
                                            integer_source[:len(widths)] + [self.cu(0)] * 4, code)
                 words = (words + [self.cu(0)] * 4)[:4]
@@ -2546,7 +2556,7 @@ class Gen:
                                 "%fs_fmt = OpFunctionParameter %uint", "%fs_entry = OpLabel"] + size_lines +
                                [f"OpReturnValue {sz}", "OpFunctionEnd"])
         r, size = self.tmp(), self.tmp()
-        args = [fmt] + fc + normalized + unorm_view + ic + signed_ic
+        args = [fmt] + fc + normalized + unorm_view + ic + signed_ic + [y_route]
         self.emit(f"{r} = OpFunctionCall %v4uint_fmt %fmt_encode_fn " + " ".join(args))
         self.emit(f"{size} = OpFunctionCall %uint %fmt_size_fn {fmt}")
         words = []
@@ -2720,7 +2730,15 @@ class Gen:
                         self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
             else:
                 pad = lambda xs: (list(xs) + [self.cu(0)] * 4)[:4]      # noqa: E731
-                words, size = self.format_encode_call(fmt, pad(fc), pad(normalized), pad(unorm_view), pad(ic), pad(signed_ic))
+                # DST_SEL_Y = Y and DST_SEL_Z a constant (0 or 1): word3 bits 5:3 are 5 and bits 8:6 are below 4
+                sely, selz, yok, zok, yz, yroute = (self.tmp() for _ in range(6))
+                self.emit(f"{sely} = OpBitFieldUExtract %uint {d3} {self.cu(3)} {self.cu(3)}")
+                self.emit(f"{selz} = OpBitFieldUExtract %uint {d3} {self.cu(6)} {self.cu(3)}")
+                self.emit(f"{yok} = OpIEqual %bool {sely} {self.cu(5)}")
+                self.emit(f"{zok} = OpULessThan %bool {selz} {self.cu(4)}")
+                self.emit(f"{yz} = OpLogicalAnd %bool {yok} {zok}")
+                self.emit(f"{yroute} = OpSelect %uint {yz} {self.cu(1)} {self.cu(0)}")
+                words, size = self.format_encode_call(fmt, pad(fc), pad(normalized), pad(unorm_view), pad(ic), pad(signed_ic), yroute)
                 # whole dwords: dword k is stored when the element has more than 4k bytes
                 for k in range(4):
                     big, lk, le = self.tmp(), self.tmp() + "_s", self.tmp() + "_se"
@@ -9656,7 +9674,7 @@ def assemble(gen):
     if gen.fmt_fn:
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
     if gen.fmt_enc_fn:
-        types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 21))
+        types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 22))
     if gen.uses_ballot:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):

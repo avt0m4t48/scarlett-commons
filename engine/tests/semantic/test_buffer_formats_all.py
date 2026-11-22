@@ -1,16 +1,14 @@
 """Every GFX10 buffer data format the translator knows, decoded and encoded, against tools/buffer_format_fuzz.py's MODEL.
 
 MODEL (decode_element / encode_element there) is what the Radeon 880M (gfx1150, RDNA3.5, not RDNA2) did for every
-pattern of tools/buffer_format_fuzz.py --oracle hw: 1.33 million validated elements over 63 formats, loads through a V# and
+pattern of tools/buffer_format_fuzz.py --oracle hw: 1.33 million validated elements over 63 formats on the 880M and the same on a real RDNA2, loads through a V# and
 through tbuffer's own format, stores through both (docs/buffer_formats.md, docs/design.md "Typed buffer formats"). This
 file holds the translated SPIR-V to it: the SPIR-V mini interpreter runs `buffer_load_format_xyzw` (the V# format and
 tbuffer's own) and `buffer_store_format_xyzw` of every format added with the SCALED / SINT / 10_11_11 / 11_11_10 /
 2_10_10_10 / 10_10_10_2 families, with edge values, NaN, infinity and denormals, and compares every word.
 
-Existing formats are only checked for their table entry (size, kind, widths against the GFX10 name): their decode and
-encode is unchanged and covered by test_buffer_load_format.py, test_norm_decode.py and the GPU fixtures. Two places
-where an existing store differs from the 880M, and the two-component buffer_store_format_* routing (x, w) that the
-translator does not do, are pinned at the end as expected failures (OlderStoresDifferFromTheGpu).
+Older formats are checked for their table entry and, for stores, against the model too (StoresOfTheOlderFormats); their
+loads are covered by test_buffer_load_format.py, test_norm_decode.py and the GPU fixtures.
 """
 import os
 import random
@@ -32,10 +30,11 @@ SENTINEL = 0xDEAD0000
 DST_XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
 
 # Added with this change: every code the SCALED, SINT, small-float and 10:10:10:2 families add to Gen.FORMATS.
-ADDED = (3, 4, 5, 6, 9, 10, 11, 12, 16, 17, 18, 19, 25, 26, 28, 36, 43, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55,
+ADDED = (3, 4, 5, 6, 9, 10, 11, 12, 16, 17, 18, 19, 25, 26, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+         45, 46, 47, 48, 49, 51, 52, 53, 54, 55,
          58, 59, 61, 67, 68, 70)
 # Of the formats above, the ones whose store the table covers (all; a SCALED store converts as its NORM format).
-GFX10_ONLY_NOT_TABLED = (30, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 42)
+GFX10_ONLY = (30, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 42, 46, 47)     # no GFX11 spelling: a real RDNA2 validated them
 
 
 def v_sharp_lines(reg, base, code):
@@ -115,15 +114,11 @@ class FormatTable(unittest.TestCase):
                 else:
                     self.assertEqual(kind, kinds[nfmt])
 
-    def test_the_added_codes_are_present_and_the_gfx10_only_ones_are_not(self):
+    def test_every_buffer_code_is_in_the_table(self):
         for code in ADDED:
             self.assertIn(code, rdna2spirv.Gen.FORMATS)
-        for code in GFX10_ONLY_NOT_TABLED:
-            self.assertNotIn(code, rdna2spirv.Gen.FORMATS)
-
-    def test_every_buffer_code_but_the_twelve_is_in_the_table(self):
-        missing = [c for c in range(1, 78) if c not in rdna2spirv.Gen.FORMATS]
-        self.assertEqual(missing, list(GFX10_ONLY_NOT_TABLED))
+        self.assertEqual([c for c in range(1, 78) if c not in rdna2spirv.Gen.FORMATS], [])
+        self.assertEqual(len(rdna2spirv.Gen.FORMATS), 77)
 
 
 class LoadsMatchTheModel(unittest.TestCase):
@@ -229,10 +224,11 @@ class HandWorkedValues(unittest.TestCase):
         self.assertEqual(store(45, [0x3F000000, 0, 0, 0])[0] & 3, 1)              # 10_10_10_2_SNORM, 2 bit x: 0.5 -> 1
 
 
-class OlderStoresDifferFromTheGpu(unittest.TestCase):
-    """Stores of formats that were in the table before this change, where the Radeon 880M (RDNA3.5) gives other bytes
-    (docs/buffer_formats.md). They are left as they were, so these assertions of the hardware's words fail today; when
-    someone fixes the store the expected failure turns into an unexpected success and says so."""
+class StoresOfTheOlderFormats(unittest.TestCase):
+    """Stores of formats that were in the table before the SCALED / SINT / small-float families, which used to differ from the
+    hardware in three places and now follow it (docs/buffer_formats.md): 16-bit float stores round toward zero and saturate,
+    UNORM / SNORM stores round the exact product once, and a two-component format takes channels (x, w) through a V# with identity selectors.
+    Measured on the Radeon 880M (gfx1150) and on a real RDNA2, gfx1036 (@AwkGrep256, #2022)."""
 
     def store(self, code, regs, instr="xyzw"):
         memory = {IN_BASE + 4 * i: w for i, w in enumerate(regs)}
@@ -240,24 +236,63 @@ class OlderStoresDifferFromTheGpu(unittest.TestCase):
         run(translate_store(code, instr), memory)
         return memory[OUT_BASE]
 
-    @unittest.expectedFailure
-    def test_two_component_mubuf_store_takes_x_and_w_on_the_880m(self):
-        # KNOWN DIFFERENCE, RDNA2 unmeasured: buffer_store_format_xyzw of (1, 2, 3, 4) into 8_8_SINT writes 01 04 on the
-        # Radeon 880M and buffer_store_format_xy writes 01 00; the translator writes (x, y) = 01 02 for both.
-        # (tbuffer_store_format_* takes (x, y) on the 880M too, so there it agrees.)
+    def test_two_component_v_sharp_store_takes_x_and_w(self):
+        # buffer_store_format_xyzw of (1, 2, 3, 4) into 8_8_SINT writes 01 04, buffer_store_format_xy writes 01 00
         self.assertEqual(self.store(19, [1, 2, 3, 4]) & 0xFFFF, 0x0401)
         self.assertEqual(self.store(19, [1, 2, 3, 4], "xy") & 0xFFFF, 0x0001)
+        self.assertEqual(self.store(27, [0x1111, 0x2222, 0x3333, 0x4444]), 0x44441111)    # 16_16_UINT
 
-    @unittest.expectedFailure
+    def test_two_component_store_with_the_runtime_selectors_takes_x_and_y(self):
+        # The runtime gives a two-component format DST_SEL X, Y, 0, 1 (gfx10_descriptors.h): channel y then, as measured natively
+        # (gfx1036, test_buffer_format_narrow_int.py; gfx1150: XY01, XY0W and XY00 all give (x, y), XYZW and XYZ1 give (x, w))
+        for sel, want in ((4 | 5 << 3 | 0 << 6 | 1 << 9, 0x0201), (4 | 5 << 3 | 0 << 6 | 7 << 9, 0x0201),
+                          (4 | 5 << 3 | 6 << 6 | 1 << 9, 0x0401), (4 | 0 << 3 | 0 << 6 | 1 << 9, 0x0401)):
+            lines = ["v_cmpx_eq_u32_e32 0, v0", *v_sharp_lines(4, OUT_BASE, 19), "v_mov_b32 v1, 0",
+                     f"s_mov_b32 s7, {0x30000000 | 19 << 12 | sel:#x}", "v_mov_b32 v2, 1", "v_mov_b32 v3, 2",
+                     "v_mov_b32 v4, 3", "v_mov_b32 v5, 4", "buffer_store_format_xyzw v[2:5], v1, s[4:7], 0 offen", "s_endpgm"]
+            spv = support.translate_lines("cs_fmt_all_sel", lines, fssm=tv.CS_BOUNDS_FSSM)
+            memory = {OUT_BASE: SENTINEL}
+            run(spv, memory)
+            self.assertEqual(memory[OUT_BASE] & 0xFFFF, want, hex(sel))
+
+    def test_two_component_tbuffer_store_takes_x_and_y(self):
+        lines = ["v_cmpx_eq_u32_e32 0, v0", *v_sharp_lines(4, OUT_BASE, 22), "v_mov_b32 v1, 0",
+                 "v_mov_b32 v2, 1", "v_mov_b32 v3, 2", "v_mov_b32 v4, 3", "v_mov_b32 v5, 4",
+                 "tbuffer_store_format_xyzw v[2:5], v1, s[4:7], 0 format:[BUF_FMT_8_8_SINT] offen", "s_endpgm"]
+        spv = support.translate_lines("cs_fmt_all_tbuf", lines, fssm=tv.CS_BOUNDS_FSSM)
+        memory = {OUT_BASE: SENTINEL}
+        run(spv, memory)
+        self.assertEqual(memory[OUT_BASE] & 0xFFFF, 0x0201)
+
     def test_16_float_store_rounds_toward_zero_and_saturates(self):
         # 65520.0 is the tie between 65504 and infinity: nearest even says infinity, the hardware 0x7BFF
         self.assertEqual(self.store(13, [0x47FFE000, 0, 0, 0]) & 0xFFFF, 0x7BFF)
         self.assertEqual(self.store(13, [0x3EFFFFFF, 0, 0, 0]) & 0xFFFF, 0x37FF)     # 0.49999997: truncated, not 0x3800
+        self.assertEqual(self.store(13, [0x7149F2CA, 0, 0, 0]) & 0xFFFF, 0x7BFF)     # 1e30
+        self.assertEqual(self.store(13, [0x7F800001, 0, 0, 0]) & 0xFFFF, 0x7C01)     # a NaN stays one
+        self.assertEqual(self.store(13, [0xFF800000, 0, 0, 0]) & 0xFFFF, 0xFC00)     # -infinity
 
-    @unittest.expectedFailure
     def test_unorm_store_rounds_the_exact_product(self):
         # 0x37C000C0 * 65535 is a hair under 1.5: the hardware stores 1, an f32 product rounds up to 1.5 and stores 2
         self.assertEqual(self.store(7, [0x37C000C0, 0, 0, 0]) & 0xFFFF, 1)
+        self.assertEqual(self.store(7, [0x3E99999A, 0, 0, 0]) & 0xFFFF, 19661)      # 0.3 * 65535
+
+    def test_every_older_format_matches_the_model(self):
+        older = [c for c, (_, kind, _) in rdna2spirv.Gen.FORMATS.items()
+                 if c not in ADDED and kind not in ("f32", "u32", "i32")]
+        for code in older:
+            name = model.GFX10_NAMES[code]
+            with self.subTest(format=name):
+                spv = translate_store(code)
+                rng = random.Random(code * 29)
+                for row in rng.sample(model.store_inputs(name, rng), 32):
+                    memory = {IN_BASE + 4 * i: w for i, w in enumerate(row)}
+                    memory.update({OUT_BASE + 4 * i: SENTINEL for i in range(4)})
+                    run(spv, memory)
+                    got = b"".join(memory[OUT_BASE + 4 * i].to_bytes(4, "little") for i in range(4))
+                    want = bytearray(b"".join(SENTINEL.to_bytes(4, "little") for _ in range(4)))
+                    want[:model.element_size(name)] = model.encode_element(name, row)
+                    self.assertEqual(got, bytes(want), (name, [f"{w:08x}" for w in row]))
 
 
 if __name__ == "__main__":

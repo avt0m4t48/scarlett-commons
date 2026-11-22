@@ -1249,12 +1249,12 @@ def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
 
 
 @pytest.mark.parametrize("suffix,fmt_code,expected_word", [
-    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
+    ("xy", 29, 0x3C013C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c01 (toward zero)
     ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
 ])
-def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
-    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
-    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+def test_encode_format_f16_rounds_toward_zero_without_pack_half(suffix, fmt_code, expected_word, make_shader):
+    """buffer_store_format_{x,xy} with f16 V# formats rounds toward zero (the hardware does, gfx1150 and gfx1036, #2022;
+    it used to round to nearest even), without PackHalf2x16, validates with spirv-val and stores exact f16 bits."""
     si = _load_mini_interp()
     base = 0x1000
     vdata = "v2" if suffix == "x" else "v[2:3]"
@@ -1263,10 +1263,10 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
+        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000 | 4 | 5 << 3 | 1 << 9:#x}\n"   # DST_SEL X, Y, 0, 1
         "v_mov_b32 v1, 0\n"
-        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
-        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (a tie to even too)
+        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c01 (toward zero; nearest even gave 0x3c02)
         f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"
         "exp mrt0 v2, v3, v2, v3 done vm\n"
@@ -1347,7 +1347,9 @@ def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, mak
         shader.validate(spv)
         memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
         si.run_fragment(spv, memory=memory)
-        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
+        # A two-component format takes channels x and w through this XYZW V# (gfx1150 and gfx1036, #2022): `_xy` writes (x, 0).
+        stored = [words[0], 0] if n == 2 else words
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == stored + [0xDEADBEEF] * (5 - n), fmt
 
 
 @pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),

@@ -465,7 +465,7 @@ class TranslatorValueSemantics(unittest.TestCase):
             0x68: 0x7FFF8000, 0x6C: 0x0011FFFD,
             0x70: 0xFFFFFFFD, 0x74: 0xFFFFFFFD,
             0x90: 0x80000000, 0xA8: 0xFFFFFFFD, 0xBC: 17,
-            0xC0: 0xFFFFFFFD, 0xC4: 0xFFFF8000, 0xC8: 0xFFFFFFFD,
+            0xC0: 0xFFFFFFFD, 0xC4: 0, 0xC8: 0xFFFFFFFD,    # 0xC4: a two-component format takes channels x and w through the XYZW V# (#2022)
         }
         for address, word in expected.items():
             with self.subTest(address=hex(address)):

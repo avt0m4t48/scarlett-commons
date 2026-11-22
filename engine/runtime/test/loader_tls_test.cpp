@@ -443,6 +443,134 @@ void test_multiple_tls_modules(const fs::path& dll, const fs::path& temp) {
     }
 }
 
+// Threads that already exist when load() runs: a thread of the caller's and a worker of the process thread pool,
+// which is where the task queue (third_party/xtaskqueue, ThreadPool_win32.cpp) runs a title's callbacks. Windows
+// gives such threads the new module's TLS block when it loads a DLL itself, and no DLL_THREAD_ATTACH; load() has to
+// do the same, or mapped code on them reads the helper DLL's one-byte block.
+struct PoolProbe {
+    int(__cdecl* get)() = nullptr;
+    void(__cdecl* set)(int) = nullptr;
+    HANDLE done = nullptr;
+    LONG value = -1;
+    DWORD thread = 0;
+};
+
+void CALLBACK pool_probe(PTP_CALLBACK_INSTANCE, void* context) {
+    auto* probe = static_cast<PoolProbe*>(context);
+    probe->thread = GetCurrentThreadId();
+    if (probe->get) {
+        probe->value = probe->get();
+        probe->set(4000);
+    }
+    SetEvent(probe->done);
+}
+
+void test_existing_threads(const fs::path& dll) {
+    // A pool worker exists from here on: the callback has run on one, and the pool keeps its workers for a while.
+    PoolProbe warm;
+    warm.done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(TrySubmitThreadpoolCallback(&pool_probe, &warm, nullptr) != 0 &&
+              WaitForSingleObject(warm.done, 10000) == WAIT_OBJECT_0,
+          "a thread-pool worker exists before load()");
+
+    struct Step {
+        HANDLE go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    };
+    Step first, second, last;
+    HANDLE started = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    int(__cdecl* get)() = nullptr;
+    void(__cdecl* set)(int) = nullptr;
+    int seen_first = -1, seen_after_write = -1, seen_second = -1;
+    void* block_first = nullptr;
+    DWORD early_id = 0;
+    uint32_t index = rt::kNoTlsIndex;
+    std::thread early([&] {
+        early_id = GetCurrentThreadId();
+        SetEvent(started);
+        WaitForSingleObject(first.go, INFINITE);  // the first Loader has mapped the fixture
+        block_first = module_tls_slots()[index];
+        seen_first = get();
+        set(55);
+        seen_after_write = get();
+        SetEvent(first.done);
+        WaitForSingleObject(second.go, INFINITE);  // that Loader is gone and a second one has mapped it again
+        seen_second = get();
+        SetEvent(second.done);
+        WaitForSingleObject(last.go, INFINITE);  // ends while the second module is initialised
+    });
+    WaitForSingleObject(started, INFINITE);
+
+    MEMORY_BASIC_INFORMATION info{};
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        index = m.tls_index;
+        get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+        set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+        set(42);
+
+        SetEvent(first.go);
+        WaitForSingleObject(first.done, INFINITE);
+        check(seen_first == 7, "a thread that existed before load() reads the template value 7");
+        check(seen_after_write == 55 && get() == 42, "its write stays in its own block");
+        check(block_first != nullptr && block_first != m.tls_block && block_first != m.tls_saved_block,
+              "it has a block of its own, not the loading thread's or the helper DLL's");
+        void* seen_block = nullptr;
+        std::thread([&] { seen_block = module_tls_slots()[index]; }).join();
+        check(seen_block != block_first, "a thread started after load() still gets its own block");
+
+        // Every callback sees the template value, or the 4000 an earlier callback left on the same worker.
+        bool pool_ok = true, on_warm_worker = false;
+        for (int i = 0; i < 16; ++i) {
+            PoolProbe probe;
+            probe.get = get;
+            probe.set = set;
+            probe.done = warm.done;
+            if (!TrySubmitThreadpoolCallback(&pool_probe, &probe, nullptr) ||
+                WaitForSingleObject(probe.done, 10000) != WAIT_OBJECT_0) {
+                pool_ok = false;
+                break;
+            }
+            pool_ok = pool_ok && (probe.value == 7 || probe.value == 4000);
+            on_warm_worker = on_warm_worker || probe.thread == warm.thread;
+        }
+        check(pool_ok, "thread-pool callbacks read the template value on workers that predate load()");
+        std::puts(on_warm_worker ? "     (one of them ran on the worker that existed before load())"
+                                 : "     (the pool did not reuse the earlier worker this time)");
+        check(VirtualQuery(block_first, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT,
+              "the block is live while the Loader is");
+    }
+    check(module_tls_slots()[index] != nullptr, "the loading thread has the helper DLL's block back");
+    check(VirtualQuery(block_first, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+          "~Loader frees the block it gave the earlier thread, which is still running");
+
+    {
+        // The same thread, a second mapping: a fresh copy of the template, not the 55 it wrote into the first.
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        index = m.tls_index;
+        get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+        set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+        auto watch = find_export<void(__cdecl*)(DWORD)>(m, "tiny_tls_watch_thread");
+        auto thread_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_attach_count");
+        auto thread_detach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_detach_count");
+        watch(early_id);
+        loader.initialise();
+        SetEvent(second.go);
+        WaitForSingleObject(second.done, INFINITE);
+        check(seen_second == 7, "the same thread reads the template value again after a second load()");
+        SetEvent(last.go);
+        early.join();
+        // As for a DLL Windows loads itself: no DLL_THREAD_ATTACH for a thread that was already running, and
+        // DLL_THREAD_DETACH when it ends.
+        check(thread_attach() == 0, "a thread that existed before load() gets no DLL_THREAD_ATTACH");
+        check(thread_detach() == 1, "it gets DLL_THREAD_DETACH once when it ends");
+    }
+    for (HANDLE h : {first.go, first.done, second.go, second.done, last.go, last.done, started, warm.done})
+        CloseHandle(h);
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\nloader_tls_test: OK (%d checks)\n", g_checks);
@@ -470,6 +598,7 @@ int main(int argc, char** argv) {
         }
 
         TempDir temp;
+        test_existing_threads(tls_dll);
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);

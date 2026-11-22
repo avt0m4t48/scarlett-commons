@@ -53,10 +53,12 @@ X = 64          # anything else that depends on the partition
 CTRL = 128      # scalar defined behind a wave-wide vote and read where the def may not have run
 MASKD = 256     # a lane mask used as data
 WFS = 512       # scalar read from the first lane of a waterfall loop
-TAG_BITS = RNK | ELECT | WFS
+ACT_RFL = 1024  # scalar from v_readfirstlane of active-EXEC-only uniform VGPR (valid only inside that EXEC mask)
+TAG_BITS = RNK | ELECT | WFS | ACT_RFL
 
 NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocation-order", ELECT: "elected-lane",
-         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar"}
+         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar",
+         ACT_RFL: "cross-lane"}
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
                                         "analysis-error"})
@@ -618,9 +620,14 @@ class Analysis:
         if op == "v_readfirstlane_b32" and len(a) == 2:
             tv = self.rd(st, ins, a[1])
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
-            if vr is not None and vr in st["ua"]:
+            if vr is not None and vr in st["u"]:
                 idiom("readfirstlane-uniform")
                 put(a[0], tv)
+            elif vr is not None and vr in st["ua"]:
+                # Uniform over active lanes only: if a half has EXEC == 0 here, v_readfirstlane returns lane 0's
+                # stale value, so this scalar is only exact while EXEC remains a subset of st["x"].
+                idiom("readfirstlane-uniform")
+                put(a[0], tv | ACT_RFL, ("act_rfl", st["x"]))
             elif tv & ELECT and st["g"].get(_regs(a[1])[0], ("",))[0] == "elect" \
                     and st["g"][_regs(a[1])[0]][1] == st["x"]:
                 idiom("aggregated-atomic")
@@ -817,9 +824,24 @@ class Analysis:
 
         # --- everything else: results depend on the sources
         def scaled_cnt_token():
-            """Linear scaling of a lane count by a clean scalar/immediate stride preserves wave-aggregated atomic
-            partition invariance: (c_lo + c_hi) * K == c_lo * K + c_hi * K."""
-            if op in ("s_lshl_b32", "s_mul_i32", "s_mulk_i32", "v_lshlrev_b32", "v_mul_lo_u32", "v_mul_u32_u24"):
+            """Linear scaling of a lane count by a clean uniform 32-bit stride preserves wave-aggregated atomic
+            partition invariance: (c_lo + c_hi) * K == c_lo * K + c_hi * K (mod 2^32).
+            Shift ops require the count to be the shifted value operand (never the shift distance), and
+            24-bit truncating multiplies (v_mul_u32_u24) are excluded because mod-2^24 truncation is nonlinear."""
+            if op in ("s_lshl_b32", "v_lshlrev_b32"):
+                if len(srcs) != 2:
+                    return None
+                val_op, sh_op = (srcs[0], srcs[1]) if op == "s_lshl_b32" else (srcs[1], srcs[0])
+                vt = self.rd(st, ins, val_op)
+                st_sh = self.rd(st, ins, sh_op)
+                if not (vt & CNT) or (vt & ~(CNT | ELECT)):
+                    return None
+                if st_sh != 0 or self.is_mask(ins, sh_op) or (
+                        sh_op.get("k") == "vgpr" and not all(r[1] in st["ua"] for r in _regs(sh_op))):
+                    return None
+                r = _regs(val_op)
+                return self.cnt_token(st, r[0]) if r else None
+            if op in ("s_mul_i32", "s_mulk_i32", "v_mul_lo_u32"):
                 cnt_toks = []
                 for x in srcs:
                     xt = self.rd(st, ins, x)
@@ -858,6 +880,18 @@ class Analysis:
                         if T.get(r, 0) & WFS and not (ok and g and g[0] == "wfs" and g[1] == st["xg"][1]):
                             good = False
                 tj = tj & ~WFS if good else tj | X
+            # an active-EXEC-only v_readfirstlane scalar is exact only on lanes active within its EXEC mask
+            if tj & ACT_RFL:
+                good = True
+                for x in srcs:
+                    for r in _regs(x):
+                        g = st["g"].get(r)
+                        if T.get(r, 0) & ACT_RFL and not (g and g[0] == "act_rfl" and self.ancestor(g[1], st["x"])):
+                            good = False
+                tj = tj & ~ACT_RFL if good else tj | X
+            if tj & X:
+                uniform = False
+                uniform_active = False
             tag = None
             ctok = None
             if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
@@ -879,10 +913,22 @@ class Analysis:
             return
         # scalar ALU, loads, anything unnamed
         tag = None
-        if t_src & WFS:
+        if t_src & WFS and t_src & ACT_RFL:
+            t_src |= X
+        elif t_src & WFS:
             gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS}
             if len(gs) == 1 and None not in gs:
                 tag = next(iter(gs))
+            else:
+                t_src |= X
+        elif t_src & ACT_RFL:
+            gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & ACT_RFL}
+            if len(gs) == 1 and None not in gs:
+                g0 = next(iter(gs))
+                if g0[0] == "act_rfl" and self.ancestor(g0[1], st["x"]):
+                    tag = g0
+                else:
+                    t_src |= X
             else:
                 t_src |= X
         elif op.startswith(("s_mov", "s_load", "s_buffer_load")) and len(srcs) == 1 and _regs(srcs[0]) and \

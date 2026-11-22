@@ -1325,6 +1325,26 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
 
 
 class PoolCacheTest(unittest.TestCase):
+    def test_zlib_chunk_rejects_a_decoded_size_larger_than_its_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "pool.ttpf")
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            write_rds5_pool(path, [record], [bytes(8192)])
+            with open(path, "r+b") as stream:
+                stream.seek(8)
+                stream.write(struct.pack("<Q", 8192 | (22 << 56)))
+                stream.seek(32)
+                sentinel = struct.unpack("<Q", stream.read(8))[0]
+                stream.seek(32)
+                stream.write(struct.pack("<Q", (sentinel & 0x3FFFFFF) | (2 << 30)))
+
+            with closing(ttpf.Pool(path)) as pool:
+                cache = {}
+                for _ in range(2):
+                    with self.assertRaises(ValueError):
+                        pool.read_range(4096, 16, cache)
+                    self.assertEqual(cache, {})
+
     def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)

@@ -173,6 +173,7 @@ def load_streams(source, skip_report=None):
             raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
         if not isinstance(out[-1]["source"], str):
             raise ValueError(f"{label.format(i=start + j)} has a non-string source")
+        out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out
@@ -201,7 +202,7 @@ def load_pins(path):
                 offset = _int(row["offset"])
                 if offset < 0:
                     raise ValueError("offset must be non-negative")
-                key = ((row.get("source") or "").strip(), offset)
+                key = ((row.get("source") or "").strip().replace("\\", "/"), offset)  # pins from before "/" too
                 raw_path = row["path"]
                 if not isinstance(raw_path, str):
                     raise TypeError("path is missing")

@@ -2,7 +2,8 @@
 
     python -I awc_markers.py <archive.rpf | bank.awc | dir of .awc> [--out FILE.json]
 
-A 0xBD tag is a headerless array of 16-byte events (docs/audio_config.md):
+A 0xBD tag is a headerless array of 16-byte events (docs/audio_config.md; the same records as
+rsc8_audio.decode_marker_records, which checks one tag, where this tool reports per type and per kind of bank):
 
     +0   u32  type    (a 32-bit name hash)
     +4   f32  value   (a number for most types; a few types store a second u32 name hash here)

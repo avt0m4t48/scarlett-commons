@@ -76,6 +76,21 @@ class EventLayoutTest(unittest.TestCase):
         self.assertEqual(awc_markers.events(b""), [])
 
 
+class AgreesWithTheBankDecoderTest(unittest.TestCase):
+    def test_same_records_as_rsc8_audio(self):
+        import rsc8_audio
+
+        chunk = event(0x11111111, 3.0, 0) + event(0x22222222, 7.0, 480, 2) + event(0x11111111, 4.0, 96000)
+        mine = awc_markers.events(chunk)
+        theirs = rsc8_audio.decode_marker_records(chunk, sample_count=96000)
+        self.assertEqual(theirs["records"], len(mine))
+        self.assertEqual(theirs["names"], {0x11111111: 2, 0x22222222: 1})
+        self.assertEqual(theirs["first_name"], mine[0][0])
+        self.assertEqual(theirs["offset_max"], max(e[2] for e in mine))
+        self.assertEqual(theirs["extra_max"], max(e[3] for e in mine))
+        self.assertTrue(theirs["offsets_ascending"] and theirs["offsets_within_samples"])
+
+
 class ScanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

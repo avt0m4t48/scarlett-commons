@@ -867,7 +867,7 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return false;
+            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;

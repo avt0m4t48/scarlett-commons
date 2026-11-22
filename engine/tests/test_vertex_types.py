@@ -57,7 +57,7 @@ def group_for(tris, n):
     return struct.pack("<3I", 0x80000000 | len(chunks), tbase, vbase) + bytes(recs + words + refs)
 
 
-def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True, extra=()):
+def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
     """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28),
     followed by its meshlet group unless with_group is false."""
     n = grid * grid
@@ -67,7 +67,6 @@ def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True, ex
         (2, 0x21, bytes((0, 0, 127, 0)) * n),
         (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % grid + uv_offset), 1000 * (v // grid + uv_offset))
                            for v in range(n))),
-        *[(slot, tag, data(n) if callable(data) else data * n) for slot, tag, data in extra],
     ]
     head = bytearray(vt.HEADER)
     off = vt.HEADER
@@ -155,6 +154,17 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(out["pos_header_finite"], 1)
 
 
+def block_with_streams(extra, grid=GRID):
+    """block() with more (slot, tag, per-vertex bytes) streams appended after its own, before the group."""
+    n = grid * grid
+    buf = bytearray(block(grid=grid, with_group=False))
+    for slot, tag, data in extra:
+        struct.pack_into("<I", buf, 4 * slot, tag | ((len(buf) // 2) << 8))
+        buf += data * n
+    buf += b"\0" * (-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
 def skin_block(weights, joints, pairs=1):
     """block() with weight slots 6(/7) (tag 0x26) and joint slots 8(/9) (tag 0x25); weights and joints are
     8-byte lists (two slots' worth), the first four bytes used when pairs == 1."""
@@ -162,7 +172,7 @@ def skin_block(weights, joints, pairs=1):
     if pairs == 2:
         extra = [(6, 0x26, bytes(weights[:4])), (7, 0x26, bytes(weights[4:])),
                  (8, 0x25, bytes(joints[:4])), (9, 0x25, bytes(joints[4:]))]
-    return block(extra=extra)
+    return block_with_streams(extra)
 
 
 class SkinTests(unittest.TestCase):
@@ -197,7 +207,7 @@ class SkinTests(unittest.TestCase):
         self.assertEqual(out["skin"], {})
 
     def test_joint_slot_without_weights_is_unpaired(self):
-        _, out = measure(block(extra=[(8, 0x25, bytes((1, 2, 3, 4)))]))
+        _, out = measure(block_with_streams([(8, 0x25, bytes((1, 2, 3, 4)))]))
         self.assertEqual(out["skin"], {"unpaired": 1})
 
 

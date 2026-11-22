@@ -11,7 +11,8 @@
 //   VKC_SUBGROUP_SIZE=N (env): run at N lanes. Where the device can't require a compute subgroup size but N is its
 //   default subgroupSize (MoltenVK: 32, and requiredSubgroupSizeStages 0), the size is still fixed for a SPIR-V 1.5
 //   module (no varying subgroup size); cs_wave_probe.comp then checks, with the test's local size and flags, that every
-//   invocation sees N lanes in order and a ballot N wide, or the test fails (exit 1) without running.
+//   subgroup is N lanes wide (by its lane numbers and a ballot), or the test fails (exit 1) without running; N-lane
+//   subgroups not in invocation order print "not available", as a size that can't be pinned does.
 //   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
 //   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
@@ -56,17 +57,32 @@ static bool parse_u32(const char*& s, uint32_t& v) {
     return true;
 }
 
-// The module's SPIR-V version and its OpExecutionMode LocalSize (all zero without one, e.g. LocalSizeId).
+// The module's SPIR-V version and the OpExecutionMode LocalSize of its GLCompute entry point "main", the one the
+// pipeline is made from. All zero when there is none (no such entry point, or LocalSizeId), and then the size is
+// unknown: nothing that needs it (the subgroup probe, full subgroups) is done.
 static uint32_t spirv_local_size(const std::vector<char>& code, uint32_t local[3]) {
     local[0] = local[1] = local[2] = 0;
     const std::size_t n = code.size() / 4;
     std::vector<uint32_t> w(n);
     if (n) std::memcpy(w.data(), code.data(), n * 4);
     if (n < 5 || w[0] != 0x07230203u) return 0;
+    constexpr uint32_t kOpEntryPoint = 15, kOpExecutionMode = 16, kGLCompute = 5, kLocalSize = 17;
+    uint32_t main_id = 0;
+    bool have_main = false;
     for (std::size_t i = 5; i < n;) {
         const uint32_t len = w[i] >> 16, op = w[i] & 0xFFFFu;
         if (!len || i + len > n) break;
-        if (op == 16 && len == 6 && w[i + 2] == 17) { local[0] = w[i + 3]; local[1] = w[i + 4]; local[2] = w[i + 5]; }
+        // OpEntryPoint model id "name" ...: the name is a nul-terminated string packed little-endian into words.
+        if (op == kOpEntryPoint && len >= 4 && w[i + 1] == kGLCompute) {
+            const char* name = reinterpret_cast<const char*>(&w[i + 3]);
+            if (std::strncmp(name, "main", 4 * (len - 3)) == 0 && std::memchr(name, 0, 4 * (len - 3))) {
+                main_id = w[i + 2];
+                have_main = true;
+            }
+        }
+        if (op == kOpExecutionMode && len == 6 && have_main && w[i + 1] == main_id && w[i + 2] == kLocalSize) {
+            local[0] = w[i + 3]; local[1] = w[i + 4]; local[2] = w[i + 5];
+        }
         i += len;
     }
     return w[1];
@@ -189,7 +205,11 @@ int main(int argc, char** argv) {
     // maxSubgroupSize (VUID-VkPipelineShaderStageCreateInfo-flags-02759).
     const bool fixed = req_sg && sgProps.minSubgroupSize == sgProps.maxSubgroupSize && subgroup.subgroupSize == req_sg;
     const uint32_t local_total = local[0] * local[1] * local[2];
-    const bool observed = req_sg && !require_wave64 && !can_request_size && !fixed &&
+    // The probe itself needs subgroup operations in compute: the basic built-ins and a ballot.
+    const bool probe_runs = (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) &&
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    const bool observed = req_sg && !require_wave64 && !can_request_size && !fixed && probe_runs &&
         subgroup.subgroupSize == req_sg && spirv_version && spirv_version < 0x00010600u &&
         local_total && local_total <= 1024;
     const bool observed_full = observed && f13q.computeFullSubgroups && local[0] % sgProps.maxSubgroupSize == 0;
@@ -366,18 +386,33 @@ int main(int argc, char** argv) {
         psi.commandBufferCount = 1; psi.pCommandBuffers = &pcmd;
         CHECK(vkQueueSubmit(q, 1, &psi, VK_NULL_HANDLE));
         CHECK(vkQueueWaitIdle(q));
-        // Invocation l: a subgroup of req_sg lanes in order (lane l % N of subgroup l / N), and a ballot of every
-        // lane it has (N, or what is left of the group in the last one when local size X is not a multiple of N).
+        // Width first, from what each invocation reports: every subgroup has N lanes (one may have the rest of a
+        // group that isn't a multiple of N), each lane once, and a ballot of the subgroup counts them all. A wrong
+        // width fails the test. Then the order: the translator takes a wave32 lane as LocalInvocationIndex % N, so
+        // invocation l must be lane l % N of subgroup l / N. Vulkan doesn't promise that mapping; where it differs,
+        // the size is reported as not available, as on a device that can't give N at all (the runners skip).
         const uint32_t* pw = static_cast<const uint32_t*>(pmap);
-        uint32_t wrong = 0, first = 0;
+        const uint32_t subgroups = (local_total + req_sg - 1) / req_sg, tail = local_total % req_sg;
+        std::vector<uint32_t> count(subgroups, 0), seen(std::size_t(subgroups) * req_sg, 0);
+        std::vector<bool> bad(local_total, false);
         for (uint32_t l = 0; l < local_total; l++) {
-            const uint32_t lanes = std::min(req_sg, local_total - l / req_sg * req_sg);
             const uint32_t* w = pw + 4 * l;
-            if (w[0] != req_sg || w[1] != l % req_sg || w[2] != l / req_sg || w[3] != lanes) {
-                if (!wrong) first = l;
-                wrong++;
-            }
+            if (w[0] == req_sg && w[2] < subgroups && w[1] < req_sg && !seen[std::size_t(w[2]) * req_sg + w[1]]++)
+                count[w[2]]++;
+            else
+                bad[l] = true;
         }
+        uint32_t wrong = 0, first = 0, misplaced = 0, first_misplaced = 0, partial = 0;
+        for (uint32_t c : count)
+            if (c != req_sg) partial++;
+        for (uint32_t l = 0; l < local_total; l++) {
+            const uint32_t* w = pw + 4 * l;
+            if (bad[l] || w[3] != count[w[2]]) {
+                if (!wrong++) first = l;
+            }
+            if ((w[1] != l % req_sg || w[2] != l / req_sg) && !misplaced++) first_misplaced = l;
+        }
+        if (!wrong && partial > (tail ? 1u : 0u)) wrong = partial;   // e.g. two half-filled subgroups
         if (wrong) {
             const uint32_t* w = pw + 4 * first;
             std::printf("compute subgroup size: %u observed wrong in %u of %u invocations; invocation %u has "
@@ -385,8 +420,16 @@ int main(int argc, char** argv) {
                         first, w[0], w[1], w[2], w[3]);
             return 1;
         }
-        std::printf("compute subgroup size: %u (observed: all %u invocations of a %ux%ux%u group%s)\n", req_sg,
-                    local_total, local[0], local[1], local[2], observed_full ? ", full subgroups" : "");
+        if (misplaced) {
+            const uint32_t* w = pw + 4 * first_misplaced;
+            std::fprintf(stderr, "%u-lane subgroups, but not in invocation order: invocation %u is lane %u of "
+                         "subgroup %u\n", req_sg, first_misplaced, w[1], w[2]);
+            // As where the size can't be pinned at all: say so, run the test, and let the runner skip it.
+            std::printf("compute subgroup size: %u not available\n", req_sg);
+        } else {
+            std::printf("compute subgroup size: %u (observed: all %u invocations of a %ux%ux%u group%s)\n", req_sg,
+                        local_total, local[0], local[1], local[2], observed_full ? ", full subgroups" : "");
+        }
     }
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));

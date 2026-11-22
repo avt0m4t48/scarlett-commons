@@ -147,7 +147,10 @@ def _mask64(a):
 
 ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
             "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
-OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64")   # before the run side narrows EXEC
+# Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
+# S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
+OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
+          "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
 
 
 def operands(ins):
@@ -975,9 +978,10 @@ class Analysis:
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
         # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
-        # mask or 0), exports and ends, so it writes nothing; the run side narrows EXEC into the mask's whole quads
-        # and never widens it again, so in the wave the lanes of that half stay off to the end. Any lane mask would
-        # do; the vote must be the mask's own "not empty" (checked from the SCC writer), not a stale or other SCC.
+        # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
+        # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
+        # Any lane mask would do; the vote must be the mask's own "not empty" (checked from the SCC writer), not a
+        # stale or other SCC.
         # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
         # before the vote: one that did would keep the pixels of the empty half alive in the wave.
         kregs = self.kill_vote(n, op, reg)
@@ -1033,8 +1037,8 @@ class Analysis:
         return False
 
     def inert_exit(self, blk, m):
-        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), exports with that
-        EXEC and ends: nothing else, no other successor."""
+        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), then may export
+        with that EXEC, and ends: nothing else, no other successor."""
         seen = set()
         narrowed = False
         while blk not in seen:

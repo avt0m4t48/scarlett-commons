@@ -707,6 +707,11 @@ class KillExit(unittest.TestCase):
             "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
             "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]"], EXIT_PS), "A", [], [])
 
+    def test_a_kill_saveexec_first(self):
+        # the run side's first narrowing is a SAVEEXEC: EXEC = wqm mask & EXEC (inside), s[30:31] = the old EXEC
+        self.tier("ps_kill_saveexec", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 s[30:31], "
+                                                  "s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+
     # -- near misses: tier C unsafe-vote-branch
     def test_c_exit_with_code_of_its_own(self):
         for name, exit_ in (
@@ -723,6 +728,16 @@ class KillExit(unittest.TestCase):
         self.tier("ps_kill_run_code", kill(KILL, ["v_mov_b32_e32 v6, 5"] + RUN_WQM, EXIT_PS),
                   "C", contains=["unsafe-vote-branch"])
         self.tier("ps_kill_run_other", kill(KILL, ["s_and_b64 exec, exec, s[10:11]"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_saveexec_that_does_not_narrow(self):
+        # s_or_saveexec: EXEC = mask | EXEC, not inside; restoring the saved (old) EXEC widens again
+        self.tier("ps_kill_or_saveexec", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_or_saveexec_b64 s[30:31], "
+                                                     "s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_saveexec_restore", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 "
+                                                          "s[30:31], s[22:23]", "s_mov_b64 exec, s[30:31]",
+                                                          "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS),
                   "C", contains=["unsafe-vote-branch"])
 
     def test_c_run_side_widens_again(self):
@@ -763,6 +778,14 @@ class KillExit(unittest.TestCase):
         self.assertEqual(tier, "A")
         self.assertEqual(whole, halves)
         # a vertex that is off writes nothing: the interpreter's outputs start at zero
+        self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
+
+    def test_kill_exit_saveexec_invariant(self):
+        tier, whole, halves = self.run_both("vs_kill_saveexec", kill(KILL, [
+            "s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 s[30:31], s[22:23]",
+            "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
         self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
 
     def test_kill_exit_that_widens_differs_and_is_c(self):

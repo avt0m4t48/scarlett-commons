@@ -23,6 +23,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_spirv_capability.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,13 +50,6 @@ static std::vector<uint32_t> read_spv(const char* p) {
     std::vector<uint32_t> w(b.size() / 4);
     std::memcpy(w.data(), b.data(), w.size() * 4);
     return w;
-}
-
-// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
-static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
-    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
-        if (spv[i + 1] == cap) return true;
-    return false;
 }
 
 #include "../src/descriptor_table.h"
@@ -183,9 +177,19 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
+    const auto fragment_code = read_spv(fs_path.c_str());
+    using leonida::vk_test::spirv_declares_capability;
+    const bool dynamic_sampled = spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4,
+        leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
-    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+    if (spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4, 42) &&
+        !have.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
         return 77;
     }

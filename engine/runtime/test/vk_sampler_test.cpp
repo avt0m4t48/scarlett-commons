@@ -12,6 +12,7 @@
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_spirv_capability.h"
 #include "../src/vulkan_device_filter.h"
 
 #include "../src/descriptor_table.h"
@@ -123,6 +124,13 @@ int main(int argc, char** argv) {
         std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray or shaderInt64\n");
         return unsupported;
     }
+    const auto fragment_code = read_spv(argv[2]);
+    const bool dynamic_sampled = leonida::vk_test::spirv_declares_capability(
+        fragment_code.data(), fragment_code.size() * 4, leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.features.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return unsupported;
+    }
     if (sampler_info.anisotropyEnable && !have.features.samplerAnisotropy) {
         std::printf("unsupported: the S# asks for anisotropy and the device has no samplerAnisotropy\n");
         return unsupported;
@@ -145,6 +153,7 @@ int main(int argc, char** argv) {
     enable12.descriptorIndexing = have12.descriptorIndexing;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
+    enable.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     enable.features.samplerAnisotropy = sampler_info.anisotropyEnable;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
@@ -355,8 +364,9 @@ int main(int argc, char** argv) {
 
     // Pipeline.
     VkShaderModule modules[2];
+    const auto vertex_code = read_spv(argv[1]);
     for (int stage = 0; stage < 2; ++stage) {
-        const auto code = read_spv(argv[1 + stage]);
+        const auto& code = stage == 0 ? vertex_code : fragment_code;
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;

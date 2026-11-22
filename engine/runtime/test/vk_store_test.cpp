@@ -18,6 +18,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_spirv_capability.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
@@ -118,20 +119,18 @@ int main(int argc, char** argv) {
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
-    if (filled) {
-        // Typed image_load fetches through the sampled arrays, so it must not need a feature Intel Xe-LP lacks
-        // (SHADER-151). shaderStorageImageReadWithoutFormat stays off; a module declaring it would be invalid here.
-        std::vector<uint32_t> words(code.size() / 4);
-        std::memcpy(words.data(), code.data(), code.size());
-        for (std::size_t i = 5; i < words.size() && (words[i] >> 16);) {
-            const uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
-            // OpCapability (17) StorageImageReadWithoutFormat (55; spirv/unified1/spirv.h)
-            if (op == 17 && count == 2 && i + 1 < words.size() && words[i + 1] == 55) {
-                std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
-                return 1;
-            }
-            i += count;
-        }
+    using leonida::vk_test::spirv_declares_capability;
+    const bool dynamic_sampled = spirv_declares_capability(code.data(), code.size(),
+        leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
+    // Typed image_load fetches through the sampled arrays without StorageImageReadWithoutFormat (55, SHADER-151).
+    if (filled && spirv_declares_capability(code.data(), code.size(), 55)) {
+        std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
+        return 1;
     }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;

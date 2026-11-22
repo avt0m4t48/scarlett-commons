@@ -952,6 +952,8 @@ int main(int argc, char** argv) {
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
+            if (feat == "shaderSampledImageArrayDynamicIndexing" && !f2.features.shaderSampledImageArrayDynamicIndexing)
+                return "no shaderSampledImageArrayDynamicIndexing";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
             if (feat == "shaderResourceMinLod" && !f2.features.shaderResourceMinLod) return "no shaderResourceMinLod";
             if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)

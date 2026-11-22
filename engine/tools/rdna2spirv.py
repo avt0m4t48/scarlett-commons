@@ -174,6 +174,7 @@ class Gen:
         self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
+        self.uses_dynamic_sampled_index = False
         self.uses_subgroup = False
         self.uses_tex_array = False
         self.uses_storage = False
@@ -1882,10 +1883,10 @@ class Gen:
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         smp_idx = self.desc_lookup_sgpr(a[3], 4)
         ip, img, sp, smp, si = (self.tmp() for _ in range(5))
-        self.emit(f"{ip} = OpAccessChain %{'_ptr_UC_imga' if arr else '_ptr_UC_img'} "
-                  f"{'%images_arr' if arr else '%images'} {img_idx}")
+        self.dynamic_sampled_access(ip, "%_ptr_UC_imga" if arr else "%_ptr_UC_img",
+                                    "%images_arr" if arr else "%images", img_idx)
         self.emit(f"{img} = OpLoad {'%img2da' if arr else '%img2d'} {ip}")
-        self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
+        self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
         self.emit(f"{smp} = OpLoad %smp {sp}")
         self.emit(f"{si} = OpSampledImage {'%simg2da' if arr else '%simg2d'} {img} {smp}")
         if a16:
@@ -8257,6 +8258,11 @@ class Gen:
             return a["r"]
         raise Unsupported("image address operand")
 
+    def dynamic_sampled_access(self, ptr, ptr_type, array, index):
+        """Index a sampled image or sampler array with the runtime descriptor lookup result."""
+        self.uses_dynamic_sampled_index = True
+        self.emit(f"{ptr} = OpAccessChain {ptr_type} {array} {index}")
+
     def cube_coords(self, f):
         """(s, t, face) of a cube sample -> the 6-layer 2D-array view. The hardware takes s and t in [1, 2]
         (sc / |cubema| + 1.5) and the third coordinate as 8 * slice + face."""
@@ -8305,7 +8311,7 @@ class Gen:
         img = None              # a coherent image_load reads the storage view, not this sampled one
         if not coherent:
             ip, img = self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
+            self.dynamic_sampled_access(ip, f"%{iptr}", iarr, img_idx)
             self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
@@ -8364,7 +8370,7 @@ class Gen:
         else:
             smp_idx = self.desc_lookup_sgpr(a[3], 4)
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
+            self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
             self.emit(f"{smp} = OpLoad %smp {sp}")
             typed_implicit = op == "image_sample" and self.stage == "ps" and dim == "dim:SQ_RSRC_IMG_2D"
             typed_sample = typed_implicit or (op == "image_sample_lz" and dim == "dim:SQ_RSRC_IMG_2D")
@@ -8774,7 +8780,7 @@ class Gen:
                 if cls == 0:
                     return img
                 ip, im = self.tmp(), self.tmp()
-                self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
+                self.dynamic_sampled_access(ip, f"%_ptr_UC_itx{cls}_{di}", f"%itx{cls}_{di}", idx)
                 self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
                 return im
         is_u, is_s = self.fmt_int_flags(t1)
@@ -8938,7 +8944,7 @@ class Gen:
             idx = self.desc_lookup_sgpr(a[2], 8)
             self.uses_tex_3d = True
             ip, img, iv, res = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_img3 %images_3d {idx}")
+            self.dynamic_sampled_access(ip, "%_ptr_UC_img3", "%images_3d", idx)
             self.emit(f"{img} = OpLoad %img3d {ip}")
             xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
             self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
@@ -9058,10 +9064,10 @@ class Gen:
         ip, img = self.tmp(), self.tmp()
         if array_query:
             self.uses_tex_array = True
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_imga %images_arr {idx}")
+            self.dynamic_sampled_access(ip, "%_ptr_UC_imga", "%images_arr", idx)
             self.emit(f"{img} = OpLoad %img2da {ip}")
         else:
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_img %images {idx}")
+            self.dynamic_sampled_access(ip, "%_ptr_UC_img", "%images", idx)
             self.emit(f"{img} = OpLoad %img2d {ip}")
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
@@ -10136,6 +10142,8 @@ def assemble(gen):
         caps.append("Float64")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
+    if gen.uses_dynamic_sampled_index:
+        caps.append("SampledImageArrayDynamicIndexing")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if gen.reads_store_views:
@@ -12330,6 +12338,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "StorageImageReadWithoutFormat": "shaderStorageImageReadWithoutFormat",
              "PhysicalStorageBufferAddresses": "bufferDeviceAddress",
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
+             "SampledImageArrayDynamicIndexing": "shaderSampledImageArrayDynamicIndexing",
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",

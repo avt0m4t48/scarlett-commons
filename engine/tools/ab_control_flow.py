@@ -35,7 +35,7 @@ BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)
 CLEAR = struct.pack("<4f", -1, -1, -1, -1)      # what vk_texture_test clears the image to
 LOCATIONS = 32      # every pixel-shader input location gets a defined value
 SUPPORTED_BINDINGS = {0, 1, 2}
-HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}
+HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64", "shaderSampledImageArrayDynamicIndexing"}
 
 
 def is_backward_branch(disassembly):

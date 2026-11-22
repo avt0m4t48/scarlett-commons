@@ -431,6 +431,17 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
+    if args.json:
+        # Besides the listings and the carve index, the census reads each shader's DXBC container and
+        # FSSM header next to the disasm folder. A report landing on one of those (or a hard link to it)
+        # would destroy an input the run just used, so refuse those names too.
+        parent = os.path.dirname(os.path.abspath(args.disasm))
+        for name in stages:
+            for path in (os.path.join(parent, name + ".dxbc"),
+                         os.path.join(parent, "fssm", name + ".fssm")):
+                if same_report_path(args.json, path):
+                    print(f"ERROR: --json would overwrite an input the census reads: {path}", file=sys.stderr)
+                    return 2
     out = census(args.disasm, args.limit, stages=stages,
                  progress=lambda k, n: print(f"  {k}/{n}", file=sys.stderr, flush=True))
     print_report(out)

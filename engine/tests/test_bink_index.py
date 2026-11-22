@@ -131,6 +131,24 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(summary["unread_bytes"], 20)
         self.assertEqual(summary["zero_padding"], 0)
 
+    def rpf(self, trailer_size, trailer):
+        """A synthetic RPF9: header (data start 0x40, +12 = trailer_size), one stream, 100 zeros, the trailer."""
+        header = b"9FPR" + struct.pack("<III", 0x40, 0x30, trailer_size) + bytes(0x30)
+        path = os.path.join(self.dir, "synthetic.rpf")
+        with open(path, "wb") as fh:
+            fh.write(header + make_stream(frames=3) + bytes(100) + trailer)
+        return path
+
+    def test_rpf_trailer_after_the_last_stream(self):
+        rows, summary = bink.scan_target(self.rpf(48, bytes(range(1, 49))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (100, 48, 0))
+
+    def test_rpf_trailer_longer_than_the_gap_is_not_split_off(self):
+        rows, summary = bink.scan_target(self.rpf(4096, bytes(range(1, 49))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (0, 0, 148))
+
     def test_fractional_rates_are_indexed(self):
         path = os.path.join(self.dir, "fractional.bk2")
         with open(path, "wb") as fh:

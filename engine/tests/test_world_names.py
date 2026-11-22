@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,6 +23,32 @@ def load_tool():
 
 
 WN = load_tool()
+
+
+class ManifestEnumerationTest(unittest.TestCase):
+    def test_an_unreadable_subtree_does_not_replace_the_dictionary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifests = os.path.join(directory, "manifests")
+            os.mkdir(manifests)
+            blocked = os.path.join(manifests, "blocked")
+            output = os.path.join(directory, "dictionary.json")
+            with open(output, "wb") as f:
+                f.write(b"existing dictionary")
+            names = os.path.join(directory, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("synthetic_model\n")
+
+            def walk(root, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(WN.os, "walk", walk), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--manifest", manifests, "--names", names, "--out", output]), 1)
+            self.assertIn(blocked, err.getvalue())
+            with open(output, "rb") as f:
+                self.assertEqual(f.read(), b"existing dictionary")
 
 
 class HashTest(unittest.TestCase):

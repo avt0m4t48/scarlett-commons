@@ -66,6 +66,7 @@ def complete_pool(source, directory, manifest, settings):
         return 0, 0
     directory = Path(directory)
     written = blocked = 0
+    superseded = set()   # the files the rows named before they were switched to a full chain
     with closing(ttpf.Pool(source)) as pool:
         decoder = None
         if profile is not None:
@@ -99,6 +100,8 @@ def complete_pool(source, directory, manifest, settings):
                 # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
                 name = f"{index:06d}_bcpack_{method[:19]}.dds"
                 publish(directory / name, blob)
+                if row.get("File") and row["File"] != name:
+                    superseded.add(row["File"])
                 row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
                 row.pop("BCPackLimitation", None)
                 written += 1
@@ -107,4 +110,14 @@ def complete_pool(source, directory, manifest, settings):
                 decoder.read_chunk.cache_clear()
     manifest["BCPackPass"] = stamp
     publish(directory / "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
+    # Only now that the manifest names the full chains: the files they replace would otherwise stay in the folder,
+    # named by no row, so every completed texture would be stored twice. A file another row still names is kept,
+    # and so is one that can't be removed (in use): the export is complete either way.
+    still_named = {row.get("File") for row in manifest["Textures"]}
+    for name in superseded - still_named:
+        if Path(name).name == name:          # a name inside this pool's folder, nothing else
+            try:
+                (directory / name).unlink(missing_ok=True)
+            except OSError:
+                pass
     return written, blocked

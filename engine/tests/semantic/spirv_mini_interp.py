@@ -848,7 +848,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if isinstance(x, bool) or not isinstance(x, int) or x > MASK \
                     or (t is not None and (t[0] != "int" or t[1] != 32)):
                 raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
+            converted = float(_s32(x) if op == "OpConvertSToF" else x)
+            # Python's binary64 float holds every 32-bit integer exactly.
+            values[res] = converted if types.t[a[0]] == ("float", 64) else f32(converted)
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -972,11 +974,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if h & 0x7C00 == 0:
                 h &= 0x8000
             values[res] = half_to_float(h)
-        elif op in ("OpConvertUToF", "OpConvertSToF"):
-            x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
-                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):

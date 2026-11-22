@@ -253,7 +253,7 @@ def centre_agreement(data, group, positions):
 def centre_distance(data, group, positions):
     """Sum over a group's meshlets of the distance (per axis, in metres) between the stored centre and the centre of
     the meshlet's vertex box, with these positions. The `42 40` block a group was built against gives the smallest
-    sum; a vertex reference past the block gives None."""
+    sum; a vertex reference past the block, or a sum that is not finite (NaN or infinite positions), gives None."""
     at, k = group["offset"], group["meshlets"]
     rec_at = at + 12
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, rec_at + 16 * k + 4 * group["triangles"])
@@ -266,7 +266,7 @@ def centre_distance(data, group, positions):
             return None
         stored = meshlet_centre(w2, w3)
         total += sum(abs((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) for i in range(3))
-    return total
+    return total if math.isfinite(total) else None
 
 
 def block4240_checks(data, block):

@@ -5,6 +5,7 @@
 Every byte here is built by the test. No game file, value or name is used.
 """
 import json
+import math
 import os
 import struct
 import subprocess
@@ -484,6 +485,18 @@ class MeshletCentreTests(unittest.TestCase):
         checks = mp.summarise_page(page(moved, moved, grp), "p", centres=True)["checks"]  # a tie keeps the nearest
         self.assertEqual((checks["centres_4240_axes_exact"], checks.get("groups_4240_block_by_centres", 0)), (2, 0))
         self.assertNotIn("groups_4240_several_blocks", mp.summarise_page(page(blk, grp), "p", centres=True)["checks"])
+
+    def test_non_finite_block_does_not_win(self):
+        """A block with NaN positions scores None: the finite block wins in either order, and with no finite block
+        the old choice stays (as before this rule)."""
+        blk, grp = self.grid_parts((0, 0, 0))
+        nan = bytearray(blk)
+        struct.pack_into("<f", nan, 0x60, float("nan"))                               # bias x
+        for data in (page(bytes(nan), blk, grp), page(blk, bytes(nan), grp)):
+            self.assertEqual(mp.summarise_page(data, "p", centres=True)["checks"]["centres_4240_axes_exact"], 3)
+        checks = mp.summarise_page(page(bytes(nan), bytes(nan), grp), "p", faces=True)["checks"]
+        self.assertEqual((checks["groups_4240_several_blocks"], checks.get("groups_4240_block_by_centres", 0)), (1, 0))
+        self.assertIsNone(mp.centre_distance(page(grp), mp.parse_page(page(grp))[0], [(math.nan, 0.0, 0.0)] * 16))
 
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:

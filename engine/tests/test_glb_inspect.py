@@ -556,6 +556,33 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(any("input accessor type is VEC3, expected SCALAR" in issue for issue in issues))
             self.assertTrue(any("path 'translation' expects VEC3 output, got VEC4" in issue for issue in issues))
 
+    def test_cubic_spline_output_count_is_validated(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["samplers"][0]["interpolation"] = "CUBICSPLINE"
+        gltf["accessors"][3]["count"] = 6
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "cubic.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["interpolations"], ["CUBICSPLINE"])
+            self.assertEqual(animation["samplers"][0]["output_count"], 6)
+            self.assertEqual(animation["issues"], [])
+
+            gltf["accessors"][3]["count"] = 5
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                issues = json.load(handle)["animations"][0]["issues"]
+            self.assertTrue(any("has 5 output values for 2 keys with CUBICSPLINE interpolation" in issue
+                                for issue in issues))
+
 
 if __name__ == "__main__":
     unittest.main()

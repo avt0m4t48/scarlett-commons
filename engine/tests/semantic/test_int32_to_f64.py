@@ -6,19 +6,26 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from support import translate_fixture, translate_lines
+import rdna2spirv
 import spirv_interface
 
 
 class Int32ToFloat64(unittest.TestCase):
     @unittest.skipUnless(all(shutil.which(t) for t in ("spirv-as", "spirv-opt", "spirv-dis")), "needs SPIRV-Tools")
     def test_constant_folded_mrt_words(self):
-        # The shader has no inputs. SPIRV-Tools folds its output to one constant vec4 store.
+        # Integer-to-double is exact. Float controls can prevent optimizers folding even these constants.
+        default = translate_fixture("ps_int32_to_f64")
+        with patch.object(rdna2spirv, "FLOAT_CONTROLS", False):
+            foldable = translate_fixture("ps_int32_to_f64")
+        self.assertEqual([line for line in default.splitlines() if "SignedZeroInfNanPreserve" not in line],
+                         foldable.splitlines())
         with tempfile.TemporaryDirectory() as tmp:
             binary, folded = Path(tmp) / "int32.spv", Path(tmp) / "folded.spv"
             subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", binary, "-"],
-                           input=translate_fixture("ps_int32_to_f64"), text=True, check=True)
+                           input=foldable, text=True, check=True)
             subprocess.run(["spirv-opt", "-O", binary, "-o", folded], check=True)
             listing = subprocess.check_output(["spirv-dis", "--raw-id", folded], text=True)
             stored, = re.findall(r"OpStore %\d+ (%\d+)", listing)

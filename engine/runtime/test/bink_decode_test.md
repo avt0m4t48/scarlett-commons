@@ -38,5 +38,6 @@ without the package. Frames are written as raw BGRA and PPM under `%TEMP%\leonid
 ## Gaps
 
 Audio tracks are only read as header metadata; no Bink Audio packet is decoded and no audio system is opened. The
-async and GPU decode paths, subtitles and the `HBINK`/`BINKTRACK`/`BINKSUMMARY` layouts are not tested. `DllMain`/TLS
+async and GPU decode paths and subtitles are not tested; the `HBINK`/`BINKSUMMARY` fields are measured by
+[`bink_abi_test`](bink_abi_test.md). `DllMain`/TLS
 are not run by the loader by default; they were not needed for this video path.

@@ -306,7 +306,6 @@ public:
         return true;
     }
 
-<<<<<<< HEAD
     // Shared by present(), present_blank() and present_planes().
     //
     // A Present is ordered behind the work the queues hold (a batch that waits for a Signal not yet submitted,

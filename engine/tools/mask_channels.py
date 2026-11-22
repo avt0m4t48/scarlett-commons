@@ -87,7 +87,7 @@ def main(argv=None) -> int:
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as fh:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
             json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
     return 0
 

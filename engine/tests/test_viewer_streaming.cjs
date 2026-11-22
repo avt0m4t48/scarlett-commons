@@ -43,6 +43,10 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
         ['duplicate chunk ID', { spawn: [0, 0, 0], chunks: [worldChunk, worldChunk] }, /chunks\[1\]\.id/],
         ['LOD tier without a band', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] },
             /chunks\[0\]\.lod/],
+        ['LOD tier is an object', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: { toString: null }, cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
+        ['LOD tier is an array', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: ['hd'], cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
         ['LOD band out of order', { spawn: [0, 0, 0], lod_bands: { hd: [5, 1] },
             chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
         ['LOD chunk without a cell', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
@@ -70,6 +74,70 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('generated terrain shares vertex normals at both kinds of chunk border', () => {
+    class Attribute {
+        constructor(count) { this.count = count; this.array = new Float32Array(count * 3); }
+        getX(i) { return this.array[i * 3]; }
+        getY(i) { return this.array[i * 3 + 1]; }
+        getZ(i) { return this.array[i * 3 + 2]; }
+        setXYZ(i, x, y, z) { this.array.set([x, y, z], i * 3); }
+    }
+    class PlaneGeometry {
+        constructor(size, _, segments) {
+            this.segments = segments;
+            const stride = segments + 1;
+            const position = new Attribute(stride * stride);
+            this.attributes = { position, normal: new Attribute(position.count) };
+            for (let i = 0; i < position.count; i++) {
+                position.setXYZ(i, (i % stride) * size / segments - size / 2, 0,
+                    Math.floor(i / stride) * size / segments - size / 2);
+            }
+        }
+        // The fixture already uses the rotated ground plane.
+        rotateX() {}
+        setAttribute(name, attribute) { this.attributes[name] = attribute; }
+        computeVertexNormals() {
+            // Like a real mesh, this stand-in can only see neighbors on this tile.
+            const { position, normal } = this.attributes;
+            const stride = this.segments + 1;
+            for (let i = 0; i < position.count; i++) {
+                const col = i % stride, row = Math.floor(i / stride);
+                const left = col === 0 ? i : i - 1, right = col === this.segments ? i : i + 1;
+                const front = row === 0 ? i : i - stride, back = row === this.segments ? i : i + stride;
+                const nx = (position.getY(left) - position.getY(right)) / (position.getX(right) - position.getX(left));
+                const nz = (position.getY(front) - position.getY(back)) / (position.getZ(back) - position.getZ(front));
+                const length = Math.hypot(nx, 1, nz);
+                normal.setXYZ(i, nx / length, 1 / length, nz / length);
+            }
+        }
+    }
+
+    const terrainSource = html.slice(worldEnd, html.indexOf('// ---------- scene ----------', worldEnd));
+    const [center, east, south] = vm.runInNewContext(terrainSource + '\n' +
+        'height = (x, z) => (x * x + z * z) / 512;' +
+        '[[0,0,256], [1,0,256], [0,1,256]].map(buildTestChunk)', {
+        THREE: {
+            PlaneGeometry,
+            Group: class { children = []; add(obj) { this.children.push(obj); } },
+            Mesh: class { constructor(geometry) { this.geometry = geometry; } },
+            MathUtils: { clamp: (x, low, high) => Math.min(high, Math.max(low, x)) },
+            MeshStandardMaterial: class {}, Float32BufferAttribute: class {},
+            BoxGeometry: class { translate() {} }, InstancedMesh: class { setMatrixAt() {} },
+            Matrix4: class { compose() {} }, Vector3: class {}, Quaternion: class {},
+        },
+    });
+    const read = (chunk, name, row, col) => {
+        const start = (row * 33 + col) * 3;
+        return Array.from(chunk.children[0].geometry.attributes[name].array.slice(start, start + 3));
+    };
+    assert.deepEqual(read(center, 'position', 16, 32), read(east, 'position', 16, 0));
+    assert.deepEqual(read(center, 'normal', 16, 32), read(east, 'normal', 16, 0));
+    assert.deepEqual(read(center, 'normal', 16, 32), [-2/3, 2/3, -1/3].map(Math.fround));
+    assert.deepEqual(read(center, 'position', 32, 16), read(south, 'position', 0, 16));
+    assert.deepEqual(read(center, 'normal', 32, 16), read(south, 'normal', 0, 16));
+    assert.deepEqual(read(center, 'normal', 32, 16), [-1/3, 2/3, -2/3].map(Math.fround));
+});
+
 test('a WebGL startup error replaces the fly prompt and preserves the original error', async () => {
     const error = new Error('Error creating WebGL context.');
     const attributes = new Map();
@@ -82,6 +150,109 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.match(start.textContent, /Could not start WebGL/);
     assert.equal(start.style.cursor, 'default');
     assert.equal(attributes.get('role'), 'alert');
+});
+
+async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
+    const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
+    const helpMessages = [];
+    const canvas = {
+        addEventListener: (type, handler) => canvasEvents.set(type, handler),
+        requestPointerLock,
+    };
+    const start = { classList: { add() {}, toggle() {} } };
+    const document = {
+        pointerLockElement: null,
+        getElementById: id => id === 'start' ? start : { insertAdjacentHTML: (_, message) => helpMessages.push(message) },
+        addEventListener: (type, handler) => documentEvents.set(type, handler),
+    };
+    const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
+    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, keys }; })()`, {
+        THREE: { MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) } },
+        renderer: { domElement: canvas }, document,
+        addEventListener: (type, handler) => windowEvents.set(type, handler),
+        loadWorld: async () => ({}),
+    });
+    return {
+        ...state,
+        helpMessages,
+        fallback: () => start.onclick(),
+        lockError: () => documentEvents.get('pointerlockerror')?.(),
+        lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
+        down: button => canvasEvents.get('mousedown')({ button }),
+        up: button => windowEvents.get('mouseup')({ button }),
+        move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
+        key: code => windowEvents.get('keydown')({ code }),
+        blur: () => windowEvents.get('blur')(),
+    };
+}
+
+test('a pointerlockerror without a rejected promise enables drag-to-look', async () => {
+    const cam = await freecamFixture(() => undefined);
+    await cam.fallback();
+    cam.lockError();
+    cam.down(0);
+    cam.move(1);
+    assert.ok(cam.yaw() < 0);
+    assert.equal(cam.helpMessages.length, 1);
+});
+
+test('a rejection and a pointerlockerror show the drag hint only once', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.lockError();
+    assert.equal(cam.helpMessages.length, 1);
+});
+
+test('drag-to-look requires a primary press and ignores a secondary release', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(2);
+    cam.move(2);
+    assert.equal(cam.yaw(), 0);
+    cam.down(0);
+    cam.move(1);
+    const afterDrag = cam.yaw();
+    assert.ok(afterDrag < 0);
+    cam.up(2);
+    cam.move(1);
+    assert.ok(cam.yaw() < afterDrag);
+    cam.up(0);
+    const afterRelease = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), afterRelease);
+});
+
+test('drag-to-look ends on the first move after a missed mouseup', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), yaw);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw, 'a new press must start on the canvas');
+});
+
+test('window blur clears pressed movement keys and ends drag-to-look', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.key('KeyW');
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    assert.equal(cam.keys.has('KeyW'), true);
+    cam.blur();
+    assert.equal(cam.keys.size, 0);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw);
+});
+
+test('pointer lock turns the camera without a pressed mouse button', async () => {
+    const cam = await freecamFixture();
+    cam.lock();
+    cam.move(0);
+    assert.ok(cam.yaw() < 0);
 });
 
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
@@ -447,12 +618,38 @@ test('a valid LOD manifest is accepted', async () => {
     assert.equal(world.test, false);
 });
 
+test('orphan HD draws independently of the LOD chain in its cell', async () => {
+    const f = fixture(0);
+    f.context.world = {
+        test: false,
+        lod_bands: { hd: [0, 130], orphan_hd: [0, 100] },
+        chunks: [
+            { ...worldChunk, id: 'hd', url: 'hd.glb', lod: 'hd', cell: [0, 0, 256, 256] },
+            { ...worldChunk, id: 'orphan', url: 'orphan.glb', lod: 'orphan_hd', cell: [0, 0, 256, 256] },
+        ],
+    };
+    const hd = Object.assign(f.object(), { visible: true });
+    const orphan = Object.assign(f.object(), { visible: true });
+    f.frame();
+    await f.succeed(0, hd);
+    await f.succeed(1, orphan);
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, true);
+
+    f.context.camera.position.x = 366; // 110 m from the cell, inside the orphan's unload slack.
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, false);
+    assert.ok(f.state.live.has('orphan'));
+});
+
 test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
     const f = fixture(0);
     const cell = [0, 0, 256, 256];
     f.context.world = { test: false, lod_bands: { hd: [0, 130], lod: [130, 450], slod1: [450, 1000] }, chunks: [
         { id: 'hd', url: 'hd.glb', bounds: [0, 0, 0, 256, 50, 256], lod: 'hd', cell },
-        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell },
+        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell: [...cell] },
         { id: 'slod1', url: 'slod1.glb', bounds: [0, 0, 0, 256, 90, 256], lod: 'slod1', cell },
     ] };
     const pos = f.context.camera.position;
@@ -466,7 +663,11 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
     assert.ok(f.state.live.has('hd'));
-    await f.succeed(1, lod);
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is fetching');
+    await f.receive(1);
+    f.frame();
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is parsing');
+    await f.finish(1, lod);
     f.frame();
     assert.equal(hd.visible, false);
     assert.equal(lod.visible, true);
@@ -485,3 +686,18 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     assert.equal(f.requests.at(-1).url, 'slod1.glb');
 });
 
+
+// The camera link in the URL hash (#cam=x,y,z,yaw,pitch) must round-trip and reject anything malformed.
+const helperSource = html.slice(html.indexOf('// Camera in the URL hash'), html.indexOf('async function loadWorld()'));
+const camHelpers = vm.runInNewContext(helperSource + '\n({ parseCamHash, formatCamHash })');
+
+test('camera hash round-trips and malformed hashes are ignored', () => {
+    const hash = camHelpers.formatCamHash([12.34, -5, 600], 1.5, -0.25);
+    assert.equal(hash, '#cam=12.3,-5.0,600.0,1.500,-0.250');
+    const cam = camHelpers.parseCamHash(hash);
+    assert.deepEqual(JSON.parse(JSON.stringify(cam)), { pos: [12.3, -5, 600], yaw: 1.5, pitch: -0.25 });
+    for (const bad of ['', '#', '#cam=', '#cam=1,2,3', '#cam=1,2,3,4,x', '#cam=1,2,3,4,Infinity',
+                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
+        assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
+    }
+});

@@ -5,7 +5,7 @@ library only."""
 import io
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import subprocess
@@ -95,8 +95,9 @@ class FakeOracle:
     arch = "gfx1031"
     device = "fake gfx1031"
 
-    def __init__(self, rule="rte", clobber_hi=False, wave64_off=None):
+    def __init__(self, rule="rte", clobber_hi=False, wave64_off=None, drop=0, none_at=None):
         self.rule, self.clobber_hi, self.wave64_off = rule, clobber_hi, wave64_off
+        self.drop, self.none_at = drop, none_at   # answer `drop` fewer kernels; no result for kernel `none_at`
 
     def run(self, kernels, words=4):
         code_of = {c: (f, k, n) for f, (c, k, n) in pr.FORMATS.items()}
@@ -121,7 +122,9 @@ class FakeOracle:
                 hi = 0 if self.clobber_hi else pr.HI_SEED
                 res.append(hi | bits)
             out.append(staged + res)
-        return out
+        if self.none_at is not None:
+            out[self.none_at] = None
+        return out[:len(out) - self.drop] if self.drop else out
 
     def close(self):
         pass
@@ -164,6 +167,19 @@ class Compare(unittest.TestCase):
     def test_a_wave_difference_exits_1(self):
         rc, out = run_main(FakeOracle(wave64_off=9))
         self.assertEqual(rc, 1, out)
+
+    def test_a_short_result_list_is_a_harness_error(self):
+        # BUILD-733: fewer results than kernels used to be zipped away, leaving values unchecked and exit 0.
+        for drop in (1, 10_000):   # one kernel missing, then every result (an empty list)
+            with self.subTest(drop=drop):
+                rc, out = run_main(FakeOracle(drop=drop))
+                self.assertEqual(rc, 2)
+                self.assertRegex(out, r"harness error: \w+ wave32: the oracle returned \d+ results for \d+ kernels")
+
+    def test_a_missing_result_is_a_harness_error(self):
+        rc, out = run_main(FakeOracle(none_at=0))
+        self.assertEqual(rc, 2)
+        self.assertIn("base 0: no result", out)
 
     def test_a_clobbered_high_half_is_a_harness_error(self):
         rc, out = run_main(FakeOracle(clobber_hi=True))
@@ -216,6 +232,36 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(w32["buffer_d16"][255] & 0xFFFF, 0x3C00)
         self.assertEqual(w32["buffer_d16"][0] & 0xFFFF, 0)
         self.assertEqual(w32["buffer_f32"][255], 0x3F800000)
+
+
+class ReportPathTests(unittest.TestCase):
+    """--json names a file; its folder is created and a write failure is one line, not a traceback."""
+
+    def test_json_creates_a_missing_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "reports", "deeper", "r.json")
+            rc, out = run_main(FakeOracle(), "--json", report)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue(os.path.isfile(report))
+
+    def test_json_folder_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                run_main(FakeOracle(), "--json", d)
+
+    def test_a_failed_write_is_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "not_a_folder")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc, _ = run_main(FakeOracle(), "--json", os.path.join(blocker, "r.json"))
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
 
 
 if __name__ == "__main__":

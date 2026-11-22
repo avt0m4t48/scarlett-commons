@@ -9,15 +9,17 @@
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
-// other module goes to the host unchanged. Only images mapped by the loader see these: they are bound through the
-// registry, the runtime's own code calls the host directly.
+// other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
+// loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "shims.h"
 
@@ -67,6 +69,25 @@ std::string module_name(std::string path) {
     return path;
 }
 
+std::string host_module_name(HMODULE module) {
+    std::lock_guard lock(loader_mutex());
+    static auto* names = new std::map<HMODULE, std::string>;
+    if (auto it = names->find(module); it != names->end()) return it->second;
+
+    std::vector<wchar_t> path(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (!length) return {};
+        if (length < path.size()) {
+            const std::string name = module_name(narrow(path.data()));
+            names->emplace(module, name);
+            return name;
+        }
+        if (path.size() == 32768) return {};
+        path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
+    }
+}
+
 }  // namespace
 
 // The pseudo-handle for an owned module, or nullptr when the shims don't own `path`'s module.
@@ -95,7 +116,7 @@ namespace {
 constexpr DWORD kDataFileLoadFlags =
     LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
-HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
+HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled) {
     handled = false;
     if (HMODULE h = owned_handle(path)) {
         handled = true;
@@ -103,7 +124,8 @@ HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
     }
     const std::string dll = module_name(path);
     if (!dll.empty()) {
-        if (void* h = load_bundled_module(dll, handled); handled) return reinterpret_cast<HMODULE>(h);
+        if (void* h = load_bundled_module(dll, static_cast<uint32_t>(flags), handled); handled)
+            return reinterpret_cast<HMODULE>(h);
     }
     return nullptr;
 }
@@ -111,7 +133,7 @@ HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
 HMODULE WINAPI load_library_a(LPCSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, handled);
+        HMODULE h = load_shim_or_bundled(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryA(name);
@@ -120,7 +142,7 @@ HMODULE WINAPI load_library_a(LPCSTR name) {
 HMODULE WINAPI load_library_w(LPCWSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        HMODULE h = load_shim_or_bundled(narrow(name), 0, handled);
         if (handled) return h;
     }
     return LoadLibraryW(name);
@@ -129,7 +151,7 @@ HMODULE WINAPI load_library_w(LPCWSTR name) {
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, handled);
+        HMODULE h = load_shim_or_bundled(name, flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExA(name, file, flags);
@@ -138,7 +160,7 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        HMODULE h = load_shim_or_bundled(narrow(name), flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExW(name, file, flags);
@@ -204,6 +226,13 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
+    if (module && !IS_INTRESOURCE(name)) {
+        const DWORD error = GetLastError();
+        const std::string dll = host_module_name(module);
+        void* shim = dll.empty() ? nullptr : find(dll, what);
+        SetLastError(error);
+        if (shim) return reinterpret_cast<FARPROC>(shim);
+    }
     return GetProcAddress(module, name);
 }
 
@@ -211,6 +240,17 @@ BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
     return FreeLibrary(module);
+}
+
+// DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
+// Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
+// DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
+// sends no thread events to a DllMain, so there is nothing further to switch off; every other handle goes to the
+// real function.
+BOOL WINAPI disable_thread_calls(HMODULE module) {
+    if (pseudo(module)) return TRUE;
+    if (owns_bundled_module_handle(module)) return TRUE;
+    return DisableThreadLibraryCalls(module);
 }
 
 #define LOADER(dll)                                                                         \
@@ -221,7 +261,8 @@ BOOL WINAPI free_library(HMODULE module) {
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
-    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)}
+    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
+    {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 
 }  // namespace
 }  // namespace rt::shims::library_loader

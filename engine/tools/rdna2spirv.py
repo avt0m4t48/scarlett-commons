@@ -10150,8 +10150,9 @@ class Gen:
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
         for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
         MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
-        (ceil(lod + 0.5) - 1, the Vulkan specification's preferred rounding) for point and for the value 3, which the
-        runtime also samples as nearest, and 0 for none, whose LOD the runtime holds in [0, 0.25]
+        with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
+        records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
+        none, whose LOD the runtime holds in [0, 0.25]
         (gfx10_descriptors.h vulkan_sampler). Texel offsets apply before wrapping and clamping, and an integer
         offset commutes with them, so the shift is exact for any address mode at that level. Only a trilinear blend
         of two levels differs: the coarser level moves by offset / 2 of its texels instead of offset. Implicit
@@ -10196,17 +10197,17 @@ class Gen:
             level = ci(0)
         else:
             static = isinstance(mip, int)
-            li = None
-            if not static or mip == 2:                    # linear: the finer of the two blended levels
-                fl, li = self.tmp(), self.tmp()
-                self.emit(f"{fl} = OpExtInst %float %glsl Floor {level_f}")
-                self.emit(f"{li} = OpConvertFToS %int {fl}")
-            if not static or mip != 2:                    # point (and 3): nearest level
-                h, c, ni, near = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{h} = OpFAdd %float {level_f} {self.fconst(0.5)}")
-                self.emit(f"{c} = OpExtInst %float %glsl Ceil {h}")
-                self.emit(f"{ni} = OpConvertFToS %int {c}")
-                self.emit(f"{near} = OpISub %int {ni} {ci(1)}")
+            fl, li = self.tmp(), self.tmp()               # linear: the finer of the two blended levels
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {level_f}")
+            self.emit(f"{li} = OpConvertFToS %int {fl}")
+            if not static or mip != 2:                    # point (and 3): nearest level, a tie rounds up
+                # floor + (fraction >= 0.5), not floor(lod + 0.5): lod - floor(lod) is exact in binary32, the sum
+                # is not (0x3f000001 + 0.5 rounds to 1.0, and 0x3effffff + 0.5 rounds up to 1.0 as well).
+                fr, up, inc, near = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{fr} = OpFSub %float {level_f} {fl}")
+                self.emit(f"{up} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")
+                self.emit(f"{inc} = OpSelect %int {up} {ci(1)} {ci(0)}")
+                self.emit(f"{near} = OpIAdd %int {li} {inc}")
                 if static:
                     li = near
                 else:

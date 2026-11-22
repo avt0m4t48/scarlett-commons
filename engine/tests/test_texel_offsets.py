@@ -146,9 +146,9 @@ def _defs(spv):
 def _folded_level(spv, lod, word2=None, levels=4):
     """Evaluate the level operand of the fallback's OpImageQuerySizeLod for a given LOD (and run-time S# word 2).
 
-    A small evaluator over the integer and float ops the level chain uses. The LOD enters as the value the level
-    rounding reads (the operand of Floor, or of the OpFAdd with 0.5); the run-time word 2 as the operand of the
-    OpBitFieldUExtract at bit 26."""
+    A small evaluator over the integer and float ops the level chain uses, with every float result rounded to
+    binary32 as the module computes it. The LOD enters as the value the level rounding reads (the operand of
+    Floor, or of an OpFAdd with 0.5); the run-time word 2 as the operand of the OpBitFieldUExtract at bit 26."""
     import math
     import struct
     d = _defs(spv)
@@ -162,7 +162,7 @@ def _folded_level(spv, lod, word2=None, levels=4):
     for k, v in d.items():
         if v[:4] == ["OpExtInst", "%float", "%glsl", "Floor"]:
             inputs[v[4]] = lod
-        if v[:2] == ["OpFAdd", "%float"] and fconst.get(v[3]) == 0.5:
+        if v[:2] == ["OpFAdd", "%float"] and fconst.get(v[3]) == 0.5:     # an lod + 0.5 rounding, if emitted
             inputs[v[2]] = lod
         if v[:2] == ["OpBitFieldUExtract", "%uint"] and uconst.get(v[3]) == 26:
             assert word2 is not None, "run-time S# word 2 read but no value given"
@@ -184,8 +184,13 @@ def _folded_level(spv, lod, word2=None, levels=4):
         if op[0] == "OpBitcast":
             v = ev(a[0])
             return struct.unpack("<i", struct.pack("<I", v & 0xFFFFFFFF))[0] if op[1] == "%int" else v
-        if op[0] in ("OpFAdd", "OpIAdd"):
+        if op[0] in ("OpFAdd", "OpFSub"):
+            r = ev(a[0]) + ev(a[1]) if op[0] == "OpFAdd" else ev(a[0]) - ev(a[1])
+            return struct.unpack("<f", struct.pack("<f", r))[0]
+        if op[0] == "OpIAdd":
             return ev(a[0]) + ev(a[1])
+        if op[0] == "OpFOrdGreaterThanEqual":
+            return ev(a[0]) >= ev(a[1])
         if op[0] == "OpISub":
             return ev(a[0]) - ev(a[1])
         if op[0] == "OpConvertFToS":
@@ -208,6 +213,11 @@ def _folded_level(spv, lod, word2=None, levels=4):
     return ev(size_q[0][-1])
 
 
+def _f32(bits):
+    import struct
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
 def _sample_l_o(tmp_path, word2=None):
     pre = f"s_mov_b32 s18, 0x{word2:x}\n" if word2 is not None else ""
     return translate_listing(tmp_path, PROLOGUE + "\n" + pre + SAMPLE_L_O)
@@ -216,7 +226,10 @@ def _sample_l_o(tmp_path, word2=None):
 @pytest.mark.parametrize("mip,lod,level", [
     (MIP_POINT, 0.75, 1),     # @whattheflop's case: a nearest mip sampler at LOD 0.75 reads mip 1, not mip 0
     (MIP_POINT, 0.25, 0),
-    (MIP_POINT, 0.5, 0),      # the specification's preferred rounding, ceil(lod + 0.5) - 1
+    (MIP_POINT, _f32(0x3effffff), 0),   # just below 0.5: + 0.5 in binary32 would round up to 1.0
+    (MIP_POINT, 0.5, 1),      # a tie rounds up: RTX 5070 (616.56, 621.01) samples mip 1 here, natively
+    (MIP_POINT, _f32(0x3f000001), 1),   # just above 0.5: + 0.5 rounds to 1.0, so ceil - 1 gave mip 0 (#3882)
+    (MIP_POINT, _f32(0x3f000002), 1),
     (MIP_POINT, 2.6, 3),
     (MIP_POINT, 9.0, 3),      # clamped to the last of 4 levels
     (MIP_POINT, -1.0, 0),
@@ -234,8 +247,8 @@ def test_fallback_level_follows_mip_filter(mip, lod, level, tmp_path, fallback):
 
 def test_fallback_literal_mip_filter_emits_one_rounding(tmp_path, fallback):
     point = _sample_l_o(tmp_path, MIP_POINT << 26)
-    assert "Ceil" in point and "Floor" not in point
+    assert "Floor" in point and "OpFOrdGreaterThanEqual" in point
     linear = _sample_l_o(tmp_path, MIP_LINEAR << 26)
-    assert "Floor" in linear and "Ceil" not in linear
+    assert "Floor" in linear and "OpFOrdGreaterThanEqual" not in linear
     none = _sample_l_o(tmp_path, MIP_NONE << 26)
-    assert "Floor" not in none and "Ceil" not in none
+    assert "Floor" not in none and "OpFOrdGreaterThanEqual" not in none

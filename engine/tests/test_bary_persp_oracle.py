@@ -41,11 +41,16 @@ class BaryPerspReference(unittest.TestCase):
 
     def test_affine_weights_fail_every_covered_pixel(self):
         problem = check.bary_persp_problem(image(False))
-        self.assertTrue(problem.startswith("1149 pixels off"), problem)
+        self.assertTrue(problem.startswith("1158 pixels off"), problem)
 
     def test_a_pixel_outside_the_triangle_is_caught(self):
         px = image(True)
         px[0] = (0.0, 0.0, 0.0, 0.0)   # (0, 0) is far outside: it must keep the clear value
+        self.assertIn("1 pixels off", check.bary_persp_problem(px))
+
+    def test_a_centre_next_to_an_edge_is_judged(self):
+        px = image(True)
+        px[16 * 64 + 56] = (0.0, 0.0, 0.0, 0.0)   # (56, 16): covered, 6.5e-4 of the way in from an edge
         self.assertIn("1 pixels off", check.bary_persp_problem(px))
 
     def test_runs_in_both_runners(self):

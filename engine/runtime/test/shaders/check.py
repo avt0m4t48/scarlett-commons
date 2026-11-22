@@ -1063,30 +1063,31 @@ def sampler_test(tools, spirv):
 def bary_persp_problem(px):
     """ps_persp_bary drawn with vs_persp: "" when every pixel matches the perspective-correct CPU reference, else what
     differs. At a pixel centre with screen-space weights l0, l1, l2, the weights are p_k = (l_k / w_k) / sum(l_m / w_m);
-    mrt0 = (attr0.xy interpolated with p, p1, p2), and pixels outside the triangle keep the clear value (-1). Pixels
-    whose centre is within 1e-3 of an edge are not judged (either rasterization rule is fine). The affine weights
-    (l1, l2) must differ from (p1, p2) by more than 100 times the tolerance on every judged pixel, so a NoPerspective
-    regression can't pass by accident."""
+    mrt0 = (attr0.xy interpolated with p, p1, p2), and pixels outside the triangle keep the clear value (-1). Coverage
+    comes from edge functions at doubled coordinates, which are exact integers: no centre lies on an edge, so every
+    pixel is judged whatever the rasterization rule. The affine weights (l1, l2) must differ from (p1, p2) by more than
+    100 times the tolerance on every covered pixel, so a NoPerspective regression can't pass by accident."""
     tol = 1e-5
-    (x0, y0), (x1, y1), (x2, y2) = PERSP_SCREEN
-    area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+    (x0, y0), (x1, y1), (x2, y2) = (tuple(int(c) for c in v) for v in PERSP_SCREEN)
+    area2 = 2 * ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))   # twice the area, in doubled coordinates
     covered, wrong, first, gap = 0, 0, "", math.inf
     for i, pixel in enumerate(px):
-        x, y = i % 64 + 0.5, i // 64 + 0.5
-        l1 = ((x - x0) * (y2 - y0) - (x2 - x0) * (y - y0)) / area
-        l2 = ((x1 - x0) * (y - y0) - (x - x0) * (y1 - y0)) / area
-        l = (1 - l1 - l2, l1, l2)
-        if min(l) < -1e-3:
+        x, y = 2 * (i % 64) + 1, 2 * (i // 64) + 1                  # the pixel centre, doubled
+        e1 = (x - 2 * x0) * (y2 - y0) - (x2 - x0) * (y - 2 * y0)
+        e2 = (x1 - x0) * (y - 2 * y0) - (x - 2 * x0) * (y1 - y0)
+        e = (area2 - e1 - e2, e1, e2)
+        if 0 in e:
+            return f"test geometry: pixel centre ({i % 64},{i // 64}) lies on an edge"
+        if min(e) < 0:
             want = (-1.0, -1.0, -1.0, -1.0)
-        elif min(l) > 1e-3:
+        else:
+            l = [ek / area2 for ek in e]
             p = [lk / wk for lk, wk in zip(l, PERSP_W)]
             p = [pk / sum(p) for pk in p]
             want = (sum(pk * a[0] for pk, a in zip(p, PERSP_ATTR)), sum(pk * a[1] for pk, a in zip(p, PERSP_ATTR)),
                     p[1], p[2])
-            gap = min(gap, max(abs(p[1] - l1), abs(p[2] - l2)))
+            gap = min(gap, max(abs(p[1] - l[1]), abs(p[2] - l[2])))
             covered += 1
-        else:
-            continue
         if not all(math.isfinite(v) and abs(v - w) <= tol for v, w in zip(pixel, want)):
             if not wrong:
                 got, exp = (tuple(round(v, 6) for v in t) for t in (pixel, want))

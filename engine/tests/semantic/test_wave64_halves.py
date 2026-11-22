@@ -170,6 +170,67 @@ class Classification(unittest.TestCase):
         self.tier("ps_b_spill", ps(["v_writelane_b32 v20, s4, 3", "v_readlane_b32 s21, v20, 3",
                                     "v_add_nc_u32_e32 v6, s21, v0"]), "B", [], ["lane-spill"])
 
+    def test_b_spill_and_reload_upper_half_lane_40(self):
+        # Pure scalar spill into lanes 32..63 (v20 is never read as a vector operand): lowered to a parked scalar
+        # slot so SGPR spills past lane 31 are exact on 32-wide subgroups (tier B).
+        self.tier("ps_b_spill_hi", ps([
+            "v_writelane_b32 v20, s4, 40", "v_writelane_b32 v20, s5, 63",
+            "v_readlane_b32 s21, v20, 40", "v_readlane_b32 s22, v20, 63",
+            "s_add_u32 s23, s21, s22", "v_add_nc_u32_e32 v6, s23, v0"]), "B", [], ["lane-spill"])
+
+    def test_c_spill_in_divergent_vote_branch_is_stale_scalar(self):
+        # Spilling to lane 40 behind a wave-wide vote and reading outside must stay tier C (stale-scalar).
+        # v_writelane_b32 is an 8-byte VOP3 instruction (2 dwords).
+        self.tier("ps_c_spill_stale", ps([
+            "v_writelane_b32 v20, s4, 40", "v_cmp_eq_u32_e32 vcc, 0, v0", "s_cbranch_vccz 2",
+            "v_writelane_b32 v20, s5, 40", "v_readlane_b32 s21, v20, 40",
+            "v_mov_b32_e32 v6, s21"]), "C", contains=["stale-scalar"])
+
+    def test_c_spill_of_tainted_count_stays_tier_c(self):
+        # Spilling a tainted scalar (lane-count) into lane 40 and reloading must still report lane-count.
+        self.tier("ps_c_spill_cnt", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc",
+            "v_writelane_b32 v20, s6, 40", "v_readlane_b32 s21, v20, 40",
+            "v_mov_b32_e32 v6, s21"]), "C", ["lane-count"])
+
+    def test_b_readfirstlane_uniform_inside_narrowed_exec(self):
+        # v5 written from a scalar inside a narrowed EXEC block is uniform across all active lanes,
+        # so v_readfirstlane_b32 inside that block is exact (tier B).
+        self.tier("ps_b_rfl_narrow", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "v_readfirstlane_b32 s20, v5", "v_add_nc_u32_e32 v6, s20, v0",
+            "s_or_b64 exec, exec, s[12:13]"]), "B", [], ["readfirstlane-uniform"])
+
+    def test_c_readfirstlane_after_exec_restore_not_uniform(self):
+        # Writing v5 from a scalar under narrowed EXEC and reading after EXEC restore is NOT uniform (tier C).
+        self.tier("ps_c_rfl_after_restore", ps([
+            "v_mov_b32_e32 v5, v0", "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "s_or_b64 exec, exec, s[12:13]", "v_readfirstlane_b32 s20, v5",
+            "v_mov_b32_e32 v6, s20"]), "C")
+
+    def test_b_scaled_aggregated_atomic_and_global_atomic_add(self):
+        # Stride-scaled s_bcnt1 (s_lshl_b32 by 2 = 4 bytes/lane) in buffer_atomic_add and global_atomic_add.
+        self.tier("ps_b_atomic_scaled", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "s_lshl_b32 s6, s6, 2",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "buffer_atomic_add v11, v12, s[0:3], 0 offen glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v11", "v_lshlrev_b32_e32 v13, 2, v10", "v_add_nc_u32_e32 v13, s7, v13",
+            "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256", "s_mov_b64 exec, s[10:11]"]), "B", [],
+            ["aggregated-atomic", "elected-lane"])
+        # global_atomic_add with glc has operand order (vdst, vaddr, vdata, saddr).
+        self.tier("ps_b_global_atomic", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "global_atomic_add v14, v12, v11, s[4:5] glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v14", "v_add_nc_u32_e32 v13, s7, v10", "v_lshlrev_b32_e32 v13, 2, v13",
+            "global_store_dword v13, v0, s[4:5]", "s_mov_b64 exec, s[10:11]"]), "B", [],
+            ["aggregated-atomic", "elected-lane"])
+
     # -- tier C: each near miss of the idioms above
     def test_c_lane_count_exported(self):
         self.tier("ps_c_cnt", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
@@ -360,6 +421,28 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "B")
         self.assertEqual(whole, halves)
         self.assertEqual([w[0] for w in whole], [9 + k for k in range(64)])
+
+    def test_b_spill_upper_half_lane_40_and_63_invariant(self):
+        # Lanes 40 and 63 do not exist on a 32-lane subgroup: parked scalar slots keep 64-lane and 2x32-lane exact.
+        tier, whole, halves = self.run_both("vs_b_spill_hi", vs([
+            "v_writelane_b32 v20, s4, 40", "v_writelane_b32 v20, s5, 63",
+            "v_readlane_b32 s21, v20, 40", "v_readlane_b32 s22, v20, 63",
+            "s_add_u32 s23, s21, s22", "v_add_nc_u32_e32 v6, s23, v0"]),
+            push=[0, 0, 0, 0, 100, 23])
+        self.assertEqual(tier, "B")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [123 + k for k in range(64)])
+
+    def test_b_readfirstlane_uniform_under_narrowed_exec_invariant(self):
+        tier, whole, halves = self.run_both("vs_b_rfl_narrow", vs([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "v_readfirstlane_b32 s20, v5", "v_add_nc_u32_e32 v6, s20, v0",
+            "s_or_b64 exec, exec, s[12:13]"]),
+            push=[0, 0, 0, 0, 50])
+        self.assertEqual(tier, "B")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [50 + k if (k & 3) == 1 else 0 for k in range(64)])
 
     def test_c_lane_count_differs(self):
         tier, whole, halves = self.run_both("vs_c_cnt", vs([

@@ -241,7 +241,19 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
-              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000)}
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
+              # 32-bit integer VALU ops on the VINT_ENV heap: 24-bit sign extension, shifts of 32+, signed vs unsigned
+              # min/max (derivations in the .asm headers)
+              "ps_vint_logic3": (0xfffffffe, 0xbbb05070, 0x1d3b5977, 0x123f5f7e),
+              "ps_vint_bits": (0xfffffffe, 0x40000000, 0x1e6a2c48, 0x000001d5),
+              "ps_vint_mul24": (0x13345678, 0xfffffffd, 0x00007fff, 0x0000ffff),
+              "ps_vint_minmax": (0x7ffffffe, 0x80000001, 0x80000001, 0x7ffffffe),
+              "ps_vint_minmax3": (0xf0f0f0f0, 0xab800000, 0xf0f0f0f0, 0xab800000)}
+# h0..h7 of the ps_vint_* fixtures: 24-bit fields with bit 23 set and garbage above, 33 (a shift of 32+), a
+# negative i32 that is a large u32, and plain bit patterns.
+VINT_ENV = {"VKH_SGPRS": "0x1000,0,32,0",
+            "VKH_HEAP": "0x1000=0xab800000,0x1004=0x12fffffe,0x1008=0x00000021,0x100c=0x80000001,"
+                        "0x1010=0x7ffffffe,0x1014=0xf0f0f0f0,0x1018=0x12345678,0x101c=0xffffffff"}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -257,7 +269,13 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
-                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
+                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)

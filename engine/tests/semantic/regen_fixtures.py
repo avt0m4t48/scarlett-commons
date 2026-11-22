@@ -27,7 +27,9 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "cs_oob_select", "cs_oob_tail", "cs_w32_mask_imm", "cs_w64_mask_imm",
            # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
            "ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods", "ps_interp_mov_mods",
-           "cs_w64x_andn2_exec")   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
+           "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
+           # 32-bit integer VALU ops with inputs from memory (test_value_semantics.py)
+           "ps_vint_logic3", "ps_vint_bits", "ps_vint_mul24", "ps_vint_minmax", "ps_vint_minmax3")
 
 
 def render(name):

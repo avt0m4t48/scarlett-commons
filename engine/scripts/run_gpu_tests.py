@@ -36,7 +36,7 @@ from check import gpu_test_timeout, timed_out   # per-program time limit (LEONID
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    wave32_lane_skip)   # as in check.py
-from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
+from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem   # ps_interp_f16_high's producers and check
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -364,7 +364,13 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
-                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
+                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
@@ -1023,6 +1029,12 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                # 32-bit integer VALU ops on VINT_ENV's heap (derivations in the .asm headers)
+                "ps_vint_logic3": (0xFFFFFFFE, 0xBBB05070, 0x1D3B5977, 0x123F5F7E),
+                "ps_vint_bits": (0xFFFFFFFE, 0x40000000, 0x1E6A2C48, 0x000001D5),
+                "ps_vint_mul24": (0x13345678, 0xFFFFFFFD, 0x00007FFF, 0x0000FFFF),
+                "ps_vint_minmax": (0x7FFFFFFE, 0x80000001, 0x80000001, 0x7FFFFFFE),
+                "ps_vint_minmax3": (0xF0F0F0F0, 0xAB800000, 0xF0F0F0F0, 0xAB800000),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])

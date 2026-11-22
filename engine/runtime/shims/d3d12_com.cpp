@@ -1542,8 +1542,11 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
 }
 
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
+    // The host runtime's order (d3d12_vulkan_device_test, compare_invalid_arguments "command allocator:"): a type
+    // past VIDEO_ENCODE is E_INVALIDARG, then a null output is E_UNEXPECTED.
+    if (out) *out = nullptr;
+    if (UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)) return E_INVALIDARG;
+    if (!out) return E_UNEXPECTED;
     auto* object = new CommandAllocator(type);
     object->attach_device(device);
     return hand_out(object, riid, out);
@@ -1551,12 +1554,13 @@ HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
+    if (out) *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
     // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
     if (command_allocator->recording()) return E_INVALIDARG;
+    // A null output only after the arguments, as the host runtime answers ("command list:" cases).
+    if (!out) return E_UNEXPECTED;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
         type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");

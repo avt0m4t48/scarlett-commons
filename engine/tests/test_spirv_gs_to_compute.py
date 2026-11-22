@@ -1,11 +1,11 @@
 """tools/spirv_gs_to_compute.py: a translated geometry shader as a compute capture pass (SHADER-159)."""
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -151,6 +151,37 @@ def test_cli_preserves_valid_capture_across_spirv_versions(tmp_path: Path, targe
     result = subprocess.run(["spirv-val", "--target-env", target, output], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert output.read_bytes()[4:8] == source.read_bytes()[4:8]
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        "%p = OpAccessChain %ptr_in_v4 %in_pos %x",
+        "%p = OpInBoundsAccessChain %ptr_in_v4 %in_pos %x",
+    ).replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_out_float = OpTypePointer Output %float\n%out_pos = OpVariable %ptr_out_v4 Output",
+    ).replace(
+        "OpStore %out_pos %v",
+        "OpStore %out_pos %v\n"
+        "%out_x = OpInBoundsAccessChain %ptr_out_float %out_pos %u0\n"
+        "%x_value = OpCompositeExtract %float %v 0\n"
+        "OpStore %out_x %x_value",
+    )
+
+    def validate(name: str, assembly: str) -> None:
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    validate("geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "%p = OpAccessChain %gsc_ptr_sb_v4 %gsc_in " in lowered
+    assert "%out_x = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0" in lowered
+    validate("compute", lowered)
 
 
 @pytest.fixture

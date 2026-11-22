@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -70,7 +71,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
-#include <filesystem>
 #endif
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -619,6 +619,25 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    const std::string index_path = dir + "/index.json";
+    const auto same_file = [](const std::string& a, const std::string& b) {
+        std::error_code error;
+        return std::filesystem::equivalent(a, b, error);
+    };
+    // These inputs already exist on a valid invocation. Compare file identity so aliases are also protected.
+    for (const auto& [option, output] : {std::pair{"cache path", &cache_path},
+                                        std::pair{"--stats", &stats_path},
+                                        std::pair{"--inflight-file", &inflight_path}}) {
+        if (output->empty()) continue;
+        const char* input = nullptr;
+        if (same_file(*output, index_path)) input = "index.json";
+        else if (!skip_path.empty() && same_file(*output, skip_path)) input = "--skip-file";
+        if (input) {
+            std::fprintf(stderr, "error: %s must not overwrite %s\n", option, input);
+            return 2;
+        }
+    }
+
     std::set<std::string> skip_names;   // --skip-file: modules that killed the driver in an earlier run
     if (!skip_path.empty()) {
         std::ifstream sf(skip_path);
@@ -634,7 +653,7 @@ int main(int argc, char** argv) {
 
     std::string index_err;
     bool index_unreadable = false;
-    auto index = read_index(dir + "/index.json", index_err, index_unreadable);
+    auto index = read_index(index_path, index_err, index_unreadable);
     if (!index_err.empty()) {
         std::fprintf(stderr, index_unreadable ? "error: cannot read %s/index.json: %s\n" : "error: malformed JSON in %s/index.json: %s\n",
                      dir.c_str(), index_err.c_str());

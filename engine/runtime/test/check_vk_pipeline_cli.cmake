@@ -24,6 +24,20 @@ check_invalid(--slow -0.5)
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
 
+function(check_protected_input name)
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  string(FIND "${log}" "must not overwrite ${name}" found)
+  if(NOT code STREQUAL "2" OR found EQUAL -1)
+    message(FATAL_ERROR "${ARGN}: expected input/output path conflict, got ${code}\n${log}")
+  endif()
+endfunction()
+
+file(WRITE "${TEST_DIR}/skip.txt" "example\n")
+check_protected_input("index.json" "${TEST_DIR}/index.json")
+check_protected_input("index.json" --stats "${TEST_DIR}/./index.json")
+check_protected_input("--skip-file" --skip-file "${TEST_DIR}/skip.txt" --inflight-file "${TEST_DIR}/skip.txt")
+
 execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
                 --jobs 2 --start 3 --count 0 --max-bytes 0 --large-module-bytes 0
                 --slow 0.5 --stage cs --stats report.csv

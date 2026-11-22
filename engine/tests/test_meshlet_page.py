@@ -567,6 +567,33 @@ class MeshletCentreTests(unittest.TestCase):
             self.assertEqual((c["cones_4240_cones"], c["cones_4240_axis_within_25_degrees"], c["cones_4240_faces_inside"],
                               c["cones_4240_faces_inside_within_0_05"]), want, hex(cone))
 
+    def test_block4240_checks_streaming_and_summary_counts(self):
+        # Normal block with 16 vertices within 300m
+        packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
+        blk16 = other_block(16, packed=packed, bias=(10.0, 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data = page(blk16)
+        parsed = mp.parse_page(data)[0]
+        chk = mp.block4240_checks(data, parsed)
+        self.assertEqual(chk, {"positions_4240": 16, "positions_4240_finite": 16, "positions_4240_within_300m": 16})
+
+        # Beyond 300m range (bias at 500m)
+        blk_far = other_block(16, packed=packed, bias=(500.0, 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data_far = page(blk_far)
+        chk_far = mp.block4240_checks(data_far, mp.parse_page(data_far)[0])
+        self.assertEqual(chk_far, {"positions_4240": 16, "positions_4240_finite": 16, "positions_4240_within_300m": 0})
+
+        # Non-finite (NaN bias)
+        blk_nan = other_block(16, packed=packed, bias=(float("nan"), 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data_nan = page(blk_nan)
+        chk_nan = mp.block4240_checks(data_nan, mp.parse_page(data_nan)[0])
+        self.assertEqual(chk_nan, {"positions_4240": 16, "positions_4240_finite": 0, "positions_4240_within_300m": 0})
+
+        # summarise_page with multiple groups matching block4240
+        data_multi = page(blk16, group([(16, 5)]), group([(16, 8)]), group([(10, 2)]))
+        summary = mp.summarise_page(data_multi, "multi")
+        self.assertEqual(summary["groups_matching_4240_block_here"], 2)
+
+
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "p.bin")

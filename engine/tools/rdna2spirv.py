@@ -221,6 +221,7 @@ class Gen:
         self.consts = {}
         self.n = 0
         self.outputs = {}
+        self.partial_color_outputs: set[str] = set()
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
@@ -11628,7 +11629,7 @@ class Gen:
             regs = [srcs[0], srcs[2]] if len(srcs) >= 3 else srcs[:1]
             for x in regs:
                 if x["k"] == "special" and x["t"] == "off":
-                    comps += ["%f0", "%f0"]
+                    comps += [None, None]
                     continue
                 u = self.src_u(x)
                 v2 = self.tmp()
@@ -11640,14 +11641,13 @@ class Gen:
         else:
             for x in a[1:5]:
                 if x["k"] == "special" and x["t"] == "off":
-                    comps.append("%f0")
+                    comps.append(None)
                 else:
                     comps.append(self.src_f(x))
         while len(comps) < 4:
-            comps.append("%f0")
+            comps.append(None)
         comps = comps[:4]
         v = self.tmp()
-        self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comps)}")
         name = {"pos0": "%out_pos"}.get(tgt)
         if name is None:
             if tgt.startswith("param") and self.stage == "vs":
@@ -11662,6 +11662,14 @@ class Gen:
         # Exports from inactive lanes don't happen: keep the previous output value.
         old, sel = self.tmp(), self.tmp()
         self.emit(f"{old} = OpLoad %v4float {name}")
+        if self.stage == "ps" and tgt.startswith("mrt") and None in comps:
+            # EN gates each component (each RG/BA pair when compressed). Keep the previous export in off slots.
+            self.partial_color_outputs.add(name)
+            for i, comp in enumerate(comps):
+                if comp is None:
+                    comps[i] = self.tmp()
+                    self.emit(f"{comps[i]} = OpCompositeExtract %float {old} {i}")
+        self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comp or '%f0' for comp in comps)}")
         self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {v} {old}")
         self.emit(f"OpStore {name} {sel}")
         if F16_HALVES and tgt.startswith("param") and self.stage == "vs":
@@ -12183,7 +12191,10 @@ def assemble(gen):
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
-    gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
+    if gen.partial_color_outputs:
+        types.append("%initial_mrt = OpConstantNull %v4float")
+    gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" + (" %initial_mrt" if n in gen.partial_color_outputs else "")
+             for n in gen.outputs]
     # Push constants: s0..s31 user data, then the tail: the 64-bit host address of the Xbox GPU VA window (heap
     # base), the code base and, with --mesh-compute, the output address. --pc-tail-ubo moves the tail to %pc_tail.
     tail = ["%uint"] * (6 if msc else 4)

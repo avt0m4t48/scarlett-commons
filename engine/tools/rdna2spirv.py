@@ -1,20 +1,17 @@
-"""RDNA (gfx10) shader -> SPIR-V assembly, version 0.
+"""RDNA2 (gfx10) shader -> SPIR-V assembly.
 
 Model: one SPIR-V invocation runs one lane. VGPRs and SGPRs are Function-scope uint arrays; float ops bitcast,
-so register contents keep exact bit patterns. EXEC is treated as all-ones (valid for branch-free code).
+so register contents keep exact bit patterns. EXEC is a per-invocation active flag, and a lane mask keeps only this
+lane's bit; the few instructions that read a whole mask (s_bcnt1, s_ff1, v_mbcnt, ...) collect the other lanes with
+subgroup operations (lane_masks.py, and wave64_halves.py for wave64). Control flow is structured by
+cfg_structure.py, with a loop around a switch where it can't be (or for every shader with --dispatch-loop).
 
-Supported in v0 (anything else is reported, never guessed):
-  vector ALU  v_mov_b32 v_add/sub/subrev/mul/mul_legacy/fma/fmac/fmaak/fmamk/mac/max/min_f32 v_rcp/rsq/sqrt/
-              exp/log/floor/fract/ceil/trunc_f32 v_cvt_f32_u32/i32/ubyte0..3 v_cvt_u32/i32_f32
-              v_add/sub_nc_u32 v_and/or/xor_b32 v_lshlrev/lshrrev/ashrrev_i32 v_cndmask_b32 v_mul_u32_u24
-              v_bfe_u32 v_med3_f32 v_mad_u32_u24
-  scalar      s_mov_b32 s_add_u32 s_and_b32 s_or_b32 s_lshl_b32 s_lshr_b32 s_mul_i32
-  no-ops      s_waitcnt* s_nop s_inst_prefetch s_endpgm s_setprio s_clause s_delay_alu
-  export      exp pos0..3 / param0..31 (vertex) and mrt0..7 (pixel)
+Anything not modelled raises Unsupported and is reported, never guessed. The contract table in docs/design.md
+("Translator status and runtime contract") lists what each instruction family does and how it was confirmed.
 Vertex inputs: v0 = VertexIndex - BaseVertex and v3 = InstanceIndex - BaseInstance (the hardware's ids are zero-based).
 
 Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
-    python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N]
+    python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N] [--shard i/n]
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
 """

@@ -5,6 +5,8 @@
 Every byte here is built by the test: a synthetic drawable system page, a synthetic graphics page and a
 synthetic RPF9-style archive made of page-aligned zlib streams. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "skin_streams.py")
@@ -203,6 +206,32 @@ class TestClassify(unittest.TestCase):
         self.assertNotIn(21, mesh.slots)
 
 
+class TestResourceKindDictionary(unittest.TestCase):
+    """Dictionary headers follow the pinned rpf9-explorer's DrawableDictionaryCheckBytes.
+
+    Every byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def dictionary(pages=0x50000000 + 0x100):
+        b = bytearray(192)
+        struct.pack_into("<Q", b, 8, pages)
+        struct.pack_into("<Q", b, 32, 0x50000000 + 0x200)
+        struct.pack_into("<Q", b, 48, 0x50000000 + 0x300)
+        for at in (40, 42, 56, 58):
+            struct.pack_into("<H", b, at, 2)
+        return bytes(b)
+
+    def test_null_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0)))
+
+    def test_non_system_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0x12345678)))
+
+    def test_system_page_pointer_is_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
+
+
 class TestValidate(unittest.TestCase):
     def test_weighted_8bit_clean(self):
         _s, gfx, mesh = weighted_mesh("weighted-8inf-8bit", vertices=16, bones=6)
@@ -268,6 +297,42 @@ class TestValidate(unittest.TestCase):
         t = ss.validate(mesh, gfx, "weighted-4inf-8bit")
         self.assertEqual(t["weight-sum-min"], 155)
         self.assertEqual(t["weight-sum-max"], 255)
+
+    def test_weight_sum_min_max_without_255_vertex(self):
+        # All vertices sum below 255 (200) or above 255 (265): min/max must not be clamped to 255.
+        s_low, g_low = build_resource({
+            0: (8, 16, 128, quantized_position(4, 128)),
+            16: (4, 28, 96, bytes([100, 50, 30, 20] * 4)),
+            20: (4, 30, 96 + 16, bytes([0, 1, 2, 3] * 4)),
+        }, 4, 6)
+        m_low = ss.walk_resource(s_low, "drawable")[0]
+        t_low = ss.validate(m_low, g_low, "weighted-4inf-8bit")
+        self.assertEqual((t_low["weight-sum-min"], t_low["weight-sum-max"]), (200, 200))
+
+        s_high, g_high = build_resource({
+            0: (8, 16, 128, quantized_position(4, 128)),
+            16: (4, 28, 96, bytes([200, 40, 10, 5] * 4)),
+            17: (4, 28, 96 + 16, bytes([10, 0, 0, 0] * 4)),
+            20: (4, 30, 96 + 32, bytes([0, 1, 2, 3] * 4)),
+            21: (4, 30, 96 + 48, bytes([0, 0, 0, 0] * 4)),
+        }, 4, 6)
+        m_high = ss.walk_resource(s_high, "drawable")[0]
+        t_high = ss.validate(m_high, g_high, "weighted-8inf-8bit")
+        self.assertEqual((t_high["weight-sum-min"], t_high["weight-sum-max"]), (265, 265))
+
+    def test_non_graphics_vb_pointer_is_rejected(self):
+        system, gfx, mesh = weighted_mesh("weighted-4inf-8bit", vertices=4, bones=6)
+        patched = bytearray(system)
+        pos = patched.index(struct.pack("<Q", 0x60000000))
+        for bad_ptr in (0, 0x50000000, 0x60000000 - len(gfx) - 16, 0x60000000 + ss.MAX_GFX):
+            with self.subTest(bad_ptr=hex(bad_ptr)):
+                struct.pack_into("<Q", patched, pos, bad_ptr)
+                with self.assertRaises(ss.Skip):
+                    ss.walk_resource(bytes(patched), "drawable")
+        neg_mesh = ss.Mesh(mesh.vertices, mesh.bones, mesh.slots, -len(gfx) - 16, mesh.gfx_len)
+        padded_gfx = b"\x00" * 1024 + gfx + b"\x00" * 16
+        self.assertEqual(ss.validate(neg_mesh, padded_gfx, "weighted-4inf-8bit"),
+                         {"buffer-short": 1, "vertices": mesh.vertices})
 
 
 def build_archive(system, gfx, unaligned_copy=None):
@@ -340,6 +405,59 @@ class TestScanArchive(unittest.TestCase):
         stats = self.run_scan(system, gfx)
         self.assertEqual(stats["layouts"].get("rigid-16bit", {"meshes": 0})["meshes"], 1)
         self.assertEqual(stats["validated"]["rigid-16bit"]["components-out-of-range"], 0)
+
+    def test_scan_finds_fragment_with_null_optional_pointers(self):
+        system, gfx, _mesh = weighted_mesh("weighted-8inf-8bit", vertices=12, bones=7)
+        b = bytearray(system)
+        for at in (16, 32, 40):
+            struct.pack_into("<Q", b, at, 0)
+        struct.pack_into("<Q", b, 24, 0x50000000)   # the embedded drawable is at offset 0
+        struct.pack_into("<Q", b, 168, 0x50000000 + 0x180)
+        for i, value in enumerate((1, 1, 1, 2)):
+            struct.pack_into("<H", b, 48 + 2 * i, value)
+        stats = self.run_scan(bytes(b), gfx)
+        self.assertEqual(stats["resources"], 1)
+        self.assertEqual(stats["layouts"]["weighted-8inf-8bit"]["meshes"], 1)
+
+
+class TestResourceKind(unittest.TestCase):
+    """Fragment headers follow the pinned rpf9-explorer decoder (breadbbbb/rpf9-explorer#8).
+
+    Every header byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def fragment(fields=(1, 1, 1, 1), optional="all", drawable=True):
+        b = bytearray(192)
+        for at in (8, 24, 168):
+            if at != 24 or drawable:
+                struct.pack_into("<Q", b, at, 0x50000000 + 0x100)
+        if optional == "all":
+            for at in (16, 32, 40):
+                struct.pack_into("<Q", b, at, 0x50000000 + 0x200)
+        for i, value in enumerate(fields):
+            struct.pack_into("<H", b, 48 + 2 * i, value)
+        return bytes(b)
+
+    def test_null_optional_pointers_are_a_fragment(self):
+        self.assertEqual(ss.resource_kind(self.fragment(fields=(1, 1, 1, 2), optional="none")), "fragment")
+
+    def test_unequal_part_fields_are_a_fragment(self):
+        self.assertEqual(ss.resource_kind(self.fragment(fields=(1, 2, 3, 9))), "fragment")
+
+    def test_reversed_part_fields_are_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(fields=(1, 1, 9, 3))))
+
+    def test_zero_first_part_count_is_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(fields=(0, 0, 1, 1))))
+
+    def test_non_null_non_system_optional_pointer_is_rejected(self):
+        b = bytearray(self.fragment(optional="none"))
+        struct.pack_into("<Q", b, 32, 0x12345678)
+        self.assertIsNone(ss.resource_kind(bytes(b)))
+
+    def test_null_drawable_pointer_is_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(drawable=False)))
 
 
 class TestFormatTable(unittest.TestCase):
@@ -425,6 +543,19 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn("--sample must be at least 1", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
+
+    def test_unreadable_archive_reports_its_path_without_writing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "report.json")
+            stderr = io.StringIO()
+            error = PermissionError(13, "input is locked", path)
+            with (mock.patch.object(ss, "open", create=True, side_effect=error),
+                  contextlib.redirect_stderr(stderr)):
+                self.assertEqual(ss.main([path, "--json", out]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(),
+                             [f"error: cannot read {path}: input is locked"])
+            self.assertFalse(os.path.exists(out))
 
     def test_missing_or_directory_input_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

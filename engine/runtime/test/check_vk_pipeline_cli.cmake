@@ -21,6 +21,7 @@ check_invalid(--large-module-bytes -1)
 check_invalid(--slow nonsense)
 check_invalid(--slow nan)
 check_invalid(--slow -0.5)
+check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its numeric prefix
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
 
@@ -41,5 +42,19 @@ foreach(bytes -1 1.5 4294967296)
   # The index parser says where it stopped (#1847: "expected unsigned 32-bit lds_bytes at byte 37").
   if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
     message(FATAL_ERROR "lds_bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
+
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"push_constant_bytes\":${bytes}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
+    message(FATAL_ERROR "push_constant_bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
+
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"pc_tail\":{\"set\":1,\"binding\":0,\"bytes\":${bytes}}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
+    message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()

@@ -107,7 +107,12 @@ def walk(game_dir: str, *, exclude=None):
             if contains_manifest and os.path.normcase(name) == excluded_name:
                 continue
             p = os.path.join(root, name)
-            yield os.path.relpath(p, game_dir).replace("\\", "/"), p
+            rel = os.path.relpath(p, game_dir)
+            if os.sep != "/":
+                rel = rel.replace(os.sep, "/")
+            if os.altsep and os.altsep != "/":
+                rel = rel.replace(os.altsep, "/")
+            yield rel, p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
@@ -206,6 +211,9 @@ def load_manifest(manifest: str) -> dict:
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
     have = dict(walk(game_dir, exclude=manifest))
+    if not want and have:
+        # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
+        raise ManifestError(f"{manifest} lists no files, but {game_dir} holds {len(have)}; create it again")
     problems = {}
     pending = []
     for rel, info in want.items():

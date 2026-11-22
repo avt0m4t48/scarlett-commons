@@ -72,10 +72,10 @@ def layout(nblocks, wblocks, mode, bpe):
     return y * wblocks + x
 
 
-def score(img):
-    dx = np.abs(np.diff(img, axis=1)).mean()
-    dy = np.abs(np.diff(img, axis=0)).mean()
-    return dx + dy
+def score(img: np.ndarray) -> float:
+    """Sum the mean color differences along axes with neighboring blocks."""
+    return float(sum(np.abs(np.diff(img, axis=axis)).mean()
+                     for axis in (1, 0) if img.shape[axis] > 1))
 
 
 def probe(data: bytes, offset=0):
@@ -152,7 +152,10 @@ def check_preview_path(out, blob):
     if same_report_path(out, blob):
         raise SystemExit(f"--out would overwrite the input {blob}")
     out_dir = os.path.dirname(os.path.abspath(out))
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:  # a regular file where the folder should be: one line, not a traceback
+        raise SystemExit(f"--out {out}: cannot create {out_dir}: {e.strerror or e}")
 
 
 def main():

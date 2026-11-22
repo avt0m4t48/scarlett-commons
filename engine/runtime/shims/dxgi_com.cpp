@@ -1,6 +1,7 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +16,9 @@
 namespace rt::dxgi {
 namespace {
 
+// Native DXGI accepts up to 40 queued frames on a waitable swapchain.
+constexpr UINT max_waitable_frame_latency = 40;
+
 void stub(const char* method) {
     static std::mutex mutex;
     static std::set<std::string> seen;
@@ -24,6 +28,14 @@ void stub(const char* method) {
 
 bool valid_flip_buffer_count(UINT count) {
     return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
+}
+
+bool is_direct_present_queue(IUnknown* candidate) {
+    ID3D12CommandQueue* queue = nullptr;
+    if (!candidate || FAILED(candidate->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return false;
+    const bool direct = queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queue->Release();
+    return direct;
 }
 
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
@@ -119,6 +131,7 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
         if (parent_) parent_->Release();
@@ -135,7 +148,7 @@ public:
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
-            waitable_ = CreateSemaphoreW(nullptr, 1, 16, nullptr);
+            waitable_ = CreateSemaphoreW(nullptr, 1, max_waitable_frame_latency, nullptr);
             if (!waitable_) return false;
         }
         register_buffers();
@@ -178,7 +191,15 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        return device_ ? device_->QueryInterface(riid, out) : E_NOINTERFACE;
+        if (!device_) return E_NOINTERFACE;
+
+        ID3D12DeviceChild* device_child = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&device_child)))) {
+            const HRESULT hr = device_child->GetDevice(riid, out);
+            device_child->Release();
+            return hr;
+        }
+        return device_->QueryInterface(riid, out);
     }
 
     // IDXGISwapChain
@@ -202,7 +223,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
         if (!surface) return E_POINTER;
         *surface = nullptr;
-        if (buffer >= buffers_.size()) return E_INVALIDARG;
+        if (buffer >= buffers_.size()) return DXGI_ERROR_INVALID_CALL;
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
@@ -230,6 +251,11 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
+        return resize_buffers(count, width, height, fmt, flags, nullptr, nullptr);
+    }
+
+    HRESULT resize_buffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags,
+                           const UINT* node_masks, IUnknown* const* present_queues) {
         if (count != 0 && !valid_flip_buffer_count(count)) return E_INVALIDARG;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
@@ -242,6 +268,11 @@ public:
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
+        const std::size_t target_count = count ? count : buffers_.size();
+        if (node_masks && !std::all_of(node_masks, node_masks + target_count, [](UINT mask) { return mask <= 1; }))
+            return DXGI_ERROR_INVALID_CALL;
+        if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
+            return DXGI_ERROR_INVALID_CALL;
         unregister_buffers();
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
@@ -256,7 +287,20 @@ public:
         return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
     }
 
-    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* mode) override {
+        if (!mode) return DXGI_ERROR_INVALID_CALL;  // host-measured, not E_INVALIDARG
+        // Windowed: the target output's client area takes the mode's size, and the back buffers keep theirs until
+        // ResizeBuffers (where 0 means the client area). The window's own style gives the frame around it. A zero
+        // size is accepted, as on the host, and the window's minimum tracking size decides what is left of it.
+        RECT frame{0, 0, static_cast<LONG>(mode->Width), static_cast<LONG>(mode->Height)};
+        const auto style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_STYLE));
+        const auto ex_style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_EXSTYLE));
+        if (!AdjustWindowRectEx(&frame, style, FALSE, ex_style)) return E_INVALIDARG;
+        if (!SetWindowPos(hwnd_, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+            return DXGI_ERROR_INVALID_CALL;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
         if (!stats) return DXGI_ERROR_INVALID_CALL;
@@ -300,12 +344,30 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void** out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        return DXGI_ERROR_INVALID_CALL;
+    }
     HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) override {
         return Present(sync, flags);
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
-    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** out) override {
+        if (!out) return E_INVALIDARG;
+        if (restrict_to_output_) {
+            *out = restrict_to_output_;
+            restrict_to_output_->AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    void set_restrict_to_output(IDXGIOutput* out) {
+        if (restrict_to_output_) restrict_to_output_->Release();
+        restrict_to_output_ = out;
+        if (restrict_to_output_) restrict_to_output_->AddRef();
+    }
     HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* color) override {
         if (!color) return E_INVALIDARG;
         background_color_ = *color;
@@ -334,8 +396,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
-        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
-        if (max_latency == 0 || max_latency > 16) return E_INVALIDARG;
+        if (!waitable_ || max_latency == 0 || max_latency > max_waitable_frame_latency)
+            return DXGI_ERROR_INVALID_CALL;
         const UINT prev = max_frame_latency_.exchange(max_latency, std::memory_order_relaxed);
         if (max_latency > prev)
             ReleaseSemaphore(waitable_, static_cast<LONG>(max_latency - prev), nullptr);
@@ -373,9 +435,9 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags, const UINT*,
-                                             IUnknown* const*) override {
-        return ResizeBuffers(count, w, h, fmt, flags);
+    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
+                                             const UINT* node_masks, IUnknown* const* present_queues) override {
+        return resize_buffers(count, w, h, fmt, flags, node_masks, present_queues);
     }
 
 private:
@@ -424,6 +486,7 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
+    IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
@@ -627,9 +690,13 @@ public:
         }
         return E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE, DWORD* cookie) override {
-        if (cookie) *cookie = 0;
-        return E_NOTIMPL;
+    // Microsoft documents only "an HRESULT success or error code" and a cookie for
+    // UnregisterVideoMemoryBudgetChangeNotification. The budget here is recomputed on every QueryVideoMemoryInfo and
+    // never changes by itself, so the event is registered and never signalled.
+    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return E_INVALIDARG;
+        *cookie = next_budget_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
 
@@ -698,6 +765,7 @@ private:
         }
     }
 
+    std::atomic<DWORD> next_budget_cookie_{1};
     std::atomic<ULONG> refs_{1};
     IDXGIFactory4* parent_ = nullptr;
     PFN_vkGetInstanceProcAddr gipa_ = nullptr;
@@ -708,7 +776,7 @@ private:
     std::shared_ptr<ReservationState> reservations_;
 };
 
-class Factory final : public IDXGIFactory5 {
+class Factory final : public IDXGIFactory7 {
 public:
     Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
             VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
@@ -727,8 +795,9 @@ public:
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIFactory) ||
             riid == __uuidof(IDXGIFactory1) || riid == __uuidof(IDXGIFactory2) ||
             riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4) ||
-            riid == __uuidof(IDXGIFactory5)) {
-            *out = static_cast<IDXGIFactory5*>(this);
+            riid == __uuidof(IDXGIFactory5) || riid == __uuidof(IDXGIFactory6) ||
+            riid == __uuidof(IDXGIFactory7)) {
+            *out = static_cast<IDXGIFactory7*>(this);
             AddRef();
             return S_OK;
         }
@@ -739,7 +808,11 @@ public:
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
-    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
 
     // IDXGIFactory
     HRESULT STDMETHODCALLTYPE EnumAdapters(UINT index, IDXGIAdapter** out) override {
@@ -750,15 +823,47 @@ public:
         *out = static_cast<IDXGIAdapter*>(adapter);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND hwnd, UINT) override { assoc_hwnd_ = hwnd; return S_OK; }
+    HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND hwnd, UINT flags) override {
+        // Host-measured: only the three documented bits are accepted; any other bit is DXGI_ERROR_INVALID_CALL.
+        constexpr UINT known = DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN;
+        if (flags & ~known) return DXGI_ERROR_INVALID_CALL;
+        assoc_hwnd_ = hwnd;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* hwnd) override {
         if (!hwnd) return E_INVALIDARG;
         *hwnd = assoc_hwnd_;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**) override {
-        stub("IDXGIFactory::CreateSwapChain");
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) override {
+        if (!out || !device || !desc) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        DXGI_SWAP_CHAIN_DESC1 desc1{};
+        desc1.Width = desc->BufferDesc.Width;
+        desc1.Height = desc->BufferDesc.Height;
+        desc1.Format = desc->BufferDesc.Format;
+        desc1.SampleDesc = desc->SampleDesc;
+        desc1.BufferUsage = desc->BufferUsage;
+        desc1.BufferCount = desc->BufferCount;
+        desc1.Scaling = DXGI_SCALING_STRETCH;
+        desc1.SwapEffect = desc->SwapEffect;
+        desc1.Flags = desc->Flags;
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc{};
+        fs_desc.Windowed = desc->Windowed;
+        fs_desc.RefreshRate = desc->BufferDesc.RefreshRate;
+        fs_desc.Scaling = desc->BufferDesc.Scaling;
+        fs_desc.ScanlineOrdering = desc->BufferDesc.ScanlineOrdering;
+        IDXGISwapChain1* sc1 = nullptr;
+        const HRESULT hr = CreateSwapChainForHwnd(device, desc->OutputWindow, &desc1, &fs_desc, nullptr, &sc1);
+        if (SUCCEEDED(hr) && sc1) {
+            *out = static_cast<IDXGISwapChain*>(sc1);
+            if (!desc->Windowed) {
+                // When exclusive fullscreen is unavailable, native DXGI creates the
+                // windowed chain and returns DXGI_STATUS_OCCLUDED.
+                return DXGI_STATUS_OCCLUDED;
+            }
+        }
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE, IDXGIAdapter**) override { return E_NOTIMPL; }
 
@@ -776,7 +881,7 @@ public:
     // IDXGIFactory2
     BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
+                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput* restrict_to_output,
                                                      IDXGISwapChain1** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -786,6 +891,7 @@ public:
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
             return E_FAIL;
@@ -870,6 +976,39 @@ public:
         return E_INVALIDARG;
     }
 
+    // IDXGIFactory6. The factory has one adapter, so every preference orders the same list. Measured on the host's
+    // dxgi.dll (Windows 11, RTX 3070): a preference outside the enum is accepted, a null `out` is
+    // DXGI_ERROR_INVALID_CALL, and an index past the end is DXGI_ERROR_NOT_FOUND with *out cleared.
+    HRESULT STDMETHODCALLTYPE EnumAdapterByGpuPreference(UINT index, DXGI_GPU_PREFERENCE, REFIID riid,
+                                                         void** out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        if (index != 0) return DXGI_ERROR_NOT_FOUND;
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        const HRESULT hr = adapter->QueryInterface(riid, out);
+        adapter->Release();
+        return hr;
+    }
+
+    // IDXGIFactory7. The adapter list never changes, so a registered event is never signalled; the registry only
+    // keeps the host's answers (same measurement): a null event or cookie and an event registered twice are
+    // DXGI_ERROR_INVALID_CALL, cookies start at 1 and are separate from the occlusion cookies, and an unknown
+    // cookie is DXGI_ERROR_NOT_FOUND.
+    HRESULT STDMETHODCALLTYPE RegisterAdaptersChangedEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        std::lock_guard lock(adapters_changed_mutex_);
+        for (const auto& [registered_cookie, registered_event] : adapters_changed_events_)
+            if (registered_event == event) return DXGI_ERROR_INVALID_CALL;
+        const DWORD next = next_adapters_changed_cookie_++;
+        adapters_changed_events_.emplace(next, event);
+        *cookie = next;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE UnregisterAdaptersChangedEvent(DWORD cookie) override {
+        std::lock_guard lock(adapters_changed_mutex_);
+        return adapters_changed_events_.erase(cookie) ? S_OK : DXGI_ERROR_NOT_FOUND;
+    }
+
 private:
     bool probe_immediate_present_mode() const {
         if (!gipa_ || !instance_ || !physical_) return false;
@@ -919,6 +1058,9 @@ private:
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
     std::atomic<DWORD> next_occlusion_cookie_{1};
+    std::mutex adapters_changed_mutex_;
+    std::map<DWORD, HANDLE> adapters_changed_events_;
+    DWORD next_adapters_changed_cookie_ = 1;
 };
 
 }  // namespace

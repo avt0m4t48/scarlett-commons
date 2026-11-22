@@ -15,6 +15,7 @@
 // A device without the bindless set refuses the PSO. No game data: the program is two marker words and the module is
 // GLSL written to the translator's contract.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -69,7 +70,7 @@ int main() {
     const auto container = shader_container(program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_set0_compute_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SET0_SAMPLE_SPV), library / "cs_set0_sample.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -98,6 +99,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
+            std::printf("d3d12_set0_compute_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(inner));
+            return 77;
+        }
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
         // Root signature: [0] two constants (s0: the view slot's offset in dwords, s1: the first output element),

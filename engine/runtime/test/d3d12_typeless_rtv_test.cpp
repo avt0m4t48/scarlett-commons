@@ -643,7 +643,9 @@ int main() {
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         invalid.Texture2DArray = {0, 1, 1, 0};
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
-        for (const auto range : {std::pair{1u, UINT_MAX}, std::pair{0u, 0u}, std::pair{4u, 1u}, std::pair{3u, 2u}}) {
+        // ArraySize -1 from a slice of the array is every slice left (d3d12_view_slices_test); past the array it is
+        // refused.
+        for (const auto range : {std::pair{4u, UINT_MAX}, std::pair{0u, 0u}, std::pair{4u, 1u}, std::pair{3u, 2u}}) {
             invalid.Texture2DArray = {1, range.first, range.second, 0};
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 3, 4)) return 1;
         }

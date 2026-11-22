@@ -1255,6 +1255,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_typeless_rtv COMMAND d3d12_typeless_rtv_test)
 
+    # ArraySize -1 in array RTVs and DSVs (every slice from the first on), against the host on the same adapter
+    # and WARP.
+    add_executable(d3d12_view_slices_test test/d3d12_view_slices_test.cpp)
+    target_link_libraries(d3d12_view_slices_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_view_slices_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_view_slices_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_view_slices COMMAND d3d12_view_slices_test)
+    set_tests_properties(d3d12_view_slices PROPERTIES SKIP_RETURN_CODE 77)
+
     # Typed RTV clears and draws of every TYPELESS color family against the host on the same adapter and WARP
     # (D3D-275). The draws need glslangValidator for their GLSL stand-ins of translated shaders.
     add_executable(d3d12_typeless_families_test test/d3d12_typeless_families_test.cpp)

@@ -375,6 +375,18 @@ with open(os.environ["FAKE_FFMPEG_STDIN_LOG"], "a", encoding="utf-8") as log:
 """
 
 
+def batch_path(path):
+    """A spelling of path that cmd.exe reads correctly from a batch file. cmd.exe decodes a batch file with the
+    console's OEM code page, not UTF-8, so a path with non-ASCII letters (a user folder named in Cyrillic, say)
+    becomes "The system cannot find the path specified". Its 8.3 short name is ASCII."""
+    if path.isascii():
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+    return buf.value if 0 < n < len(buf) else path
+
+
 def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
     """Write source as a Python script and return an ffmpeg command for --ffmpeg that runs it."""
     script = os.path.join(directory, "fake_ffmpeg.py")
@@ -382,8 +394,9 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
         f.write(source)
     if os.name == "nt":
         ffmpeg = os.path.join(directory, "ffmpeg.cmd")
-        with open(ffmpeg, "w", encoding="utf-8") as f:
-            f.write(f'@"{sys.executable}" "{script}" %*\n')
+        # "oem" for the rare path without a short name (8.3 names turned off on the volume).
+        with open(ffmpeg, "w", encoding="oem") as f:
+            f.write(f'@"{batch_path(sys.executable)}" "{batch_path(script)}" %*\n')
     else:
         ffmpeg = os.path.join(directory, "ffmpeg")
         with open(ffmpeg, "w", encoding="utf-8") as f:

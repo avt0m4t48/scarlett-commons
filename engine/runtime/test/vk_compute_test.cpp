@@ -8,6 +8,10 @@
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
 //   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
+//   VKC_SUBGROUP_SIZE=N (env): run at N lanes. Where the device can't require a compute subgroup size but N is its
+//   default subgroupSize (MoltenVK: 32, and requiredSubgroupSizeStages 0), the size is still fixed for a SPIR-V 1.5
+//   module (no varying subgroup size); cs_wave_probe.comp then checks, with the test's local size and flags, that every
+//   invocation sees N lanes in order and a ballot N wide, or the test fails (exit 1) without running.
 //   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
 //   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
@@ -17,6 +21,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "cs_wave_probe_spv.h"
 
 #include <cctype>
 #include <cmath>
@@ -49,6 +54,22 @@ static bool parse_u32(const char*& s, uint32_t& v) {
     if (x > 0xFFFFFFFFull) return false;
     v = uint32_t(x); s = end;
     return true;
+}
+
+// The module's SPIR-V version and its OpExecutionMode LocalSize (all zero without one, e.g. LocalSizeId).
+static uint32_t spirv_local_size(const std::vector<char>& code, uint32_t local[3]) {
+    local[0] = local[1] = local[2] = 0;
+    const std::size_t n = code.size() / 4;
+    std::vector<uint32_t> w(n);
+    if (n) std::memcpy(w.data(), code.data(), n * 4);
+    if (n < 5 || w[0] != 0x07230203u) return 0;
+    for (std::size_t i = 5; i < n;) {
+        const uint32_t len = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (!len || i + len > n) break;
+        if (op == 16 && len == 6 && w[i + 2] == 17) { local[0] = w[i + 3]; local[1] = w[i + 4]; local[2] = w[i + 5]; }
+        i += len;
+    }
+    return w[1];
 }
 
 static bool next_item(const char*& s) {
@@ -97,6 +118,10 @@ int main(int argc, char** argv) {
         }
         out_words = uint32_t(n);
     }
+    std::ifstream f(argv[1], std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    uint32_t local[3];
+    const uint32_t spirv_version = spirv_local_size(code, local);
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -153,19 +178,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
     if (needs_float64 && !f2q.features.shaderFloat64) {
         std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
         return 77;
     }
+    // A size the device can't require but runs anyway: one min..max range (fixed), or its default subgroupSize in a
+    // module below SPIR-V 1.6 (Vulkan "Varying Subgroup Size": SubgroupSize then always equals subgroupSize), which
+    // cs_wave_probe checks before the test runs (observed). Full subgroups where local size X is a multiple of
+    // maxSubgroupSize (VUID-VkPipelineShaderStageCreateInfo-flags-02759).
+    const bool fixed = req_sg && sgProps.minSubgroupSize == sgProps.maxSubgroupSize && subgroup.subgroupSize == req_sg;
+    const uint32_t local_total = local[0] * local[1] * local[2];
+    const bool observed = req_sg && !require_wave64 && !can_request_size && !fixed &&
+        subgroup.subgroupSize == req_sg && spirv_version && spirv_version < 0x00010600u &&
+        local_total && local_total <= 1024;
+    const bool observed_full = observed && f13q.computeFullSubgroups && local[0] % sgProps.maxSubgroupSize == 0;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
     if (f13q.subgroupSizeControl || require_wave64) {
         f13.subgroupSizeControl = f13q.subgroupSizeControl;
-        f13.computeFullSubgroups = require_wave64 ? VK_TRUE : VK_FALSE;
+        f13.computeFullSubgroups = require_wave64 || observed_full ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -269,7 +302,7 @@ int main(int argc, char** argv) {
     reqSg.requiredSubgroupSize = req_sg;
     if (can_request_size)
         cpi.stage.pNext = &reqSg;
-    if (require_wave64)
+    if (require_wave64 || observed_full)
         cpi.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
@@ -277,9 +310,8 @@ int main(int argc, char** argv) {
     else if (req_sg) {
         // VKC_SUBGROUP_SIZE: say whether the pipeline really runs at that size, so a runner can skip a test the device
         // can't pin instead of judging words from whatever size the driver picked (#774).
-        const bool fixed = sgProps.minSubgroupSize == sgProps.maxSubgroupSize && subgroup.subgroupSize == req_sg;
         if (can_request_size || fixed) std::printf("compute subgroup size: %u\n", req_sg);
-        else std::printf("compute subgroup size: %u not available\n", req_sg);
+        else if (!observed) std::printf("compute subgroup size: %u not available\n", req_sg);
     }
 
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0x31016FACu;     // V#: base 0, stride 0, num_records max, OOB_SELECT 3 (raw)
@@ -290,6 +322,72 @@ int main(int argc, char** argv) {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    if (observed) {
+        // cs_wave_probe with the test's local size and flags, one group, four words per invocation in its own buffer.
+        VkBufferCreateInfo pbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        pbi.size = VkDeviceSize(local_total) * 16;
+        pbi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        VkBuffer pbuf; CHECK(vkCreateBuffer(dev, &pbi, nullptr, &pbuf));
+        VkMemoryRequirements pmr; vkGetBufferMemoryRequirements(dev, pbuf, &pmr);
+        VkMemoryAllocateInfo pmai = mai;
+        pmai.allocationSize = pmr.size;
+        VkDeviceMemory pmem; CHECK(vkAllocateMemory(dev, &pmai, nullptr, &pmem));
+        CHECK(vkBindBufferMemory(dev, pbuf, pmem, 0));
+        void* pmap; CHECK(vkMapMemory(dev, pmem, 0, pbi.size, 0, &pmap));
+        std::memset(pmap, 0xEE, size_t(pbi.size));
+        VkBufferDeviceAddressInfo pbai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        pbai.buffer = pbuf;
+        const uint64_t paddr = vkGetBufferDeviceAddress(dev, &pbai);
+        VkShaderModuleCreateInfo psmi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        psmi.codeSize = sizeof(leonida::vk_test::cs_wave_probe_spirv);
+        psmi.pCode = leonida::vk_test::cs_wave_probe_spirv;
+        VkShaderModule psm; CHECK(vkCreateShaderModule(dev, &psmi, nullptr, &psm));
+        const VkSpecializationMapEntry entries[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+        const VkSpecializationInfo spec{3, entries, sizeof(local), local};
+        VkComputePipelineCreateInfo pcpi = cpi;
+        pcpi.flags = 0;
+        pcpi.stage.module = psm;
+        pcpi.stage.pSpecializationInfo = &spec;
+        VkPipeline ppipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pcpi, nullptr, &ppipe));
+        const uint32_t ppc[2] = {uint32_t(paddr), uint32_t(paddr >> 32)};   // cs_wave_probe's buffer address
+        VkCommandBuffer pcmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &pcmd));
+        VkCommandBufferBeginInfo pcbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        CHECK(vkBeginCommandBuffer(pcmd, &pcbi));
+        vkCmdBindPipeline(pcmd, VK_PIPELINE_BIND_POINT_COMPUTE, ppipe);
+        vkCmdPushConstants(pcmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ppc), ppc);
+        vkCmdDispatch(pcmd, 1, 1, 1);
+        VkMemoryBarrier pread{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        pread.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        pread.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(pcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                             1, &pread, 0, nullptr, 0, nullptr);
+        CHECK(vkEndCommandBuffer(pcmd));
+        VkSubmitInfo psi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        psi.commandBufferCount = 1; psi.pCommandBuffers = &pcmd;
+        CHECK(vkQueueSubmit(q, 1, &psi, VK_NULL_HANDLE));
+        CHECK(vkQueueWaitIdle(q));
+        // Invocation l: a subgroup of req_sg lanes in order (lane l % N of subgroup l / N), and a ballot of every
+        // lane it has (N, or what is left of the group in the last one when local size X is not a multiple of N).
+        const uint32_t* pw = static_cast<const uint32_t*>(pmap);
+        uint32_t wrong = 0, first = 0;
+        for (uint32_t l = 0; l < local_total; l++) {
+            const uint32_t lanes = std::min(req_sg, local_total - l / req_sg * req_sg);
+            const uint32_t* w = pw + 4 * l;
+            if (w[0] != req_sg || w[1] != l % req_sg || w[2] != l / req_sg || w[3] != lanes) {
+                if (!wrong) first = l;
+                wrong++;
+            }
+        }
+        if (wrong) {
+            const uint32_t* w = pw + 4 * first;
+            std::printf("compute subgroup size: %u observed wrong in %u of %u invocations; invocation %u has "
+                        "SubgroupSize %u, lane %u, subgroup %u, a ballot of %u lanes\n", req_sg, wrong, local_total,
+                        first, w[0], w[1], w[2], w[3]);
+            return 1;
+        }
+        std::printf("compute subgroup size: %u (observed: all %u invocations of a %ux%ux%u group%s)\n", req_sg,
+                    local_total, local[0], local[1], local[2], observed_full ? ", full subgroups" : "");
+    }
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);

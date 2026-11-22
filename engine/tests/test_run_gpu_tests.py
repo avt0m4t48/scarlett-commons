@@ -300,6 +300,14 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
                          "SKIP (the device can't run this shader at 32 lanes on request)")
         self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
+        observed = "compute subgroup size: 32 (observed: all 20 invocations of a 20x1x1 group)\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: Apple M3 Max (subgroup 4..32)\n" + observed))
+        wrong = "compute subgroup size: 32 observed wrong in 4 of 64 invocations; invocation 60 has SubgroupSize 32\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 4..32)\n" + wrong))
+        ok, detail = rgt.judge_cs_dump(1, "device: X (subgroup 4..32)\n" + wrong, [1], wave64=False, partial=False,
+                                       emulated=False)
+        self.assertIs(ok, False)
+        self.assertIn("observed wrong", detail)
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),

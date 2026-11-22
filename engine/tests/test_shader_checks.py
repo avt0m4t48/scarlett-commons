@@ -859,6 +859,26 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
+    def test_judged_when_32_lanes_are_observed(self):
+        # MoltenVK: no compute stage in requiredSubgroupSizeStages, but vk_compute_test's cs_wave_probe saw 32 lanes.
+        out = "device: Apple M3 Max (subgroup 4..32)\ncompute subgroup size: 32 (observed: all 64 invocations of a " \
+              "64x1x1 group, full subgroups)\n"
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                problem = self.run_dump(name, 0, out + self.words(name, flip=True))
+                self.assertTrue(problem)
+                self.assertNotIsInstance(problem, check.Skip)
+
+    def test_failed_when_the_observed_size_is_wrong(self):
+        out = ("device: gpu (subgroup 4..32)\ncompute subgroup size: 32 observed wrong in 64 of 64 invocations; "
+               "invocation 0 has SubgroupSize 32, lane 0, subgroup 0, a ballot of 16 lanes\n")
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                problem = self.run_dump(name, 1, out)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("observed wrong", problem)
+
 
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""

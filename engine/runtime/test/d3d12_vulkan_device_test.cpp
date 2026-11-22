@@ -6385,7 +6385,7 @@ int main() {
             UINT64 frequency = 0;
             EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
             EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
-            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, refused;
+            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, so, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
             // A null output is E_UNEXPECTED, as on the host runtime (compare_invalid_arguments, "query heap:").
@@ -6398,16 +6398,20 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
             EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
-            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1, 0};  // no stream output path yet
-            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+            // The layer has no stream output, so stream-output statistics heaps are made without a Vulkan pool and
+            // every query reads zero (D3D-302).
+            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 3, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&so.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
             if (d.pipeline_statistics_query)
                 EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&statistics.p))));
             else
                 std::printf("pipeline statistics: no pipelineStatisticsQuery, skipped\n");
 
-            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, the second run's at 1024.
-            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, again_at = 1024;
+            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, stream output at 512, the second
+            // run's at 1024.
+            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, so_at = 512, again_at = 1024;
+            static_assert(sizeof(D3D12_QUERY_DATA_SO_STATISTICS) == 16);
             const auto u64 = [&](UINT64 offset) {
                 UINT64 value;
                 std::memcpy(&value, down + offset, sizeof(value));
@@ -6417,15 +6421,21 @@ int main() {
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
             if (statistics.p) list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            // Two streams at once, inside the statistics query and crossing the occlusion one: none of them is a
+            // Vulkan query, so none overlaps.
+            list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+            list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1);
             // A rectangle clear runs in a render pass inside a query; clears count no samples.
             device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);  // the resolve test reused it
             list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
             barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &barrier);
             list->ClearRenderTargetView(rtv1, red, 1, &square);
+            list->EndQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
             list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
             list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
             list->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+            list->EndQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1);
             list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
             if (statistics.p) list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -6436,6 +6446,8 @@ int main() {
             if (statistics.p)
                 list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, readback.p,
                                        statistics_at);
+            list->ResolveQueryData(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 1, readback.p, so_at);
+            list->ResolveQueryData(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1, 2, readback.p, so_at + 16);  // 2: never
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
@@ -6448,6 +6460,8 @@ int main() {
             for (UINT i = 0; i < 4; ++i) EXPECT(u64(occlusion_at + 8 * i) == 0);
             for (UINT i = 0; statistics.p && i < 22; ++i) EXPECT(u64(statistics_at + 8 * i) == 0);
             EXPECT(u64(statistics.p ? statistics_at + 176 : statistics_at) == 0xcdcdcdcdcdcdcdcdull);  // not past it
+            for (UINT i = 0; i < 6; ++i) EXPECT(u64(so_at + 8 * i) == 0);  // written and needed, three queries
+            EXPECT(u64(so_at + 48) == 0xcdcdcdcdcdcdcdcdull);              // not past them
 
             // A second execution reuses timestamp 0 (reset before it is written again) and resolves timestamp 1,
             // which keeps the result of the first execution.
@@ -6507,6 +6521,12 @@ int main() {
                           [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // a type the heap does not hold
                           [&] { list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query, [&] {  // a stream-output query in an occlusion heap
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
+            }));
+            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // a stream-output query begun and never ended
+                          [&] { list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // into a texture
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, rt_resource.p, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the buffer

@@ -3931,7 +3931,11 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
         {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
-        {"command list1: type -1", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1)); }},
+        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and Windows 11's refuses it
+        // (measured on #2297), so it is compared only on a host with ID3D12Device10.
+        {"command list1: type -1", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1));
+         }, +device10},
         {"command list1: node mask 1", [](ID3D12Device* d) {
              return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
          }},

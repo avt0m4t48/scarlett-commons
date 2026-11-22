@@ -603,6 +603,21 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
                 self.assertEqual(len(dds) - 148, array_size * 6 * 4)
                 self.assertEqual(dds[148:], payload)
 
+    def test_dds_bytes_describes_the_top_subresource(self) -> None:
+        cases = (
+            # 6x5 RGBA8 top level (120 bytes) and 3x2 next level (24 bytes).
+            (6, 5, 28, bytes(range(144)), 0x8, 24),
+            # 9x5 BC1 top level (six blocks) and 4x2 next level (one block).
+            (9, 5, 71, bytes(range(56)), 0x80000, 48),
+        )
+        for width, height, fmt, payload, expected_flags, expected_size in cases:
+            with self.subTest(dxgi_format=fmt):
+                dds = tex_headers.dds_bytes(width, height, fmt, payload, mips=2)
+                self.assertEqual(dds[148:], payload)
+                _, flags, got_height, got_width, pitch_or_size, _, mips = struct.unpack_from("<7I", dds, 4)
+                self.assertEqual((got_width, got_height, mips), (width, height, 2))
+                self.assertEqual((flags & (0x8 | 0x80000), pitch_or_size), (expected_flags, expected_size))
+
     def test_dds_header_2d_array(self):
         hdr = tex_headers.dds_header(256, 256, depth=1, mips=1, fmt=83, is_cube=False, array_size=5)
         info = tex_headers.parse_dds_header(hdr)
@@ -615,7 +630,7 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         self.assertEqual(tex_headers.parse_dds_header(blob)["array_size"], 4)
 
     def test_dds_bytes_payload(self):
-        payload = b"\xAA\xBB\xCC\xDD" * 64
+        payload = b"\xAA\xBB\xCC\xDD" * 32  # Sixteen BC1 blocks at eight bytes each.
         data = tex_headers.dds_bytes(16, 16, fmt=71, payload=payload)
         self.assertEqual(len(data), 148 + len(payload))
         self.assertEqual(data[148:], payload)
@@ -946,6 +961,21 @@ class CliInputTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             with open(manifest, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"files": []})
+
+    def test_output_parent_creation_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            archive = os.path.join(carve, "a")
+            os.makedirs(archive)
+            with open(os.path.join(archive, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            blocker = os.path.join(tmp, "not-a-directory")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("existing file")
+            result = self.run_tool(carve, "--out", os.path.join(blocker, "out.json"))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR: cannot write", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     def test_out_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

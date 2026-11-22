@@ -234,7 +234,7 @@ class RadvOracleWithoutGpu(unittest.TestCase):
             open(os.path.join(d.name, name), "wb").close()
         bins = [(32, b"k" * 32, _radv(RadvBinary.CODE, stage=0, next_stage=4)), (32, b"q" * 32, _radv(RadvBinary.CODE))]
 
-        def fake(exe, vs, ps, out_raw, size, env):
+        def fake(exe, vs, ps, out_raw, size, env, fmt="rgba32f"):
             P.write_binaries(env["VKH_BINARY_OUT"], bins)
             with open(out_raw, "wb") as f:
                 f.write(bytes(16 * size[0] * size[1]))

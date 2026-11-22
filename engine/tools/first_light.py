@@ -495,10 +495,8 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
-    if os.path.exists(raw):
-        os.unlink(
-            raw
-        )  # a harness that exits 0 without writing must not pass on a stale file
+    ppm = os.path.join(out_dir, "image.ppm")
+    manifest_path = os.path.join(out_dir, "manifest.json")
     env = harness_env(manifest, out_dir)
     cmd = [
         harness,
@@ -508,6 +506,14 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         str(manifest["width"]),
         str(manifest["height"]),
     ]
+    # A new draw must not reuse an old readback or leave an old success report on failure.
+    for path in (raw, ppm):
+        if os.path.exists(path):
+            os.unlink(path)
+    if "result" in manifest:
+        del manifest["result"]
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f, indent=1)
     subprocess.run(cmd, check=True, env=env)
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
@@ -517,7 +523,6 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         result = check_image(data, manifest)
     except AssertionError as e:
         raise SystemExit(str(e)) from e
-    ppm = os.path.join(out_dir, "image.ppm")
     write_ppm(ppm, result["pixels"], manifest["width"], manifest["height"])
     print(
         f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
@@ -529,7 +534,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     return result
 

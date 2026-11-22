@@ -847,7 +847,28 @@ class CliTests(unittest.TestCase):
             with open(bin_path, "rb") as fh:
                 self.assertEqual(fh.read(), bin_data)
 
-    def test_fresh_json_inside_carve_dir_is_allowed(self):
+    def test_json_hard_link_to_a_page_in_a_scanned_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            source = os.path.join(carve, "page.bin")
+            data = page(block(4))
+            with open(source, "wb") as fh:
+                fh.write(data)
+            report = os.path.join(tmp, "report.json")
+            try:
+                os.link(source, report)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+
+            r = self.run_tool(carve, "--json", report, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(source, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_inside_carve_dir_can_be_written_and_replaced(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
             os.mkdir(carve)
@@ -855,11 +876,12 @@ class CliTests(unittest.TestCase):
             with open(bin_path, "wb") as fh:
                 fh.write(page(block(4)))
             out = os.path.join(carve, "report.json")
-            r = self.run_tool(carve, "--json", out, "--quiet")
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertTrue(os.path.isfile(out))
-            with open(out, "r", encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh)["totals"]["pages"], 1)
+            for run in ("new report", "existing report"):
+                with self.subTest(run=run):
+                    r = self.run_tool(carve, "--json", out, "--quiet")
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    with open(out, "r", encoding="utf-8") as fh:
+                        self.assertEqual(json.load(fh)["totals"]["pages"], 1)
 
     def test_json_over_draw_system_inputs_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

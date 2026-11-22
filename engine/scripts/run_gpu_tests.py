@@ -1153,6 +1153,7 @@ def run_suite(a, work: str) -> int:
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
+                "ps_valu16_mad_sel": (0x00008003, 0xDB880000, 0xFFFFFFFF, 0x80000000),   # measured on gfx1036
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }

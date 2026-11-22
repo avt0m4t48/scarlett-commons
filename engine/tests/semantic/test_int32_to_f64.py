@@ -20,7 +20,12 @@ class Int32ToFloat64(unittest.TestCase):
         default = translate_fixture("ps_int32_to_f64")
         with patch.object(rdna2spirv, "FLOAT_CONTROLS", False):
             foldable = translate_fixture("ps_int32_to_f64")
-        self.assertEqual([line for line in default.splitlines() if "SignedZeroInfNanPreserve" not in line],
+        float_controls = {
+            "OpCapability SignedZeroInfNanPreserve", "OpCapability DenormPreserve",
+            "OpExecutionMode %main SignedZeroInfNanPreserve 32", "OpExecutionMode %main DenormPreserve 16",
+        }
+        self.assertTrue(float_controls.issubset(line.strip() for line in default.splitlines()))
+        self.assertEqual([line for line in default.splitlines() if line.strip() not in float_controls],
                          foldable.splitlines())
         with tempfile.TemporaryDirectory() as tmp:
             binary, folded = Path(tmp) / "int32.spv", Path(tmp) / "folded.spv"

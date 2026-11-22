@@ -47,6 +47,21 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_image_atomic_data_width(self):
+        for opcode, name, mask, data in (
+            (0x17, "umax", 1, "v16"), (0x17, "umax", 3, "v[16:17]"),
+            (0x10, "cmpswap", 3, "v[16:17]"), (0x10, "cmpswap", 15, "v[16:19]"),
+        ):
+            for glc in (0, 1):
+                with self.subTest(name=name, mask=mask, glc=glc):
+                    code = words(0xf0001008 | opcode << 18 | mask << 8 | glc << 13, 0x00021004)
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    asm = (f"image_atomic_{name} {data}, v[4:5], s[8:15] "
+                           f"dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D unorm" + (" glc" if glc else ""))
+                    expected = shader_ir.parse_line(asm)
+                    for field in ("op", "args", "mods"):
+                        self.assertEqual(ins[field], expected[field])
+
     def test_image_slc_is_independent_of_sampler(self):
         for sampler in (0, 64):
             for slc in (0, 1):

@@ -392,6 +392,10 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
         return 4
     if name.startswith("image_atomic_"):
+        # The GFX10 atomic dmask selects the total VDATA width, including
+        # both compare and swap values for cmpswap (masks 0x3 and 0xf).
+        if dmask in (1, 3, 15):
+            return dmask.bit_count()
         n = 2 if "cmpswap" in name else 1
         if name.endswith("_x2"):
             n *= 2

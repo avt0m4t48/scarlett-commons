@@ -66,11 +66,16 @@ struct XdxrLayout {
             nodes += std::uint32_t(here);
             below = here;
         } while (below > 1);
-        const std::uint64_t body_units = (std::uint64_t(count) * element_size + std::uint64_t(nodes) * node_size) / 64;
+        // BOX16: one spare 64-byte unit after the nodes. The root is the last node, and the translator's
+        // image_bvh_intersect_ray loads a box node's 112 bytes of BOX32 bounds before it knows the type, so without
+        // it a BOX16 root (64 bytes) would be read 48 bytes past the structure.
+        const std::uint64_t pad = box16 ? 64u : 0u;
+        const std::uint64_t body_units =
+            (std::uint64_t(count) * element_size + std::uint64_t(nodes) * node_size + pad) / 64;
         const std::uint64_t parent_bytes = (4 * body_units + 63) / 64 * 64;
         const std::uint64_t e_off = header_size + parent_bytes;
         const std::uint64_t n_off = e_off + std::uint64_t(count) * element_size;
-        const std::uint64_t end = n_off + std::uint64_t(nodes) * node_size;
+        const std::uint64_t end = n_off + std::uint64_t(nodes) * node_size + pad;
         // node pointers hold the 64-byte unit index in 29 bits
         if (end > (std::uint64_t(1) << 32) - 64 || (end >> 6) >= (std::uint64_t(1) << 29)) return false;
         elements_off = std::uint32_t(e_off);
@@ -241,7 +246,7 @@ private:
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push init = p;
         init.mode = mode_init;
-        init.count = l.parent_entries > 3 ? l.parent_entries : 3;
+        init.count = l.parent_entries > 16 ? l.parent_entries : 16;   // the parent table has at least 16 entries
         dispatch(cb, init, init.count);
     }
 

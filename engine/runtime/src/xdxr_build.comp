@@ -6,7 +6,7 @@
 //
 // One pipeline, one dispatch per step, selected by pc.mode (xdxr_build.h records them in this order, with a compute
 // barrier between each):
-//   MODE_INIT      parent table to 0xffffffff, centroid bounds to empty
+//   MODE_INIT      parent table to 0xffffffff, centroid bounds to empty, a BOX16 layout's spare last unit to 0
 //   MODE_TRIANGLES one thread per triangle of one geometry: the leaf (TRI0, remap 0x09), its box, the centroid bounds
 //   MODE_INSTANCES one thread per D3D12_RAYTRACING_INSTANCE_DESC: the 128-byte INSTANCE record and its world box
 //   MODE_MORTON    one thread per element: 30-bit Morton key of its box centre (empty boxes sort last)
@@ -596,6 +596,7 @@ void main() {
     } else if (pc.mode == MODE_INIT) {
         store(pc.dst, pc.parents_off + 4u * i, INVALID);
         if (i < 3u) { store(pc.scratch, 4u * i, INVALID); store(pc.scratch, 12u + 4u * i, 0u); }
+        if (is_box16() && i < 16u) store(pc.dst, pc.total_size - 64u + 4u * i, 0u);   // the spare unit (xdxr_build.h)
     } else if (pc.mode == MODE_TRIANGLES) {
         build_triangle(i);
     } else if (pc.mode == MODE_INSTANCES) {

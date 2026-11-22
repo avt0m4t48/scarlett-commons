@@ -200,10 +200,11 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
 """
 
 
-def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
-    """Assembly for one kernel. The descriptor takes the wave size and the register counts (raised to the registers
-    the lines name, register_counts). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up
-    read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
+def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32, lds=0):
+    """Assembly for one kernel. The descriptor takes the wave size, the register counts (raised to the registers
+    the lines name, register_counts) and the LDS size (the group segment: without it a Linux launcher has nothing
+    to program COMPUTE_PGM_RSRC2.LDS_SIZE from). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036
+    v16 and up read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
     fam = family(arch)
     vgprs, sgprs = register_counts(lines, vgprs, sgprs)
     load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
@@ -226,6 +227,7 @@ def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_next_free_vgpr {vgprs}
   .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0
 .end_amdhsa_kernel
@@ -258,7 +260,7 @@ def module_text(programs, arch, prefix="k", wave=32):
         if isinstance(prog, Kernel):
             vg, sg = register_counts(prog.lines, prog.vgprs, prog.sgprs)
             text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, vg, sg) if prog.raw
-                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg))
+                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg, prog.lds))
         else:
             vg, sg = register_counts(prog, 16, 32)
             text = kernel_text(name, prog, arch, wave, vg, sg)

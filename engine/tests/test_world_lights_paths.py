@@ -420,6 +420,30 @@ class ScanTest(unittest.TestCase):
         xs = sorted(r["position"][0] for r in rows if r["owner"] == "archetype")
         self.assertEqual(xs, [0.0, 0.0, 50.0, 50.0])
 
+    def test_cli_rejects_report_aliasing_an_input(self):
+        with open(self.rpf, "rb") as f:
+            rpf_bytes = f.read()
+        with open(self.entities, "rb") as f:
+            entities_bytes = f.read()
+        cases = [
+            (["--out", self.rpf], "--out must use a different path than archive"),
+            (["--out", self.entities], "--out must use a different path than --entities"),
+            (["--lights-out", self.rpf], "--lights-out must use a different path than archive"),
+            (["--lights-out", self.entities], "--lights-out must use a different path than --entities"),
+        ]
+        for args, msg in cases:
+            err = io.StringIO()
+            with mock.patch.object(T, "scan", side_effect=AssertionError("scan started before rejecting the alias")) as scan, \
+                    contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([self.rpf, "--entities", self.entities] + args)
+            scan.assert_not_called()
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn(msg, err.getvalue())
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), rpf_bytes)
+        with open(self.entities, "rb") as f:
+            self.assertEqual(f.read(), entities_bytes)
+
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

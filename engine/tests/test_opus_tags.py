@@ -1,5 +1,7 @@
 """Synthetic tests for tools/opus_tags.py (no game data: invented banks, names and subtitles)."""
 import codecs
+import contextlib
+import io
 import csv
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "opus_tags.py")
@@ -279,6 +282,24 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(stats["tagged"], 1)
         self.assertNotIn("ambiguous name", stats)
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
+
+    def test_cli_reports_incomplete_directory_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, "opus")
+            os.mkdir(root)
+            blocked = os.path.join(root, "blocked")
+            names = os.path.join(directory, "names.csv")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("source,bank,stream_id,name\n")
+
+            def walk(path, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(T.os, "walk", walk), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(T.main([root, "--names", names, "--dry-run"]), 2)
+            self.assertIn(blocked, err.getvalue())
 
     def test_cli(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",

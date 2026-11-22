@@ -14,6 +14,9 @@ what an unimplemented thunk returns under LEONIDA_UNIMPLEMENTED=fail — and is 
 registrations in runtime/shims/*.cpp, mirroring the loader's routing: a registered ``dll!name`` binds to the
 shim; an unregistered import on a module the shims own binds to the unimplemented-import thunk; anything else
 binds to the host Windows DLL (when the host has it — the tool reports the route, not the host's exports).
+
+DLL names are reported under the loader's key — pe_loader.cpp's dll_key(), the LoadLibrary file-name rule —
+so an import naming ``GameInput`` or ``gameinput.dll.`` groups and routes as ``gameinput.dll``.
 """
 from __future__ import annotations
 
@@ -84,8 +87,19 @@ def classify(dll: str, name: str) -> str:
     return OTHER
 
 
+def dll_key(name: str) -> str:
+    """Port of pe_loader.cpp's dll_key(): the LoadLibrary file-name rule on a module name — basename only,
+    lower-case, one trailing '.' dropped, '.dll' added when the name has no extension. An import naming
+    "GameInput" or "gameinput.dll." resolves to gameinput.dll, the module the shims register."""
+    name = name[max(name.rfind("\\"), name.rfind("/")) + 1:].lower()
+    if name.endswith("."):
+        return name[:-1]
+    return name if "." in name else name + ".dll"
+
+
 def parse_import_lines(lines) -> tuple[list[tuple[str, str]], int]:
-    """(dll, name) pairs from `dll!function` lines, and the count of lines skipped as malformed."""
+    """(dll, name) pairs from `dll!function` lines, and the count of lines skipped as malformed. The DLL part
+    comes back under the loader's dll_key."""
     imports, bad = [], 0
     for line in lines:
         line = line.strip()
@@ -95,7 +109,7 @@ def parse_import_lines(lines) -> tuple[list[tuple[str, str]], int]:
         if not bang or not dll.strip() or not name.strip():
             bad += 1
             continue
-        imports.append((dll.strip().lower(), name.strip()))
+        imports.append((dll_key(dll.strip()), name.strip()))
     return imports, bad
 
 
@@ -104,7 +118,7 @@ class PeFormatError(ValueError):
 
 
 MAX_ENTRIES = 65536  # a table this long is not a table; stops a malformed image from looping forever
-MAX_TOTAL_ENTRIES = 262144  # a bound over every table together, so many tables cannot loop forever either
+MAX_TOTAL_ENTRIES = 262144  # bounds the table entries parsed and the (dll, name) pairs emitted
 
 
 def _cstring(data: bytes, offset: int, limit: int = 4097) -> str | None:
@@ -162,14 +176,17 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
         return None if at is None else _cstring(data, at)
 
     out = []
-    seen_tables = set()  # thunk tables already walked: descriptors may share one, and the entries are the same
+    tables = {}  # lookup-table RVA -> symbol names, parsed once per table
     total = 0
 
-    def walk_thunks(dll: str, lookup: int) -> None:
+    def walk_table(lookup: int) -> list[str]:
+        """The symbol names one lookup table lists. Descriptors may share a table; the loader still binds
+        each descriptor's IAT separately, so the names emit per DLL, but the table parses only once."""
         nonlocal total
-        if not lookup or lookup in seen_tables:
-            return
-        seen_tables.add(lookup)
+        names = tables.get(lookup)
+        if names is not None:
+            return names
+        names = []
         for j in range(MAX_ENTRIES):
             entry = offset(lookup + j * 8)
             if entry is None or entry + 8 > len(data):
@@ -181,12 +198,22 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
             if total > MAX_TOTAL_ENTRIES:
                 raise PeFormatError(f"more than {MAX_TOTAL_ENTRIES} import entries")
             if value & (1 << 63):
-                out.append((dll, f"#{value & 0xFFFF}"))
+                names.append(f"#{value & 0xFFFF}")
                 continue
             name = string_at((value & 0x7FFFFFFF) + 2)  # skip the 2-byte hint
             if name is None:
                 raise PeFormatError("an import thunk points at an unreadable name")
-            out.append((dll, name))
+            names.append(name)
+        tables[lookup] = names
+        return names
+
+    def walk_thunks(dll: str, lookup: int) -> None:
+        if not lookup:
+            return
+        names = walk_table(lookup)
+        if len(out) + len(names) > MAX_TOTAL_ENTRIES:
+            raise PeFormatError(f"more than {MAX_TOTAL_ENTRIES} import entries")
+        out.extend((dll, name) for name in names)
 
     # Data directory entry 1. The loader stops the table at the first descriptor with Name == 0 and fails on an
     # unreadable name; read_string throws there.
@@ -204,7 +231,7 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
                 dll = string_at(name_rva)
                 if dll is None:
                     raise PeFormatError("an import descriptor points at an unreadable DLL name")
-                walk_thunks(dll.lower(), oft if oft else iat_rva)
+                walk_thunks(dll_key(dll), oft if oft else iat_rva)
 
     # Data directory entry 13: delay imports, which the loader binds eagerly — the same checks it makes on an
     # IMAGE_DELAYLOAD_DESCRIPTOR (32 bytes; version-2 fields are RVAs).
@@ -227,7 +254,7 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
                 dll = string_at(name_rva)
                 if dll is None:
                     raise PeFormatError("a delay-import descriptor points at an unreadable DLL name")
-                walk_thunks(dll.lower(), int_rva)
+                walk_thunks(dll_key(dll), int_rva)
     return out
 
 
@@ -377,13 +404,12 @@ def owned_dlls(implemented: set[str]) -> frozenset[str]:
 
 
 def summarize(imports: list[tuple[str, str]], implemented: set[str]):
-    """(rows, per_dll): rows are (dll, name, class, binding) sorted and deduplicated, where binding is
-    IMPLEMENTED, HOST or THUNK, mirroring the loader's routing order; per_dll maps a dll to
-    [imports, hresult, other, implemented, host, unimplemented thunk]."""
+    """(rows, per_dll): rows are (dll, name, class, binding) sorted and deduplicated on the loader's
+    dll_key, where binding is IMPLEMENTED, HOST or THUNK, mirroring the loader's routing order; per_dll
+    maps a dll to [imports, hresult, other, implemented, host, unimplemented thunk]."""
     owned = owned_dlls(implemented)
     rows = []
-    for dll, name in sorted(set(imports)):
-        dll = dll.lower()
+    for dll, name in sorted({(dll_key(d), n) for d, n in imports}):
         cls = classify(dll, name)
         if f"{dll}!{name}" in implemented:
             binding = IMPLEMENTED

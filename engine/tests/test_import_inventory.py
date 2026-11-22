@@ -157,6 +157,28 @@ class ImportListTest(unittest.TestCase):
         self.assertEqual(imports, [("ok.dll", "Fine")])
         self.assertEqual(bad, 3)
 
+    def test_dll_names_normalise_like_the_loader(self):
+        # pe_loader.cpp's dll_key: ".dll" is added when there is no extension, one trailing '.' is
+        # dropped, a directory part is stripped — "GameInput" and "gameinput.dll." key gameinput.dll.
+        imports, bad = inv.parse_import_lines([
+            "GameInput!GameInputCreate",
+            "gameinput.dll.!GameInputCreate",
+            "dir\\XMem.DLL!XMemAlloc",
+        ])
+        self.assertEqual(imports, [("gameinput.dll", "GameInputCreate"),
+                                   ("gameinput.dll", "GameInputCreate"),
+                                   ("xmem.dll", "XMemAlloc")])
+        self.assertEqual(bad, 0)
+
+    def test_dll_key_edge_cases(self):
+        # The same rules the C++ applies, including the odd corners: only one trailing dot is
+        # dropped, and a name that is all extension keeps it.
+        self.assertEqual(inv.dll_key("GameInput"), "gameinput.dll")
+        self.assertEqual(inv.dll_key("gameinput.dll."), "gameinput.dll")
+        self.assertEqual(inv.dll_key("gameinput.."), "gameinput.")
+        self.assertEqual(inv.dll_key("api-ms-win-core-file-l2-1-0.dll"),
+                         "api-ms-win-core-file-l2-1-0.dll")
+
 
 class PeParseTest(unittest.TestCase):
     @classmethod
@@ -239,8 +261,9 @@ class PeParseTest(unittest.TestCase):
         with self.assertRaisesRegex(inv.PeFormatError, "unreadable name"):
             inv.pe_imports(path)
 
-    def test_shared_thunk_table_is_walked_once(self):
-        # Two descriptors pointing at one lookup table report one set of imports, not two.
+    def test_shared_thunk_table_reports_each_dll(self):
+        # Two descriptors pointing at one lookup table parse it once, but the loader binds each
+        # descriptor's IAT separately, so both DLLs get the association.
         buf, place, directory = make_pe32plus()
         directory(1, 0x1100, 60)
         place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))
@@ -250,7 +273,20 @@ class PeParseTest(unittest.TestCase):
         place(0x1320, b"xtest2.dll\0")
         place(0x1400, b"\x00\x00" + b"XTestFunc\0")
         path = write_image(self.tmp.name, "shared.exe", bytes(buf))
-        self.assertEqual(inv.pe_imports(path), [("xtest.dll", "XTestFunc")])
+        self.assertEqual(inv.pe_imports(path),
+                         [("xtest.dll", "XTestFunc"), ("xtest2.dll", "XTestFunc")])
+
+    def test_descriptor_dll_name_normalises_like_the_loader(self):
+        # A descriptor naming "GameInput" binds the module the shims register — pe_loader.cpp's
+        # dll_key adds the extension; a bare name must not report a "gameinput" host import.
+        buf, place, directory = make_pe32plus()
+        directory(1, 0x1100, 40)
+        place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))
+        place(0x1200, struct.pack("<QQ", 0x1400, 0))
+        place(0x1300, b"GameInput\0")
+        place(0x1400, b"\x00\x00" + b"GameInputCreate\0")
+        path = write_image(self.tmp.name, "bare.exe", bytes(buf))
+        self.assertEqual(inv.pe_imports(path), [("gameinput.dll", "GameInputCreate")])
 
 
 class ShimTableTest(unittest.TestCase):
@@ -321,6 +357,13 @@ class ReportTest(unittest.TestCase):
         rows, per_dll = inv.summarize(self.IMPORTS + [self.IMPORTS[0]], self.implemented)
         self.assertEqual(len(rows), len(self.rows))
         self.assertEqual(per_dll, self.per_dll)
+
+    def test_unnormalised_names_route_as_their_key(self):
+        # summarize() must route on the loader's dll_key too: "GameInput" is the registered
+        # gameinput.dll, not a "gameinput" host module.
+        rows, per_dll = inv.summarize([("GameInput", "GameInputCreate")], self.implemented)
+        self.assertEqual(rows, [("gameinput.dll", "GameInputCreate", inv.HRESULT, inv.IMPLEMENTED)])
+        self.assertEqual(per_dll["gameinput.dll"], [1, 1, 0, 1, 0, 0])
 
     def test_report_text(self):
         text = inv.format_report(self.IMPORTS, self.implemented)

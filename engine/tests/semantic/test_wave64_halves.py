@@ -95,6 +95,22 @@ def out_param(words, k=0):
     return result
 
 
+# ---- the early exit of a pixel kill ------------------------------------------------------------------------------
+KILL = ["s_mov_b64 s[20:21], exec", "v_cmp_gt_u32_e32 vcc, 40, v0", "s_andn2_b64 s[20:21], s[20:21], vcc"]
+RUN_WQM = ["s_wqm_b64 s[22:23], s[20:21]", "s_and_b64 exec, exec, s[22:23]"]
+EXIT_PS = ["s_mov_b64 exec, s[20:21]", "exp null off, off, off, off done vm", "s_endpgm"]
+EXIT_VS = ["s_mov_b64 exec, s[20:21]", "exp pos0 v5, v5, v5, v5 done", "s_endpgm"]
+
+
+def kill(head, run, exit_, stage="ps", vote="s_cbranch_scc0"):
+    """head, a branch to the exit when the live mask is empty, the run side and the epilogue, then the exit."""
+    epi = EPI_PS if stage == "ps" else EPI_VS
+    tail = run + epi
+    hop = sum(size(t) for t in tail) // 4
+    return PRO + ["v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0", "v_mov_b32_e32 v5, 0"] + head + \
+        [f"{vote} {hop}"] + tail + exit_
+
+
 class Classification(unittest.TestCase):
     def tier(self, name, lines, tier, reasons=None, idioms=None, contains=None):
         (t, r, i), _ = meta_of(name, lines)
@@ -658,6 +674,103 @@ class SccVotePolarity(unittest.TestCase):
         self.tier("vs_cmp_eq_scc0", vs(self.HEAD + [
             "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc0 2", "s_and_b64 exec, exec, s[20:21]",
             "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
+
+
+class KillExit(unittest.TestCase):
+    """The early exit of a pixel kill (`s_andn2_b64 live, live, exec/vcc`, `s_cbranch_scc0` to a block that only
+    empties EXEC from that mask, exports and ends): a half whose live mask is empty writes nothing there, and in the
+    wave its lanes stay off on the run side to the end. Tier A only when the exit is inert, the run side narrows EXEC
+    into the mask's quads before anything else and never widens it, and the vote is the mask's own."""
+    tier = Classification.tier
+    run_both = Execution.run_both
+
+    # -- tier A
+    def test_a_kill_wqm_and_exec(self):
+        self.tier("ps_kill_wqm", kill(KILL, RUN_WQM + ["v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+
+    def test_a_kill_cmpx_wqm_mov_exec(self):
+        self.tier("ps_kill_cmpx", kill(
+            ["s_mov_b64 s[20:21], exec", "v_cmpx_gt_u32_e32 40, v0", "s_andn2_b64 s[20:21], s[20:21], exec"],
+            ["s_wqm_b64 s[22:23], s[20:21]", "s_mov_b64 exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"],
+            EXIT_PS), "A", [], [])
+
+    def test_a_kill_direct_narrowing(self):
+        for name, run in (("ps_kill_and", ["s_and_b64 exec, exec, s[20:21]"]),
+                          ("ps_kill_mov", ["s_mov_b64 exec, s[20:21]"]),
+                          ("ps_kill_wqm_exec", ["s_wqm_b64 exec, s[20:21]"])):
+            self.tier(name, kill(KILL, run + ["v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+        self.tier("ps_kill_exit0", kill(KILL, RUN_WQM, ["s_mov_b64 exec, 0"] + EXIT_PS[1:]), "A", [], [])
+
+    def test_a_kill_then_if_endif(self):
+        # a saveexec / restore pair after the narrowing restores a mask taken inside it: EXEC stays in the quads
+        self.tier("ps_kill_if", kill(KILL, RUN_WQM + [
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]"], EXIT_PS), "A", [], [])
+
+    # -- near misses: tier C unsafe-vote-branch
+    def test_c_exit_with_code_of_its_own(self):
+        for name, exit_ in (
+                ("ps_kill_exit_vmov", ["v_mov_b32_e32 v6, 1"] + EXIT_PS),
+                ("ps_kill_exit_exp_first", ["exp mrt0 v6, v7, v5, v5 done vm", "s_mov_b64 exec, s[20:21]",
+                                            "s_endpgm"]),
+                ("ps_kill_exit_store", EXIT_PS[:1] + ["buffer_store_dword v6, v5, s[0:3], 0 offen"] + EXIT_PS[1:]),
+                ("ps_kill_exit_sgpr", EXIT_PS[:1] + ["s_mov_b32 s5, 1"] + EXIT_PS[1:]),
+                ("ps_kill_exit_other_mask", ["s_mov_b64 exec, s[10:11]"] + EXIT_PS[1:]),
+                ("ps_kill_exit_jumps_back", EXIT_PS[:2] + ["s_branch -8"])):      # into the run side's s_and
+            self.tier(name, kill(KILL, RUN_WQM, exit_), "C", contains=["unsafe-vote-branch"])
+
+    def test_c_run_side_does_not_narrow(self):
+        self.tier("ps_kill_run_code", kill(KILL, ["v_mov_b32_e32 v6, 5"] + RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_run_other", kill(KILL, ["s_and_b64 exec, exec, s[10:11]"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_run_side_widens_again(self):
+        self.tier("ps_kill_widen", kill(KILL, RUN_WQM + ["s_mov_b64 exec, s[10:11]", "v_mov_b32_e32 v6, 9"],
+                                        EXIT_PS), "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_or", kill(KILL, RUN_WQM + ["s_or_b64 exec, exec, s[10:11]"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_mask_redefined_or_not_the_vote(self):
+        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value
+        self.tier("ps_kill_redef", kill(KILL + ["s_mov_b64 s[20:21], exec"], RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        # SCC = (mask == 0): the branch to the "exit" is taken when the mask is not empty
+        self.tier("ps_kill_cmp_eq", kill(KILL + ["s_cmp_eq_u64 s[20:21], 0"], RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_vm_export_before_the_vote(self):
+        self.tier("ps_kill_vm_first", kill(["exp mrt1 v6, v7, v5, v5 vm"] + KILL, RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_shared_exit_of_two_kills_stays_c(self):
+        # conservative: the exit sets EXEC from a live mask the second kill redefined behind the first vote (stale)
+        second = ["v_cmp_gt_u32_e32 vcc, 50, v0", "s_andn2_b64 s[20:21], s[20:21], vcc"]
+        run = RUN_WQM + second + ["s_cbranch_scc0 5"] + RUN_WQM
+        self.tier("ps_kill_shared", kill(KILL, run, EXIT_PS), "C", contains=["tainted-exec"])
+
+    def test_mov_of_a_mask_is_not_a_vote(self):
+        # s_mov_b64 writes no SCC: the branch reads the lane-count compare before it, not a vote on the copy
+        self.tier("ps_mov_scc", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "s_cmp_eq_u32 s6, 5",
+            "s_mov_b64 s[24:25], vcc", "s_cbranch_scc0 3", "s_and_saveexec_b64 s[16:17], s[24:25]",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[16:17]"]), "C", contains=["lane-count"])
+
+    # -- execution: vertex shaders, 64 lanes against two halves of 32 (vertices < 40 killed: all of the first half)
+    def test_kill_exit_invariant(self):
+        tier, whole, halves = self.run_both("vs_kill", kill(KILL, RUN_WQM + [
+            "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        # a vertex that is off writes nothing: the interpreter's outputs start at zero
+        self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
+
+    def test_kill_exit_that_widens_differs_and_is_c(self):
+        tier, whole, halves = self.run_both("vs_kill_widen", kill(KILL, RUN_WQM + [
+            "s_mov_b64 exec, s[10:11]", "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "C")
+        self.assertEqual([w[:2] for w in whole], [(3 * k, 1) for k in range(64)])
+        self.assertEqual([w[:2] for w in halves[:32]], [(0, 0)] * 32)      # the first half took the exit
 
 
 class Refusal(unittest.TestCase):

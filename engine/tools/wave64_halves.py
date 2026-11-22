@@ -134,6 +134,22 @@ def _half(a):
     return None
 
 
+def _zero(a):
+    return a.get("k") == "imm" and a.get("v") == 0
+
+
+def _mask64(a):
+    """A whole 64-bit SGPR pair or VCC (a lane mask register), not EXEC and not a 32-bit half."""
+    if a.get("k") == "sgpr":
+        return a.get("n", 1) == 2
+    return a.get("k") == "special" and a.get("t") == "vcc"
+
+
+ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
+            "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
+OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64")   # before the run side narrows EXEC
+
+
 def operands(ins):
     """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
     op, a = base_op(ins["op"]), ins["args"]
@@ -958,8 +974,166 @@ class Analysis:
         # that side must be no code of its own: the join, which the run side reaches again.
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
+        # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
+        # mask or 0), exports and ends, so it writes nothing; the run side narrows EXEC into the mask's whole quads
+        # and never widens it again, so in the wave the lanes of that half stay off to the end. Any lane mask would
+        # do; the vote must be the mask's own "not empty" (checked from the SCC writer), not a stale or other SCC.
+        # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
+        # before the vote: one that did would keep the pixels of the empty half alive in the wave.
+        kregs = self.kill_vote(n, op, reg)
+        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
+                and self.confined(run, kregs) and not self.vm_export_before(n):
+            ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+
+    def kill_vote(self, n, op, reg):
+        """Registers of the mask whose emptiness the branch ending block `n` tests (SCC or VCC = mask != 0), or None
+        when that is not plain: the last SCC writer must set SCC = (its 64-bit mask destination != 0), and nothing
+        after it in the block may write that mask."""
+        if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+            return ("vcc",) if reg == "vcc" else None
+        body = self.blocks[n][:-1]
+        for k in range(len(body) - 1, -1, -1):
+            ins = body[k]
+            o, a = base_op(ins["op"]), ins["args"]
+            dests, _, defs, _ = operands(ins)
+            if "scc" not in defs and not o.startswith(("s_cmp", "s_bitcmp")):
+                continue
+            if o in ZERO_SCC and len(a) >= 2 and _mask64(a[0]):
+                m = tuple(_regs(a[0]))
+            elif o == "s_cmp_lg_u64" and len(a) == 2 and _mask64(a[0]) and a[1].get("k") == "imm" and a[1]["v"] == 0:
+                m = tuple(_regs(a[0]))
+            else:
+                return None
+            if m[0] != reg or m == ("exec",):
+                return None
+            for later in body[k + 1:]:
+                d, _, df, _ = operands(later)
+                if set(m) & ({r for x in d for r in _regs(x)} | set(df)):
+                    return None
+            return m
+        return None
+
+    def vm_export_before(self, n):
+        """Whether an `exp ... vm` is in a block from which block `n` can be reached (`n` itself included)."""
+        pred = {}
+        for b, ss in enumerate(self.succ):
+            for s_ in ss:
+                pred.setdefault(s_, []).append(b)
+        seen, work = set(), [n]
+        while work:
+            b = work.pop()
+            if b in seen:
+                continue
+            seen.add(b)
+            if any(base_op(i["op"]) == "exp" and "vm" in (i.get("mods") or []) for i in self.blocks[b]):
+                return True
+            work.extend(pred.get(b, []))
+        return False
+
+    def inert_exit(self, blk, m):
+        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), exports with that
+        EXEC and ends: nothing else, no other successor."""
+        seen = set()
+        narrowed = False
+        while blk not in seen:
+            seen.add(blk)
+            for ins in self.blocks[blk]:
+                op, a = base_op(ins["op"]), ins["args"]
+                if op in ("s_nop", "s_waitcnt", "s_branch"):
+                    continue
+                if op == "s_endpgm":
+                    return narrowed
+                if op == "exp" and narrowed:
+                    continue
+                if a and _regs(a[0]) == ["exec"] and not _half(a[0]) and (
+                        (op == "s_mov_b64" and len(a) == 2 and (tuple(_regs(a[1])) == m or _zero(a[1]))) or
+                        (op == "s_and_b64" and len(a) == 3 and any(tuple(_regs(x)) == m or _zero(x) for x in a[1:]))):
+                    narrowed = True
+                    continue
+                return False
+            if len(self.succ[blk]) != 1:
+                return False
+            blk = self.succ[blk][0]
+        return False
+
+    def confined(self, run, m):
+        """Whether, on every path from block `run` (loops included), EXEC is narrowed into the whole quads of mask
+        `m` before anything but mask arithmetic runs, and stays inside them: then a lane of a half whose `m` is empty
+        is off for the rest of the wave. A must-dataflow over the blocks `run` reaches: (EXEC inside, set of 64-bit
+        registers that hold a subset); a write to EXEC keeps it inside only when it is provably a subset (a narrowing,
+        or a copy / union of registers known to be inside)."""
+        region, work = set(), [run]
+        while work:
+            b = work.pop()
+            if b not in region:
+                region.add(b)
+                work.extend(self.succ[b])
+        entry = {run: (False, frozenset({m}))}
+        work = [run]
+        while work:
+            b = work.pop()
+            inside, sub = entry[b]
+            for ins in self.blocks[b]:
+                if not inside and base_op(ins["op"]) not in OFF_OK:
+                    return False
+                inside, sub = self.confine_step(ins, inside, sub)
+            for s in self.succ[b]:
+                new = (inside, sub) if s not in entry else (entry[s][0] and inside, entry[s][1] & sub)
+                if new != entry.get(s):
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    @staticmethod
+    def confine_step(ins, inside, sub):
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, srcs, defs, _ = operands(ins)
+
+        def ok(x):
+            return _zero(x) or (inside and _regs(x) == ["exec"] and not _half(x)) or tuple(_regs(x)) in sub
+
+        def combine(o, xs):
+            if o in ("s_mov_b64", "s_wqm_b64") and len(xs) == 1:
+                return ok(xs[0])
+            if o == "s_and_b64" and len(xs) == 2:
+                return ok(xs[0]) or ok(xs[1])
+            if o == "s_andn2_b64" and len(xs) == 2:
+                return ok(xs[0])
+            if o in ("s_or_b64", "s_xor_b64") and len(xs) == 2:
+                return ok(xs[0]) and ok(xs[1])
+            return False
+
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        new_sub = {k for k in sub if not set(k) & written}
+        old_inside = inside
+        if "exec" in written:
+            if op.startswith("v_cmpx"):
+                pass                                            # EXEC &= compare: a narrowing
+            elif op.startswith(SAVEEXEC) and len(a) == 2 and not _half(a[1]):
+                x = a[1]
+                if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")):
+                    inside = old_inside or ok(x)
+                elif op.startswith(("s_andn1_saveexec_b64", "s_andn1_wrexec_b64")):
+                    inside = old_inside
+                elif op.startswith(("s_andn2_saveexec_b64", "s_andn2_wrexec_b64")):
+                    inside = ok(x)
+                elif op.startswith(("s_or_saveexec_b64", "s_xor_saveexec_b64")):
+                    inside = old_inside and ok(x)
+                else:
+                    inside = False
+                if _mask64(a[0]):
+                    keep = inside if "_wrexec_" in op else old_inside
+                    if keep:
+                        new_sub.add(tuple(_regs(a[0])))
+            elif dests and _regs(dests[0]) == ["exec"] and not _half(dests[0]):
+                inside = combine(op, srcs)
+            else:
+                inside = False
+        elif dests and _mask64(dests[0]) and combine(op, srcs):
+            new_sub.add(tuple(_regs(dests[0])))
+        return inside, frozenset(new_sub)
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""

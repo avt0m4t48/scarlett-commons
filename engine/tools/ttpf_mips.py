@@ -1265,8 +1265,10 @@ def find_pools(arg):
     pools = sorted(glob.glob(os.path.join(root, "data", "ttdb", "**", "*.ttpf"), recursive=True))
     pools += sorted(glob.glob(os.path.join(root, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
+    pools = [path for path in pools if os.path.isfile(path)]
     if not pools:
-        pools = sorted(glob.glob(os.path.join(root, "**", "*.ttpf"), recursive=True))
+        pools = sorted(path for path in glob.iglob(os.path.join(root, "**", "*.ttpf"), recursive=True)
+                       if os.path.isfile(path))
     return pools
 
 

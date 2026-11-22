@@ -237,6 +237,15 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
     return op
 
 
+def _sdwa_src(code: int, scalar: bool) -> dict:
+    if not scalar:
+        return _vreg(code, 1)
+    # SDWA supports inline constants but has no trailing literal word.
+    if 128 <= code <= 208 or code in _INLINE_FLOAT:
+        return _src(code, 1, None)
+    return _sreg(code, 1)
+
+
 def _vcc_operand(wave32: bool) -> dict:
     return {"k": "special", "t": "vcc_lo" if wave32 else "vcc", "neg": False, "abs": False}
 
@@ -480,8 +489,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
                     src0_sext = bool((w1 >> 19) & 1)
                     src0_neg = bool((w1 >> 20) & 1)
                     src0_abs = bool((w1 >> 21) & 1)
-                    s0_is_sgpr = bool((w1 >> 23) & 1)
-                    s0 = _sreg(src0_reg, 1) if s0_is_sgpr else _vreg(src0_reg, 1)
+                    s0_scalar = bool((w1 >> 23) & 1)
+                    s0 = _sdwa_src(src0_reg, s0_scalar)
                     if src0_sext:
                         s0["sext"] = True
                     s0["neg"], s0["abs"] = src0_neg, src0_abs
@@ -536,14 +545,14 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
                 src0_sext = bool((w1 >> 19) & 1)
                 src0_neg = bool((w1 >> 20) & 1)
                 src0_abs = bool((w1 >> 21) & 1)
-                s0_is_sgpr = bool((w1 >> 23) & 1)
+                s0_scalar = bool((w1 >> 23) & 1)
                 src1_sel = (w1 >> 24) & 7
                 src1_sext = bool((w1 >> 27) & 1)
                 src1_neg = bool((w1 >> 28) & 1)
                 src1_abs = bool((w1 >> 29) & 1)
-                s1_is_sgpr = bool((w1 >> 31) & 1)
-                s0 = _sreg(src0_reg, 1) if s0_is_sgpr else _vreg(src0_reg, 1)
-                s1 = _sreg(vsrc1, 1) if s1_is_sgpr else _vreg(vsrc1, 1)
+                s1_scalar = bool((w1 >> 31) & 1)
+                s0 = _sdwa_src(src0_reg, s0_scalar)
+                s1 = _sdwa_src(vsrc1, s1_scalar)
                 if src0_sext:
                     s0["sext"] = True
                 if src1_sext:
@@ -628,14 +637,14 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
                 src0_sext = bool((w1 >> 19) & 1)
                 src0_neg = bool((w1 >> 20) & 1)
                 src0_abs = bool((w1 >> 21) & 1)
-                s0_is_sgpr = bool((w1 >> 23) & 1)
+                s0_scalar = bool((w1 >> 23) & 1)
                 src1_sel = (w1 >> 24) & 7
                 src1_sext = bool((w1 >> 27) & 1)
                 src1_neg = bool((w1 >> 28) & 1)
                 src1_abs = bool((w1 >> 29) & 1)
-                s1_is_sgpr = bool((w1 >> 31) & 1)
-                s0 = _sreg(src0_reg, 1) if s0_is_sgpr else _vreg(src0_reg, 1)
-                s1 = _sreg(vsrc1, 1) if s1_is_sgpr else _vreg(vsrc1, 1)
+                s1_scalar = bool((w1 >> 31) & 1)
+                s0 = _sdwa_src(src0_reg, s0_scalar)
+                s1 = _sdwa_src(vsrc1, s1_scalar)
                 if src0_sext:
                     s0["sext"] = True
                 if src1_sext:

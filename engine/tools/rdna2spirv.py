@@ -10123,7 +10123,7 @@ class Gen:
             # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
             # half early. A texel offset comes first and keeps its full dword under a16.
             extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
-            w_off = 1 if extras.endswith("_o") else 0
+            w_off = 1 if op.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
             w_bias = 1 if extras in ("_b", "_c_b") else 0
             w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
@@ -10180,8 +10180,8 @@ class Gen:
             goff = None
             if op in ("image_gather4_lz_o", "image_gather4_l_o"):
                 # first address dword: signed 6-bit texel offsets x [5:0], y [13:8]
-                if a16:
-                    raise Unsupported(op + " a16")
+                if a16 and ("tfe" in mods or "lwe" in mods):
+                    raise Unsupported(op + " a16 status")
                 parts = []
                 for k in range(2):
                     u, i = self.tmp(), self.tmp()

@@ -740,6 +740,100 @@ class Gen:
         self.emit(f"{v} = OpCompositeConstruct %v2float {out[0]} {out[1]}")
         return v
 
+    def _f32_step_toward_zero(self, r, step):
+        rb, nb, sb, out = (self.tmp() for _ in range(4))
+        self.emit(f"{rb} = OpBitcast %uint {r}")
+        self.emit(f"{nb} = OpISub %uint {rb} {self.cu(1)}")
+        self.emit(f"{sb} = OpSelect %uint {step} {nb} {rb}")
+        self.emit(f"{out} = OpBitcast %float {sb}")
+        return out
+
+    def _f32_finite(self, x):
+        i, n, o, f = (self.tmp() for _ in range(4))
+        self.emit(f"{i} = OpIsInf %bool {x}")
+        self.emit(f"{n} = OpIsNan %bool {x}")
+        self.emit(f"{o} = OpLogicalOr %bool {i} {n}")
+        self.emit(f"{f} = OpLogicalNot %bool {o}")
+        return f
+
+    def _f32_overflowed(self, r, x, y):
+        ri, fx, fy, both, of = (self.tmp() for _ in range(5))
+        self.emit(f"{ri} = OpIsInf %bool {r}")
+        fx, fy = self._f32_finite(x), self._f32_finite(y)
+        self.emit(f"{both} = OpLogicalAnd %bool {fx} {fy}")
+        self.emit(f"{of} = OpLogicalAnd %bool {ri} {both}")
+        return of
+
+    def _f32_away(self, r, e):
+        rp, rn, ep, en, a1, a2, away = (self.tmp() for _ in range(7))
+        self.emit(f"{rp} = OpFOrdGreaterThan %bool {r} %f0")
+        self.emit(f"{rn} = OpFOrdLessThan %bool {r} %f0")
+        self.emit(f"{ep} = OpFOrdGreaterThan %bool {e} %f0")
+        self.emit(f"{en} = OpFOrdLessThan %bool {e} %f0")
+        self.emit(f"{a1} = OpLogicalAnd %bool {rp} {en}")
+        self.emit(f"{a2} = OpLogicalAnd %bool {rn} {ep}")
+        self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
+        return away
+
+    def f32_sub_rtz(self, x, y):
+        r, bb, t1, t2, t3, e = (self.tmp() for _ in range(6))
+        self.emit(f"{r} = OpFSub %float {x} {y}")
+        self.emit(f"{bb} = OpFSub %float {r} {x}")
+        self.emit(f"{t1} = OpFSub %float {r} {bb}")
+        self.emit(f"{t2} = OpFSub %float {x} {t1}")
+        self.emit(f"{t3} = OpFAdd %float {y} {bb}")
+        self.emit(f"{e} = OpFSub %float {t2} {t3}")
+        step = self.tmp()
+        self.emit(f"{step} = OpLogicalOr %bool {self._f32_away(r, e)} {self._f32_overflowed(r, x, y)}")
+        return self._f32_step_toward_zero(r, step)
+
+    def f32_mul_rtz(self, x, y):
+        m = self.tmp()
+        self.emit(f"{m} = OpFMul %float {x} {y}")
+
+        def mant(v):
+            b, k, s, f, ex, nz, nm, ok = (self.tmp() for _ in range(8))
+            self.emit(f"{b} = OpBitcast %uint {v}")
+            self.emit(f"{k} = OpBitwiseAnd %uint {b} {self.cu(0x007FFFFF)}")
+            self.emit(f"{s} = OpBitwiseOr %uint {k} {self.cu(0x3F800000)}")
+            self.emit(f"{f} = OpBitcast %float {s}")
+            self.emit(f"{ex} = OpBitFieldUExtract %uint {b} {self.cu(23)} {self.cu(8)}")
+            self.emit(f"{nz} = OpINotEqual %bool {ex} {self.cu(0)}")
+            self.emit(f"{nm} = OpINotEqual %bool {ex} {self.cu(0xFF)}")
+            self.emit(f"{ok} = OpLogicalAnd %bool {nz} {nm}")
+            return f, ok
+
+        def split(v):
+            c, d, hi_, lo_ = (self.tmp() for _ in range(4))
+            self.emit(f"{c} = OpFMul %float {self.tof(self.cu(0x45801000))} {v}")
+            self.emit(f"{d} = OpFSub %float {c} {v}")
+            self.emit(f"{hi_} = OpFSub %float {c} {d}")
+            self.emit(f"{lo_} = OpFSub %float {v} {hi_}")
+            return hi_, lo_
+
+        xm, xok = mant(x)
+        ym, yok = mant(y)
+        p = self.tmp()
+        self.emit(f"{p} = OpFMul %float {xm} {ym}")
+        (xh, xl), (yh, yl) = split(xm), split(ym)
+        hh, hl, lh, ll, e1, e2, e3, e = (self.tmp() for _ in range(8))
+        self.emit(f"{hh} = OpFMul %float {xh} {yh}")
+        self.emit(f"{hl} = OpFMul %float {xh} {yl}")
+        self.emit(f"{lh} = OpFMul %float {xl} {yh}")
+        self.emit(f"{ll} = OpFMul %float {xl} {yl}")
+        self.emit(f"{e1} = OpFSub %float {hh} {p}")
+        self.emit(f"{e2} = OpFAdd %float {e1} {hl}")
+        self.emit(f"{e3} = OpFAdd %float {e2} {lh}")
+        self.emit(f"{e} = OpFAdd %float {e3} {ll}")
+        over, normals, mfin, valid, step = (self.tmp() for _ in range(5))
+        self.emit(f"{over} = OpFOrdLessThan %bool {e} %f0")
+        self.emit(f"{normals} = OpLogicalAnd %bool {xok} {yok}")
+        mf = self._f32_finite(m)
+        self.emit(f"{mfin} = OpLogicalAnd %bool {normals} {mf}")
+        self.emit(f"{valid} = OpLogicalAnd %bool {mfin} {over}")
+        self.emit(f"{step} = OpLogicalOr %bool {valid} {self._f32_overflowed(m, x, y)}")
+        return self._f32_step_toward_zero(m, step)
+
     def f64_add_mode(self, x, y, r, lo, hi):
         """v_add_f64 under MODE.FP_ROUND[3:2]: ``r`` = x + y rounded to nearest (bits lo/hi). When the mode is
         toward zero (3) and the nearest result rounded away from zero, step one ulp back. The rounding error comes
@@ -10579,8 +10673,8 @@ class Gen:
                     e(f"{x} = OpCompositeExtract %float {v2} {c}")
                     m16.append(x)
             mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
-            b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), inv[c]) for c in range(3)]
-            b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), inv[c]) for c in range(3)]
+            b0 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[c], org[c]), inv[c]) for c in range(3)]
+            b1 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[3 + c], org[c]), inv[c]) for c in range(3)]
             near, far, nnan, fnan = [], [], [], []
             for c in range(3):
                 pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")

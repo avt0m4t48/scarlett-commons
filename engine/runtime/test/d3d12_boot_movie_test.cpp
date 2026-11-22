@@ -183,6 +183,37 @@ RGB decoded_at(const std::vector<uint8_t>& bgra, UINT w, UINT x, UINT y) {
     return RGB{p[2], p[1], p[0]};
 }
 
+// The decoded frame as the presenter's scaling blit samples it at the centre of
+// destination texel (x, y). vkCmdBlitImage maps the destination centre through
+// normalized coordinates onto the source with CLAMP_TO_EDGE (so a sample outside
+// the frame repeats the edge texel) and then filters: linearly when the source
+// format reports VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT, the nearest
+// texel otherwise, which is the presenter's choice (runtime/src/vulkan_present.h,
+// blit_filter). At 1:1 the centre lands on a texel centre and this reduces to
+// decoded_at(x, y).
+RGB sampled_at(const std::vector<uint8_t>& bgra, UINT W, UINT H, UINT ew, UINT eh, UINT x, UINT y, bool linear) {
+    const double sx = ((double)x + 0.5) * double(W) / double(ew) - 0.5;
+    const double sy = ((double)y + 0.5) * double(H) / double(eh) - 0.5;
+    if (!linear) {
+        const int nx = std::clamp((int)std::floor(sx + 0.5), 0, (int)W - 1);
+        const int ny = std::clamp((int)std::floor(sy + 0.5), 0, (int)H - 1);
+        return decoded_at(bgra, W, (UINT)nx, (UINT)ny);
+    }
+    const int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+    const double fx = sx - x0, fy = sy - y0;
+    const auto texel = [&](int tx, int ty) {
+        return decoded_at(bgra, W, (UINT)std::clamp(tx, 0, (int)W - 1), (UINT)std::clamp(ty, 0, (int)H - 1));
+    };
+    const RGB t00 = texel(x0, y0), t10 = texel(x0 + 1, y0);
+    const RGB t01 = texel(x0, y0 + 1), t11 = texel(x0 + 1, y0 + 1);
+    const auto mix = [&](int a, int b, int c, int d) {
+        const double v = (1 - fx) * (1 - fy) * a + fx * (1 - fy) * b + (1 - fx) * fy * c + fx * fy * d;
+        return (int)std::lround(v);
+    };
+    return RGB{mix(t00.r, t10.r, t01.r, t11.r), mix(t00.g, t10.g, t01.g, t11.g),
+               mix(t00.b, t10.b, t01.b, t11.b)};
+}
+
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -231,9 +262,10 @@ int main() {
     std::printf("movie: %ux%u %u frames %u/%u fps\n", W, H, header.frames, header.fps_num, header.fps_den);
 
     uint32_t first = 0;
-    if (!env("LEONIDA_MOVIE_FRAME").empty()) {
+    const std::string frame_arg = env("LEONIDA_MOVIE_FRAME");
+    if (!frame_arg.empty()) {
         char* end = nullptr;
-        unsigned long v = std::strtoul(env("LEONIDA_MOVIE_FRAME").c_str(), &end, 10);
+        const unsigned long v = std::strtoul(frame_arg.c_str(), &end, 10);
         if (!end || *end || v >= header.frames) fatal("LEONIDA_MOVIE_FRAME is not a frame in this movie");
         first = (uint32_t)v;
     }
@@ -528,25 +560,36 @@ int main() {
         EXPECT(SUCCEEDED(xbox.SetFrameIntervalX(nullptr, period, 1, 0)));
         EXPECT(SUCCEEDED(xbox.ScheduleFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0)));
 
+        // The presenter filters a scaling blit linearly when the source format
+        // reports linear filtering and takes the nearest texel otherwise
+        // (runtime/src/vulkan_present.h, blit_filter). Mirror that query so the
+        // expected pixels follow the filter the blit actually used.
+        VkFormatProperties source_properties{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+            d.physical, VK_FORMAT_B8G8R8A8_UNORM, &source_properties);
+        const bool scaling_linear =
+            (source_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+
         // Compares the captured swapchain image with the decoded BGRA frame: every
         // pixel bit-exact at 1:1 (the window is the movie's size, so the plain
-        // blit samples texel centres), or within 2 levels of a nearest-neighbour
-        // resample when the swapchain came back at another size (documented, not
-        // silent: the extent is printed).
+        // blit samples texel centres), or within 2 levels of the presenter's
+        // filter model at destination texel centres when the swapchain came back
+        // at another size (documented, not silent: extent and filter are printed).
         const auto compare_presented = [&](const Frame& frame, const std::vector<uint8_t>& bgra,
                                            const char* label) {
             const UINT ew = frame.extent.width, eh = frame.extent.height;
             const bool one_to_one = (ew == W && eh == H);
-            std::printf("%s presented extent: %ux%u (movie %ux%u, swapchain format %d)%s\n", label, ew, eh, W, H,
-                        int(frame.format), one_to_one ? "" : " (scaled comparison)");
+            std::printf("%s presented extent: %ux%u (movie %ux%u, swapchain format %d, %s filter)%s\n", label, ew, eh,
+                        W, H, int(frame.format), scaling_linear ? "linear" : "nearest",
+                        one_to_one ? "" : " (scaled comparison)");
             uint64_t exact = 0, within1 = 0, within2 = 0;
             int worst = 0;
             UINT bad_x = 0, bad_y = 0;
             RGB bad_got{0, 0, 0}, bad_want{0, 0, 0};
             for (UINT y = 0; y < eh; ++y) {
                 for (UINT x = 0; x < ew; ++x) {
-                    const UINT sx = (UINT)((uint64_t)x * W / ew), sy = (UINT)((uint64_t)y * H / eh);
-                    const RGB want = decoded_at(bgra, W, sx, sy);
+                    const RGB want = one_to_one ? decoded_at(bgra, W, x, y)
+                                                : sampled_at(bgra, W, H, ew, eh, x, y, scaling_linear);
                     const RGB got = presented_at(frame, x, y);
                     const int err = std::max({std::abs(got.r - want.r), std::abs(got.g - want.g),
                                               std::abs(got.b - want.b)});
@@ -574,17 +617,18 @@ int main() {
             if (one_to_one)
                 check(exact == 0, std::string(label) + " presented pixels bit-exact at 1:1");
             else
-                check(within2 == total, std::string(label) + " presented pixels within 2 of the resample");
-            // The centre pixel and the four corners, explicitly.
-            const UINT px[5][2] = {{W / 2, H / 2}, {0, 0}, {W - 1, 0}, {0, H - 1}, {W - 1, H - 1}};
+                check(within2 == total, std::string(label) + " presented pixels within 2 of the filter model");
+            // The centre pixel and the four corners of the presented frame,
+            // against the same filter model.
+            const UINT px[5][2] = {{ew / 2, eh / 2}, {0, 0}, {ew - 1, 0}, {0, eh - 1}, {ew - 1, eh - 1}};
             const char* name[5] = {"centre", "top-left", "top-right", "bottom-left", "bottom-right"};
             for (int i = 0; i < 5; ++i) {
-                const UINT cx = (UINT)((uint64_t)px[i][0] * ew / W), cy = (UINT)((uint64_t)px[i][1] * eh / H);
-                const RGB want = decoded_at(bgra, W, px[i][0], px[i][1]);
-                const RGB got = presented_at(frame, cx, cy);
+                const RGB got = presented_at(frame, px[i][0], px[i][1]);
+                const RGB want = one_to_one ? decoded_at(bgra, W, px[i][0], px[i][1])
+                                            : sampled_at(bgra, W, H, ew, eh, px[i][0], px[i][1], scaling_linear);
                 const int err = std::max({std::abs(got.r - want.r), std::abs(got.g - want.g),
                                           std::abs(got.b - want.b)});
-                std::printf("%s %s (%u,%u): presented %d,%d,%d decoded %d,%d,%d\n", label, name[i], px[i][0],
+                std::printf("%s %s (%u,%u): presented %d,%d,%d expected %d,%d,%d\n", label, name[i], px[i][0],
                             px[i][1], got.r, got.g, got.b, want.r, want.g, want.b);
                 check(err <= (one_to_one ? 0 : 2), std::string(label) + " " + name[i] + " pixel matches");
             }

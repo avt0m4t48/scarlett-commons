@@ -86,7 +86,7 @@ bool compare_pixel(std::vector<std::uint32_t>& result, std::uint32_t actual, std
 }
 
 bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
-         std::vector<std::uint32_t>& result, bool layer, bool& sparse) {
+         std::vector<std::uint32_t>& result, bool layer, bool separate_copy_queue, bool& sparse) {
     ComPtr<ID3D12Resource> a, b, upload, readback;
     const auto desc = texture_desc(width, height);
     EXPECT(SUCCEEDED(device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
@@ -127,19 +127,26 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     std::array<ComPtr<ID3D12CommandAllocator>, snapshots> allocators;
     std::array<ComPtr<ID3D12GraphicsCommandList>, snapshots> lists;
     for (UINT i = 0; i < snapshots; ++i) {
-        EXPECT(SUCCEEDED(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i]))));
-        EXPECT(SUCCEEDED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].Get(), nullptr,
-                                                 IID_PPV_ARGS(&lists[i]))));
+        const auto type = separate_copy_queue && i == 1 ? D3D12_COMMAND_LIST_TYPE_COPY : D3D12_COMMAND_LIST_TYPE_DIRECT;
+        EXPECT(SUCCEEDED(device.CreateCommandAllocator(type, IID_PPV_ARGS(&allocators[i]))));
+        EXPECT(SUCCEEDED(device.CreateCommandList(0, type, allocators[i].Get(), nullptr, IID_PPV_ARGS(&lists[i]))));
     }
-    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandQueue> queue, copy_queue;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     EXPECT(SUCCEEDED(device.CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
+    ComPtr<ID3D12Fence> handoff;
+    if (separate_copy_queue) {
+        const D3D12_COMMAND_QUEUE_DESC copy_desc{D3D12_COMMAND_LIST_TYPE_COPY};
+        EXPECT(SUCCEEDED(device.CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy_queue))));
+        EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&handoff))));
+    }
     const Event event;
     EXPECT(event.handle);
     const auto submit = [&](UINT i) {
         if (FAILED(lists[i]->Close())) return false;
         ID3D12CommandList* batch[] = {lists[i].Get()};
-        queue->ExecuteCommandLists(1, batch);
+        auto* target = separate_copy_queue && i == 1 ? copy_queue.Get() : queue.Get();
+        target->ExecuteCommandLists(1, batch);
         return SUCCEEDED(device.GetDeviceRemovedReason());
     };
     const auto wait_done = [&](UINT64 value) {
@@ -179,7 +186,16 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint = {row_major_offset, {desc.Format, width, height, 1, 2 * row_pitch}};
     lists[1]->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (separate_copy_queue) {
+        // The copy must see the direct queue's mappings. The later direct read must see the copy's writes.
+        EXPECT(SUCCEEDED(queue->Signal(handoff.Get(), 1)));
+        EXPECT(SUCCEEDED(copy_queue->Wait(handoff.Get(), 1)));
+    }
     EXPECT(submit(1));
+    if (separate_copy_queue) {
+        EXPECT(SUCCEEDED(copy_queue->Signal(handoff.Get(), 2)));
+        EXPECT(SUCCEEDED(queue->Wait(handoff.Get(), 2)));
+    }
     EXPECT(wait_done(2));
 
     Gate open_on_exit{gate.Get()};
@@ -268,21 +284,31 @@ int main() {
         return 1;
     }
     auto native = native_device();
-    constexpr std::array cases{std::array{256u, 256u, 4u}, std::array{256u, 240u, 1u}, std::array{240u, 240u, 3u}};
-    for (const auto& [width, height, linear_offset] : cases) {
+    const auto* info = rt::d3d12::vulkan_device_info(vulkan.Get());
+    const bool dedicated_copy = info && !info->copy_queues.empty() && info->copy_family != info->queue_family;
+    struct ReplayCase {
+        UINT width, height, linear_offset;
+        bool separate_copy_queue;
+    };
+    constexpr std::array cases{ReplayCase{256, 256, 4, false}, ReplayCase{256, 240, 1, false},
+                               ReplayCase{240, 240, 3, false}, ReplayCase{256, 256, 4, true}};
+    if (!dedicated_copy) std::puts("No separate Vulkan copy family for the cross-family case");
+    for (const auto& [width, height, linear_offset, separate_copy_queue] : cases) {
+        if (separate_copy_queue && !dedicated_copy) continue;
         bool sparse = false;
         std::vector<std::uint32_t> observed, expected;
-        if (!run(*vulkan.Get(), width, height, linear_offset, observed, true, sparse)) return 1;
+        if (!run(*vulkan.Get(), width, height, linear_offset, observed, true, separate_copy_queue, sparse)) return 1;
         if (!sparse) {
             std::printf("Vulkan device does not support compatible sparse RGBA8 tiling for %u x %u\n", width, height);
             if (height == 256) return 77;
             continue;
         }
-        std::printf("Vulkan replay: %u x %u, linear offset %u, initially unbound, aliased, row-major, and gated remap\n",
-                    width, height, linear_offset);
+        std::printf("Vulkan replay: %u x %u, linear offset %u, initially unbound, aliased, row-major, gated remap%s\n",
+                    width, height, linear_offset,
+                    separate_copy_queue ? ", COPY-to-DIRECT handoff" : "");
         if (native) {
-            if (!run(*native.Get(), width, height, linear_offset, expected, false, sparse) || observed != expected)
-                return 1;
+            if (!run(*native.Get(), width, height, linear_offset, expected, false, separate_copy_queue, sparse) ||
+                observed != expected) return 1;
             std::printf("Native D3D12 matched all %zu verified pixels\n", observed.size());
         }
     }

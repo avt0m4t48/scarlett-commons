@@ -16,7 +16,7 @@ class BuildBatchTest(unittest.TestCase):
         start = text.index('$bat = Join-Path $Temp "_build.cmd"')
         writer = text[start:text.index("$p = Start-Process", start)]
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="leonida & llvm ") as directory:
             work = Path(directory) / "LLVM 東京"
             work.mkdir()
             (work / "vcvars64.bat").write_bytes(b"@exit /b 0\r\n")
@@ -49,7 +49,7 @@ class BuildBatchTest(unittest.TestCase):
                     self.assertTrue(batch.startswith(b"@echo off\r\n"))
                     self.assertIn(str(work).encode("utf-8"), batch)
                     result = subprocess.run(
-                        ["cmd.exe", "/d", "/c", str(console_check)], cwd=work, timeout=30,
+                        ["cmd.exe", "/d", "/c", r".\check-console.cmd"], cwd=work, timeout=30,
                         env={**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"},
                         creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=startup, capture_output=True,
                     )

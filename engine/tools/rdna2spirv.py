@@ -1266,6 +1266,9 @@ class Gen:
     #   code: (bytes, kind, component bit widths from bit 0)
     # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
     # Full-width SINT and UINT preserve the same raw dwords. Keep separate kinds for signed D16 conversion.
+    # Kinds: unorm/snorm/uint (the first entries), uscaled/sscaled (the integer converted to float, not divided), sint
+    # (sign-extended), ufloat (the unsigned 5-bit-exponent 10/11-bit float). 10_11_11 and 11_11_10 are the FLOAT ones
+    # only: GFX10's UNORM/SNORM/USCALED/SSCALED/UINT/SINT codes of those two (30-35, 37-42) are not in the table.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
                72: (12, "u32", (32, 32, 32)), 75: (16, "u32", (32, 32, 32, 32)),
@@ -1281,9 +1284,69 @@ class Gen:
                # Narrow integer formats, measured natively on gfx1036 (wave32 and wave64): UINT loads zero-extend
                # and stores saturate to the channel; SINT loads sign-extend and stores clamp the 32-bit signed value
                # to [-2^(w-1), 2^(w-1) - 1].
-               5: (1, "uint", (8,)), 11: (2, "uint", (16,)), 18: (2, "uint", (8, 8)),
-               6: (1, "sint", (8,)), 12: (2, "sint", (16,)), 19: (2, "sint", (8, 8)), 28: (4, "sint", (16, 16)),
-               61: (4, "sint", (8, 8, 8, 8)), 70: (8, "sint", (16, 16, 16, 16))}
+               3: (1, "uscaled", (8,)), 4: (1, "sscaled", (8,)), 5: (1, "uint", (8,)), 6: (1, "sint", (8,)),
+               9: (2, "uscaled", (16,)), 10: (2, "sscaled", (16,)), 11: (2, "uint", (16,)), 12: (2, "sint", (16,)),
+               16: (2, "uscaled", (8, 8)), 17: (2, "sscaled", (8, 8)), 18: (2, "uint", (8, 8)),
+               19: (2, "sint", (8, 8)), 25: (4, "uscaled", (16, 16)), 26: (4, "sscaled", (16, 16)),
+               28: (4, "sint", (16, 16)), 36: (4, "ufloat", (11, 11, 10)), 43: (4, "ufloat", (10, 11, 11)),
+               45: (4, "snorm", (2, 10, 10, 10)), 46: (4, "uscaled", (2, 10, 10, 10)),
+               47: (4, "sscaled", (2, 10, 10, 10)), 48: (4, "uint", (2, 10, 10, 10)), 49: (4, "sint", (2, 10, 10, 10)),
+               51: (4, "snorm", (10, 10, 10, 2)), 52: (4, "uscaled", (10, 10, 10, 2)),
+               53: (4, "sscaled", (10, 10, 10, 2)), 54: (4, "uint", (10, 10, 10, 2)), 55: (4, "sint", (10, 10, 10, 2)),
+               58: (4, "uscaled", (8, 8, 8, 8)), 59: (4, "sscaled", (8, 8, 8, 8)), 61: (4, "sint", (8, 8, 8, 8)),
+               67: (8, "uscaled", (16, 16, 16, 16)), 68: (8, "sscaled", (16, 16, 16, 16)),
+               70: (8, "sint", (16, 16, 16, 16))}
+
+    # Formats whose float -> NORM store rounds the exact product x * max (the hardware does, gfx1150): the f32 product of
+    # the older entries rounds twice (0.3 * 65535 = 19660.5008 is 19660.5 in f32, a tie that goes to 19660; the hardware
+    # stores 19661) and stays as it is. A SCALED store converts as its NORM format.
+    EXACT_NORM_CODES = frozenset((3, 4, 9, 10, 16, 17, 25, 26, 45, 46, 47, 51, 52, 53, 58, 59, 67, 68))
+
+    def norm_encode_exact(self, x, maxval, signed):
+        """The field of a NORM store of the f32 bits x (NaN already 0): round-to-nearest-even of x * maxval, exact
+        (24 bit significand times a 16 bit maxval in 64 bit integers), clamped to [0, maxval] or [-maxval, maxval].
+        Negative gives 0 when not signed. Returns a uint whose low bits are the field (two's complement when signed)."""
+        a, e, m0, mant, m64, mx, p, s, s1, sc, sc64, q, qs, r, h, h64, hv, gt, eq, odd, tie, up, up32, q32, res, one, \
+            sgn, ng, nz = (self.tmp() for _ in range(29))
+        self.emit(f"{a} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{e} = OpShiftRightLogical %uint {a} {self.cu(23)}")
+        self.emit(f"{m0} = OpBitwiseAnd %uint {a} {self.cu(0x7FFFFF)}")
+        self.emit(f"{mant} = OpBitwiseOr %uint {m0} {self.cu(0x800000)}")
+        self.emit(f"{m64} = OpUConvert %ulong {mant}")
+        self.emit(f"{p} = OpIMul %ulong {m64} {self.cl(maxval)}")
+        self.emit(f"{s} = OpISub %uint {self.cu(150)} {e}")                 # x * maxval = p * 2^-s
+        self.emit(f"{s1} = OpExtInst %uint %glsl UMax {s} {self.cu(1)}")
+        self.emit(f"{sc} = OpExtInst %uint %glsl UMin {s1} {self.cu(63)}")   # 63: p < 2^40 rounds to 0
+        self.emit(f"{sc64} = OpUConvert %ulong {sc}")
+        self.emit(f"{q} = OpShiftRightLogical %ulong {p} {sc64}")
+        self.emit(f"{qs} = OpShiftLeftLogical %ulong {q} {sc64}")
+        self.emit(f"{r} = OpISub %ulong {p} {qs}")
+        self.emit(f"{h} = OpISub %uint {sc} {self.cu(1)}")
+        self.emit(f"{h64} = OpUConvert %ulong {h}")
+        self.emit(f"{hv} = OpShiftLeftLogical %ulong {self.cl(1)} {h64}")
+        self.emit(f"{gt} = OpUGreaterThan %bool {r} {hv}")
+        self.emit(f"{eq} = OpIEqual %bool {r} {hv}")
+        self.emit(f"{q32} = OpUConvert %uint {q}")
+        self.emit(f"{odd} = OpBitwiseAnd %uint {q32} {self.cu(1)}")
+        self.emit(f"{tie} = OpINotEqual %bool {odd} {self.cu(0)}")
+        self.emit(f"{up} = OpLogicalAnd %bool {eq} {tie}")
+        self.emit(f"{up32} = OpLogicalOr %bool {gt} {up}")
+        self.emit(f"{one} = OpSelect %uint {up32} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{res} = OpIAdd %uint {q32} {one}")
+        big = self.tmp()
+        self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x3F800000)}")      # 1.0 and up, infinity too
+        clamped = self.tmp()
+        self.emit(f"{clamped} = OpSelect %uint {big} {self.cu(maxval)} {res}")
+        self.emit(f"{sgn} = OpShiftRightLogical %uint {x} {self.cu(31)}")
+        self.emit(f"{ng} = OpINotEqual %bool {sgn} {self.cu(0)}")
+        out = self.tmp()
+        if signed:
+            negv = self.tmp()
+            self.emit(f"{negv} = OpISub %uint {self.cu(0)} {clamped}")
+            self.emit(f"{out} = OpSelect %uint {ng} {negv} {clamped}")
+        else:
+            self.emit(f"{out} = OpSelect %uint {ng} {self.cu(0)} {clamped}")
+        return out
 
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
@@ -1302,26 +1365,40 @@ class Gen:
         for c, w in enumerate(widths):
             if kind == "f16":
                 field = self.f16_bits(self.tof(fcomps[c]))
-            elif kind == "unorm":
+            elif kind in ("unorm", "uscaled") and code in self.EXACT_NORM_CODES:   # a SCALED store: its NORM format
+                field = self.norm_encode_exact(fcomps[c], (1 << w) - 1, False)
+            elif kind in ("unorm", "uscaled"):
                 cl, sc, rd, u = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} %f0 %f1")
                 self.emit(f"{sc} = OpFMul %float {cl} {self.fconst(float((1 << w) - 1))}")
                 self.emit(f"{rd} = OpExtInst %float %glsl RoundEven {sc}")
                 self.emit(f"{u} = OpConvertFToU %uint {rd}")
                 field = u
-            elif kind == "snorm":
+            elif kind in ("snorm", "sscaled") and w > 2 and code in self.EXACT_NORM_CODES:
+                field = self.norm_encode_exact(fcomps[c], (1 << (w - 1)) - 1, True)
+            elif kind in ("snorm", "sscaled"):
                 cl, sc, rd, i, u = self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} {self.fconst(-1.0)} %f1")
-                self.emit(f"{sc} = OpFMul %float {cl} {self.fconst(float((1 << (w - 1)) - 1))}")
-                self.emit(f"{rd} = OpExtInst %float %glsl RoundEven {sc}")
-                self.emit(f"{i} = OpConvertFToS %int {rd}")
-                self.emit(f"{u} = OpBitcast %uint {i}")
+                if w == 2:
+                    # {-1, 0, 1}: a half rounds away from zero here (gfx1150), where RoundEven would give 0
+                    hi, lo, one, neg = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{hi} = OpFOrdGreaterThanEqual %bool {cl} {self.fconst(0.5)}")
+                    self.emit(f"{lo} = OpFOrdLessThanEqual %bool {cl} {self.fconst(-0.5)}")
+                    self.emit(f"{one} = OpSelect %uint {hi} {self.cu(1)} {self.cu(0)}")
+                    self.emit(f"{u} = OpSelect %uint {lo} {self.cu(0xFFFFFFFF)} {one}")
+                else:
+                    self.emit(f"{sc} = OpFMul %float {cl} {self.fconst(float((1 << (w - 1)) - 1))}")
+                    self.emit(f"{rd} = OpExtInst %float %glsl RoundEven {sc}")
+                    self.emit(f"{i} = OpConvertFToS %int {rd}")
+                    self.emit(f"{u} = OpBitcast %uint {i}")
                 field = u
             elif kind == "sint":   # Narrow SINT stores clamp the signed value to the field's range.
                 clamped, field = self.tmp(), self.tmp()
                 lo, hi = self.as_int(self.cu((-(1 << (w - 1))) & 0xFFFFFFFF)), self.as_int(self.cu((1 << (w - 1)) - 1))
                 self.emit(f"{clamped} = OpExtInst %int %glsl SClamp {self.as_int(icomps[c])} {lo} {hi}")
                 self.emit(f"{field} = OpBitcast %uint {clamped}")
+            elif kind == "ufloat":
+                field = self.ufloat_encode_bits(fcomps[c], w)
             else:   # Narrow UINT stores saturate to the field width before insertion.
                 field = self.tmp()
                 self.emit(f"{field} = OpExtInst %uint %glsl UMin {icomps[c]} {self.cu((1 << w) - 1)}")
@@ -1331,6 +1408,74 @@ class Gen:
             words[wi] = ins
             bit += w
         return words
+
+    def ufloat_encode_bits(self, x, w):
+        """The w-bit unsigned float (5 exponent bits, bias 15, w - 5 mantissa bits) of the f32 bits x, integer ops only.
+        Round toward zero; a value past the largest finite one gives that largest finite value; +-0 and every negative
+        number except a NaN give 0; +inf gives infinity; a NaN keeps the top mantissa bits of its payload, or 1 when they
+        are all zero, so it stays a NaN (all measured on gfx1150, tools/buffer_format_fuzz.py)."""
+        mb = w - 5
+        (a, ex, sg, sig, hid, sh0, sh, shc, dn, nr0, nr, nm, nm1, nz, nmant, nanb, isnan, isinf, big, norm,
+         r0, r1, r2, neg, ng, r3, snan) = (self.tmp() for _ in range(27))
+        self.emit(f"{a} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{sg} = OpShiftRightLogical %uint {x} {self.cu(31)}")
+        self.emit(f"{ex} = OpShiftRightLogical %uint {a} {self.cu(23)}")
+        self.emit(f"{hid} = OpBitwiseAnd %uint {a} {self.cu(0x7FFFFF)}")
+        self.emit(f"{sig} = OpBitwiseOr %uint {hid} {self.cu(0x800000)}")
+        self.emit(f"{sh0} = OpISub %uint {self.cu(136 - mb)} {ex}")      # denormal result: sig >> (136 - mb - e)
+        self.emit(f"{shc} = OpExtInst %uint %glsl UMin {sh0} {self.cu(31)}")
+        self.emit(f"{dn} = OpShiftRightLogical %uint {sig} {shc}")
+        self.emit(f"{nr0} = OpISub %uint {a} {self.cu(112 << 23)}")      # normal result: rebias, drop mantissa bits
+        self.emit(f"{nr} = OpShiftRightLogical %uint {nr0} {self.cu(23 - mb)}")
+        self.emit(f"{nm} = OpShiftRightLogical %uint {a} {self.cu(23 - mb)}")
+        self.emit(f"{nm1} = OpBitwiseAnd %uint {nm} {self.cu((1 << mb) - 1)}")
+        self.emit(f"{nz} = OpIEqual %bool {nm1} {self.cu(0)}")
+        self.emit(f"{nmant} = OpSelect %uint {nz} {self.cu(1)} {nm1}")
+        self.emit(f"{nanb} = OpBitwiseOr %uint {nmant} {self.cu(31 << mb)}")
+        self.emit(f"{isnan} = OpUGreaterThan %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
+        self.emit(f"{norm} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
+        self.emit(f"{r0} = OpSelect %uint {norm} {nr} {dn}")
+        self.emit(f"{r1} = OpSelect %uint {big} {self.cu((30 << mb) | ((1 << mb) - 1))} {r0}")
+        self.emit(f"{r2} = OpSelect %uint {isinf} {self.cu(31 << mb)} {r1}")
+        self.emit(f"{r3} = OpSelect %uint {isnan} {nanb} {r2}")
+        self.emit(f"{neg} = OpINotEqual %bool {sg} {self.cu(0)}")
+        self.emit(f"{snan} = OpLogicalNot %bool {isnan}")
+        self.emit(f"{ng} = OpLogicalAnd %bool {neg} {snan}")
+        res = self.tmp()
+        self.emit(f"{res} = OpSelect %uint {ng} {self.cu(0)} {r3}")
+        return res
+
+    def ufloat_decode_bits(self, f, w):
+        """f32 bits of the w-bit unsigned float in the low bits of f (see ufloat_encode_bits): exact, integer ops only.
+        A NaN keeps its payload shifted up, unquieted; there is no sign."""
+        mb = w - 5
+        e, m, eb, es, ms, nrm, p, pi, pb, db, ds, dm, dsh, dmk, dn, nzm, isz, dres, inf, mz, r0, r1, r2 = \
+            (self.tmp() for _ in range(23))
+        self.emit(f"{e} = OpBitFieldUExtract %uint {f} {self.cu(mb)} {self.cu(5)}")
+        self.emit(f"{m} = OpBitFieldUExtract %uint {f} {self.cu(0)} {self.cu(mb)}")
+        self.emit(f"{eb} = OpIAdd %uint {e} {self.cu(112)}")
+        self.emit(f"{es} = OpShiftLeftLogical %uint {eb} {self.cu(23)}")
+        self.emit(f"{ms} = OpShiftLeftLogical %uint {m} {self.cu(23 - mb)}")
+        self.emit(f"{nrm} = OpBitwiseOr %uint {es} {ms}")
+        # exponent 0: a denormal m * 2^(-14 - mb); its top set bit p gives the f32 exponent p + 113 - mb
+        self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {m}")
+        self.emit(f"{p} = OpBitcast %uint {pi}")
+        self.emit(f"{pb} = OpIAdd %uint {p} {self.cu(113 - mb)}")
+        self.emit(f"{db} = OpShiftLeftLogical %uint {pb} {self.cu(23)}")
+        self.emit(f"{dsh} = OpISub %uint {self.cu(23)} {p}")
+        self.emit(f"{dm} = OpShiftLeftLogical %uint {m} {dsh}")
+        self.emit(f"{dmk} = OpBitwiseAnd %uint {dm} {self.cu(0x7FFFFF)}")
+        self.emit(f"{dn} = OpBitwiseOr %uint {db} {dmk}")
+        self.emit(f"{mz} = OpIEqual %bool {m} {self.cu(0)}")
+        self.emit(f"{dres} = OpSelect %uint {mz} {self.cu(0)} {dn}")
+        self.emit(f"{isz} = OpIEqual %bool {e} {self.cu(0)}")
+        self.emit(f"{r0} = OpSelect %uint {isz} {dres} {nrm}")
+        self.emit(f"{inf} = OpIEqual %bool {e} {self.cu(31)}")
+        self.emit(f"{r1} = OpBitwiseOr %uint {ms} {self.cu(0x7F800000)}")
+        self.emit(f"{r2} = OpSelect %uint {inf} {r1} {r0}")
+        return r2
 
     def norm_bits(self, m, n):
         """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
@@ -1417,6 +1562,23 @@ class Gen:
                 out.append(self.tou(x))
             elif kind == "unorm":
                 out.append(normalize(f, w))
+            elif kind == "uscaled":
+                x = self.tmp()
+                self.emit(f"{x} = OpConvertUToF %float {f}")
+                out.append(self.tou(x))
+            elif kind in ("sscaled", "sint"):
+                si = self.tmp()
+                self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
+                if kind == "sint":
+                    u = self.tmp()
+                    self.emit(f"{u} = OpBitcast %uint {si}")
+                    out.append(u)
+                else:
+                    x = self.tmp()
+                    self.emit(f"{x} = OpConvertSToF %float {si}")
+                    out.append(self.tou(x))
+            elif kind == "ufloat":
+                out.append(self.ufloat_decode_bits(f, w))
             elif kind == "snorm":
                 # magnitude over 2^(w-1)-1 with the same integer rounding; the most negative code is -1.0
                 si, neg, ab, au, sg, sel, lo, res = (self.tmp() for _ in range(8))
@@ -2469,7 +2631,7 @@ class Gen:
                     self.emit(f"OpBranchConditional {e} {ld} {le}")
                     self.emit(f"{ld} = OpLabel")
                 ncomp = min(len(widths), n)
-                source = normalized if kind in ("unorm", "snorm") else fc
+                source = normalized if kind in ("unorm", "snorm", "uscaled", "sscaled") else fc
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 if code in (50, 56):
                     fcs = unorm_view

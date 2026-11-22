@@ -429,9 +429,9 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     root = ptr_root[base]
                     ptr_root[res] = root
                     base_slot = ptr_slot.get(base)
-                    if base_slot is not None and all(i in const_ids for i in idxs):
+                    if base_slot is not None and all(i in const_int_val for i in idxs):
                         # Canonicalize integer index constants by unsigned value so %uint_0 and %int_0 alias.
-                        cidxs = tuple(const_int_val[i][1] if i in const_int_val else i for i in idxs)
+                        cidxs = tuple(const_int_val[i][1] for i in idxs)
                         ptr_slot[res] = base_slot + cidxs
                     else:
                         ptr_slot[res] = None
@@ -440,14 +440,29 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 elif base in readonly_global_vars:
                     ptr_root[res] = base
 
+        slot_depths: dict[str, set[int]] = {}
         for res, op, args, _ in insts:
             if op is None:
                 continue
             if op == "OpLoad":
+                if len(args) >= 2 and args[1] in ptr_root and ptr_root[args[1]] in func_vars:
+                    root = ptr_root[args[1]]
+                    if any("Volatile" in m for m in args[2:]):
+                        escaped.add(root)
+                    sl = ptr_slot.get(args[1])
+                    if sl is not None:
+                        slot_depths.setdefault(root, set()).add(len(sl))
                 for tok in args[2:]:
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
             elif op == "OpStore":
+                if len(args) >= 2 and args[0] in ptr_root and ptr_root[args[0]] in func_vars:
+                    root = ptr_root[args[0]]
+                    if any("Volatile" in m for m in args[2:]):
+                        escaped.add(root)
+                    sl = ptr_slot.get(args[0])
+                    if sl is not None:
+                        slot_depths.setdefault(root, set()).add(len(sl))
                 for tok in args[1:]:
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
@@ -459,6 +474,11 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 for tok in args:
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
+
+        # Exclude variables accessed at mixed aggregate/subobject depths (e.g. whole array + element pointer).
+        for root, depths in slot_depths.items():
+            if len(depths) > 1:
+                escaped.add(root)
 
         trackable = {v for v in func_vars if v not in escaped}
         static_trackable = {v for v in trackable if v not in dyn_indexed}

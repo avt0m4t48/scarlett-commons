@@ -193,6 +193,154 @@ class SpirvOptTests(unittest.TestCase):
         self.assertNotIn("%local = OpVariable", opt)
         self.assertNotIn("%sum = OpIAdd", opt)
 
+    def test_alias_signed_unsigned_index_volatile_and_aggregate_overlap(self):
+        # Regression tests for standalone memory aliasing cases (PR #2298 review):
+        # 1) Store 1 via %uint 0, store 2 via %int 0, load via first pointer -> must observe 2, not 1.
+        # 2) Store 1, Volatile store 2, ordinary load -> must NOT forward stale 1.
+        # 3) Store 1, Volatile load, store 2 -> must NOT kill store 1 before volatile load.
+        # 4) Store element 0 = 1, store whole array = {2, 2}, load element 0 -> must NOT forward stale 1.
+        spv_idx = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+         %c2 = OpConstant %uint 2
+        %arr = OpTypeArray %uint %c2
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_Fa = OpTypePointer Function %arr
+    %_ptr_Fu = OpTypePointer Function %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+        %u0  = OpConstant %uint 0
+        %s0  = OpConstant %int 0
+        %u1  = OpConstant %uint 1
+        %u2  = OpConstant %uint 2
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %a = OpVariable %_ptr_Fa Function
+         %p0 = OpAccessChain %_ptr_Fu %a %u0
+         %p1 = OpAccessChain %_ptr_Fu %a %s0
+               OpStore %p0 %u1
+               OpStore %p1 %u2
+          %r = OpLoad %uint %p0
+        %vec = OpCompositeConstruct %v4uint %r %u0 %u0 %u0
+               OpStore %out0 %vec
+               OpReturn
+               OpFunctionEnd
+"""
+        _validate(spv_idx)
+        opt_idx = spirv_opt.optimize(spv_idx)
+        _validate(opt_idx)
+        self.assertIn("OpCompositeConstruct %v4uint %u2 %u0 %u0 %u0", opt_idx)
+
+        spv_vol_store = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_Fu = OpTypePointer Function %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+        %u0  = OpConstant %uint 0
+        %u1  = OpConstant %uint 1
+        %u2  = OpConstant %uint 2
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %x = OpVariable %_ptr_Fu Function
+               OpStore %x %u1
+               OpStore %x %u2 Volatile
+          %r = OpLoad %uint %x
+        %vec = OpCompositeConstruct %v4uint %r %u0 %u0 %u0
+               OpStore %out0 %vec
+               OpReturn
+               OpFunctionEnd
+"""
+        _validate(spv_vol_store)
+        opt_vs = spirv_opt.optimize(spv_vol_store)
+        _validate(opt_vs)
+        self.assertIn("OpStore %x %u2 Volatile", opt_vs)
+        self.assertIn("%r = OpLoad %uint %x", opt_vs)
+        self.assertIn("OpCompositeConstruct %v4uint %r %u0 %u0 %u0", opt_vs)
+
+        spv_vol_load = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_Fu = OpTypePointer Function %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+        %u0  = OpConstant %uint 0
+        %u1  = OpConstant %uint 1
+        %u2  = OpConstant %uint 2
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %x = OpVariable %_ptr_Fu Function
+               OpStore %x %u1
+          %r = OpLoad %uint %x Volatile
+               OpStore %x %u2
+        %vec = OpCompositeConstruct %v4uint %r %u0 %u0 %u0
+               OpStore %out0 %vec
+               OpReturn
+               OpFunctionEnd
+"""
+        _validate(spv_vol_load)
+        opt_vl = spirv_opt.optimize(spv_vol_load)
+        _validate(opt_vl)
+        self.assertIn("OpStore %x %u1", opt_vl)
+        self.assertIn("%r = OpLoad %uint %x Volatile", opt_vl)
+        self.assertIn("OpStore %x %u2", opt_vl)
+
+        spv_agg = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+         %c2 = OpConstant %uint 2
+        %arr = OpTypeArray %uint %c2
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_Fa = OpTypePointer Function %arr
+    %_ptr_Fu = OpTypePointer Function %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+        %u0  = OpConstant %uint 0
+        %u1  = OpConstant %uint 1
+        %u2  = OpConstant %uint 2
+       %a22  = OpConstantComposite %arr %u2 %u2
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %a = OpVariable %_ptr_Fa Function
+         %p0 = OpAccessChain %_ptr_Fu %a %u0
+               OpStore %p0 %u1
+               OpStore %a %a22
+          %r = OpLoad %uint %p0
+        %vec = OpCompositeConstruct %v4uint %r %u0 %u0 %u0
+               OpStore %out0 %vec
+               OpReturn
+               OpFunctionEnd
+"""
+        _validate(spv_agg)
+        opt_agg = spirv_opt.optimize(spv_agg)
+        _validate(opt_agg)
+        self.assertIn("OpStore %a %a22", opt_agg)
+        self.assertIn("%r = OpLoad %uint %p0", opt_agg)
+        self.assertIn("OpCompositeConstruct %v4uint %r %u0 %u0 %u0", opt_agg)
+
     def test_wave64_emulated_compute_validates_and_shrinks(self):
         cs_lines = [
             "s_load_dwordx2 s[4:5], s[0:1], 0x0",

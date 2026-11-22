@@ -48,14 +48,20 @@ def words(*ws: int) -> bytes:
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
     def test_sopp_endpgm_branch_and_waitcnt(self):
-        # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC; s_endpgm = 0xBF810000
-        code = words(0xBF8C0070, 0xBF85FFFC, 0xBF810000)
+        # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
+        # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000
+        code = words(0xBF8C0070, 0xBF85FFFC, 0xBF82FFEC, 0xBF810000)
         info = rdna2_decode.decode_bytes(code)
         self.assertEqual(info["invalid"], 0)
-        self.assertEqual([i["op"] for i in info["insns"]], ["s_waitcnt", "s_cbranch_scc1", "s_endpgm"])
+        self.assertEqual([i["op"] for i in info["insns"]], ["s_waitcnt", "s_cbranch_scc1", "s_branch", "s_endpgm"])
         self.assertEqual([a["t"] for a in info["insns"][0]["args"]], ["vmcnt(0)", "lgkmcnt(0)"])
-        self.assertEqual(info["insns"][1]["args"], [{"k": "imm", "v": 0xFFFC}])
-        self.assertEqual([i["pc"] for i in info["insns"]], [0, 4, 8])
+        self.assertEqual(info["insns"][1]["args"], [{"k": "imm", "v": -4}])
+        self.assertEqual(info["insns"][2]["args"], [{"k": "imm", "v": -20}])
+        self.assertEqual([i["pc"] for i in info["insns"]], [0, 4, 8, 12])
+        text, inv = rdna2_decode.disasm_bytes(code)
+        self.assertEqual(inv, 0)
+        self.assertIn("s_cbranch_scc1 -4", text)
+        self.assertIn("s_branch -20", text)
 
     def test_sop1_sop2_sopc_sopk_with_literals(self):
         # s_mov_b32 s4, 0x12345678 (SOP1: op=3, sdst=4, ssrc0=255 + lit)
@@ -198,12 +204,14 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     op = op[:-len(suf)]
             return op
 
-        def norm_arg(a):
+        def norm_arg(a, op=""):
             k = a["k"]
             if k in ("vgpr", "sgpr"):
                 return (k, a["r"], a.get("n", 1), bool(a.get("neg")), bool(a.get("abs")), bool(a.get("sext")))
             if k == "imm":
-                return ("imm", a["v"] & 0xFFFFFFFF, bool(a.get("neg")), bool(a.get("abs")))
+                # LLVM 18 disassembles SOPP branch offsets unsigned (0xfff0), LLVM 21/22 signed (-16).
+                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES else 0xFFFFFFFF
+                return ("imm", a["v"] & mask, bool(a.get("neg")), bool(a.get("abs")))
             if k == "fimm":
                 return ("fimm", round(a["v"], 6), bool(a.get("neg")), bool(a.get("abs")))
             if k in ("vlist", "slist"):
@@ -254,7 +262,8 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             for li, di in zip(llvm_insns, dec["insns"]):
                 self.assertEqual(di["enc"], li["enc"], path)
                 self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
-                self.assertEqual([norm_arg(x) for x in di["args"]], [norm_arg(x) for x in li["args"]],
+                self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
+                                 [norm_arg(x, li["op"]) for x in li["args"]],
                                  f"{path}: {li['op']}")
                 self.assertEqual(sorted(di["mods"]), sorted(li["mods"]), f"{path}: {li['op']}")
                 checked += 1

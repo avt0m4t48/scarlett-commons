@@ -2,7 +2,7 @@
 
 Decodes raw RDNA2 machine code directly into either:
   - `shader_ir`-compatible instruction dictionaries (`decode_bytes`), or
-  - LLVM-compatible `.s` disassembly text with `; encoding: [...]` (`disasm_bytes`).
+  - `shader_ir`-compatible `.s` disassembly text with `; encoding: [...]` (`disasm_bytes`).
 
 Opcode tables in `tools/rdna2_isa_tables.py` are derived from AMD's MIT-licensed
 machine-readable RDNA2 ISA specification (`amdgpu_isa_rdna2.xml`), plus the seven
@@ -314,10 +314,19 @@ def _format_dpp16_ctrl(ctrl: int) -> str:
 
 def _format_ds_swizzle(offset16: int) -> str:
     if (offset16 & 0x8000) == 0:
-        # BITMASK_PERM: bits [4:0] = and_mask, [9:5] = or_mask, [14:10] = xor_mask
+        # Bitmask mode: bits [4:0] = and_mask, [9:5] = or_mask, [14:10] = xor_mask.
+        # Match LLVM's canonical aliases (SWAP, REVERSE, BROADCAST) before general BITMASK_PERM.
         and_m = offset16 & 0x1F
         or_m = (offset16 >> 5) & 0x1F
         xor_m = (offset16 >> 10) & 0x1F
+        if and_m == 0x1F and or_m == 0:
+            if xor_m in (1, 2, 4, 8, 16):
+                return f"offset:swizzle(SWAP,{xor_m})"
+            if xor_m in (3, 7, 15, 31):
+                return f"offset:swizzle(REVERSE,{xor_m + 1})"
+        if xor_m == 0 and (or_m & and_m) == 0 and (0x1F ^ and_m) in (1, 3, 7, 15, 31):
+            grp = (0x1F ^ and_m) + 1
+            return f"offset:swizzle(BROADCAST,{grp},{or_m})"
         chars = []
         for bit in range(4, -1, -1):
             a = (and_m >> bit) & 1
@@ -334,19 +343,10 @@ def _format_ds_swizzle(offset16: int) -> str:
             else:
                 return f"offset:{offset16}"
         return f'offset:swizzle(BITMASK_PERM,"{"".join(chars)}")'
-    mode = (offset16 >> 13) & 3
-    if mode == 0:
+    if (offset16 & 0xFF00) == 0x8000:
         p = [(offset16 >> (2 * i)) & 3 for i in range(4)]
         return f"offset:swizzle(QUAD_PERM,{p[0]},{p[1]},{p[2]},{p[3]})"
-    if mode == 1:
-        grp = (offset16 & 0x1F) + 1
-        lane = (offset16 >> 5) & 0x1F
-        return f"offset:swizzle(BROADCAST,{grp},{lane})"
-    if mode == 2:
-        size = offset16 & 0x1F
-        return f"offset:swizzle(SWAP,{size})"
-    size = (offset16 & 0x1F) + 1
-    return f"offset:swizzle(REVERSE,{size})"
+    return f"offset:{offset16}"
 
 
 def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
@@ -755,7 +755,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
             if name == "s_sendmsg" or name == "s_sendmsghalt":
                 return finish(name, [{"k": "special", "t": _format_sendmsg(simm16)}], [], 4)
             if name in _SOPP_BRANCHES:
-                return finish(name, [{"k": "imm", "v": simm16}], [], 4)
+                return finish(name, [{"k": "imm", "v": _s16(simm16)}], [], 4)
             if name == "s_clause":
                 return finish(name, [{"k": "imm", "v": simm16}], [], 4)
             return finish(name, [{"k": "imm", "v": simm16}], [], 4)
@@ -1357,7 +1357,7 @@ def _format_operand(a: dict) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if v >= 100 or v < -16 else str(v)
+        s = f"0x{v:x}" if v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))

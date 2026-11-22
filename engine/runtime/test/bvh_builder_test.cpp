@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -531,15 +532,32 @@ struct PsoName {
     int number;
     void* object;
     void** original_vtable;
+    bool restored;
 };
 std::vector<PsoName> g_pso_names;
-int g_named = 0;
-bool g_in_set_name = false;
+std::set<int> g_named;  // creation numbers that got a name
+thread_local bool g_in_set_name = false;
 
+// The newest live entry for the address (an address can be reused after a PSO is released).
 PsoName* find_pso(void* object) {
-    for (auto& p : g_pso_names)
-        if (p.object == object) return &p;
+    for (auto it = g_pso_names.rbegin(); it != g_pso_names.rend(); ++it)
+        if (!it->restored && it->object == object) return &*it;
     return nullptr;
+}
+
+// Puts the object's own vtable back, so its destructor and every virtual call past the 9 copied slots see the
+// original. Done as soon as the name is logged, and for the rest after the constructor returns.
+void restore_pso_vtable(PsoName& p) {
+    if (p.restored) return;
+    p.restored = true;
+    __try {
+        *static_cast<void***>(p.object) = p.original_vtable;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void restore_all_pso_vtables() {
+    for (auto& p : g_pso_names) restore_pso_vtable(p);
 }
 
 std::string narrow(const wchar_t* w) {
@@ -554,11 +572,12 @@ constexpr GUID kDebugNameA = {0x429b8c22, 0x9188, 0x4b0c, {0x87, 0x42, 0xac, 0xb
 HRESULT STDMETHODCALLTYPE pso_set_name(void* self, const wchar_t* name) {
     if (auto* p = find_pso(self)) {
         std::printf("  slot62 #%d name via SetName: \"%s\"\n", p->number, narrow(name).c_str());
-        ++g_named;
+        g_named.insert(p->number);
         using Fn = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*);
         g_in_set_name = true;  // the runtime's SetName may call SetPrivateData through the vtable
         const HRESULT hr = reinterpret_cast<Fn>(p->original_vtable[6])(self, name);
         g_in_set_name = false;
+        restore_pso_vtable(*p);
         return hr;
     }
     return E_FAIL;
@@ -581,9 +600,11 @@ HRESULT STDMETHODCALLTYPE pso_set_private_data(void* self, const GUID& guid, UIN
         }
         std::printf("  slot62 #%d SetPrivateData guid %s size %u%s%s%s\n", p->number, g, size,
                     value.empty() ? "" : " name \"", value.c_str(), value.empty() ? "" : "\"");
-        if (!value.empty()) ++g_named;
+        if (!value.empty()) g_named.insert(p->number);
         using Fn = HRESULT(STDMETHODCALLTYPE*)(void*, const GUID&, UINT, const void*);
-        return reinterpret_cast<Fn>(p->original_vtable[4])(self, guid, size, data);
+        const HRESULT hr = reinterpret_cast<Fn>(p->original_vtable[4])(self, guid, size, data);
+        if (!value.empty()) restore_pso_vtable(*p);
+        return hr;
     }
     return E_FAIL;
 }
@@ -605,7 +626,7 @@ void hook_pso_names(uint64_t out_ptr, int number) {
     std::memcpy(copy, orig, kSlots * sizeof(void*));
     copy[4] = reinterpret_cast<void*>(&pso_set_private_data);
     copy[6] = reinterpret_cast<void*>(&pso_set_name);
-    g_pso_names.push_back({number, object, orig});
+    g_pso_names.push_back({number, object, orig, false});
     *static_cast<void***>(object) = copy;
 }
 
@@ -803,6 +824,7 @@ int main() {
         std::vector<uint8_t> object(kObjectBuffer, kSentinel);
         const ULONGLONG t0 = GetTickCount64();
         Call c = guarded_ctor(ctor, object.data(), proxy, flag);
+        restore_all_pso_vtables();  // PSOs never named keep the copy until here (RT-266)
         const ULONGLONG ms = GetTickCount64() - t0;
         size_t last = 0, changed = 0;
         for (size_t i = 0; i < object.size(); ++i)
@@ -820,7 +842,7 @@ int main() {
              (g_slot62_logged ? ", succeeded " + std::to_string(g_slot62_ok) + ", failed " + std::to_string(g_slot62_failed)
                               : std::string()));
         if (g_slot62_logged) {
-            note("slot 62 creations given a name by the builder: " + std::to_string(g_named) + " of " +
+            note("slot 62 creations given a name by the builder: " + std::to_string(g_named.size()) + " of " +
                  std::to_string(g_slot62_logged));
             note("slot 62 creations: " + std::to_string(g_slot62_logged) + ", distinct containers: " +
                  std::to_string(g_slot62_logged - g_repeats) + ", repeated creations: " + std::to_string(g_repeats));

@@ -1965,84 +1965,28 @@ class Gen:
         self.emit(f"{lbl_exit} = OpLabel")
         return cur, lbl_exit
 
-    def global_atomic(self, op, a, mods):
-        """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
-        (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
-        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. inc/dec wrap unsigned against DATA
-        via a CAS loop. Inactive lanes don't touch memory and keep vdst. and/or/xor/swap_x2 work on a 64-bit element
-        (two dwords, low first) as one 32-bit atomic per dword, with no Int64 atomics. That leaves the same memory for
-        a bitwise op, whose bits are independent, but not always for an exchange: two lanes swapping into one element
-        at once can leave one's low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is
-        two reads, so another lane's 64-bit op on the same element between them could be seen half done. The other
-        _x2 forms (add/sub/min/max/inc/dec carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and
-        fcmpswap stay Unsupported."""
-        kind = op[len("global_atomic_"):]
-        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
-            return self.global_atomic_x2(op, kind[:-3], a, mods)
-        if kind in ("fmin", "fmax"):
-            return self.global_atomic_float(op, kind, a, mods)
-        is_inc_dec = kind in ("inc", "dec")
-        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or any(m in mods for m in ("slc", "dlc", "lds")):
-            raise Unsupported(op if (kind not in self.BUF_ATOMICS and not is_inc_dec) else op + " form")
-        rtn = "glc" in mods
-        if len(a) != (4 if rtn else 3):
-            raise Unsupported(op + " operands")
-        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
-        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (2 if kind == "cmpswap" else 1) or \
-                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
-            raise Unsupported(op + " operands")
-        full = self.global_address(op, vaddr, saddr, mods)
-        val = self.load_reg("vgpr", vdata["r"])
-        cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind == "cmpswap" else None
-        old_d = self.load_reg("vgpr", vdst["r"]) if vdst is not None else self.cu(0)
-        lbl_do, lbl_end, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp()
-        pre = self.current_label_placeholder()
-        act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
-        self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
-        self.emit(f"{lbl_do} = OpLabel")
-        ptr, p = self.tmp(), self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
-        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
-        if is_inc_dec:
-            res, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
-        else:
-            res, done_lbl = self.tmp(), lbl_do
-            if kind == "cmpswap":
-                self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
-            else:
-                self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
-        self.emit(f"OpBranch {lbl_end}")
-        self.emit(f"{lbl_end} = OpLabel")
-        self.emit(f"{old} = OpPhi %uint {res} {done_lbl} {old_d} {pre}")
-        if vdst is not None:
-            self.store_reg("vgpr", vdst["r"], old)
+    def atomic_aligned(self, addr, align_bytes):
+        """True iff 64-bit Xbox VA `addr` is naturally aligned to `align_bytes` (4 or 8).
+        Measured natively on RDNA2 (gfx1036, wave32 & wave64): unaligned buffer_atomic* and global_atomic*
+        leave memory untouched and active glc lanes receive 0 / (0, 0), while inactive lanes keep vdst."""
+        lo, rem, ok = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpUConvert %uint {addr}")
+        self.emit(f"{rem} = OpBitwiseAnd %uint {lo} {self.cu(align_bytes - 1)}")
+        self.emit(f"{ok} = OpIEqual %bool {rem} {self.cu(0)}")
+        return ok
 
-    def global_atomic_float(self, op, kind, a, mods):
-        """global_atomic_{fmin,fmax} [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: 32-bit float min/max at the
-        global_* address via a CAS loop (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax, so no shader float atomic
-        extension is needed). Inactive lanes don't touch memory and keep vdst."""
-        if any(m in mods for m in ("slc", "dlc", "lds")):
-            raise Unsupported(op + " form")
-        rtn = "glc" in mods
-        if len(a) != (4 if rtn else 3):
-            raise Unsupported(op + " operands")
-        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
-        if vdata["k"] != "vgpr" or vdata.get("n", 1) != 1 or \
-                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
-            raise Unsupported(op + " operands")
-        full = self.global_address(op, vaddr, saddr, mods)
-        val_f = self.tof(self.load_reg("vgpr", vdata["r"]))
-        old_d = self.load_reg("vgpr", vdst["r"]) if vdst is not None else self.cu(0)
+    def _emit_atomic_fminmax_cas(self, kind, addr, val_f, cond):
+        """Shared CAS loop for 32-bit float atomic min/max (global_atomic_{fmin,fmax} and buffer_atomic_{fmin,fmax}).
+        Returns the pre-op uint word on taken lanes and 0 on skipped lanes (caller writes via self.dst so inactive
+        lanes keep their destination VGPR untouched)."""
         lbl_do, lbl_hdr, lbl_cont, lbl_exit, lbl_end = (
             self.tmp() + s for s in ("_do", "_hdr", "_cont", "_exit", "_end"))
         pre = self.current_label_placeholder()
-        act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
         self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr, p, init = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         self.emit(f"{init} = OpLoad %uint {p} Aligned 4")
         self.emit(f"OpBranch {lbl_hdr}")
@@ -2063,9 +2007,85 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         old = self.tmp()
-        self.emit(f"{old} = OpPhi %uint {cur} {lbl_exit} {old_d} {pre}")
+        self.emit(f"{old} = OpPhi %uint {cur} {lbl_exit} {self.cu(0)} {pre}")
+        return old
+
+    def global_atomic(self, op, a, mods):
+        """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
+        (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
+        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
+        and keep vdst; active unaligned lanes (addr % 4 != 0, or addr % 8 != 0 for _x2) leave memory untouched and
+        write 0 / (0, 0) to vdst (measured natively on gfx1036). and/or/xor/swap_x2 work on a 64-bit element (two
+        dwords, low first) as one 32-bit atomic per dword, with no Int64 atomics. That leaves the same memory for a
+        bitwise op, whose bits are independent, but not always for an exchange: two lanes swapping into one element at
+        once can leave one's low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two
+        reads, so another lane's 64-bit op on the same element between them could be seen half done. The other _x2
+        forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and inc/dec stay
+        Unsupported."""
+        kind = op[len("global_atomic_"):]
+        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
+            return self.global_atomic_x2(op, kind[:-3], a, mods)
+        if kind in ("fmin", "fmax"):
+            return self.global_atomic_float(op, kind, a, mods)
+        is_inc_dec = kind in ("inc", "dec")
+        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op if (kind not in self.BUF_ATOMICS and not is_inc_dec) else op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (2 if kind == "cmpswap" else 1) or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        val = self.load_reg("vgpr", vdata["r"])
+        cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind == "cmpswap" else None
+        al = self.atomic_aligned(full, 4)
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {al}")
+        lbl_do, lbl_end, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp()
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        ptr, p = self.tmp(), self.tmp()
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
+        if is_inc_dec:
+            res, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
+        else:
+            res, done_lbl = self.tmp(), lbl_do
+            if kind == "cmpswap":
+                self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
+            else:
+                self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        self.emit(f"{old} = OpPhi %uint {res} {done_lbl} {self.cu(0)} {pre}")
         if vdst is not None:
-            self.store_reg("vgpr", vdst["r"], old)
+            self.dst(vdst, old)
+
+    def global_atomic_float(self, op, kind, a, mods):
+        """global_atomic_{fmin,fmax} [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: 32-bit float min/max at the
+        global_* address via a CAS loop (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax, so no shader float atomic
+        extension is needed). Inactive lanes don't touch memory and keep vdst; active unaligned lanes write 0."""
+        if any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != 1 or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        val_f = self.tof(self.load_reg("vgpr", vdata["r"]))
+        al = self.atomic_aligned(full, 4)
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {al}")
+        old = self._emit_atomic_fminmax_cas(kind, full, val_f, cond)
+        if vdst is not None:
+            self.dst(vdst, old)
 
     def global_atomic_x2(self, op, kind, a, mods):
         """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element."""
@@ -2080,13 +2100,14 @@ class Gen:
             raise Unsupported(op + " operands")
         full = self.global_address(op, vaddr, saddr, mods)
         vals = [self.load_reg("vgpr", vdata["r"] + w) for w in range(2)]
-        keep = [self.load_reg("vgpr", vdst["r"] + w) for w in range(2)] if vdst is not None else [self.cu(0)] * 2
         spv = self.BUF_ATOMICS[kind][0]
+        al = self.atomic_aligned(full, 8)
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {al}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         pre = self.current_label_placeholder()
-        act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
         self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
@@ -2101,18 +2122,21 @@ class Gen:
         olds = []
         for w in range(2):                     # both OpPhi first: they must open the merge block
             old = self.tmp()
-            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {keep[w]} {pre}")
+            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {self.cu(0)} {pre}")
             olds.append(old)
         if vdst is not None:
             for w in range(2):
-                self.store_reg("vgpr", vdst["r"] + w, olds[w])
+                self.dst({"k": "vgpr", "r": vdst["r"] + w, "n": 1}, olds[w])
 
     def buffer_atomic(self, op, a, mods):
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
-        address). With 'glc' the pre-op value is returned in vdata. Inactive or out-of-bounds lanes don't touch memory."""
+        address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory and keep vdata;
+        active OOB or unaligned (addr % 4 != 0) lanes leave memory untouched and write 0 with glc (measured on gfx1036)."""
         kind = op[len("buffer_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
+        if kind in ("fmin", "fmax"):
+            return self.buffer_atomic_float(op, kind, a, mods)
         is_inc_dec = kind in ("inc", "dec")
         if (kind not in self.BUF_ATOMICS and not is_inc_dec) or "x2" in kind:
             raise Unsupported(op)
@@ -2121,9 +2145,11 @@ class Gen:
             raise Unsupported(op + " data")
         addr, _, in_b, _ = self.buffer_address(a, mods)
         val = self.load_reg("vgpr", vd["r"])
-        cond = self.tmp()
-        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
-        # Guard all atomics with a structured if so inactive or OOB lanes never touch memory.
+        al = self.atomic_aligned(addr, 4)
+        ok, cond = self.tmp(), self.tmp()
+        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {al}")
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {ok}")
+        # Guard all atomics with a structured if so inactive, OOB or unaligned lanes never touch memory.
         lbl_do, lbl_end, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp()
         pre_label = self.current_label_placeholder()
         self.emit(f"OpSelectionMerge {lbl_end} None")
@@ -2150,21 +2176,44 @@ class Gen:
         if "glc" in mods:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
 
+    def buffer_atomic_float(self, op, kind, a, mods):
+        """buffer_atomic_{fmin,fmax} vdata, vaddr, s[V#], soffset ...: 32-bit float min/max at the MUBUF address via
+        the shared OpAtomicCompareExchange + GLSL.std.450 NMin/NMax CAS loop (no float-atomic extension needed).
+        Enforces V# bounds and 4-byte natural alignment; with glc returns the old word (0 when OOB/unaligned,
+        preserved when inactive)."""
+        if "lds" in mods:
+            raise Unsupported(op + " form")
+        vd = a[0]
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
+            raise Unsupported(op + " data")
+        addr, _, in_b, _ = self.buffer_address(a, mods)
+        val_f = self.tof(self.load_reg("vgpr", vd["r"]))
+        al = self.atomic_aligned(addr, 4)
+        ok, cond = self.tmp(), self.tmp()
+        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {al}")
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {ok}")
+        old = self._emit_atomic_fminmax_cas(kind, addr, val_f, cond)
+        if "glc" in mods:
+            self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
+
     def buffer_atomic_x2(self, op, kind, a, mods):
         """buffer_atomic_{and,or,xor,swap}_x2 vdata[0:1], vaddr, s[V#], soffset: M = op(M, DATA) on the 64-bit element
         (two dwords, low first); with glc the old 64 bits are returned in vdata. Each dword is its own 32-bit atomic, so
         no Int64 atomics are needed. That leaves the same memory for a bitwise op, whose bits are independent, but an
         exchange can tear: two lanes swapping into one element at once can leave one's low dword with the other's high
         dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same element
-        between them could be seen half done. The bounds check covers the whole 8-byte element, all or nothing, as for a typed element (a 32_32
-        format): how hardware treats a 64-bit atomic that is only partly in range is not measured."""
+        between them could be seen half done. Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
+        covers the whole 8-byte element all or nothing (fixed_fmt=62) and addresses with (addr & 7) != 0 are dropped
+        (memory untouched, active glc returns (0, 0), inactive preserves vdata)."""
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
             raise Unsupported(op + " data")
         addr, _, in_b, _ = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)  # step: as buffer_atomic
         vals = [self.load_reg("vgpr", vd["r"] + w) for w in range(2)]
-        cond = self.tmp()
-        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
+        al = self.atomic_aligned(addr, 8)
+        ok, cond = self.tmp(), self.tmp()
+        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {al}")
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {ok}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         pre = self.current_label_placeholder()
         self.emit(f"OpSelectionMerge {lbl_end} None")
@@ -2183,7 +2232,7 @@ class Gen:
         olds = []
         for w in range(2):                     # both OpPhi first: they must open the merge block
             old = self.tmp()
-            # an inactive or out-of-range lane returns 0, as buffer_atomic does
+            # an inactive, out-of-range or unaligned lane skips the atomic (active gets 0, inactive keeps vdata via dst)
             self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {self.cu(0)} {pre}")
             olds.append(old)
         if "glc" in mods:

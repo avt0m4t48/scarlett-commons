@@ -758,6 +758,11 @@ def _load_case(directory, name):
             desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
         elif kind != "tlas":
             raise CaseError(f"{js}: kind {kind!r} is neither 'blas' nor 'tlas'")
+        # Check the keys check_build needs while the filename is still in scope: a KeyError there would name only the
+        # directory and the missing key, and in a folder of several cases the user cannot tell which file to fix.
+        for key in ("address",) + (("blas", "instances") if kind == "tlas" else ()):
+            if key not in desc:
+                raise CaseError(f"{js}: the case has no {key!r} key")
     except KeyError as error:
         raise CaseError(f"{js}: the case has no {error} key") from None
     except (OSError, ValueError, TypeError, IndexError) as error:

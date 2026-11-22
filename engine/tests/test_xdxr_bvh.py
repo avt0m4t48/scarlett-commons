@@ -499,6 +499,32 @@ class Cli(unittest.TestCase):
                 f.write('{"address": 0, "triangles": []}')
             self.assertIn("no 'kind' key", self.check_build_stderr(d))
 
+    def test_check_build_tlas_without_an_address_names_its_json(self):
+        # Several cases in one folder: the missing key must be reported against the file that has it.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "good.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "blas", "address": 0, "triangles": []}')
+            with open(os.path.join(d, "good.bin"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "blas": [], "instances": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("no 'address' key", text)
+            self.assertNotIn("good.json", text)
+
+    def test_check_build_tlas_without_its_instances_names_its_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "broken.json"), "w", encoding="utf-8") as f:
+                f.write('{"kind": "tlas", "address": 4096, "blas": []}')
+            with open(os.path.join(d, "broken.bin"), "wb") as f:
+                f.write(b"")
+            text = self.check_build_stderr(d)
+            self.assertIn("broken.json", text)
+            self.assertIn("no 'instances' key", text)
+
     def test_selftest(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(X.main(["selftest", "--rays", "50"]), 0)

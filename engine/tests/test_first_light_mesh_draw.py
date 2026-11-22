@@ -70,7 +70,7 @@ class FirstLightMeshDrawTests(unittest.TestCase):
         vertices = [(0.0, 0.0, 0.5, 0.0, 0.0), (1.0, 0.0, 0.5, 1.0, 0.0), (0.0, 1.0, 0.5, 0.0, 1.0)]
         first_light.write_mesh(self.mesh, vertices, [0, 1, 2])
         (self.out / "manifest.json").write_text(
-            '{"width": 2, "height": 2, "vertex_count": 3, "index_count": 3}',
+            '{"width": 2, "height": 2, "vertex_count": 3, "index_count": 3, "files": {"mesh": "mesh.bin"}}',
             encoding="utf-8", newline="\n",
         )
         self.assertEqual(first_light.main(["--check", "--out", str(self.out)]), 0)

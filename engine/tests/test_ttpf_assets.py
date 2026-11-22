@@ -118,6 +118,27 @@ class TextureAssets(unittest.TestCase):
         self.assertTrue(old.exists())
         # Not hidden: a folder that stays double-sized has its reason on screen.
         self.assertIn("pool: 1 replaced DDS file(s) could not be removed", stderr.getvalue())
+        # And not forever: the manifest lists it, so the next build removes it once nothing holds it, although
+        # that build finds the pass stamped and writes nothing else.
+        self.assertEqual(json.loads(self.catalog.read_bytes())[ttpf_assets.PENDING], ["partial.dds"])
+        with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("unexpected reopen")):
+            self.build()
+        self.assertFalse(old.exists())
+        self.assertNotIn(ttpf_assets.PENDING, json.loads(self.catalog.read_bytes()))
+        self.build()                                      # nothing left to do: no further write, no error
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+
+    def test_a_run_stopped_after_the_switch_is_finished_by_the_next(self):
+        # The manifest that switches the rows already lists the file to remove, so a build stopped between that
+        # write and the removal leaves nothing behind for good.
+        old = self.upgrade()
+        with mock.patch.object(ttpf_assets, "finish_replaced"):
+            self.build()
+        self.assertTrue(old.exists())
+        self.assertEqual(json.loads(self.catalog.read_bytes())[ttpf_assets.PENDING], ["partial.dds"])
+        self.build()
+        self.assertFalse(old.exists())
+        self.assertNotIn(ttpf_assets.PENDING, json.loads(self.catalog.read_bytes()))
 
     def complete_with_row_file(self, file):
         """Run the pass on a manifest whose row names `file`; returns the folder's file names afterwards."""
@@ -160,7 +181,7 @@ class TextureAssets(unittest.TestCase):
 
         with mock.patch.object(ttpf_assets.os, "stat", counted), \
                 mock.patch.object(ttpf_assets.os.path, "samefile", side_effect=AssertionError("per-pair check")):
-            self.assertEqual(ttpf_assets.remove_replaced(self.folder, replaced, rows), 0)
+            self.assertEqual(ttpf_assets.remove_replaced(self.folder, replaced, rows), [])
         self.assertLessEqual(len(calls), 100, len(calls))
         # The replaced files are gone and the rows' files stay.
         self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted(row["File"] for row in rows))

@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_system.h"
@@ -479,6 +480,19 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return false;
     }
 
+    // Every deletion marker for an entry of this folder lives inside its marker folder, so when that folder is missing
+    // nothing here is deleted and the per-entry probes (two file checks each) can be skipped.
+    std::error_code ec;
+    const bool has_markers = !r.overlay.empty() && std::filesystem::is_directory(marker(r.overlay, dirs), ec);
+    // Names already listed, folded the way same_name (_wcsicmp) compares them: _wcslwr_s uses the same locale rule.
+    std::unordered_set<std::wstring> seen;
+    auto key = [](const wchar_t* name) {
+        std::wstring k = name;
+        _wcslwr_s(k.data(), k.size() + 1);
+        return k;
+    };
+    for (const auto& e : out) seen.insert(key(e.cFileName));
+
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
         std::filesystem::path search = join(root, dirs);
@@ -489,18 +503,12 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
-            if (!overlay_root && !dot) {
+            if (!overlay_root && !dot && has_markers) {
                 std::vector<std::wstring> entry_parts = dirs;
                 entry_parts.push_back(found.cFileName);
                 if (deleted(r.overlay, entry_parts)) continue;
             }
-            bool duplicate = false;
-            for (const auto& e : out)
-                if (same_name(e.cFileName, found.cFileName)) {
-                    duplicate = true;
-                    break;
-                }
-            if (!duplicate) out.push_back(found);
+            if (seen.insert(key(found.cFileName)).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
         ::FindClose(h);
     };

@@ -5,6 +5,7 @@
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <initializer_list>
@@ -221,6 +222,29 @@ int main() {
         const HANDLE missing = first_w(L"GAME:\\missing\\*", &none);
         check(missing == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
               "a listing inside a folder that does not exist reports ERROR_PATH_NOT_FOUND, as the host does");
+    }
+
+    // Names that differ only in case are one entry, as on the host, and the overlay's spelling is the one listed.
+    {
+        write_path(overlay / "data" / "Mixed.TXT", "overlay");
+        write_path(package / "data" / "mixed.txt", "package");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\data\\*");
+        check(count(names, L"mixed.txt") == 1, "names that differ only in case are listed once");
+        check(std::find(names.begin(), names.end(), std::wstring(L"Mixed.TXT")) != names.end(),
+              "and the overlay's spelling wins");
+    }
+
+    // A folder with no deletion markers at all (its marker folder does not exist) lists every package entry once.
+    {
+        for (int i = 0; i < 300; ++i) write_path(package / "many" / ("f" + std::to_string(i) + ".bin"), "x");
+        write_path(overlay / "many" / "F7.BIN", "overlay");
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "many"), "GAME:\\many has no marker folder");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\many\\*");
+        int files = 0;
+        for (const auto& n : names)
+            if (n != L"." && n != L"..") ++files;
+        check(files == 300 && count(names, L"f7.bin") == 1 && count(names, L"f299.bin") == 1,
+              "a folder without markers lists all 300 files, with the overlay's copy once");
     }
 
     // A delete hides the package file without removing it.

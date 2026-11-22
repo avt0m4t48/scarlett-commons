@@ -942,7 +942,7 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
@@ -959,7 +959,7 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev, st=None):
+    def vote(self, n, ins, op, reg, on_taken, ev, st):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
         to that mask, so lanes that voted no are inert there.

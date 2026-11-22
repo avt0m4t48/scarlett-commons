@@ -357,9 +357,12 @@ class AtomicPackTest(unittest.TestCase):
                     link = os.path.join(self.root, "link-" + label)
                     spelling = os.path.relpath(target, self.root) if relative else target
                     self.symlink(spelling, link)
+                    # What the link stores, read back before packing: on Windows an absolute target comes back
+                    # with a \\?\ prefix, so comparing with `spelling` failed there for a link pack() left alone.
+                    stored = os.readlink(link)
                     quiet(saves.pack, self.extracted, link)
                     self.assertTrue(os.path.islink(link))
-                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(os.readlink(link), stored)
                     self.assertEqual(rd(target), self.new)
                     self.assertEqual(os.listdir(target_dir), ["save.jsav"])
 

@@ -111,6 +111,11 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
             return ReturnClass::HResult;
     } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
         if (name == "XAudio2Create" || name == "#1") return ReturnClass::HResult;
+        // Host xaudio2_9.dll ordinals 8-10 are XAudio2CreateV2_9 / XAudio2CreateWithVersionInfo /
+        // XAudio2CreateWithSharedContexts (measured on the System32 export table); the redist's ordinal
+        // table is not confirmed, so only the system copy gets them.
+        if (dll == "xaudio2_9.dll" && (name == "#8" || name == "#9" || name == "#10"))
+            return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
         if (name == "GameInputCreate" || name == "#1") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {

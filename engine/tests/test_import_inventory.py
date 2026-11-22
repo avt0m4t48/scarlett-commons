@@ -53,8 +53,17 @@ CLASSIFY_CASES = [
     ("xgameruntime.dll", "XGameRuntimeUninitialize", inv.OTHER),
     ("xaudio2_9.dll", "XAudio2Create", inv.HRESULT),
     ("XAUDIO2_9REDIST.DLL", "XAudio2Create", inv.HRESULT),
+    ("xaudio2_9.dll", "#1", inv.HRESULT),                            # package modules import it by ordinal
+    ("xaudio2_9redist.dll", "#1", inv.HRESULT),
+    ("xaudio2_9.dll", "#8", inv.HRESULT),                            # XAudio2CreateV2_9 on the host copy
+    ("xaudio2_9.dll", "#9", inv.HRESULT),
+    ("xaudio2_9.dll", "#10", inv.HRESULT),
+    ("xaudio2_9.dll", "#11", inv.OTHER),
+    ("xaudio2_9redist.dll", "#8", inv.OTHER),                        # redist ordinal table unconfirmed
     ("xaudio2_9.dll", "XAudio2SomethingElse", inv.OTHER),
     ("gameinput.dll", "GameInputCreate", inv.HRESULT),
+    ("gameinput.dll", "#1", inv.HRESULT),
+    ("gameinput.dll", "#2", inv.OTHER),
     ("gameinput.dll", "GameInputOther", inv.OTHER),
     ("dstorage.dll", "DStorageGetFactory", inv.HRESULT),
     ("dstorage_xs.dll", "DStorageGetFactory", inv.HRESULT),
@@ -69,8 +78,8 @@ TEXT_RAW = 0x200
 TEXT_SIZE = 0x1000
 
 
-def build_pe32plus() -> bytes:
-    """A one-section PE32+ image importing xtest.dll!XTestFunc by name and xmem.dll!#7 by ordinal."""
+def make_pe32plus():
+    """A one-section PE32+ image and its place(rva, blob) helper; import tables go under the caller."""
     opt_size = 240
     buf = bytearray(TEXT_RAW + TEXT_SIZE)
     buf[0:2] = b"MZ"
@@ -82,7 +91,6 @@ def build_pe32plus() -> bytes:
     struct.pack_into("<I", buf, opt + 56, 0x2000)                    # SizeOfImage
     struct.pack_into("<I", buf, opt + 60, TEXT_RAW)                  # SizeOfHeaders
     struct.pack_into("<I", buf, opt + 108, 16)                       # NumberOfRvaAndSizes
-    struct.pack_into("<II", buf, opt + 112 + 8, 0x1100, 40)          # data directory entry 1 (import)
     sec = opt + opt_size
     buf[sec:sec + 8] = b".text\0\0\0"
     struct.pack_into("<IIII", buf, sec + 8, TEXT_SIZE, TEXT_RVA, TEXT_SIZE, TEXT_RAW)
@@ -91,6 +99,16 @@ def build_pe32plus() -> bytes:
         at = TEXT_RAW + (rva - TEXT_RVA)
         buf[at:at + len(blob)] = blob
 
+    def directory(entry: int, rva: int, size: int) -> None:
+        struct.pack_into("<II", buf, opt + 112 + entry * 8, rva, size)
+
+    return buf, place, directory
+
+
+def build_pe32plus() -> bytes:
+    """An image importing xtest.dll!XTestFunc by name and xmem.dll!#7 by ordinal."""
+    buf, place, directory = make_pe32plus()
+    directory(1, 0x1100, 40)
     place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))  # xtest.dll descriptor
     place(0x1114, struct.pack("<IIIII", 0x1280, 0, 0, 0x1320, 0x12C0))  # xmem.dll descriptor
     place(0x1128, bytes(20))                                            # terminator
@@ -100,6 +118,13 @@ def build_pe32plus() -> bytes:
     place(0x1320, b"xmem.dll\0")
     place(0x1400, b"\x00\x00" + b"XTestFunc\0")                         # hint + name
     return bytes(buf)
+
+
+def write_image(tmp: str, name: str, blob: bytes) -> str:
+    path = os.path.join(tmp, name)
+    with open(path, "wb") as f:
+        f.write(blob)
+    return path
 
 
 class ClassifyTest(unittest.TestCase):
@@ -156,6 +181,77 @@ class PeParseTest(unittest.TestCase):
         with self.assertRaises(inv.PeFormatError):
             inv.pe_imports(bad)
 
+    def test_delay_imports_are_listed(self):
+        # Directory 13, IMAGE_DELAYLOAD_DESCRIPTOR: RvaBased attr set, name/IAT/INT as RVAs — the loader
+        # binds these eagerly, so they are part of the image's import surface.
+        buf, place, directory = make_pe32plus()
+        directory(13, 0x1180, 64)
+        place(0x1180, struct.pack("<8I", 1, 0x1300, 0x1400, 0x1240, 0x1200, 0, 0, 0))
+        place(0x11A0, bytes(32))                                          # terminator
+        place(0x1200, struct.pack("<QQ", 0x1420, 0))                        # INT: one named import
+        place(0x1300, b"xdelay.dll\0")
+        place(0x1420, b"\x00\x00" + b"XDelayFunc\0")
+        path = write_image(self.tmp.name, "delay.exe", bytes(buf))
+        self.assertEqual(inv.pe_imports(path), [("xdelay.dll", "XDelayFunc")])
+
+    def test_delay_descriptor_without_rva_attribute_fails(self):
+        # Same throw the loader makes: a version-1 descriptor's fields are virtual addresses.
+        buf, place, directory = make_pe32plus()
+        directory(13, 0x1180, 64)
+        place(0x1180, struct.pack("<8I", 0, 0x1300, 0x1400, 0x1240, 0x1200, 0, 0, 0))
+        place(0x1300, b"xdelay.dll\0")
+        path = write_image(self.tmp.name, "bad_delay.exe", bytes(buf))
+        with self.assertRaisesRegex(inv.PeFormatError, "RVA attribute"):
+            inv.pe_imports(path)
+
+    def test_descriptor_table_stops_at_name_zero(self):
+        # The loader ends the table at the first descriptor with Name == 0, even when other fields are
+        # set — the parser must not read past it (string_at(0) decodes the MZ header).
+        buf, place, directory = make_pe32plus()
+        directory(1, 0x1100, 60)
+        place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))  # xtest.dll descriptor
+        place(0x1114, struct.pack("<IIIII", 0x1280, 0, 0, 0, 0x12C0))       # Name == 0: table ends
+        place(0x1128, struct.pack("<IIIII", 0x1280, 0, 0, 0x1320, 0x12C0))  # unreachable xmem.dll
+        place(0x1200, struct.pack("<QQ", 0x1400, 0))
+        place(0x1280, struct.pack("<QQ", (1 << 63) | 7, 0))
+        place(0x1300, b"xtest.dll\0")
+        place(0x1320, b"xmem.dll\0")
+        place(0x1400, b"\x00\x00" + b"XTestFunc\0")
+        path = write_image(self.tmp.name, "early_end.exe", bytes(buf))
+        self.assertEqual(inv.pe_imports(path), [("xtest.dll", "XTestFunc")])
+
+    def test_unreadable_descriptor_name_fails(self):
+        # Where the tool skipped the descriptor, the loader throws on the same image.
+        buf, place, directory = make_pe32plus()
+        directory(1, 0x1100, 40)
+        place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x3FF0, 0x1240))  # name outside the image
+        path = write_image(self.tmp.name, "bad_name.exe", bytes(buf))
+        with self.assertRaisesRegex(inv.PeFormatError, "DLL name"):
+            inv.pe_imports(path)
+
+    def test_unreadable_thunk_name_fails(self):
+        buf, place, directory = make_pe32plus()
+        directory(1, 0x1100, 40)
+        place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))
+        place(0x1200, struct.pack("<QQ", 0x3FF0, 0))                        # name outside the image
+        place(0x1300, b"xtest.dll\0")
+        path = write_image(self.tmp.name, "bad_sym.exe", bytes(buf))
+        with self.assertRaisesRegex(inv.PeFormatError, "unreadable name"):
+            inv.pe_imports(path)
+
+    def test_shared_thunk_table_is_walked_once(self):
+        # Two descriptors pointing at one lookup table report one set of imports, not two.
+        buf, place, directory = make_pe32plus()
+        directory(1, 0x1100, 60)
+        place(0x1100, struct.pack("<IIIII", 0x1200, 0, 0, 0x1300, 0x1240))
+        place(0x1114, struct.pack("<IIIII", 0x1200, 0, 0, 0x1320, 0x12C0))  # same lookup rva
+        place(0x1200, struct.pack("<QQ", 0x1400, 0))
+        place(0x1300, b"xtest.dll\0")
+        place(0x1320, b"xtest2.dll\0")
+        place(0x1400, b"\x00\x00" + b"XTestFunc\0")
+        path = write_image(self.tmp.name, "shared.exe", bytes(buf))
+        self.assertEqual(inv.pe_imports(path), [("xtest.dll", "XTestFunc")])
+
 
 class ShimTableTest(unittest.TestCase):
     @classmethod
@@ -203,22 +299,23 @@ class ReportTest(unittest.TestCase):
         cls.rows, cls.per_dll = inv.summarize(cls.IMPORTS, cls.implemented)
 
     def test_rows_classify_and_bind(self):
-        by_name = {f"{d}!{n}": (c, i) for d, n, c, i in self.rows}
-        self.assertEqual(by_name["d3d12_xs.dll!D3D12XboxCreateDevice"], (inv.HRESULT, True))
-        self.assertEqual(by_name["d3d12_xs.dll!D3D12XboxSetProcessDebugFlags"], (inv.OTHER, False))
-        self.assertEqual(by_name["xgameruntime.dll!XTaskQueueCreate"], (inv.HRESULT, True))
-        self.assertEqual(by_name["xgameruntime.dll!XUserGetId"], (inv.HRESULT, False))
-        self.assertEqual(by_name["xmem.dll!XMemAlloc"], (inv.OTHER, True))
-        self.assertEqual(by_name["kernel32.dll!ExitProcess"], (inv.OTHER, True))
-        self.assertEqual(by_name["kernel32.dll!NotAFunction"], (inv.OTHER, False))
-        self.assertEqual(by_name["unknown.dll!Func"], (inv.OTHER, False))
+        by_name = {f"{d}!{n}": (c, b) for d, n, c, b in self.rows}
+        self.assertEqual(by_name["d3d12_xs.dll!D3D12XboxCreateDevice"], (inv.HRESULT, inv.IMPLEMENTED))
+        self.assertEqual(by_name["d3d12_xs.dll!D3D12XboxSetProcessDebugFlags"], (inv.OTHER, inv.THUNK))
+        self.assertEqual(by_name["xgameruntime.dll!XTaskQueueCreate"], (inv.HRESULT, inv.IMPLEMENTED))
+        self.assertEqual(by_name["xgameruntime.dll!XUserGetId"], (inv.HRESULT, inv.THUNK))
+        self.assertEqual(by_name["xmem.dll!XMemAlloc"], (inv.OTHER, inv.IMPLEMENTED))
+        self.assertEqual(by_name["kernel32.dll!ExitProcess"], (inv.OTHER, inv.IMPLEMENTED))
+        self.assertEqual(by_name["kernel32.dll!NotAFunction"], (inv.OTHER, inv.HOST))
+        self.assertEqual(by_name["unknown.dll!Func"], (inv.OTHER, inv.HOST))
 
     def test_per_dll_counts(self):
-        self.assertEqual(self.per_dll["d3d12_xs.dll"], [2, 1, 1, 1])
-        self.assertEqual(self.per_dll["xgameruntime.dll"], [2, 2, 0, 1])
-        self.assertEqual(self.per_dll["xmem.dll"], [1, 0, 1, 1])
-        self.assertEqual(self.per_dll["kernel32.dll"], [2, 0, 2, 1])
-        self.assertEqual(self.per_dll["unknown.dll"], [1, 0, 1, 0])
+        # [imports, hresult, other, implemented, host, unimplemented thunk]
+        self.assertEqual(self.per_dll["d3d12_xs.dll"], [2, 1, 1, 1, 0, 1])
+        self.assertEqual(self.per_dll["xgameruntime.dll"], [2, 2, 0, 1, 0, 1])
+        self.assertEqual(self.per_dll["xmem.dll"], [1, 0, 1, 1, 0, 0])
+        self.assertEqual(self.per_dll["kernel32.dll"], [2, 0, 2, 1, 1, 0])
+        self.assertEqual(self.per_dll["unknown.dll"], [1, 0, 1, 0, 1, 0])
 
     def test_duplicates_collapse(self):
         rows, per_dll = inv.summarize(self.IMPORTS + [self.IMPORTS[0]], self.implemented)
@@ -232,8 +329,8 @@ class ReportTest(unittest.TestCase):
         self.assertIn("unimplemented thunk", text)
         total = [ln for ln in text.splitlines() if ln.startswith("total")]
         self.assertEqual(len(total), 1)
-        # 8 imports, 3 hresult, 5 other, 4 implemented, 4 thunks
-        self.assertRegex(total[0], r"total\s+8\s+3\s+5\s+4\s+4$")
+        # 8 imports, 3 hresult, 5 other, 4 implemented, 2 host-bound, 2 thunks
+        self.assertRegex(total[0], r"total\s+8\s+3\s+5\s+4\s+2\s+2$")
 
 
 class CliTest(unittest.TestCase):
@@ -249,7 +346,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("xmem.dll!XMemAlloc", text)
         self.assertIn("implemented", text)
         self.assertIn("unknown.dll!Func", text)
-        self.assertIn("unimplemented thunk", text)
+        self.assertIn("host", text)
 
     def test_main_reports_bad_lines(self):
         with tempfile.TemporaryDirectory() as d:

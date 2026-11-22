@@ -5,13 +5,15 @@ Usage:
     python -I import_inventory.py --pe <image.exe> [--pe <image.dll>]
 
 An imports file lists one ``dll!function`` per line; the DLL part is case-insensitive, blank lines and ``#``
-comments are ignored. ``--pe`` reads the import directory of a PE32+ image directly (standard library only);
-ordinal-only imports report as ``dll!#ordinal``.
+comments are ignored. ``--pe`` reads the import and delay-import directories of a PE32+ image directly (the
+loader binds delay imports eagerly, so both are its import surface); ordinal-only imports report as
+``dll!#ordinal``.
 
 Each import gets the return class runtime/shims/registry.cpp's classify() gives it — the same table that decides
 what an unimplemented thunk returns under LEONIDA_UNIMPLEMENTED=fail — and is checked against the SHIM_TABLE
-registrations in runtime/shims/*.cpp: a registered ``dll!name`` has a real implementation; anything else binds to
-the unimplemented-import thunk (or to the host Windows DLL, for system modules).
+registrations in runtime/shims/*.cpp, mirroring the loader's routing: a registered ``dll!name`` binds to the
+shim; an unregistered import on a module the shims own binds to the unimplemented-import thunk; anything else
+binds to the host Windows DLL (when the host has it — the tool reports the route, not the host's exports).
 """
 from __future__ import annotations
 
@@ -59,10 +61,15 @@ def classify(dll: str, name: str) -> str:
                                                            "DXGIDeclareAdapterRemovalSupport"):
             return HRESULT
     elif dll in ("xaudio2_9.dll", "xaudio2_9redist.dll"):
-        if name == "XAudio2Create":
+        if name == "XAudio2Create" or name == "#1":
+            return HRESULT
+        # Host xaudio2_9.dll ordinals 8-10 are XAudio2CreateV2_9 / XAudio2CreateWithVersionInfo /
+        # XAudio2CreateWithSharedContexts (measured on the System32 export table); the redist's ordinal
+        # table is not confirmed, so only the system copy gets them — same split as registry.cpp.
+        if dll == "xaudio2_9.dll" and name in ("#8", "#9", "#10"):
             return HRESULT
     elif dll == "gameinput.dll":
-        if name == "GameInputCreate":
+        if name == "GameInputCreate" or name == "#1":
             return HRESULT
     elif dll in ("dstorage.dll", "dstorage_xs.dll"):
         if name == "DStorageGetFactory":
@@ -97,6 +104,7 @@ class PeFormatError(ValueError):
 
 
 MAX_ENTRIES = 65536  # a table this long is not a table; stops a malformed image from looping forever
+MAX_TOTAL_ENTRIES = 262144  # a bound over every table together, so many tables cannot loop forever either
 
 
 def _cstring(data: bytes, offset: int, limit: int = 4097) -> str | None:
@@ -107,7 +115,8 @@ def _cstring(data: bytes, offset: int, limit: int = 4097) -> str | None:
 
 
 def pe_imports(path: str) -> list[tuple[str, str]]:
-    """(dll, name) pairs from a PE32+ image's import directory. Ordinal-only imports come back as '#ordinal'."""
+    """(dll, name) pairs from a PE32+ image's import and delay-import directories, matching the tables
+    pe_loader.cpp's bind_imports walks. Ordinal-only imports come back as '#ordinal'."""
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 0x40 or data[:2] != b"MZ":
@@ -152,25 +161,15 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
         at = offset(rva)
         return None if at is None else _cstring(data, at)
 
-    if dir_count <= 1 or opt + 120 > len(data):
-        return []
-    imp_rva, _imp_size = struct.unpack_from("<II", data, opt + 112 + 8)  # data directory entry 1
-    base = offset(imp_rva) if imp_rva else None
-    if base is None:
-        return []
-
     out = []
-    for i in range(MAX_ENTRIES):
-        at = base + i * 20  # IMAGE_IMPORT_DESCRIPTOR
-        if at + 20 > len(data):
-            break
-        oft, _stamp, _forwarder, name_rva, iat_rva = struct.unpack_from("<IIIII", data, at)
-        if not (oft or name_rva or iat_rva):
-            break
-        dll = string_at(name_rva)
-        if dll is None:
-            continue
-        lookup = oft if oft else iat_rva
+    seen_tables = set()  # thunk tables already walked: descriptors may share one, and the entries are the same
+    total = 0
+
+    def walk_thunks(dll: str, lookup: int) -> None:
+        nonlocal total
+        if not lookup or lookup in seen_tables:
+            return
+        seen_tables.add(lookup)
         for j in range(MAX_ENTRIES):
             entry = offset(lookup + j * 8)
             if entry is None or entry + 8 > len(data):
@@ -178,11 +177,57 @@ def pe_imports(path: str) -> list[tuple[str, str]]:
             value = struct.unpack_from("<Q", data, entry)[0]
             if not value:
                 break
+            total += 1
+            if total > MAX_TOTAL_ENTRIES:
+                raise PeFormatError(f"more than {MAX_TOTAL_ENTRIES} import entries")
             if value & (1 << 63):
-                out.append((dll.lower(), f"#{value & 0xFFFF}"))
+                out.append((dll, f"#{value & 0xFFFF}"))
                 continue
             name = string_at((value & 0x7FFFFFFF) + 2)  # skip the 2-byte hint
-            out.append((dll.lower(), name if name is not None else "?"))
+            if name is None:
+                raise PeFormatError("an import thunk points at an unreadable name")
+            out.append((dll, name))
+
+    # Data directory entry 1. The loader stops the table at the first descriptor with Name == 0 and fails on an
+    # unreadable name; read_string throws there.
+    if dir_count > 1 and opt + 120 <= len(data):
+        imp_rva, _imp_size = struct.unpack_from("<II", data, opt + 112 + 8)
+        base = offset(imp_rva) if imp_rva else None
+        if base is not None:
+            for i in range(MAX_ENTRIES):
+                at = base + i * 20  # IMAGE_IMPORT_DESCRIPTOR
+                if at + 20 > len(data):
+                    break
+                oft, _stamp, _forwarder, name_rva, iat_rva = struct.unpack_from("<IIIII", data, at)
+                if not name_rva:
+                    break
+                dll = string_at(name_rva)
+                if dll is None:
+                    raise PeFormatError("an import descriptor points at an unreadable DLL name")
+                walk_thunks(dll.lower(), oft if oft else iat_rva)
+
+    # Data directory entry 13: delay imports, which the loader binds eagerly — the same checks it makes on an
+    # IMAGE_DELAYLOAD_DESCRIPTOR (32 bytes; version-2 fields are RVAs).
+    if dir_count > 13 and opt + 112 + 14 * 8 <= len(data):
+        dd_rva, _dd_size = struct.unpack_from("<II", data, opt + 112 + 13 * 8)
+        dbase = offset(dd_rva) if dd_rva else None
+        if dbase is not None:
+            for i in range(MAX_ENTRIES):
+                at = dbase + i * 32
+                if at + 32 > len(data):
+                    break
+                (attrs, name_rva, _module, iat_rva, int_rva,
+                 _bound, _unload, _stamp) = struct.unpack_from("<8I", data, at)
+                if not name_rva:
+                    break
+                if not (attrs & 1):
+                    raise PeFormatError("a delay-import descriptor without the RVA attribute")
+                if not iat_rva or not int_rva:
+                    raise PeFormatError("a delay-import descriptor without an address or name table")
+                dll = string_at(name_rva)
+                if dll is None:
+                    raise PeFormatError("a delay-import descriptor points at an unreadable DLL name")
+                walk_thunks(dll.lower(), int_rva)
     return out
 
 
@@ -311,21 +356,51 @@ def shim_table_entries(shims_dir: str) -> set[str]:
     return entries
 
 
+IMPLEMENTED = "implemented"
+HOST = "host"
+THUNK = "unimplemented thunk"
+
+# Ported from registry.cpp's owns_dll(): the modules that always stay on the host even though the shim
+# table registers names for them, and the API-set prefixes it rules out before the table is consulted.
+HOST_DLLS = frozenset({
+    "kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+    "vulkan-1.dll", "ntdll.dll", "user32.dll",
+})
+
+
+def owned_dlls(implemented: set[str]) -> frozenset[str]:
+    """The DLLs registry.cpp's owns_dll() calls shim-owned: any SHIM_TABLE entry exists for them and they
+    are not the host-bound system modules or API sets it excludes."""
+    owned = {key.split("!", 1)[0] for key in implemented}
+    return frozenset(d for d in owned
+                     if d not in HOST_DLLS and not d.startswith(("api-ms-", "ext-ms-")))
+
+
 def summarize(imports: list[tuple[str, str]], implemented: set[str]):
-    """(rows, per_dll): rows are (dll, name, class, implemented) sorted and deduplicated; per_dll maps a dll to
-    [imports, hresult, other, implemented]."""
+    """(rows, per_dll): rows are (dll, name, class, binding) sorted and deduplicated, where binding is
+    IMPLEMENTED, HOST or THUNK, mirroring the loader's routing order; per_dll maps a dll to
+    [imports, hresult, other, implemented, host, unimplemented thunk]."""
+    owned = owned_dlls(implemented)
     rows = []
     for dll, name in sorted(set(imports)):
         dll = dll.lower()
         cls = classify(dll, name)
-        rows.append((dll, name, cls, f"{dll}!{name}" in implemented))
+        if f"{dll}!{name}" in implemented:
+            binding = IMPLEMENTED
+        elif dll in owned:
+            binding = THUNK
+        else:
+            binding = HOST
+        rows.append((dll, name, cls, binding))
     per_dll: dict[str, list[int]] = {}
-    for dll, _name, cls, impl in rows:
-        c = per_dll.setdefault(dll, [0, 0, 0, 0])
+    for dll, _name, cls, binding in rows:
+        c = per_dll.setdefault(dll, [0, 0, 0, 0, 0, 0])
         c[0] += 1
         c[1] += cls == HRESULT
         c[2] += cls == OTHER
-        c[3] += impl
+        c[3] += binding == IMPLEMENTED
+        c[4] += binding == HOST
+        c[5] += binding == THUNK
     return rows, per_dll
 
 
@@ -334,23 +409,22 @@ def format_report(imports: list[tuple[str, str]], implemented: set[str]) -> str:
     rows, per_dll = summarize(imports, implemented)
 
     out = []
-    width = max((len(d) + len(n) + 1 for d, n, _c, _i in rows), default=6)
-    for dll, name, cls, impl in rows:
-        out.append(f"{dll + '!' + name:<{width}}  {cls:<7}  "
-                   f"{'implemented' if impl else 'unimplemented thunk'}")
+    width = max((len(d) + len(n) + 1 for d, n, _c, _b in rows), default=6)
+    for dll, name, cls, binding in rows:
+        out.append(f"{dll + '!' + name:<{width}}  {cls:<7}  {binding}")
     out.append("")
 
-    head = ("dll", "imports", "hresult", "other", "implemented", "unimplemented thunk")
+    head = ("dll", "imports", "hresult", "other", "implemented", "host", "unimplemented")
     dw = max([len(d) for d in per_dll] + [len(head[0]), len("total")])
-    out.append(f"{head[0]:<{dw}}  {head[1]:>7}  {head[2]:>7}  {head[3]:>5}  {head[4]:>11}  {head[5]:>19}")
-    totals = [0, 0, 0, 0]
+    out.append(f"{head[0]:<{dw}}  {head[1]:>7}  {head[2]:>7}  {head[3]:>5}  {head[4]:>11}  "
+               f"{head[5]:>4}  {head[6]:>13}")
+    totals = [0, 0, 0, 0, 0, 0]
     for dll in sorted(per_dll):
-        imports_n, hresult, other, impl = per_dll[dll]
+        n, hresult, other, impl, host, thunk = per_dll[dll]
         totals = [a + b for a, b in zip(totals, per_dll[dll])]
-        out.append(f"{dll:<{dw}}  {imports_n:>7}  {hresult:>7}  {other:>5}  {impl:>11}  "
-                   f"{imports_n - impl:>19}")
+        out.append(f"{dll:<{dw}}  {n:>7}  {hresult:>7}  {other:>5}  {impl:>11}  {host:>4}  {thunk:>13}")
     out.append(f"{'total':<{dw}}  {totals[0]:>7}  {totals[1]:>7}  {totals[2]:>5}  "
-               f"{totals[3]:>11}  {totals[0] - totals[3]:>19}")
+               f"{totals[3]:>11}  {totals[4]:>4}  {totals[5]:>13}")
     return "\n".join(out) + "\n"
 
 

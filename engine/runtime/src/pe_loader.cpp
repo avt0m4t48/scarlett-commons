@@ -1038,6 +1038,19 @@ void Loader::parse_exports(Module& m) {
     }
 }
 
+// The file-name rule LoadLibrary applies to a bare module name, the same normalisation library_loader.cpp's
+// module_name() uses: lower-case, a trailing '.' dropped, ".dll" added when there is no extension. Without it an
+// import naming "GameInput" or "gameinput.dll." misses the shim and owns_dll lookups while LoadLibraryExA still
+// binds the real System32 module.
+std::string dll_key(std::string name) {
+    const size_t slash = name.find_last_of("\\/");
+    if (slash != std::string::npos) name.erase(0, slash + 1);
+    name = lower(name);
+    if (!name.empty() && name.back() == '.') name.pop_back();
+    else if (name.find('.') == std::string::npos) name += ".dll";
+    return name;
+}
+
 // Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
 // the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
 // own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
@@ -1049,8 +1062,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 
     // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
     // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
-    std::string shim_key = lower(module);
-    if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
+    std::string shim_key = dll_key(module);
     if (void* p = shims::find(shim_key, symbol)) {
         binding = Binding::Shim;
         return p;
@@ -1099,7 +1111,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
-    std::string key = lower(dll);
+    std::string key = dll_key(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
 
     if (void* p = shims::find(key, sym)) {

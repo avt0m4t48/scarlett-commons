@@ -80,6 +80,58 @@ class AuditShader4RegsTests(unittest.TestCase):
         )]
         self.assertEqual(audit_mod.rbw_registers(nsa_insns), (list(range(4, 16)), [1, 3], []))
 
+    def test_non_returning_ds_ops_read_every_operand(self):
+        def rbw(*lines):
+            return audit_mod.rbw_registers([audit_mod.shader_ir.parse_line("\t" + line) for line in lines])
+
+        # A later read of the LDS address register still counts: the non-returning op did not write it.
+        self.assertEqual(rbw("ds_add_u32 v1, v2", "v_mov_b32 v3, v1"), ([], [1, 2], []))
+        # Every non-_rtn DS atomic, the 64-bit and float forms, src2 forms and GWS ops write nothing.
+        for line, reads in (
+            ("ds_sub_u32 v1, v2 offset:16", [1, 2]),
+            ("ds_rsub_u32 v1, v2", [1, 2]),
+            ("ds_inc_u32 v1, v2", [1, 2]),
+            ("ds_dec_u32 v1, v2", [1, 2]),
+            ("ds_min_i32 v1, v2", [1, 2]),
+            ("ds_max_u32 v1, v2", [1, 2]),
+            ("ds_and_b32 v1, v2", [1, 2]),
+            ("ds_or_b32 v1, v2", [1, 2]),
+            ("ds_xor_b32 v1, v2", [1, 2]),
+            ("ds_mskor_b32 v1, v2, v4", [1, 2, 4]),
+            ("ds_cmpst_b32 v1, v2, v4", [1, 2, 4]),
+            ("ds_cmpst_f32 v1, v2, v4", [1, 2, 4]),
+            ("ds_add_f32 v1, v2", [1, 2]),
+            ("ds_max_f32 v1, v2", [1, 2]),
+            ("ds_add_u64 v1, v[2:3]", [1, 2, 3]),
+            ("ds_cmpst_b64 v1, v[2:3], v[4:5]", [1, 2, 3, 4, 5]),
+            ("ds_min_f64 v1, v[2:3]", [1, 2, 3]),
+            ("ds_add_src2_u32 v1", [1]),
+            ("ds_gws_init v2 gds", [2]),
+            ("ds_gws_barrier v2 gds", [2]),
+            ("ds_write_b32 v1, v2", [1, 2]),
+            ("ds_write2_b32 v1, v2, v4 offset1:1", [1, 2, 4]),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(rbw(line, "v_mov_b32 v8, v1", "v_mov_b32 v9, v2"),
+                                 ([], sorted({1, 2} | set(reads)), []))
+        # Returning forms keep args[0] (v6, or v[6:7]) as a destination that is written and not read.
+        for line, reads in (
+            ("ds_add_rtn_u32 v6, v1, v2", [1, 2]),
+            ("ds_cmpst_rtn_b32 v6, v1, v2, v4", [1, 2, 4]),
+            ("ds_wrxchg_rtn_b32 v6, v1, v2", [1, 2]),
+            ("ds_wrxchg2_rtn_b32 v[6:7], v1, v2, v4", [1, 2, 4]),
+            ("ds_append v6", []),
+            ("ds_consume v6", []),
+            ("ds_swizzle_b32 v6, v1 offset:swizzle(BROADCAST,2,0)", [1]),
+            ("ds_permute_b32 v6, v1, v2", [1, 2]),
+            ("ds_bpermute_b32 v6, v1, v2", [1, 2]),
+            ("ds_read_b32 v6, v1", [1]),
+            ("ds_read2_b32 v[6:7], v1 offset1:1", [1]),
+            ("ds_ordered_count v6, v1 gds", [1]),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(rbw(line, "v_mov_b32 v8, v6"), ([], reads, []))
+
     def test_vector_carry_in_and_out_are_distinct_in_the_audit(self) -> None:
         with tempfile.TemporaryDirectory() as disasm:
             for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):

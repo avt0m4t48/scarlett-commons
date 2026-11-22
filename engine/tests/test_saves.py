@@ -533,6 +533,27 @@ class PackIndexValidationTest(unittest.TestCase):
                 self.assertIn(self.index_path, str(error.exception))
                 self.assertIn("invalid JSON", str(error.exception))
 
+    def test_excessive_json_nesting_names_the_index(self):
+        # The decoder's recursion limit can differ from sys.getrecursionlimit().
+        write(self.index_path, b"[" * 6000 + b"0" + b"]" * 6000)
+        with self.assertRaises(ValueError) as error:
+            saves.pack_from_dir(self.extracted)
+        self.assertIn(self.index_path, str(error.exception))
+        self.assertIn("invalid JSON", str(error.exception))
+
+    def test_cli_excessive_json_nesting_preserves_existing_output(self):
+        write(self.index_path, b"[" * 6000 + b"0" + b"]" * 6000)
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn(self.index_path, result.stderr)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(out), b"previous complete output")
+
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"
         self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]

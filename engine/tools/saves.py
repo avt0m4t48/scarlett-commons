@@ -280,7 +280,7 @@ def pack_from_dir(src):
 
     try:
         idx = json.loads(read(index_path))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
     if not isinstance(idx, dict):
         invalid('index', 'an object')

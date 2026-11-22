@@ -533,6 +533,7 @@ struct PsoName {
     void* object;
     void** original_vtable;
     bool restored;
+    void** vtable_copy;  // the hooked copy installed on the object; freed once the original is back
 };
 std::vector<PsoName> g_pso_names;
 std::set<int> g_named;  // creation numbers that got a name
@@ -554,6 +555,10 @@ void restore_pso_vtable(PsoName& p) {
         *static_cast<void***>(p.object) = p.original_vtable;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    // The thunks that call this have already been dispatched through the copy and read only the original vtable
+    // afterwards; find_pso skips restored entries, so nothing reads the copy past this point.
+    delete[] p.vtable_copy;
+    p.vtable_copy = nullptr;
 }
 
 void restore_all_pso_vtables() {
@@ -626,7 +631,7 @@ void hook_pso_names(uint64_t out_ptr, int number) {
     std::memcpy(copy, orig, kSlots * sizeof(void*));
     copy[4] = reinterpret_cast<void*>(&pso_set_private_data);
     copy[6] = reinterpret_cast<void*>(&pso_set_name);
-    g_pso_names.push_back({number, object, orig, false});
+    g_pso_names.push_back({number, object, orig, false, copy});
     *static_cast<void***>(object) = copy;
 }
 

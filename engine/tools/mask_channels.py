@@ -65,6 +65,16 @@ def channel_counts(width: int, height: int, rgba: bytes, thresholds=(64, 128, 19
     return out
 
 
+def same_file(first: str, second: str) -> bool:
+    """True when opening ``second`` for writing would truncate ``first`` (same path, symlink or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dds", help="an exported .dds texture")
@@ -77,6 +87,8 @@ def main(argv=None) -> int:
         ap.error("--thresholds takes integers")
     if not thresholds or any(not 0 < t <= 255 for t in thresholds):
         ap.error("--thresholds must be within 1..255")
+    if a.json and same_file(a.dds, a.json):
+        ap.error("--json names the input texture; writing it would replace the DDS")
     with open(a.dds, "rb") as fh:
         width, height, rgba = dds_png.decode_dds(fh.read())
     counts = channel_counts(width, height, rgba, thresholds)

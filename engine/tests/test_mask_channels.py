@@ -80,6 +80,31 @@ class MaskChannelTests(unittest.TestCase):
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_json_cannot_replace_the_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            original = rgba8_dds(W, H, image())
+            with open(path, "wb") as fh:
+                fh.write(original)
+            aliases = {"same path": path, "other spelling": os.path.join(tmp, ".", "m.dds")}
+            link = os.path.join(tmp, "hard.json")
+            try:
+                os.link(path, link)
+                aliases["hard link"] = link
+            except OSError:
+                pass                                                    # file system without hard links
+            for name, out in aliases.items():
+                with self.subTest(alias=name), redirect_stdout(io.StringIO()), \
+                        self.assertRaises(SystemExit) as cm:
+                    sys.stderr, saved_err = io.StringIO(), sys.stderr
+                    try:
+                        mc.main([path, "--json", out])
+                    finally:
+                        sys.stderr = saved_err
+                self.assertEqual(cm.exception.code, 2)
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

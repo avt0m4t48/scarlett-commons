@@ -94,6 +94,7 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 # can use there.
 F16_HALVES = False
 F16_HALF_TOP = 29
+OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
 
 
 def pc_tail_chain(name, member, c):
@@ -13818,7 +13819,11 @@ def translate(path):
                 break
             g.insn(ins)
         translate.last_gen = g
-        return assemble(g)
+        out = assemble(g)
+        if OPT_SPIRV:
+            import spirv_opt
+            out = spirv_opt.optimize(out)
+        return out
 
     # ---- basic blocks ----
     def next_pc(ins):
@@ -14136,7 +14141,11 @@ def translate(path):
     assert succ == g.succ, "the lane-mask analysis ran on a different graph"
     g.body = []
     translate.last_gen = g
-    return assemble(g)
+    out = assemble(g)
+    if OPT_SPIRV:
+        import spirv_opt
+        out = spirv_opt.optimize(out)
+    return out
 
 
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
@@ -14920,6 +14929,9 @@ def main():
                     help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
                          "for devices whose maxPushConstantsSize is below 144")
+    ap.add_argument("--opt", action="store_true",
+                    help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
+                         "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
     a = ap.parse_args()
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
@@ -14937,7 +14949,7 @@ def main():
     if ancestor and not os.path.isdir(ancestor):
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
@@ -14950,6 +14962,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    OPT_SPIRV = a.opt
     if a.merge:
         try:
             merged = merge_shard_parts(a.out)

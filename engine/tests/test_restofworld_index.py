@@ -4,7 +4,9 @@
 
 Every byte is built by this test. No game file, asset name or payload is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -311,6 +313,22 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+
+    def test_write_failure_after_scan_names_the_output(self):
+        for ext in (".json", ".csv"):
+            out = os.path.join(self.root, "report" + ext)
+            with self.subTest(ext=ext), \
+                    unittest.mock.patch.object(sys, "argv", [TOOL, self.rpf, out]), \
+                    unittest.mock.patch.object(restofworld_index, "write_output",
+                                               side_effect=OSError("report write denied")) as write, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(restofworld_index.main(), 1)
+                self.assertEqual(write.call_args.args[0], out)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                self.assertIn(out, stderr.getvalue())
+                self.assertIn("report write denied", stderr.getvalue())
 
     def test_cli_rejects_output_aliasing_source_archive(self):
         with open(self.rpf, "rb") as f:

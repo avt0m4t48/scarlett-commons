@@ -66,6 +66,8 @@ class FakeDevice:
     )
     fragment_shader_barycentric: bool = True
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
+    vendor_id: int = 0
+    device_id: int = 0
 
 
 class FakeVulkan:
@@ -159,6 +161,8 @@ class FakeVulkan:
         base = addr + 16
         ctypes.c_uint32.from_address(base + vk_info.PROPS_API_VERSION).value = dev.api_version
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_TYPE).value = dev.device_type
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_VENDOR_ID).value = dev.vendor_id
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_ID).value = dev.device_id
         raw_name = dev.name.encode("utf-8") if isinstance(dev.name, str) else dev.name
         name_bytes = raw_name[:256].ljust(256, b"\x00")
         ctypes.memmove(base + vk_info.PROPS_DEVICE_NAME, name_bytes, 256)
@@ -521,6 +525,67 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["device"], expected_name)
                 self.assertEqual(vk.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
 
+    def test_leonida_vk_device_filters_case_insensitively_and_fails_on_no_match(self):
+        igpu = FakeDevice(
+            name="AMD Radeon(TM) 780M Graphics",
+            device_type=1,
+            subgroup_size=64,
+            min_subgroup_size=32,
+            max_subgroup_size=64,
+        )
+        dgpu = FakeDevice(
+            name="NVIDIA GeForce RTX 4070",
+            device_type=vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            subgroup_size=32,
+            min_subgroup_size=32,
+            max_subgroup_size=32,
+        )
+        other_dgpu = FakeDevice(
+            name="AMD Radeon RX 7900 XTX",
+            device_type=vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            subgroup_size=64,
+            min_subgroup_size=32,
+            max_subgroup_size=64,
+        )
+        old_match = FakeDevice(
+            name="Legacy Radeon 1.2",
+            api_version=(1 << 22) | (2 << 12),
+        )
+
+        # Unset or empty selects the last discrete GPU as usual.
+        for empty in ("",):
+            with mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": empty}):
+                res, _ = self._run_query(igpu, dgpu)
+                self.assertEqual(res["device"], "NVIDIA GeForce RTX 4070")
+                self.assertFalse(res["native64"])
+
+        # Case-insensitive substring can select the integrated GPU over a later discrete GPU.
+        for filt in ("780m", "RADEON(tm) 780M", "amd radeon"):
+            with self.subTest(filter=filt), mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": filt}):
+                res, vk = self._run_query(igpu, dgpu)
+                self.assertEqual(res["device"], "AMD Radeon(TM) 780M Graphics")
+                self.assertTrue(res["native64"])
+                # Non-matching discrete GPU was skipped before feature/queue queries.
+                self.assertEqual(vk.features_calls, [vk._device_handles[0]])
+                self.assertEqual(vk.queue_calls, [vk._device_handles[0], vk._device_handles[0]])
+
+        # Among multiple matching devices, the runtime's discrete/last-discrete rule still applies.
+        with mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": "radeon"}):
+            res, _ = self._run_query(igpu, dgpu, other_dgpu)
+            self.assertEqual(res["device"], "AMD Radeon RX 7900 XTX")
+        with mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": "geforce"}):
+            res, _ = self._run_query(igpu, dgpu, other_dgpu)
+            self.assertEqual(res["device"], "NVIDIA GeForce RTX 4070")
+
+        # A filter that matches no device (or only an unsuitable device) raises RuntimeError and destroys the instance.
+        for filt, devs in (("nomatch", (igpu, dgpu)), ("legacy", (old_match, dgpu))):
+            with self.subTest(no_match=filt), mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": filt}):
+                vk = FakeVulkan(devices=devs)
+                with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+                    with self.assertRaisesRegex(RuntimeError, rf"LEONIDA_VK_DEVICE={filt}"):
+                        vk_info.query()
+                self.assertEqual(vk.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
+
     def test_native64_conditions_and_boundaries(self):
         both = vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
         cases = [
@@ -559,6 +624,10 @@ class QueryTest(unittest.TestCase):
                     "mesh_in_supported_stages": True,
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "vendor_id": 0,
+                    "device_id": 0,
+                    "driver_id": 1,
+                    "rdna2_amd_windows": False,
                 })
 
     def test_per_vertex_inputs(self):
@@ -568,6 +637,33 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_rdna2_amd_windows(self):
+        """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""
+        amd, radv = vk_info.VK_DRIVER_ID_AMD_PROPRIETARY, 3
+        cases = (("rx6700", 0x1002, 0x73DF, amd, True), ("rx6800", 0x1002, 0x73BF, amd, True),
+                 ("navi24", 0x1002, 0x743F, amd, True), ("granite_ridge_igpu", 0x1002, 0x13C0, amd, True),
+                 ("raphael_igpu", 0x1002, 0x164E, amd, True), ("rx6700_radv", 0x1002, 0x73DF, radv, False),
+                 ("rdna3_7900xtx", 0x1002, 0x744C, amd, False), ("rdna4_9070xt", 0x1002, 0x7550, amd, False),
+                 ("rdna3_780m", 0x1002, 0x15BF, amd, False), ("nvidia_same_id", 0x10DE, 0x73DF, 4, False))
+        for label, vendor, device, driver, want in cases:
+            with self.subTest(case=label):
+                self.assertIs(vk_info.rdna2_amd_windows(vendor, device, driver), want)
+                res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
+                self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
+                self.assertIs(res["rdna2_amd_windows"], want)
+
+    def test_rdna2_answer_is_for_the_runtime_gpu(self):
+        """An Intel iGPU next to an RX 6700: the runtime takes the discrete card, and so does the answer."""
+        intel = FakeDevice(name="Intel iGPU", device_type=1, vendor_id=0x8086, device_id=0xA780, driver_id=5,
+                           min_subgroup_size=8, max_subgroup_size=32)
+        rx = FakeDevice(name="AMD Radeon RX 6700", vendor_id=0x1002, device_id=0x73DF)
+        for devs in ((intel, rx), (rx, intel)):
+            with self.subTest(order=[d.name for d in devs]):
+                res, _vk = self._run_query(*devs)
+                self.assertEqual(res["device"], "AMD Radeon RX 6700")
+                self.assertTrue(res["rdna2_amd_windows"])
+                self.assertTrue(res["native64"])
 
     def test_native64_uses_default_size_without_required_mesh_stage(self):
         dev = FakeDevice(

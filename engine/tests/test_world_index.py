@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -351,9 +353,20 @@ class WorldIndexTest(unittest.TestCase):
             self.assert_report_collision([source, "--out", upper, "--csv", lower],
                                          "--out and --csv must use different paths")
             self.assertEqual(os.listdir(folder), [])
-            accent = os.path.join(folder, "café.json")             # composed é
-            self.assert_report_collision([source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
-                                         "--out and --csv must use different paths")
+            # Case folding and Unicode normalization are separate filesystem behaviors.
+            composed = os.path.join(folder, "caf\u00e9.json")
+            decomposed = os.path.join(folder, "cafe\u0301.json")
+            with open(composed, "wb"):
+                pass
+            aliases = os.path.exists(decomposed)
+            os.unlink(composed)
+            reports = [source, "--out", composed, "--csv", decomposed]
+            if aliases:
+                self.assert_report_collision(reports, "--out and --csv must use different paths")
+                self.assertEqual(os.listdir(folder), [])
+            else:
+                self.assertEqual(WI.main(reports), 0)
+                self.assertFalse(os.path.samefile(composed, decomposed))
         else:
             self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
             with open(upper, encoding="utf-8") as f:
@@ -435,6 +448,34 @@ class WorldIndexTest(unittest.TestCase):
                 self.assertEqual(os.listdir(outputs), ["entities.jsonl"])
                 with open(entities, "rb") as f:
                     self.assertEqual(f.read(), previous)
+
+    def test_failed_directory_walk_keeps_existing_reports(self):
+        carve = os.path.join(self.dir, "carve")
+        blocked = os.path.join(carve, "unreadable")
+        os.makedirs(blocked)
+        with open(os.path.join(carve, "resource.bin"), "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "summary.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        previous = b'{"previous":true}\n'
+        for report in (summary, entities):
+            with open(report, "wb") as f:
+                f.write(previous)
+
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "permission denied", blocked)
+            return scandir(path)
+
+        err = io.StringIO()
+        with mock.patch.object(WI.os, "scandir", side_effect=scan), contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([carve, "--out", summary, "--entities-out", entities]), 2)
+        self.assertIn("unreadable", err.getvalue())
+        for report in (summary, entities):
+            with open(report, "rb") as f:
+                self.assertEqual(f.read(), previous)
 
     def test_summary_write_failure_keeps_existing_placement_report(self):
         source = os.path.join(self.dir, "resource.bin")
@@ -567,6 +608,22 @@ class WorldIndexTest(unittest.TestCase):
         blob = make_resource()
         rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
         self.assertEqual(rows, [])
+
+    def test_carved_file_inflate_cap_matches_directory_scan(self):
+        resource = make_resource()
+        path = os.path.join(self.dir, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+
+        for source in (path, self.dir):
+            for cap, expected in ((len(resource) - 1, 0), (len(resource), 1)):
+                with self.subTest(source=source, cap=cap):
+                    entities = []
+                    rows, stats = WI.scan_path(source, max_inflate=cap, collect=entities)
+                    self.assertEqual(len(rows), expected)
+                    self.assertEqual(len(entities), expected)
+                    self.assertEqual(stats["files"], expected)
+                    self.assertEqual(stats["scanned_bytes"], expected * len(resource))
 
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()

@@ -35,7 +35,6 @@
 #include <cstring>
 #include <functional>
 #include <map>
-#include <optional>
 #include <vector>
 
 namespace leonida {
@@ -75,9 +74,10 @@ class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
-                    bool swapchain_maintenance1 = false)
+                    bool swapchain_maintenance1 = false,
+                    std::function<VkExtent2D()> extent_fn = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1) {
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -270,25 +270,34 @@ public:
 
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
-        std::optional<LayoutTracker> next_tracker;
+        bool rollback_source = false;
+        VkImageLayout prev_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (binding) {
             // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_ (vulkan_backend.h).
-            // Release resource_mutex_ before vkQueueSubmit while keeping tracker_mutex_ held so layout updates
-            // commit in submission order and roll back if vkQueueSubmit fails.
+            // record() only touches subresource 0 (mip 0, layer 0, color) of `source`, so saving that one layout
+            // rolls back a failed submit in O(1) without copying the entire LayoutTracker map.
             std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
                 tracker_lock.lock();
-                next_tracker.emplace(context_.tracker_);
-                record(frame.commands, *current, source, image, source_rect, *next_tracker);
+                rollback_source = context_.tracker_.tracked(source);
+                if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
+                record(frame.commands, *current, source, image, source_rect);
                 recorded = true;
             }
         } else {
             record_blank(frame.commands, image);
             recorded = true;
         }
+        const auto rollback = [&] {
+            if (rollback_source)
+                context_.tracker_.set(source, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, prev_layout);
+        };
         if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
-        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) return stop(reset);
+        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
+            rollback();
+            return stop(reset);
+        }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit_info.waitSemaphoreCount = 1;
@@ -321,10 +330,12 @@ public:
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
+            if (submitted != VK_SUCCESS) rollback();
+            // Commit/rollback happened before releasing tracker_mutex_ inside submit_mutex(), preserving submission
+            // order without holding tracker_mutex_ across vkQueuePresentKHR.
+            if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
-        if (submitted == VK_SUCCESS && next_tracker) context_.tracker_ = std::move(*next_tracker);
-        if (tracker_lock.owns_lock()) tracker_lock.unlock();
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
@@ -400,7 +411,7 @@ private:
     }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
-                const PresentRect* source_rect, LayoutTracker& tracker) {
+                const PresentRect* source_rect) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -413,8 +424,8 @@ private:
         // PRESENT is D3D12's common state: GENERAL for an ordinary texture. A never-written back buffer is
         // zero-filled first, as any committed resource is.
         const VkImageLayout common = image_layout(binding, VK_IMAGE_LAYOUT_GENERAL);
-        auto pieces = detail::current(&tracker, source, range, common);
-        detail::initialize(fn, commands, binding, source, pieces, common, &tracker);
+        auto pieces = detail::current(&context_.tracker_, source, range, common);
+        detail::initialize(fn, commands, binding, source, pieces, common, &context_.tracker_);
         for (const auto& piece : pieces)
             detail::image_barrier(fn, commands, binding, piece.range, piece.layout,
                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -595,7 +606,21 @@ private:
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+        VkExtent2D extent = caps.currentExtent;
+        // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
+        // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+            if (extent_fn_) extent = extent_fn_();
+            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
+                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+            }
+            if (extent.width && extent.height) {
+                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+            }
+        }
+        if (extent.width == 0 || extent.height == 0) {
             release(swapchain_);
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
@@ -659,7 +684,7 @@ private:
         if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
         info.imageFormat = chosen.format;
         info.imageColorSpace = chosen.colorSpace;
-        info.imageExtent = caps.currentExtent;
+        info.imageExtent = extent;
         info.imageArrayLayers = 1;
         info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -713,7 +738,7 @@ private:
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
-        extent_ = caps.currentExtent;
+        extent_ = extent;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -812,6 +837,7 @@ private:
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     std::function<bool()> abort_;
+    std::function<VkExtent2D()> extent_fn_;
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;

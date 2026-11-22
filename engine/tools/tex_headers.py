@@ -18,6 +18,7 @@ import argparse
 import array
 import json
 import os
+import stat
 import struct
 import sys
 from collections import Counter
@@ -747,6 +748,33 @@ def input_files(carve, archs):
                     yield "blob", entry.path
 
 
+def report_needs_input_check(carve, archs, path):
+    """Whether a report path has to be compared with every scanned input.
+
+    A report that already exists as a regular file, is not a symlink and has one link is reachable
+    only through its own name. When that name is not ``index.json`` or a ``*.bin`` stream, no input
+    can resolve to it, so the per-file realpath/samefile checks can be skipped. A missing report,
+    a link, or an input-like name is always compared; an input may also be a symlink to it.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return True
+    name = os.path.basename(os.path.realpath(path)).lower()
+    if name == "index.json" or name.endswith(".bin"):
+        return True
+    for arch in archs:
+        with os.scandir(os.path.join(carve, arch)) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    leaf = entry.name.lower()
+                    if leaf == "index.json" or leaf.endswith(".bin"):
+                        return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve")
@@ -765,9 +793,10 @@ def main():
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
-    for kind, source in input_files(a.carve, archs):
-        if same_output_path(source, path):
-            ap.error(f"output would overwrite an input {kind}: {path}")
+    if report_needs_input_check(a.carve, archs, path):
+        for kind, source in input_files(a.carve, archs):
+            if same_output_path(source, path):
+                ap.error(f"output would overwrite an input {kind}: {path}")
     allt = []
     for arch in archs:
         try:

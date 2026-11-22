@@ -233,6 +233,20 @@ def test_pops_interlock_begins_and_ends_once(make_shader, body):
     assert spvasm.count("OpEndInvocationInterlockEXT") == 1
     assert spvasm.index("OpBeginInvocationInterlockEXT") < spvasm.index("OpEndInvocationInterlockEXT")
 
+def test_constants_asked_for_late_are_defined(make_shader):
+    """assemble writes the uint constants before the format tables, which then ask gen.cu for their own. In a shader
+    whose only typed access is a d16 store nothing else used 128, so fmt_size_arr's length was %c80 with no
+    definition and the module failed spirv-val."""
+    shader = make_shader("v_mov_b32 v1, 0x9c004000\nv_mov_b32 v2, 0\n"
+                         "buffer_store_format_d16_xy v1, v2, s[0:3], 0 offen\n"
+                         "exp mrt0 v0, v0, v0, v0 done vm\ns_endpgm\n", "ps_late_constants")
+    spvasm = shader.translate()
+    assert re.search(r"%fmt_size_arr = OpTypeArray %uint %c80$", spvasm, re.M)
+    defs = [m.start() for m in re.finditer(r"^\s*%c80 = OpConstant %uint 128$", spvasm, re.M)]
+    assert len(defs) == 1 and defs[0] < spvasm.index("%fmt_size_arr = OpTypeArray")
+    shader.validate(spvasm)
+
+
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
     with open(path, encoding="utf-8") as fixture:

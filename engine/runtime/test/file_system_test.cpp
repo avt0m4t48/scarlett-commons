@@ -470,6 +470,67 @@ int main() {
               "CopyFile2 copies too");
         check(copy2(L"GAME:\\misc\\keep.txt", L"GAME:\\misc\\two.txt", &params) == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS),
               "and returns its HRESULT for an existing name");
+
+        // CopyFile2 again, through the host's CopyFile2 (where it has one) and through the CopyFileExW fallback the
+        // shim uses where it has none (Wine 9), so both are checked wherever the test runs.
+        for (const bool fallback : {false, true}) {
+            rt::fs::force_copy_file2_fallback(fallback);
+            const std::string mode = fallback ? " (fallback)" : " (host CopyFile2, or the fallback without one)";
+            const std::wstring dir = fallback ? L"GAME:\\copy2_fallback" : L"GAME:\\copy2_host";
+            const std::filesystem::path out = overlay / (fallback ? "copy2_fallback" : "copy2_host");
+            const auto to = [&](const wchar_t* name) { return dir + L"\\" + name; };
+            check(mkdir_w(dir.c_str(), nullptr) != FALSE, ("a folder for the CopyFile2 checks" + mode).c_str());
+
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"null.txt").c_str(), nullptr) == S_OK &&
+                      read_path(out / "null.txt") == "keep",
+                  ("CopyFile2 without a parameter block copies" + mode).c_str());
+            for (const DWORD size : {DWORD{0}, DWORD{4}, DWORD{sizeof(COPYFILE2_EXTENDED_PARAMETERS) - 1}}) {
+                COPYFILE2_EXTENDED_PARAMETERS short_block{};
+                short_block.dwSize = size;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"short.txt").c_str(), &short_block) == E_INVALIDARG &&
+                          !std::filesystem::exists(out / "short.txt"),
+                      ("a parameter block of " + std::to_string(size) +
+                       " bytes is E_INVALIDARG and writes nothing" + mode)
+                          .c_str());
+            }
+            COPYFILE2_EXTENDED_PARAMETERS block{};
+            block.dwSize = sizeof(block);
+            block.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS | 0x00040000 /* NO_OFFLOAD, a hint */;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"hint.txt").c_str(), &block) == S_OK &&
+                      read_path(out / "hint.txt") == "keep",
+                  ("fail-if-exists with a hint flag copies" + mode).c_str());
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"hint.txt").c_str(), &block) ==
+                      HRESULT_FROM_WIN32(ERROR_FILE_EXISTS),
+                  ("and refuses an existing name" + mode).c_str());
+            BOOL cancel = TRUE;
+            block.dwCopyFlags = 0;
+            block.pfCancel = &cancel;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) ==
+                          HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
+                      !std::filesystem::exists(out / "cancelled.txt"),
+                  ("a cancel flag set before the copy cancels it" + mode).c_str());
+            block.pfCancel = nullptr;
+            if (fallback) {
+                // A flag that changes what the copy produces, and which CopyFileExW can't do, is refused before
+                // anything is written: the fallback doesn't copy the alternate streams it was told to skip.
+                block.dwCopyFlags = 0x00008000 /* COPY_FILE_SKIP_ALTERNATE_STREAMS */;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"streams.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) &&
+                          !std::filesystem::exists(out / "streams.txt"),
+                      "the fallback refuses SKIP_ALTERNATE_STREAMS and writes nothing");
+                block.dwCopyFlags = 0x00000080 /* COPY_FILE_DIRECTORY */;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"directory.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
+                      "and COPY_FILE_DIRECTORY");
+                block.dwCopyFlags = 0;
+                block.dwSize = sizeof(block) + 8;  // a longer (V2-sized) block: its extra fields have no equivalent
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"v2.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) &&
+                          !std::filesystem::exists(out / "v2.txt"),
+                      "and a block longer than COPYFILE2_EXTENDED_PARAMETERS");
+            }
+        }
+        rt::fs::force_copy_file2_fallback(false);
         SetLastError(0);
         check(copy_w(L"GAME:\\misc\\one.txt", L"GAME:\\cache\\one.txt", FALSE) == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "a deleted name cannot be copied");

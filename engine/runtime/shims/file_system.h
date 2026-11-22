@@ -27,4 +27,8 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
 
+// For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
+// path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
+void force_copy_file2_fallback(bool force);
+
 }  // namespace rt::fs

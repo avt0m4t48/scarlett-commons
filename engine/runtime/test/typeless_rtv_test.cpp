@@ -91,7 +91,9 @@ int main() {
             if (format == ColorViewFormat::rgba8_uint) {
                 EXPECT(captured.uint32[0] == 1 && captured.uint32[1] == 2 && captured.uint32[2] == 255 && captured.uint32[3] == 0);
             } else {
-                EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
+                // UNORM and sRGB views round and clamp like D3D (render_target_clear_color): 1.5 and 256 are 1.0, -1 is 0.
+                const VkClearColorValue converted = leonida::detail::render_target_clear_color(expected, color);
+                EXPECT(std::memcmp(captured.float32, converted.float32, sizeof(captured)) == 0);
             }
             ++checks;
         }

@@ -87,6 +87,17 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
+    case DXGI_FORMAT_R16G16_UNORM: return {VK_FORMAT_R16G16_UNORM, color};
+    case DXGI_FORMAT_R16_UNORM: return {VK_FORMAT_R16_UNORM, color};
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return {VK_FORMAT_R16G16B16A16_SNORM, color};
+    case DXGI_FORMAT_R16G16_SNORM: return {VK_FORMAT_R16G16_SNORM, color};
+    case DXGI_FORMAT_R16_SNORM: return {VK_FORMAT_R16_SNORM, color};
+    case DXGI_FORMAT_R8G8_SNORM: return {VK_FORMAT_R8G8_SNORM, color};
+    case DXGI_FORMAT_R8_SNORM: return {VK_FORMAT_R8_SNORM, color};
+    case DXGI_FORMAT_R16_SINT: return {VK_FORMAT_R16_SINT, color};
+    case DXGI_FORMAT_R16_UINT: return {VK_FORMAT_R16_UINT, color};
+    case DXGI_FORMAT_R8_SINT: return {VK_FORMAT_R8_SINT, color};
+    case DXGI_FORMAT_R8_UINT: return {VK_FORMAT_R8_UINT, color};
     case DXGI_FORMAT_R32_FLOAT: return {VK_FORMAT_R32_SFLOAT, color};
     case DXGI_FORMAT_R32_UINT: return {VK_FORMAT_R32_UINT, color};
     case DXGI_FORMAT_R32_SINT: return {VK_FORMAT_R32_SINT, color};

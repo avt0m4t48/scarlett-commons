@@ -27,6 +27,8 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -362,10 +364,11 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT:
-    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
     case VK_FORMAT_R16G16B16A16_UINT:
     case VK_FORMAT_R16G16B16A16_SINT:
     case VK_FORMAT_R32G32_SFLOAT:
@@ -385,6 +388,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R16G16_UINT:
     case VK_FORMAT_R16G16_SINT:
     case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
     case VK_FORMAT_R32_UINT:
     case VK_FORMAT_R32_SINT:
     case VK_FORMAT_D32_SFLOAT:
@@ -394,9 +399,16 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8G8_UINT:
     case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R8G8_SNORM:
     case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT:
     case VK_FORMAT_D16_UNORM: return {2, 1};
-    case VK_FORMAT_R8_UNORM: return {1, 1};
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8_SINT: return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -612,51 +624,81 @@ struct Prepared {
     VkImageResolve resolve{};  // resolves
 };
 
-// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
-// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
-// instead interprets the matching union member as an integer already; copying float bits changes the value.
+// D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
+// even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
+// step below WARP and AMD. The value is rounded here and handed over as the exact fraction, which no GPU rounds
+// differently. NaN is 0 and values outside 0..1 clamp, as in D3D.
+inline float quantize_unorm(float value, double maximum) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(std::nearbyint(double(value) * maximum) / maximum);
+}
+
+// The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
+// as -127 and ties go to the even neighbour.
+inline float quantize_snorm(float value, double maximum) {
+    if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(std::nearbyint(double(value) * maximum) / maximum);
+}
+
+// ClearRenderTargetView takes FLOATs even for integer RTVs. For the integer formats exposed by the device, Windows
+// D3D12 (WARP and AMD) clamps to the component range and truncates fractions toward zero. Vulkan instead interprets
+// the matching union member as an integer already; copying float bits changes the value.
+// The normalised formats are rounded like D3D (quantize_unorm, quantize_snorm).
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
-    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
-    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
-    std::uint32_t unsigned_maximum = 0;
-    std::int64_t signed_minimum = 0, signed_maximum = 0;
+    double minimum = 0, maximum = 0;  // the component range of an integer format; maximum 0: not an integer format
     bool is_signed = false;
+    std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
+    double snorm = 0;               // the largest value of a signed normalised format
     switch (format) {
-    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
+    case VK_FORMAT_R16_UINT: maximum = 65535; break;
     case VK_FORMAT_R32_UINT:
-    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
-    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8G8B8A8_SINT: is_signed = true; minimum = -128; maximum = 127; break;
+    case VK_FORMAT_R16_SINT: is_signed = true; minimum = -32768; maximum = 32767; break;
     case VK_FORMAT_R32_SINT:
     case VK_FORMAT_R32G32B32A32_SINT:
-        signed_minimum = std::numeric_limits<std::int32_t>::min();
-        signed_maximum = std::numeric_limits<std::int32_t>::max();
         is_signed = true;
+        minimum = std::numeric_limits<std::int32_t>::min();
+        maximum = std::numeric_limits<std::int32_t>::max();
         break;
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM: snorm = 127; break;
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM: snorm = 32767; break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM: unorm = {255, 255, 255, 255}; break;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB: unorm = {0, 0, 0, 255}; break;  // the colour channels go through the sRGB curve
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: unorm = {1023, 1023, 1023, 3}; break;
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM: unorm = {65535, 65535, 65535, 65535}; break;
     default: break;
     }
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (is_signed) {
-            const double v = double(input[i]);
-            std::int32_t out;
-            if (v != v) {
-                out = 0;  // NaN
-            } else if (v <= double(signed_minimum)) {
-                out = static_cast<std::int32_t>(signed_minimum);
-            } else if (v >= double(signed_maximum)) {
-                out = static_cast<std::int32_t>(signed_maximum);
-            } else {
-                out = static_cast<std::int32_t>(v);  // truncates toward zero
-            }
-            value.int32[i] = out;
-        } else if (!unsigned_maximum) {
-            value.float32[i] = input[i];
-        } else if (!(input[i] > 0.0f)) {
-            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
-        } else if (double(input[i]) >= double(unsigned_maximum)) {
-            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        const double x = input[i];
+        if (maximum == 0) {
+            if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
+            else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
+        } else if (!is_signed) {
+            if (!(x > 0.0)) value.uint32[i] = 0;  // NaN, negative values and either zero; no out-of-range float-to-int cast.
+            else if (x >= maximum) value.uint32[i] = static_cast<std::uint32_t>(maximum);  // includes +infinity
+            else value.uint32[i] = static_cast<std::uint32_t>(input[i]);
         } else {
-            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+            if (x != x) value.int32[i] = 0;
+            else if (x <= minimum) value.int32[i] = static_cast<std::int32_t>(minimum);  // includes -infinity
+            else if (x >= maximum) value.int32[i] = static_cast<std::int32_t>(maximum);
+            else value.int32[i] = static_cast<std::int32_t>(input[i]);  // toward zero
         }
     }
     return value;
@@ -1301,7 +1343,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const VkClearDepthStencilValue value{depth_clear->depth, depth_clear->stencil};
+            const float depth = p.binding.format == VK_FORMAT_D16_UNORM
+                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                                    : depth_clear->depth;
+            const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {

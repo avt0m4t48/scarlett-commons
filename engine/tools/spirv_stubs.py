@@ -194,25 +194,28 @@ def build_ps_stub(in_locations=(), flat_locations=()):
     return struct.pack(f"<{len(words)}I", *words)
 
 
+def _interface_locations(meta, field, legacy_field=None):
+    if legacy_field is not None and meta.get(field) is None:
+        field = legacy_field
+    locations = meta.get(field, [])
+    if not isinstance(locations, (list, tuple)) or any(type(loc) is not int for loc in locations):
+        raise ValueError(f"{field} must be a list of integer locations")
+    return tuple(sorted(set(locations)))
+
+
 def required_stubs_for_meta(meta):
     """Return list of (kind, tuple(sorted_locations)) partner stubs needed for one index.json entry."""
     stage = meta.get("stage", "")
     if stage == "ps":
-        return [("vs", tuple(sorted({int(x) for x in meta.get("inputs", [])})))]
+        return [("vs", _interface_locations(meta, "inputs"))]
     if stage == "vs":
-        return [("ps", tuple(sorted({int(x) for x in meta.get("outputs", [])})))]
+        return [("ps", _interface_locations(meta, "outputs"))]
     if stage == "ms":
-        return [("ps", tuple(sorted({int(x) for x in meta.get("params", [])})))]
+        return [("ps", _interface_locations(meta, "params"))]
     if stage == "gs":
-        in_locs = meta.get("gs_input_locations")
-        if in_locs is None:
-            in_locs = meta.get("gs_inputs", [])
-        out_locs = meta.get("gs_output_locations")
-        if out_locs is None:
-            out_locs = meta.get("gs_outputs", [])
         return [
-            ("vs", tuple(sorted({int(x) for x in in_locs}))),
-            ("ps", tuple(sorted({int(x) for x in out_locs}))),
+            ("vs", _interface_locations(meta, "gs_input_locations", "gs_inputs")),
+            ("ps", _interface_locations(meta, "gs_output_locations", "gs_outputs")),
         ]
     return []
 

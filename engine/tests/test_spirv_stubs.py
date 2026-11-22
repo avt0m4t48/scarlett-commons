@@ -93,6 +93,8 @@ class SpirvStubsTests(unittest.TestCase):
             "ms_a": {"stage": "ms", "params": [0, 1]},  # same PS stub as vs_a
             "gs_a": {"stage": "gs", "gs_inputs": [0, 1], "gs_outputs": [0, 1],
                      "gs_input_locations": [1], "gs_output_locations": [1]},
+            "gs_legacy": {"stage": "gs", "gs_inputs": [1, 0, 1], "gs_outputs": [1, 0],
+                          "gs_output_locations": None},
         }
         with tempfile.TemporaryDirectory() as tmp:
             written = spirv_stubs.generate_for_index(tmp, index)
@@ -184,6 +186,28 @@ class MalformedIndexTest(unittest.TestCase):
                 if name in ("ms_bad", "gs_bad"):
                     self.assertIn("invalid Location", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
+
+    def test_malformed_location_types_stop_the_entire_preflight(self):
+        cases = (
+            {"stage": "ps", "inputs": [1.9]},
+            {"stage": "vs", "outputs": [True]},
+            {"stage": "ms", "params": ["3"]},
+            {"stage": "gs", "gs_input_locations": "23"},
+            {"stage": "gs", "gs_output_locations": {"2": 0}},
+            {"stage": "gs", "gs_input_locations": None, "gs_inputs": [0.5]},
+        )
+        for meta in cases:
+            with self.subTest(meta=meta), tempfile.TemporaryDirectory() as tmp:
+                index = {"good": {"stage": "ps", "inputs": [0]}, "bad": meta}
+                with self.assertRaisesRegex(ValueError, "bad: invalid graphics interface locations"):
+                    spirv_stubs.generate_for_index(tmp, index)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "stubs")))
+
+    def test_non_finite_location_is_one_error_not_a_traceback(self):
+        p = self.run_tool('{"ps_bad": {"stage": "ps", "inputs": [1e999]}}')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("ps_bad: invalid graphics interface locations", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

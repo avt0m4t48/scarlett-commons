@@ -189,6 +189,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
                                  (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
                                  (pair && !moved ? (expect_no_pairs ? ", \"pairs\": false" : ", \"pairs\": true")
                                                  : "") +
+                                 (box16 ? ", \"box16\": true" : "") +
                                  ", \"triangles\": " + tris_json(tris) + "}\n";
         return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());

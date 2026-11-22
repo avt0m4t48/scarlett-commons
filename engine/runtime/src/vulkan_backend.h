@@ -1112,13 +1112,15 @@ public:
 
     // Whether a build's inner nodes are BOX16 (64 bytes, half boxes rounded outward) instead of BOX32: bottom-level
     // builds with MINIMIZE_MEMORY (VK LOW_MEMORY). The flags of an update must match its build's (D3D12), so prebuild
-    // info, the build and its refits agree. A top-level build keeps BOX32: it is in world space, where half precision
+    // info, the build and its refits agree. An update that breaks that rule (MINIMIZE_MEMORY on one and not the
+    // other) is refitted with the wrong layout, out of the structure's bounds: D3D12 leaves it undefined too. A top-level build keeps BOX32: it is in world space, where half precision
     // would make boxes metres too large a few kilometres from the origin.
     static bool xdxr_box16(const BuildAccelerationStructure& b) {
         return !b.is_tlas && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR) != 0;
     }
     // Whether a bottom-level build pairs sibling triangles into TRI0/TRI1 leaves: not when the structure may be
-    // updated (ALLOW_UPDATE), since a refit rewrites the leaves one triangle each. Pairing changes neither the layout
+    // updated (ALLOW_UPDATE), since a refit rewrites the leaves one triangle each (D3D12 allows PERFORM_UPDATE only on
+    // a structure built with ALLOW_UPDATE; an update of a paired one would lose every TRI1 triangle). Pairing changes neither the layout
     // nor the tree, so prebuild info does not depend on it.
     static bool xdxr_pair(const BuildAccelerationStructure& b) {
         return !b.is_tlas && !b.update && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) == 0;

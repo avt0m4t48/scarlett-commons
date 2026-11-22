@@ -86,7 +86,8 @@ class Layout(unittest.TestCase):
                 self.assertGreaterEqual(dhi[c], hi[c])
 
     def test_half_round_edges(self):
-        # the same table runtime/src/xdxr_build.comp half_directed is checked against through check-build
+        # runtime/src/xdxr_build.comp half_directed computes the same bits; check-build compares the GPU's BOX16
+        # words with encode_box16, which uses this function
         cases = [
             (0.0, False, 0x0000), (0.0, True, 0x0000), (-0.0, False, 0x8000), (-0.0, True, 0x8000),
             (1.0, False, 0x3C00), (1.0, True, 0x3C00), (1.0001, False, 0x3C00), (1.0001, True, 0x3C01),

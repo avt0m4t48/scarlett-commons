@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
     const std::string tris = triangles_json(soup);
     // ALLOW_UPDATE: never paired, since a refit rewrites the leaves one triangle each ("pairs": false)
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas",
-              "{\"kind\": \"blas\", \"pairs\": false, \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": false, \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + tris + "}\n"))
         return fail("BLAS readback");
     std::string inst = "[";
@@ -442,7 +442,8 @@ int main(int argc, char** argv) {
     }
     if (box16_size != box16_info.ResultDataMaxSizeInBytes) return fail("MINIMIZE_MEMORY postbuild size");
     if (!dump(box16_rb.p, box16_info.ResultDataMaxSizeInBytes, "d3d12_blas_box16",
-              "{\"kind\": \"blas\", \"pairs\": false, \"address\": " + std::to_string(box16_blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": true, \"address\": " +
+                  std::to_string(box16_blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + triangles_json(moved) + "}\n"))
         return fail("MINIMIZE_MEMORY BLAS readback");
     // the soup moves back to where it started, and the BOX16 BLAS is refitted in place
@@ -457,7 +458,8 @@ int main(int argc, char** argv) {
     list->CopyBufferRegion(box16_rb.p, 0, box16_blas.p, 0, box16_info.ResultDataMaxSizeInBytes);
     if (!submit(6)) return fail("BOX16 update submission");
     if (!dump(box16_rb.p, box16_info.ResultDataMaxSizeInBytes, "d3d12_blas_box16_update",
-              "{\"kind\": \"blas\", \"pairs\": false, \"address\": " + std::to_string(box16_blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": true, \"address\": " +
+                  std::to_string(box16_blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + tris + "}\n"))
         return fail("BOX16 BLAS readback after the update");
     std::printf("d3d12_xdxr_rt: MINIMIZE_MEMORY BLAS %llu bytes (BOX16)\n", static_cast<unsigned long long>(box16_size));

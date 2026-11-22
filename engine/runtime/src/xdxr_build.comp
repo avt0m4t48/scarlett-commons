@@ -438,7 +438,7 @@ void radix_scatter(uint w, uint t) {
 // per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf
 // and the sibling's own leaf is left unreferenced. Both pointers have this node as parent. Pairs never cross nodes,
 // so no other thread touches these leaves. The barycentric remap byte of a node type returns D3D12's (b1, b2): bits
-// [1:0] and [3:2] are the slots holding the triangle's vertices 1 and 2.
+// [1:0] and [3:2] are the positions, in the order that node type reads its slots, of the triangle's vertices 1 and 2.
 uint leaf_off(uint e) { return pc.elements_off + 64u * e; }
 uvec3 leaf_vertex(uint e, uint k) {
     uint o = leaf_off(e) + 12u * k;

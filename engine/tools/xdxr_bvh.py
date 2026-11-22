@@ -108,7 +108,8 @@ def _half_step(bits, up):
 
 def half_round(x, up):
     """Round a float to a half that is >= x (up) or <= x, so a quantised box still contains the exact one. Values
-    beyond the half range become +-inf, which the decoder clamps to +-FLT_MAX: still conservative. No denormal half
+    beyond the half range become +-inf on their outward side (the decoder clamps them to +-FLT_MAX: still
+    conservative) and +-HALF_MAX on their inward side, so an empty box stays empty. No denormal half
     is produced: a value below the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its
     side, because a decoder that flushes half denormals to zero would otherwise shrink the box. The GPU builder
     (runtime/src/xdxr_build.comp half_directed) computes the same bits."""
@@ -775,20 +776,24 @@ def box16_rounding(data):
     return errs
 
 
-def count_pairs(data):
-    """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
-    count = 0
+def node_census(data):
+    """Reachable pointers of a valid BVH by node type: {type: count}, the root included."""
+    count = {}
     stack = [struct.unpack_from("<I", data, 48)[0]]
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
         kind = ptr_type(p)
-        if kind == TRI1:
-            count += 1
-        elif kind in (BOX16, BOX32):
+        count[kind] = count.get(kind, 0) + 1
+        if kind in (BOX16, BOX32):
             stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
     return count
+
+
+def count_pairs(data):
+    """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
+    return node_census(data).get(TRI1, 0)
 
 
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
@@ -836,6 +841,12 @@ def check_build(directory, rays=300, seed=1):
             errs.append("built with pairing, but no TRI1 node is reachable")
         if desc.get("pairs") is False and pairs:
             errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
+        if "box16" in desc and not errs:          # the node type the build was asked for, so no check runs vacuously
+            census = node_census(data)
+            want, other = (BOX16, BOX32) if desc["box16"] else (BOX32, BOX16)
+            if census.get(other) or not census.get(want):
+                errs.append(f"inner nodes {census.get(BOX16, 0)} BOX16 and {census.get(BOX32, 0)} BOX32, expected "
+                            f"only {'BOX16' if desc['box16'] else 'BOX32'}")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]

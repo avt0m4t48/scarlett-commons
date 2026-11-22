@@ -114,8 +114,22 @@ int main() {
     zero_length.push_back(OpVariable);  // word count 0
     check(!spirv_declares_writable_storage(zero_length), "an instruction of length 0");
     check(!spirv_declares_writable_storage(header()), "a header with no instructions");
+    // An array type that names itself as its element: the walk through array types stops instead of spinning.
+    Words self_array = header();
+    inst(self_array, OpTypeRuntimeArray, {array_t, array_t});
+    inst(self_array, OpTypePointer, {pointer_t, UniformConstant, array_t});
+    inst(self_array, OpVariable, {pointer_t, var, UniformConstant});
+    check(!spirv_declares_writable_storage(self_array), "a self-referential array type ends, and needs nothing");
+    // The same module with a real storage image declared after it is still seen.
+    Words mixed = self_array;
+    inst(mixed, OpTypeInt, {uint_t, 32, 0});
+    inst(mixed, OpTypeImage, {image_t, uint_t, 1, 0, 0, 0, 2, 33});
+    inst(mixed, OpTypePointer, {struct_t, UniformConstant, image_t});
+    inst(mixed, OpVariable, {struct_t, length_c, UniformConstant});
+    check(spirv_declares_writable_storage(mixed), "a storage image after a malformed array is still found");
 
     if (failures) return 1;
-    std::printf("spirv_stores_test: OK (storage images, arrays of them, storage buffers in both forms, framing)\n");
+    std::printf("spirv_stores_test: OK (storage images, arrays of them, storage buffers in both forms, framing, a "
+                "self-referential array)\n");
     return 0;
 }

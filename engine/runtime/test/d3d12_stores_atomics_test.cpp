@@ -6,8 +6,9 @@
 //   - the runtime's own device (create_vulkan_device_standalone, the one D3D12XboxCreateDevice hands a title with
 //     LEONIDA_D3D12=vulkan): it enables fragmentStoresAndAtomics and vertexPipelineStoresAndAtomics exactly where
 //     the GPU has them, and with the first one creates the PSO.
-// When VK_LAYER_KHRONOS_validation is installed, both devices run under it (the test turns it on for itself) and
-// any validation error fails the test: before the fix the second device gave -06340 and S_OK.
+// When VK_LAYER_KHRONOS_validation is installed, both devices run under it (the test turns it on for itself unless
+// LEONIDA_VK_VALIDATION=0) and any validation error fails the test: before the fix the second device gave -06340
+// and S_OK. Without the layer the test still checks the HRESULTs and the feature bits.
 // The shaders are GLSL written to the translator's runtime contract; nothing is drawn. No game data.
 #include "d3d12_test_shaders.h"
 #include "shader_fixture_path.h"
@@ -104,8 +105,14 @@ std::vector<std::uint32_t> read_words(const std::filesystem::path& path) {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Under the validation layer wherever it is installed: that is what shows the pipeline is one Vulkan allows.
-    const bool validating = validation_layer_installed();
-    if (validating) _putenv_s("LEONIDA_VK_VALIDATION", "1");
+    // Unlike the other tests, this one turns the layer on for itself when LEONIDA_VK_VALIDATION is not set; set to
+    // 0 it stays off, and the test then checks the HRESULTs and the feature bits only.
+#pragma warning(push)
+#pragma warning(disable : 4996)  // getenv: read once, at startup
+    const char* const requested = std::getenv("LEONIDA_VK_VALIDATION");
+#pragma warning(pop)
+    const bool validating = requested ? requested[0] && requested[0] != '0' : validation_layer_installed();
+    if (validating && !requested) _putenv_s("LEONIDA_VK_VALIDATION", "1");
 
     // The shader library: three programs and the translator's index for them. The atomic pixel shader lists the
     // set-0 binding it declares (4: the R32ui storage images).

@@ -81,9 +81,15 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
     for (const Variable& variable : variables) {
         const auto pointer = pointers.find(variable.pointer_type);
         if (pointer == pointers.end()) continue;
+        // An array of images or of buffer blocks: the element decides. Arrays nest a few levels at most; the bound
+        // is for a malformed module whose array type names itself, which would otherwise never end.
+        constexpr int max_array_depth = 16;
         std::uint32_t type = pointer->second.pointee;
-        for (auto element = element_of.find(type); element != element_of.end(); element = element_of.find(type))
-            type = element->second;  // an array of images or of buffer blocks: the element decides
+        int depth = 0;
+        for (auto element = element_of.find(type); element != element_of.end() && depth < max_array_depth;
+             element = element_of.find(type), ++depth)
+            type = element->second;
+        if (depth == max_array_depth) continue;  // not a type a driver would accept either
         if (non_writable.count(variable.id)) continue;
         if (variable.storage_class == class_uniform_constant) {
             if (storage_images.count(type)) return true;  // a storage image or a storage texel buffer

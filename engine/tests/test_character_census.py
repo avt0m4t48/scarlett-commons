@@ -28,7 +28,6 @@ def skinned_model():
         "type": "dr",
         "vertex_count": 12,
         "triangle_count": 4,
-        "index_count": 12,
         "drawable": {
             "name": "synthetic_skinned",
             "skeleton": [
@@ -61,7 +60,6 @@ def static_model():
         "type": "dr",
         "vertex_count": 6,
         "triangle_count": 2,
-        "index_count": 6,
         "materials": [
             {"shader_name_hash": "12345678", "textures": [{"hash32": "89ABCDEF"}]},
         ],
@@ -77,7 +75,6 @@ def fragment_model():
         "type": "ft",
         "vertex_count": 25,
         "triangle_count": 32,
-        "index_count": 96,
         "drawable": {
             "skeleton": [{"name": "SKEL_ROOT"}, {"name": "SKEL_Pelvis"}],
         },
@@ -136,7 +133,7 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertIn("character census: 5 models", result.stdout)
         self.assertIn("43 vertices (2 without)", result.stdout)
         self.assertIn("38 triangles (2 without)", result.stdout)
-        self.assertIn("114 indices (2 without)", result.stdout)
+        self.assertIn("? indices", result.stdout)
         self.assertIn("8-influence skin: 1 yes, 3 no, 1 unknown", result.stdout)
         self.assertIn("by kind:", result.stdout)
         self.assertIn("by shader (a model with several materials counts under each):", result.stdout)
@@ -153,10 +150,10 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(summary["models"], 5)
         self.assertEqual(summary["vertices"], 43)
         self.assertEqual(summary["triangles"], 38)
-        self.assertEqual(summary["indices"], 114)
+        self.assertEqual(summary["indices"], 0)
         self.assertEqual(summary["unknown_vertices"], 2)
         self.assertEqual(summary["unknown_triangles"], 2)
-        self.assertEqual(summary["unknown_indices"], 2)
+        self.assertEqual(summary["unknown_indices"], 5)
         self.assertEqual(summary["skin_8"], 1)
         self.assertEqual(summary["skin_unknown"], 1)
         self.assertEqual(summary["malformed"], 2)
@@ -185,7 +182,7 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(skinned["kind"], "drawable")
         self.assertEqual(skinned["vertices"], 12)
         self.assertEqual(skinned["triangles"], 4)
-        self.assertEqual(skinned["indices"], 12)
+        self.assertIsNone(skinned["indices"])
         self.assertEqual(skinned["bones"], 3)
         self.assertIs(skinned["skin_8"], True)
         self.assertEqual(skinned["shaders"], ["0x210FBC6A", "0xDEADBEEF"])
@@ -215,6 +212,26 @@ class CharacterCensusTest(unittest.TestCase):
                      "vertex count is not a non-negative integer", "missing vertex count",
                      "triangle count is not a non-negative integer", "missing triangle count"):
             self.assertTrue(any(text in issue for issue in partial["issues"]), text)
+
+    def test_optional_index_count_is_counted_when_an_input_supplies_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td) / "one"
+            write_json(root / "model.json", {
+                "name": "synthetic_indexed",
+                "type": "dr",
+                "vertex_count": 4,
+                "triangle_count": 1,
+                "index_count": 12,
+                "materials": [],
+                "meshes": [{"name": "m", "vertex_count": 4, "triangle_count": 1}],
+            })
+            out = pathlib.Path(td) / "report.json"
+            result = self.run_tool(root, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(data["summary"]["indices"], 12)
+            self.assertEqual(data["summary"]["unknown_indices"], 0)
+            self.assertEqual(data["models"][0]["indices"], 12)
 
     def test_csv_has_one_row_per_model(self):
         path = pathlib.Path(self.temp.name) / "report.csv"

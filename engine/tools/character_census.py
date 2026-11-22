@@ -15,6 +15,10 @@ manifest. The decoded ``model.json`` layout written by the local pack exporter i
     drawable.models[]         bone_palette[] (local bone count)
     meshes[]                  vertex_count, triangle_count, skinned, skin_influences, bones
 
+The local exporter does not write an index count, so the index column and total normally stay
+unknown. An input that supplies ``index_count`` (or ``indices``/``IndexCount``) is counted; the
+field is optional, not part of the decoded layout above.
+
 An ``rpf9dump models`` manifest (``Items[]`` with ``Verts``, ``Tris``, ``IsFragment``,
 ``HasBoneBindings`` and ``Materials[]``) and a simple ``models[]`` list of model paths or inline
 model objects are also accepted. An ``rpf9dump models`` manifest has only ``HasBoneBindings``, not

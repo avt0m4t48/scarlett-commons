@@ -69,9 +69,14 @@ struct Probe {
     UINT frame, index;
 };
 // The SRVs a frame's dispatches sample: four of its own and four from up to three frames before.
-Probe probe_of(UINT f, UINT p) {
+// With `async`, the compute queue (q 1) samples only textures of `use_span` frames ago, which the CPU has seen
+// finished: it has no D3D12 fence on the direct queue, so what it must wait for is the table the direct queue's
+// flush just grew, nothing else.
+bool async_compute(bool async, UINT q, UINT f) { return async && q == 1 && f >= use_span; }
+Probe probe_of(UINT f, UINT p, bool async = false, UINT q = 0) {
     static constexpr UINT ages[probes] = {0, 0, 0, 0, 1, 2, 3, 1};
-    const UINT age = ages[p] <= f ? ages[p] : 0;
+    const UINT wanted = async_compute(async, q, f) ? use_span : ages[p];
+    const UINT age = wanted <= f ? wanted : 0;
     return {f - age, (p * 5 + f * 3) % per_frame};
 }
 
@@ -79,9 +84,10 @@ struct Result {
     double total_ms = 0, worst_frame_ms = 0;
     rt::d3d12::BindlessStats stats{};
     unsigned mismatches = 0, compared = 0;
+    std::uint64_t max_retired_pending = 0;  // seen right after an ExecuteCommandLists, with work in flight
 };
 
-bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_idle, Result& result) {
+bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_idle, bool async, Result& result) {
     _putenv_s("LEONIDA_BINDLESS_IDLE_WAIT", legacy_idle ? "1" : "0");
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = d.instance_proc;
@@ -225,7 +231,7 @@ bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_id
             }
             const auto* bytes = static_cast<const std::uint8_t*>(mapped);
             for (UINT p = 0; p < probes; ++p) {
-                const Probe probe = probe_of(g, p);
+                const Probe probe = probe_of(g, p, async, q);
                 for (UINT i = 0; i < texels; ++i) {
                     const Texel want = texel(probe.frame, probe.index, i % texture_size, i / texture_size);
                     const std::uint8_t* got = bytes + p * run_bytes + i * 4;
@@ -313,7 +319,7 @@ bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_id
             list[q]->SetComputeRootUnorderedAccessView(1, output[q][k]->GetGPUVirtualAddress());
             list[q]->SetComputeRootDescriptorTable(3, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu});
             for (UINT p = 0; p < probes; ++p) {
-                const Probe probe = probe_of(f, p);
+                const Probe probe = probe_of(f, p, async, q);
                 const UINT heap_slot = (probe.frame % ring) * per_frame + probe.index;
                 list[q]->SetComputeRootDescriptorTable(
                     2, D3D12_GPU_DESCRIPTOR_HANDLE{view_gpu + UINT64(heap_slot) * view_step});
@@ -328,11 +334,14 @@ bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_id
             list[q]->CopyBufferRegion(readback[q][k].p, 0, output[q][k].p, 0, probes * run_bytes);
             EXPECT(list[q]->Close() == S_OK);
             // The compute queue samples what the direct queue uploads: that is a wait on the GPU, not on the CPU.
-            if (q == 1) EXPECT(SUCCEEDED(queue[1]->Wait(fence[0].p, f + 1)));
+            if (q == 1 && !async_compute(async, q, f)) EXPECT(SUCCEEDED(queue[1]->Wait(fence[0].p, f + 1)));
             ID3D12CommandList* lists[] = {list[q].p};
             queue[q]->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue[q].p) == leonida::ReplayResult::success);
             EXPECT(SUCCEEDED(queue[q]->Signal(fence[q].p, f + 1)));
+            // A generation the flush retired stays until the submissions that may have used it are done.
+            result.max_retired_pending = std::max(result.max_retired_pending,
+                                                  rt::d3d12::bindless_stats(device.p).retired_pending);
         }
         const double frame_ms = std::chrono::duration<double, std::milli>(Clock::now() - frame_start).count();
         result.worst_frame_ms = std::max(result.worst_frame_ms, frame_ms);
@@ -369,10 +378,17 @@ bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_id
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // `--validated` runs under the validation layer with synchronization validation, and skips when it is not there.
+    const bool validated = argc > 1 && std::strcmp(argv[1], "--validated") == 0;
+    if (validated) _putenv_s("LEONIDA_VK_VALIDATION", "1");
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
+    if (validated && device_status != vktest::DeviceStatus::ready) {
+        std::printf("SKIP: the validation layer is not available\n");
+        return 77;
+    }
     if (device_status != vktest::DeviceStatus::ready) return 1;
     if (!d.bindless) {
         std::printf("SKIP: the device lacks the descriptor indexing features of the bindless set 0\n");
@@ -392,9 +408,10 @@ int main() {
                  "\"uses_code_base\": false, \"wave64\": false}}";
     }
 
-    Result now, legacy;
-    bool ok = run(d, library, false, now);
-    if (ok) ok = run(d, library, true, legacy);
+    Result now, async, legacy;
+    bool ok = run(d, library, false, false, now);
+    if (ok) ok = run(d, library, false, true, async);
+    if (ok) ok = run(d, library, true, false, legacy);
     std::filesystem::remove_all(library);
     if (!ok) return 1;
 
@@ -408,8 +425,11 @@ int main() {
                     static_cast<unsigned long long>(r.stats.retired_pending), r.compared, r.mismatches);
     };
     report("deferred retirement:", now);
+    report("async compute:", async);
     report("old device-idle wait:", legacy);
-    MAIN_EXPECT(now.mismatches == 0 && legacy.mismatches == 0);
+    MAIN_EXPECT(now.mismatches == 0 && async.mismatches == 0 && legacy.mismatches == 0);
+    MAIN_EXPECT(async.compared == now.compared && async.stats.device_idle_waits == 0 && async.stats.generations_made > 0);
+    MAIN_EXPECT(now.max_retired_pending > 0 && async.max_retired_pending > 0);
     MAIN_EXPECT(now.compared == frames * queues * probes * texels);
     MAIN_EXPECT(now.stats.device_idle_waits == 0);
     MAIN_EXPECT(now.stats.generations_made > 0);

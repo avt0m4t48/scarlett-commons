@@ -1625,6 +1625,8 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bindless_churn_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bindless_churn COMMAND d3d12_bindless_churn_test)
       set_tests_properties(d3d12_bindless_churn PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_bindless_churn_validated COMMAND d3d12_bindless_churn_test --validated)
+      set_tests_properties(d3d12_bindless_churn_validated PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
                      ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)

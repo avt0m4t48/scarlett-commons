@@ -737,6 +737,7 @@ struct DeviceState {
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
     bool bindless_legacy_idle = false;
+    std::atomic<bool> bindless_cap_logged{false};
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
@@ -3947,7 +3948,7 @@ public:
             },
             &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
-            std::lock_guard lock(state_.descriptor_mutex);
+            std::unique_lock lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
             auto& context = *state_.context;
             if (state_.bindless_legacy_idle && state_.bindless->flush_replaces_table()) {
@@ -3964,11 +3965,28 @@ public:
                 // Nothing waits; the rest stay for a later submit. completed_retire_ticket() takes submit_mutex_,
                 // which comes after the resource, tracker and descriptor locks held here.
                 state_.bindless->release_retired(context.completed_retire_ticket());
+                // A queue whose work is stalled (a fence only the CPU signals, long async work) keeps its ticket from
+                // completing, and each replacing flush adds a generation. Past the cap wait, once the oldest is in the
+                // way, for the submissions up to its ticket (the queues' timelines, not the device), with the
+                // descriptor lock released: the thread that signals such a fence may need it.
+                constexpr std::size_t max_retired = 8;
+                if (state_.bindless->retired_count() > max_retired) {
+                    if (!state_.bindless_cap_logged.exchange(true))
+                        std::fprintf(stderr, "[rt] d3d12: more than %zu retired bindless table generations: waiting "
+                                             "for the queues that still use the oldest\n", max_retired);
+                    const std::uint64_t oldest = state_.bindless->oldest_retired_ticket();
+                    lock.unlock();
+                    const std::uint64_t completed = context.wait_retire_ticket(oldest);
+                    lock.lock();
+                    state_.bindless->release_retired(completed);
+                }
             }
             // Under tracker_mutex_ (held from here to the submit) no other ExecuteCommandLists has recorded work that
             // is not yet submitted, so every submission that can have bound the set being replaced has a ticket up to
             // the one read here.
-            return state_.bindless->flush(command_buffer, context.submitted_retire_ticket());
+            const bool flushed = state_.bindless->flush(command_buffer, context.submitted_retire_ticket());
+            if (flushed && state_.bindless->last_flush_replaced()) context.note_bindless_upload();
+            return flushed;
         });
         state_.context->set_bindless_current([this]() {
             std::lock_guard lock(state_.descriptor_mutex);

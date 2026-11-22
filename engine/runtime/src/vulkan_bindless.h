@@ -493,7 +493,12 @@ public:
     bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0) {
         bool replaced = false;
         bool written = true;
+        const bool must_replace = flush_replaces_table();
         if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer, retire_ticket, replaced);
+        last_flush_replaced_ = replaced;
+        // The new generation could not be made: the current set is the one running work reads, so its descriptors are
+        // not written in place either. The pending writes and the table's changes stay for the next flush.
+        if (!written && must_replace) return false;
         for (const Pending& pending : pending_) {
             if (pending.binding >= shadow_.size() || pending.index >= shadow_[pending.binding].size()) continue;
             shadow_[pending.binding][pending.index] = pending.info;
@@ -534,6 +539,11 @@ public:
         retired_.resize(kept);
     }
     bool has_retired() const { return !retired_.empty(); }
+    // True when the last flush() started a new generation: its table upload is in that flush's command buffer, so
+    // work on other queues that binds the new set must run after it (the owner orders them).
+    bool last_flush_replaced() const { return last_flush_replaced_; }
+    // The ticket of the oldest retired generation (0 when there is none).
+    std::uint64_t oldest_retired_ticket() const { return retired_.empty() ? 0 : retired_.front().ticket; }
     // How many generations flush() has made after the first, and how many wait for release_retired().
     std::uint64_t generations_made() const { return generations_made_; }
     std::size_t retired_count() const { return retired_.size(); }
@@ -1034,6 +1044,7 @@ private:
     };
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
+    bool last_flush_replaced_ = false;
     std::array<VkDescriptorPoolSize, bindless::bindings.size()> pool_sizes_{};
     std::uint32_t pool_size_count_ = 0;
     // Every descriptor written to the set (the table's binding aside), to fill the next generation's set.

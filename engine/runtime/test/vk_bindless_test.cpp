@@ -647,7 +647,9 @@ int main(int argc, char** argv) {
         const auto flush = [&]() {
             vkResetCommandBuffer(cmd, 0);
             if (const VkResult r = vkBeginCommandBuffer(cmd, &begin); r != VK_SUCCESS) return false;
-            const bool ok = set.flush(cmd);
+            // Ticket 1: what a flush that replaces the table stamps its retired generation with; release_retired(0)
+            // below must keep it, as the owner's completed ticket 0 means nothing has finished.
+            const bool ok = set.flush(cmd, 1);
             return submit() == VK_SUCCESS && ok;
         };
 
@@ -947,7 +949,7 @@ int main(int argc, char** argv) {
         EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_replaces_table());
         vkResetCommandBuffer(cmd, 0);
         CHECK(vkBeginCommandBuffer(cmd, &begin));
-        EXPECT(set.flush(cmd));  // recorded in a command buffer that is never submitted
+        EXPECT(set.flush(cmd, 1));  // recorded in a command buffer that is never submitted
         CHECK(vkEndCommandBuffer(cmd));
         set.table_upload_result(false);
         EXPECT(set.flush_replaces_table());  // the retry rewrites the whole table, in a new generation

@@ -96,6 +96,9 @@ bool run(vktest::Device& d, const std::filesystem::path& library, bool legacy_id
     info.device = d.device;
     info.queue = d.queue;
     info.queue_family = d.family;
+    // Distinct VkQueues for the D3D12 queues where the family has them: two queues on one VkQueue are ordered by
+    // submission, which hides a missing wait between them.
+    if (d.queues.size() >= 2) info.command_queues = d.queues;
     info.buffer_device_address = true;
     info.bindless = d.bindless;
     info.bindless_partially_bound = d.partially_bound;
@@ -383,6 +386,7 @@ int main(int argc, char** argv) {
     const bool validated = argc > 1 && std::strcmp(argv[1], "--validated") == 0;
     if (validated) _putenv_s("LEONIDA_VK_VALIDATION", "1");
     vktest::Device d;
+    d.queue_count_wanted = 2;  // a VkQueue for each of the two D3D12 queues, where the family has two
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (validated && device_status != vktest::DeviceStatus::ready) {
@@ -408,10 +412,15 @@ int main(int argc, char** argv) {
                  "\"uses_code_base\": false, \"wave64\": false}}";
     }
 
-    Result now, async, legacy;
+    const bool distinct = d.queues.size() >= 2 && d.queues[0] != d.queues[1];
+    std::printf("D3D12 queues on %s VkQueues (%zu created in family %u)\n",
+                distinct ? "distinct" : "ONE shared (the family has a single queue: the cross-queue wait is only "
+                                        "checked for validity)", d.queues.size(), d.family);
+    Result now, async, legacy, async_legacy;
     bool ok = run(d, library, false, false, now);
     if (ok) ok = run(d, library, false, true, async);
     if (ok) ok = run(d, library, true, false, legacy);
+    if (ok) ok = run(d, library, true, true, async_legacy);  // the old wait, and no wait between the queues
     std::filesystem::remove_all(library);
     if (!ok) return 1;
 
@@ -426,8 +435,10 @@ int main(int argc, char** argv) {
     };
     report("deferred retirement:", now);
     report("async compute:", async);
-    report("old device-idle wait:", legacy);
-    MAIN_EXPECT(now.mismatches == 0 && async.mismatches == 0 && legacy.mismatches == 0);
+    report("old wait:", legacy);
+    report("old wait, async:", async_legacy);
+    MAIN_EXPECT(now.mismatches == 0 && async.mismatches == 0 && legacy.mismatches == 0 &&
+                async_legacy.mismatches == 0);
     MAIN_EXPECT(async.compared == now.compared && async.stats.device_idle_waits == 0 && async.stats.generations_made > 0);
     MAIN_EXPECT(now.max_retired_pending > 0 && async.max_retired_pending > 0);
     MAIN_EXPECT(now.compared == frames * queues * probes * texels);

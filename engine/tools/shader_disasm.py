@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+import rdna2_decode  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -66,7 +67,10 @@ def probe(mcpu: str) -> None:
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
-def disasm(code: bytes, mcpu: str):
+def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+    if backend == "python":
+        asm, bad = rdna2_decode.disasm_bytes(code, wave32=wave32)
+        return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
@@ -98,7 +102,7 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
-def one(path, out, mcpu):
+def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
     start, end, how = code_range(b)
@@ -108,13 +112,13 @@ def one(path, out, mcpu):
         # Walk back in 4-byte steps from the end and keep the longest clean decode.
         start, best = end - 4, None
         for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-            _, bad, _ = disasm(b[s:end], mcpu)
+            _, bad, _ = disasm(b[s:end], mcpu, backend=backend)
             if bad == 0:
                 best = s
         if best is None:
             return "scan failed"
         start = best
-    asm, bad, err = disasm(b[start:end], mcpu)
+    asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
         FAILED.append((path, reason))
@@ -134,6 +138,8 @@ def main():
     ap.add_argument("--unpack-index", help="disassemble only the FSSMs listed in this unpack index")
     ap.add_argument("--out")
     ap.add_argument("--mcpu", default="gfx1013")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
@@ -165,10 +171,11 @@ def main():
         os.makedirs(out, exist_ok=True)
     except OSError as e:
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
-    probe(a.mcpu)
+    if a.backend == "llvm-mc":
+        probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
-        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
+        res = Counter(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]

@@ -9,8 +9,9 @@ there is no partner half to exchange values with (compute and mesh shaders have 
     analyse(blocks, succ, masks, stage) -> {"tier": "A" | "B" | "C", "reasons": [...], "idioms": [...],
                                             "uniform_readlane": {id(ins), ...}}
 
-    A  nothing wave-wide is consumed except votes that only skip lane-masked work, whole-quad masks and
-       per-lane arithmetic: exact as translated, on any subgroup size.
+    A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
+       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
+       whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
        is the same in every lane. Exact (the aggregated atomic up to the order in which lanes get slots), with the
@@ -94,6 +95,7 @@ MOVREL_OPS = (
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
+UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
 
 
 def base_op(op):
@@ -606,6 +608,8 @@ class Analysis:
         if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
             d = dests[0] if dests else {"k": "special", "t": "vcc"}
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
+            if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
+                tag = UVOTE
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -648,8 +652,13 @@ class Analysis:
                 r = _regs(srcs[0])
                 if srcs[0].get("k") == "special" and srcs[0].get("t") == "exec":
                     tag = ("mask", st["x"])
-                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
+                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
                     tag = st["g"][r[0]]
+            elif op == "s_and_b64" and not t_src and all(
+                    (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
+                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+                tag = UVOTE
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -792,6 +801,24 @@ class Analysis:
             return g[2]
         return None
 
+    def uniform_cmp(self, st, ins, srcs, uses, tj):
+        """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
+        every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
+        and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
+        if tj or uses or not st["f"] or not srcs:
+            return False
+        for x in srcs:
+            k = x.get("k")
+            if k in ("imm", "fimm"):
+                continue
+            if self.rd(st, ins, x) or self.is_mask(ins, x):
+                return False
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+                continue
+            return False
+        return True
+
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
         scalar against the VGPR it was read from (every lane of the mask owns that value), and a lane rank
@@ -922,7 +949,7 @@ class Analysis:
         if t & ~ELECT:
             self.bad_branch(ev, ins, op, t)
             return
-        self.vote(n, ins, op, reg, op.endswith("nz"), ev)
+        self.vote(n, ins, op, reg, op.endswith("nz"), ev, st)
 
     def bad_branch(self, ev, ins, op, t):
         if ev is not None:
@@ -932,10 +959,20 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev):
+    def vote(self, n, ins, op, reg, on_taken, ev, st=None):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
-        to that mask, so lanes that voted no are inert there."""
+        to that mask, so lanes that voted no are inert there.
+
+        A VCC that is a wave-uniform compare (UVOTE: every launch lane or none) is no lane vote: each half votes as
+        the wave does, so either side may have code of its own and scalars it defines are not stale. EXEC must have
+        been the launch mask at the compare: under a narrowed EXEC a half with no active lane votes no while the
+        wave votes yes."""
+        # st only for s_cbranch_vccz/vccnz: an SCC vote was taken on the mask as it was then, and VCC may since hold
+        # another value (a later v_cmp writes no SCC)
+        if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
+                and (id(ins), "vcc") not in self.stale:
+            return
         self.voted[n] = reg
         if n + 1 > self.n:
             return

@@ -660,6 +660,91 @@ class SccVotePolarity(unittest.TestCase):
             "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
 
 
+UNIFORM = [[0, 0, 0, 0, 9], [0, 0, 0, 0, 1]]     # s4 = 9: the compare 5 < s4 says yes; s4 = 1: no
+VCCZ_SIDES = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+              "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+
+
+class UniformVote(unittest.TestCase):
+    """A vote on a compare of a wave-uniform value made while EXEC is the launch mask is no lane vote: the mask is every
+    launch lane or none, so each half votes as the wave does, and both sides may have code (scalars included) of their
+    own. The near misses vote differently in the two halves and must stay tier C."""
+    run_both = Execution.run_both
+
+    def invariant(self, name, body, tier, idioms, want):
+        for push in UNIFORM:
+            t, whole, halves = self.run_both(name, vs(body), push)
+            (_, reasons, got_idioms), _ = meta_of(name, vs(body))
+            self.assertEqual((t, reasons, got_idioms), (tier, [], idioms), name)
+            self.assertEqual(whole, halves, (name, push))
+            self.assertEqual([w[:2] for w in whole], [want(push[4], k) for k in range(64)], (name, push))
+
+    def differs(self, name, body, reason, push=UNIFORM[0]):
+        t, whole, halves = self.run_both(name, vs(body), push)
+        (_, reasons, _), _ = meta_of(name, vs(body))
+        self.assertEqual(t, "C", name)
+        self.assertIn(reason, reasons, name)
+        self.assertNotEqual(whole, halves, name)
+        return whole, halves
+
+    def test_a_vccz_if_else_with_scalars_read_after_the_join(self):
+        self.invariant("vs_uv_vccz", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES, "A", [],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_llvm_and_exec_vccnz(self):
+        self.invariant("vs_uv_and_exec", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccnz 3", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_branch 2", "v_mov_b32_e32 v6, 7",
+            "s_mov_b32 s20, 1", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_uniform_loop_back_edge(self):
+        # s20 counts the trips in an SGPR across the back edge: every half runs s4 of them, as the wave does
+        self.invariant("vs_uv_loop", [
+            "s_mov_b32 s20, 0", "s_add_u32 s20, s20, 1", "v_add_nc_u32_e32 v6, 3, v6", "v_mov_b32_e32 v1, s20",
+            "v_cmp_gt_u32_e32 vcc, s4, v1", "s_cbranch_vccnz -5", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (3 * s4, s4 + k))
+
+    def test_b_readfirstlane_of_a_uniform_value_feeds_the_vote(self):
+        self.invariant("vs_uv_rfl", ["v_mov_b32_e32 v1, s4", "v_readfirstlane_b32 s21, v1", "v_mov_b32_e32 v2, s21",
+                                     "v_cmp_lt_u32_e32 vcc, 5, v2"] + VCCZ_SIDES, "B", ["readfirstlane-uniform"],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_c_compare_under_a_narrowed_exec(self):
+        # EXEC narrowed to lanes 0..31: the second half has no active lane, votes no and sets s20 = 2, which the lanes
+        # of that half read once EXEC is restored; the wave voted yes (s20 = 1)
+        whole, halves = self.differs("vs_uv_narrowed", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1",
+            "s_branch 2", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_mov_b64 exec, s[12:13]",
+            "v_add_nc_u32_e32 v7, s20, v0"], "unsafe-vote-branch")
+        self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
+        self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
+
+    def test_c_readfirstlane_of_a_varying_value(self):
+        # the first lane is vertex 0 in the wave and vertex 32 in the second half
+        self.differs("vs_uv_rfl_varying", ["v_readfirstlane_b32 s21, v0", "v_mov_b32_e32 v1, s21",
+                                           "v_cmp_eq_u32_e32 vcc, 0, v1"] + VCCZ_SIDES, "tainted-branch")
+
+    def test_c_compare_on_a_lane_count(self):
+        # 64 lanes in the wave, 32 in a half: 40 < count is yes for the wave, no for each half
+        self.differs("vs_uv_bcnt", ["s_bcnt1_i32_b64 s21, exec", "v_mov_b32_e32 v1, s21",
+                                    "v_cmp_lt_u32_e32 vcc, 40, v1"] + VCCZ_SIDES, "lane-count")
+
+    def test_c_scc_of_a_lane_mask_with_a_uniform_vcc_written_after_it(self):
+        # SCC is the vote of the AND (vertex 1 on: the wave and the first half say yes); the uniform v_cmp after it
+        # writes VCC but not SCC, so the branch still votes on the lane mask
+        self.differs("vs_uv_scc_stale", ["v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, exec, s[16:17]",
+                                         "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_scc0 3"]
+                     + VCCZ_SIDES[1:], "unsafe-vote-branch")
+
+    def test_c_uniform_mask_anded_with_a_lane_mask(self):
+        # only vertex 1 survives the AND: the wave and the first half vote yes, the second half no
+        self.differs("vs_uv_and_lane", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1",
+                                        "v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, vcc, s[16:17]"]
+                     + VCCZ_SIDES, "unsafe-vote-branch")
+
+
 class Refusal(unittest.TestCase):
     def test_error_mode_refuses_tier_c(self):
         old = rdna2spirv.WAVE64_GRAPHICS

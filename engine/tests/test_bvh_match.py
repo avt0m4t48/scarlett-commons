@@ -164,6 +164,59 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("found no model in its window", err)
 
+    def test_json_over_the_dehydrated_input_is_refused_before_it_is_read(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        blas = os.path.join(self.dir, "blas.bin")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", blas])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(blas, "rb") as f:
+            self.assertEqual(f.read(), src)
+
+    def test_json_over_the_manifest_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        manifest = os.path.join(self.dir, "manifest.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", manifest])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(manifest, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["Items"]), 1)
+
+    def test_json_over_the_descriptor_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        descriptor = os.path.join(self.dir, "instance208.bin")
+        data = bytes(0x50) + struct.pack("<12f", *[v for row in SHIFTED for v in row]) + bytes(60)
+        with open(descriptor, "wb") as f:
+            f.write(data)
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--descriptor", descriptor, "--json", descriptor])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(descriptor, "rb") as f:
+            self.assertEqual(f.read(), data)
+
+    def test_json_over_the_write_export_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        os.makedirs(out_dir)
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "export.json")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's export.json", err)
+
+    def test_json_to_its_own_path_still_writes_the_report(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        report = os.path.join(self.dir, "report.json")
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]}, ["--json", report])
+        self.assertEqual(status, 0, out)
+        with open(report, encoding="utf-8") as f:
+            body = json.load(f)
+        self.assertTrue(body["consistent"])
+        self.assertEqual(body["matched"]["geometry"], [1])
+
     def test_write_produces_the_buffers_bvh_rehydrate_reads(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         out = os.path.join(self.dir, "written")

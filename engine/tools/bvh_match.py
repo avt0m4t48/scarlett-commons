@@ -44,6 +44,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_geometry_check as C  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 INSTANCE_TRANSFORM_OFFSET = 0x50
 SKIP_SHADERS_ENV = "BVH_SKIP_SHADERS"
@@ -250,6 +251,17 @@ def main(argv=None):
                                                   "and an export.json for tools/bvh_rehydrate.py")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        # The report is written last, after the inputs have been read, so an aliased input would silently
+        # be replaced by it. Refuse the alias before any input is opened, as the other report tools do.
+        for what, other in (("the dehydrated input", a.dehydrated), ("the manifest", a.manifest),
+                            ("the --descriptor input", a.descriptor)):
+            if other and same_report_path(a.json, other):
+                print("error: --json would overwrite %s: %s" % (what, other), file=sys.stderr)
+                return 2
+        if a.write and same_report_path(a.json, os.path.join(a.write, "export.json")):
+            print("error: --json would overwrite --write's export.json: %s" % a.json, file=sys.stderr)
+            return 2
     try:
         with open(a.dehydrated, "rb") as f:
             src = f.read()

@@ -110,8 +110,8 @@ def load_names(path, source=None):
         for row in reader:
             if source and row.get("source") != source:
                 continue
-            if row["bank"] is None or row["stream_id"] is None:   # a row cut short, e.g. by an interrupted write
-                raise ValueError(f"{path}: line {reader.line_num} has no bank or stream_id")
+            if row["bank"] is None or row["stream_id"] is None or row["name"] is None:   # a row cut short, e.g. by an interrupted write
+                raise ValueError(f"{path}: line {reader.line_num} is missing bank, stream_id or name")
             bank = row["bank"].replace("\\", "/")
             sid = int(row["stream_id"], 16) & 0x1FFFFFFF
             if sid in out[bank]:
@@ -123,6 +123,7 @@ def load_names(path, source=None):
         for sid in ids:
             del out[bank][sid]
     return dict(out), {bank: ids for bank, ids in ambiguous.items()}
+
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""

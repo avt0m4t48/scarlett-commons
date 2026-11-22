@@ -10158,7 +10158,8 @@ def assemble(gen):
         # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed. Without this execution mode Vulkan lets
         # the driver assume none of them occur, and AMD's compiler does: a -0 product came back +0, and a NaN result
         # narrowed to f16 with integer ops was never stored (RX 9070 XT; docs/design.md, "Float controls").
-        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks shaderSignedZeroInfNanPreserveFloat32.
+        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks shaderSignedZeroInfNanPreserveFloat32,
+        # and shaderSignedZeroInfNanPreserveFloat64 for a module that uses Float64 (SHADER-597).
         caps.append("SignedZeroInfNanPreserve")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
@@ -10195,6 +10196,10 @@ def assemble(gen):
             hdr.append("OpExecutionMode %main DepthReplacing")
     if FLOAT_CONTROLS:
         hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 32")
+        if gen.uses_f64:
+            # SHADER-597: the same for doubles (Vulkan guarantees neither -0 nor NaN/inf for f64 without it), only
+            # in modules that declare Float64; --no-float-controls leaves it out with the 32-bit mode.
+            hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -12361,8 +12366,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:
-        # A property, not a feature: VkPhysicalDeviceFloatControlsProperties members the device must report true.
-        m["float_controls"] = ["shaderSignedZeroInfNanPreserveFloat32"]
+        # A property, not a feature: VkPhysicalDeviceFloatControlsProperties members the device must report true,
+        # one per width the module declares the execution mode for (32 always, 64 with Float64; SHADER-597).
+        widths = sorted({int(w) for w in re.findall(r"OpExecutionMode %main SignedZeroInfNanPreserve (\d+)", asm)})
+        m["float_controls"] = [f"shaderSignedZeroInfNanPreserveFloat{w}" for w in widths]
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:

@@ -213,26 +213,15 @@ class RefMachine:
         elif op.startswith("buffer_load_dword") or op.startswith("buffer_store_dword"):
             n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
             vdata = reg_first(args[0])
-            vaddr = None if args[1] == "off" else reg_first(args[1])
-            rsrc = reg_first(args[2])
-            d0, d1 = self.s.get(rsrc, 0), self.s.get(rsrc + 1, 0)
-            base = (d1 & 0xFFFF) << 32 | d0
-            stride = (d1 >> 16) & 0x3FFF
-            offset = self.scalar(args[3])
-            for m in mods:
-                if m.startswith("offset:"):
-                    offset += int(m.split(":", 1)[1], 0)
-            regs = [] if vaddr is None else [vaddr, vaddr + 1]
-            if "idxen" in mods:
-                offset += self.v.get(regs.pop(0), 0) * stride
-            if "offen" in mods:
-                offset += self.v.get(regs.pop(0), 0)
-            addr = base + (offset & MASK32)
+            addr = self._mubuf_addr(args[1], args[2], args[3], mods)
             for i in range(n):
                 if op.startswith("buffer_load"):
                     self.v[vdata + i] = self.word(addr + 4 * i)
                 else:
                     self.put(addr + 4 * i, self.v.get(vdata + i, 0))
+        elif op in BUFFER_SUB:
+            addr = self._mubuf_addr(args[1], args[2], args[3], mods)
+            self.v[reg_first(args[0])] = self._sub_dword(addr, *BUFFER_SUB[op])
         elif op.startswith(("buffer_load_format_", "tbuffer_load_format_")):
             ncomp = len(op.rsplit("_", 1)[1])
             vdata, rsrc = reg_first(args[0]), reg_first(args[2])
@@ -274,47 +263,27 @@ class RefMachine:
                 self.v[vdata + c] = {0: 0, 1: one, 4: comps[0], 5: comps[1], 6: comps[2], 7: comps[3]}.get(sel, 0)
         elif op.startswith("buffer_atomic_"):
             kind = op[len("buffer_atomic_"):]
-            vdata, rsrc = reg_first(args[0]), reg_first(args[2])
-            vaddr = None if args[1] == "off" else reg_first(args[1])
-            d0, d1 = self.s.get(rsrc, 0), self.s.get(rsrc + 1, 0)
-            base, stride = (d1 & 0xFFFF) << 32 | d0, (d1 >> 16) & 0x3FFF
-            offset = self.scalar(args[3]) + sum(int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:"))
-            regs = [] if vaddr is None else [vaddr, vaddr + 1]
-            if "idxen" in mods:
-                offset += self.v.get(regs.pop(0), 0) * stride
-            if "offen" in mods:
-                offset += self.v.get(regs.pop(0), 0)
-            addr = base + (offset & MASK32)
-            old, src = self.word(addr), self.v.get(vdata, 0)
-            s32 = lambda x: x - (1 << 32) if x >> 31 else x  # noqa: E731
-            new = {"add": old + src, "sub": old - src, "umin": min(old, src), "umax": max(old, src),
-                   "smin": old if s32(old) <= s32(src) else src, "smax": old if s32(old) >= s32(src) else src,
-                   "and": old & src, "or": old | src, "xor": old ^ src, "swap": src,
-                   "cmpswap": src if old == self.v.get(vdata + 1, 0) else old}[kind]
-            self.put(addr, new)
+            vdata = reg_first(args[0])
+            addr = self._mubuf_addr(args[1], args[2], args[3], mods)
+            old = self._apply_atomic(kind, addr, self.v.get(vdata, 0), self.v.get(vdata + 1, 0))
             if "glc" in mods:
                 self.v[vdata] = old
+        elif op.startswith("global_atomic_"):
+            kind = op[len("global_atomic_"):]
+            glc = "glc" in mods
+            vaddr, vdata_arg, saddr = (args[1], args[2], args[3]) if glc else (args[0], args[1], args[2])
+            addr = self._global_addr(vaddr, saddr, mods)
+            vdata = reg_first(vdata_arg)
+            old = self._apply_atomic(kind, addr, self.v.get(vdata, 0), self.v.get(vdata + 1, 0))
+            if glc:
+                self.v[reg_first(args[0])] = old
         elif op.startswith("global_load") or op.startswith("global_store"):
             load = op.startswith("global_load")
             data, vaddr = (reg_first(args[0]), args[1]) if load else (reg_first(args[1]), args[0])
-            saddr = args[2]
-            inst = sum(int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:"))
-            if saddr == "off":
-                v0 = reg_first(vaddr)
-                addr = self.v.get(v0 + 1, 0) << 32 | self.v.get(v0, 0)
-            else:
-                s0 = reg_first(saddr)
-                addr = (self.s.get(s0 + 1, 0) << 32 | self.s.get(s0, 0)) + self.v.get(reg_first(vaddr), 0)
-            addr = (addr + inst) & MASK64          # the printed offset is already signed (llvm-mc)
-            sub = {"global_load_ubyte": (8, False), "global_load_sbyte": (8, True),
-                   "global_load_ushort": (16, False), "global_load_sshort": (16, True)}.get(op)
+            addr = self._global_addr(vaddr, args[2], mods)
+            sub = GLOBAL_SUB_SPEC.get(op)
             if sub:
-                bits, sign = sub
-                shift = (addr & 3) * 8
-                value = (self.word(addr & ~3) >> shift) & ((1 << bits) - 1)
-                if sign and value >> (bits - 1):
-                    value -= 1 << bits
-                self.v[data] = value & MASK32
+                self.v[data] = self._sub_dword(addr, *sub)
             else:
                 n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
                 for i in range(n):
@@ -326,6 +295,46 @@ class RefMachine:
             pass
         else:
             raise AssertionError(f"reference model: unexpected op {op}")
+
+    def _mubuf_addr(self, vaddr_arg, rsrc_arg, soff_arg, mods):
+        vaddr = None if vaddr_arg == "off" else reg_first(vaddr_arg)
+        rsrc = reg_first(rsrc_arg)
+        d0, d1 = self.s.get(rsrc, 0), self.s.get(rsrc + 1, 0)
+        base, stride = (d1 & 0xFFFF) << 32 | d0, (d1 >> 16) & 0x3FFF
+        offset = self.scalar(soff_arg) + sum(int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:"))
+        regs = [] if vaddr is None else [vaddr, vaddr + 1]
+        if "idxen" in mods:
+            offset += self.v.get(regs.pop(0), 0) * stride
+        if "offen" in mods:
+            offset += self.v.get(regs.pop(0), 0)
+        return base + (offset & MASK32)
+
+    def _global_addr(self, vaddr, saddr, mods):
+        inst = sum(int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:"))
+        if saddr == "off":
+            v0 = reg_first(vaddr)
+            addr = self.v.get(v0 + 1, 0) << 32 | self.v.get(v0, 0)
+        else:
+            s0 = reg_first(saddr)
+            addr = (self.s.get(s0 + 1, 0) << 32 | self.s.get(s0, 0)) + self.v.get(reg_first(vaddr), 0)
+        return (addr + inst) & MASK64            # the printed offset is already signed (llvm-mc)
+
+    def _sub_dword(self, addr, bits, sign):
+        shift = (addr & 3) * 8
+        value = (self.word(addr & ~3) >> shift) & ((1 << bits) - 1)
+        if sign and value >> (bits - 1):
+            value -= 1 << bits
+        return value & MASK32
+
+    def _apply_atomic(self, kind, addr, src, cmp_val=0):
+        old = self.word(addr)
+        s32 = lambda x: x - (1 << 32) if x >> 31 else x  # noqa: E731
+        new = {"add": old + src, "sub": old - src, "umin": min(old, src), "umax": max(old, src),
+               "smin": old if s32(old) <= s32(src) else src, "smax": old if s32(old) >= s32(src) else src,
+               "and": old & src, "or": old | src, "xor": old ^ src, "swap": src,
+               "cmpswap": src if old == cmp_val else old}[kind]
+        self.put(addr, new)
+        return old
 
 
 def reg_first(text):
@@ -471,6 +480,21 @@ def gen_buffer_store(rng, prog):
     return [("v", VDATA + i) for i in range(n)]
 
 
+BUFFER_SUB = {"buffer_load_ubyte": (8, False), "buffer_load_sbyte": (8, True),
+              "buffer_load_ushort": (16, False), "buffer_load_sshort": (16, True)}
+
+
+def gen_buffer_sub(rng, prog):
+    name = rng.choice(tuple(BUFFER_SUB))
+    size = 1 if "byte" in name else 2
+    operands = _mubuf_operands(rng, prog, 1)
+    head, inst_str = operands.rsplit("offset:", 1)
+    inst = int(inst_str, 0) + rng.randrange(0, 4 // size) * size
+    prog.lines.append(f"{name} v{VDATA}, {head}offset:{inst}")
+    prog.lines.append("s_waitcnt vmcnt(0)")
+    return [("v", VDATA)]
+
+
 ATOMICS = ("add", "sub", "umin", "umax", "smin", "smax", "and", "or", "xor", "swap", "cmpswap")
 
 
@@ -493,31 +517,22 @@ def gen_buffer_atomic(rng, prog):
     return [("v", VDATA), ("v", VDATA + 2)]
 
 
-GLOBAL_SUB = ("global_load_ubyte", "global_load_sbyte", "global_load_ushort", "global_load_sshort")
+GLOBAL_SUB_SPEC = {"global_load_ubyte": (8, False), "global_load_sbyte": (8, True),
+                   "global_load_ushort": (16, False), "global_load_sshort": (16, True)}
+GLOBAL_SUB = tuple(GLOBAL_SUB_SPEC)
 
 
-def gen_global(rng, prog):
-    """global_load/store with a 64-bit VGPR address or an SGPR base + 32-bit VGPR offset, and a signed 12-bit
-    immediate printed the way llvm-mc prints it for gfx10 (decimal, negative values with a minus sign)."""
+def _global_addr_operands(rng, prog, width, align, sub_size=0):
+    """Emit a 64-bit VGPR address or SGPR base + 32-bit VGPR offset reaching an in-bounds address."""
     base = _buffer_base(rng) + REGION            # room below the base for negative offsets
     _seed_region(rng, prog.memory, base - REGION)
     _seed_region(rng, prog.memory, base)
-    op = rng.choice(("load", "load", "store", "sub"))
-    n = rng.choice((1, 2, 3, 4)) if op != "sub" else 1
-    width = 4 * n
     inst = rng.randrange(-2048 // 4, 2048 // 4) * 4
-    if op == "sub":
-        name = rng.choice(GLOBAL_SUB)
-        size = 1 if "byte" in name else 2
-        inst += rng.randrange(0, 4 // size) * size
-        width = size
-    # Pick the final address inside the two seeded regions (base - REGION .. base + REGION), aligned to the access,
-    # then the register part that reaches it once the immediate is added.
-    align = 4 if op != "sub" else width
+    if sub_size:
+        inst += rng.randrange(0, 4 // sub_size) * sub_size
     target = rng.randrange(-REGION // align, (REGION - width) // align + 1) * align
     voff = target - inst
     if voff >= 0 and rng.random() < 0.5:
-        # SGPR base + zero-extended 32-bit VGPR offset.
         prog.lines += [f"s_mov_b32 s{POINTER}, {base & MASK32:#x}", f"s_mov_b32 s{POINTER + 1}, {base >> 32:#x}",
                        f"v_mov_b32 v{VADDR}, {voff:#x}"]
         vaddr, saddr = f"v{VADDR}", f"s[{POINTER}:{POINTER + 1}]"
@@ -526,6 +541,21 @@ def gen_global(rng, prog):
         prog.lines += [f"v_mov_b32 v{VADDR}, {a & MASK32:#x}", f"v_mov_b32 v{VADDR + 1}, {a >> 32:#x}"]
         vaddr, saddr = f"v[{VADDR}:{VADDR + 1}]", "off"
     off = f" offset:{inst}" if inst else ""
+    return vaddr, saddr, off
+
+
+def gen_global(rng, prog):
+    """global_load/store with a 64-bit VGPR address or an SGPR base + 32-bit VGPR offset, and a signed 12-bit
+    immediate printed the way llvm-mc prints it for gfx10 (decimal, negative values with a minus sign)."""
+    op = rng.choice(("load", "load", "store", "sub"))
+    n = rng.choice((1, 2, 3, 4)) if op != "sub" else 1
+    width = 4 * n
+    sub_size = 0
+    if op == "sub":
+        name = rng.choice(GLOBAL_SUB)
+        sub_size = 1 if "byte" in name else 2
+        width = sub_size
+    vaddr, saddr, off = _global_addr_operands(rng, prog, width, 4 if op != "sub" else width, sub_size)
     if op == "store":
         for i in range(n):
             prog.lines.append(f"v_mov_b32 v{VDATA + i}, {rng.getrandbits(32):#x}")
@@ -539,6 +569,25 @@ def gen_global(rng, prog):
         prog.lines.append(f"global_load_dword{suffix} {reg_range('v', VDATA, n)}, {vaddr}, {saddr}{off}")
     prog.lines.append("s_waitcnt vmcnt(0)")
     return [("v", VDATA + i) for i in range(n)]
+
+
+def gen_global_atomic(rng, prog):
+    kind = rng.choice(ATOMICS)
+    glc = rng.random() < 0.7
+    prog.lines.append(f"v_mov_b32 v{VDATA}, {rng.getrandbits(32):#x}")
+    vaddr, saddr, off = _global_addr_operands(rng, prog, 4, 4)
+    if kind == "cmpswap":
+        prog.lines.append(f"global_load_dword v{VDATA + 1}, {vaddr}, {saddr}{off}" if rng.random() < 0.5
+                          else f"v_mov_b32 v{VDATA + 1}, {rng.getrandbits(32):#x}")
+        prog.lines.append("s_waitcnt vmcnt(0)")
+        vdata = f"v[{VDATA}:{VDATA + 1}]"
+    else:
+        vdata = f"v{VDATA}"
+    vdst = f"v{VDATA + 2}, " if glc else ""
+    prog.lines.append(f"global_atomic_{kind} {vdst}{vaddr}, {vdata}, {saddr}{off}{' glc' if glc else ''}")
+    prog.lines.append(f"global_load_dword v{VDATA + 3}, {vaddr}, {saddr}{off}")
+    prog.lines.append("s_waitcnt vmcnt(0)")
+    return [("v", VDATA + 2 if glc else VDATA), ("v", VDATA + 3)]
 
 
 # The five formats tbuffer loads use in the 1.0.2.1 corpus (counted over all 26,503 shaders).
@@ -600,9 +649,11 @@ GENERATORS = {
     "s_load": gen_s_load,
     "s_buffer_load": gen_s_buffer_load,
     "buffer_load": gen_buffer_load,
+    "buffer_sub": gen_buffer_sub,
     "buffer_store": gen_buffer_store,
     "buffer_atomic": gen_buffer_atomic,
     "global": gen_global,
+    "global_atomic": gen_global_atomic,
     "buffer_format": gen_buffer_format,
 }
 

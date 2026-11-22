@@ -145,6 +145,7 @@ public:
         const std::uint32_t h = size.height;
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
+        source_size_ = {w, h};
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
@@ -280,6 +281,7 @@ public:
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
         register_buffers();
@@ -389,10 +391,18 @@ public:
     }
 
     // IDXGISwapChain2
-    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT, UINT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
+        // Host-measured: a region larger than either back-buffer dimension is refused and keeps the stored one;
+        // zero is accepted. Present does not scale by it yet (documented difference).
+        const VkExtent2D extent = swapchain_.extent();
+        if (width > extent.width || height > extent.height) return DXGI_ERROR_INVALID_CALL;
+        source_size_ = {width, height};
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* w, UINT* h) override {
-        if (w) *w = swapchain_.extent().width;
-        if (h) *h = swapchain_.extent().height;
+        if (!w || !h) return DXGI_ERROR_INVALID_CALL;  // host-measured: both are required
+        *w = source_size_.width;
+        *h = source_size_.height;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
@@ -497,6 +507,7 @@ private:
     DXGI_RGBA background_color_{0, 0, 0, 0};
     DXGI_MATRIX_3X2_F matrix_transform_{1, 0, 0, 1, 0, 0};
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
+    VkExtent2D source_size_{0, 0};
 };
 
 struct ReservationState {

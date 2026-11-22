@@ -344,7 +344,7 @@ def collect_skeletons_dir(path):
 
 def collect_rbf0_dir(path):
     """The same continuation rule for a carved directory sorted by offset."""
-    rows, span = [], 0
+    entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):

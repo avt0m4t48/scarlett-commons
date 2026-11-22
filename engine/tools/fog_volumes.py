@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+import hashlib
 import json
 import mmap
 import os
@@ -122,7 +123,7 @@ def _read_field(b: bytes, base: int, member):
     return WI._value(b, base, member)
 
 
-def parse_fog_volumes(b: bytes) -> list[dict]:
+def parse_fog_volumes(b: bytes, *, include_digest: bool = False) -> list[dict]:
     """Decode all CScatteringTransmittance__FogVolume instances in a 0x7a resource."""
     structs, blocks = parse_schema(b)
     if STRUCT_VOLUME not in structs:
@@ -137,7 +138,10 @@ def parse_fog_volumes(b: bytes) -> list[dict]:
         for k in range(bsz // vsz):
             base = boff + k * vsz
             row = {name: _read_field(b, base, vmems.get(h)) for name, h in FIELDS.items()}
-            out.append({k_: v for k_, v in row.items() if v is not None})
+            cleaned = {k_: v for k_, v in row.items() if v is not None}
+            if include_digest:
+                cleaned["_sha256"] = hashlib.sha256(b[base:base + vsz]).digest()
+            out.append(cleaned)
     return out
 
 
@@ -145,9 +149,15 @@ def _is_identity3(m) -> bool:
     return m is not None and len(m) == 9 and all(abs(a - c) < 1e-4 for a, c in zip(m, _IDENT3))
 
 
-def _scan_rpf_chunk(args: tuple[str, int, int]) -> list[int]:
+def _scan_rpf_chunk(args: tuple[str, int, int]) -> tuple[list[int], int, int]:
+    """Scan [start, end) of an RPF9 archive for complete 0x7a FogVolume resources without a 256 KiB cap.
+
+    Returns (matching_offsets, complete_0x7a_count, incomplete_0x7a_count).
+    """
     path, start, end = args
     offs: list[int] = []
+    complete_0x7a = 0
+    incomplete_0x7a = 0
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         size = len(m)
         pos = start
@@ -161,29 +171,61 @@ def _scan_rpf_chunk(args: tuple[str, int, int]) -> list[int]:
                 continue
             d = zlib.decompressobj()
             try:
-                out = d.decompress(m[off:min(size, off + 131072)], 262144)
+                head = d.decompress(m[off:min(size, off + 256)], 24)
             except zlib.error:
                 pos = off + 1
                 continue
-            if not d.eof or len(out) < 0x50:
-                pos = off + 1
+            if len(head) < 21 or head[0x10:0x14] != b"0DRP" or head[0x14] != 0x7A:
+                pos = off + 2
                 continue
-            used = min(size, off + 131072) - off - len(d.unused_data)
-            pos = off + max(used, 2)
-            if out[0x10:0x14] != b"0DRP" or out[0x14] != 0x7A:
+            res = WC.assemble(m, off, size)
+            if not res:
+                pos = off + 2
                 continue
-            nst = struct.unpack_from("<H", out, 0x48)[0]
-            st = _ptr(struct.unpack_from("<Q", out, 0x28)[0], len(out))
-            if not (1 <= nst <= 4096) or st is None or st + 32 * nst > len(out):
+            pos = max(off + 2, res.get("end", off + 2))
+            if not res.get("complete"):
+                incomplete_0x7a += 1
+                continue
+            complete_0x7a += 1
+            data = res["data"]
+            nst = struct.unpack_from("<H", data, 0x48)[0]
+            st = _ptr(struct.unpack_from("<Q", data, 0x28)[0], len(data))
+            if not (1 <= nst <= 4096) or st is None or st + 32 * nst > len(data):
                 continue
             for i in range(nst):
-                if struct.unpack_from("<I", out, st + 32 * i)[0] == STRUCT_VOLUME:
+                if struct.unpack_from("<I", data, st + 32 * i)[0] == STRUCT_VOLUME:
                     offs.append(off)
                     break
-    return offs
+    return offs, complete_0x7a, incomplete_0x7a
 
 
-def iter_fog_resources(path: str, jobs: int = 1):
+def _scan_rpf_offsets(path: str, jobs: int = 1) -> tuple[list[int], int, int]:
+    size = os.path.getsize(path)
+    if size < 16:
+        return [], 0, 0
+    workers = max(1, jobs)
+    chunk_sz = max(4 * 1024 * 1024, min(64 * 1024 * 1024, (size + workers - 1) // workers))
+    ranges = [(path, s, min(size, s + chunk_sz)) for s in range(0, size, chunk_sz)]
+    offs: list[int] = []
+    complete_0x7a = 0
+    incomplete_0x7a = 0
+    if len(ranges) == 1 or workers == 1:
+        for r in ranges:
+            part_offs, c7a, i7a = _scan_rpf_chunk(r)
+            offs.extend(part_offs)
+            complete_0x7a += c7a
+            incomplete_0x7a += i7a
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+            for part_offs, c7a, i7a in ex.map(_scan_rpf_chunk, ranges):
+                offs.extend(part_offs)
+                complete_0x7a += c7a
+                incomplete_0x7a += i7a
+    offs.sort()
+    return offs, complete_0x7a, incomplete_0x7a
+
+
+def iter_fog_resources(path: str, jobs: int = 1, stats: dict | None = None):
     """Yield (source_id, raw_0x7a_bytes) for every complete 0x7a fog-volume resource in `path`."""
     if os.path.isdir(path):
         for name in sorted(os.listdir(path)):
@@ -191,7 +233,7 @@ def iter_fog_resources(path: str, jobs: int = 1):
             if not os.path.isfile(p):
                 continue
             with open(p, "rb") as f:
-                data = f.read(WI.CAP + 1)
+                data = f.read(WC.CAP + 1)
             if len(data) >= 0x50 and data[0x10:0x14] == b"0DRP" and data[0x14] == 0x7A:
                 if STRUCT_VOLUME in parse_schema(data)[0]:
                     yield name, data
@@ -201,26 +243,16 @@ def iter_fog_resources(path: str, jobs: int = 1):
         magic = f.read(4)
     if magic != b"9FPR":
         with open(path, "rb") as f:
-            data = f.read(WI.CAP + 1)
+            data = f.read(WC.CAP + 1)
         if STRUCT_VOLUME in parse_schema(data)[0]:
             yield os.path.basename(path), data
         return
 
     size = os.path.getsize(path)
-    if size < 16:
-        return
-    workers = max(1, jobs)
-    chunk_sz = max(4 * 1024 * 1024, min(64 * 1024 * 1024, (size + workers - 1) // workers))
-    ranges = [(path, s, min(size, s + chunk_sz)) for s in range(0, size, chunk_sz)]
-    offs: list[int] = []
-    if len(ranges) == 1 or workers == 1:
-        for r in ranges:
-            offs.extend(_scan_rpf_chunk(r))
-    else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
-            for part in ex.map(_scan_rpf_chunk, ranges):
-                offs.extend(part)
-    offs.sort()
+    offs, complete_0x7a, incomplete_0x7a = _scan_rpf_offsets(path, jobs=jobs)
+    if stats is not None:
+        stats["scanned_0x7a_complete"] = complete_0x7a
+        stats["scanned_0x7a_incomplete"] = incomplete_0x7a
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         for off in offs:
             res = WC.assemble(m, off, size)
@@ -232,8 +264,11 @@ def summarize(path: str, jobs: int = 1) -> dict:
     """Aggregate counts and numeric distributions (no game strings or names)."""
     resources = 0
     volumes = 0
+    distinct_digests: set[bytes] = set()
     per_res: list[int] = []
+    by_vol_count: collections.Counter[str] = collections.Counter()
     offsets: list[int] = []
+    scan_stats: dict[str, int] = {}
     is_box: collections.Counter[str] = collections.Counter()
     blend_mode: collections.Counter[str] = collections.Counter()
     int_ext: collections.Counter[str] = collections.Counter()
@@ -251,14 +286,16 @@ def summarize(path: str, jobs: int = 1) -> dict:
     po_axes: list[list[float]] = [[], [], []]
     sc_axes: list[list[float]] = [[], [], []]
 
-    for src, data in iter_fog_resources(path, jobs=jobs):
-        vols = parse_fog_volumes(data)
+    for src, data in iter_fog_resources(path, jobs=jobs, stats=scan_stats):
+        vols = parse_fog_volumes(data, include_digest=True)
         resources += 1
         if isinstance(src, int):
             offsets.append(src)
         per_res.append(len(vols))
+        by_vol_count[str(len(vols))] += 1
         for v in vols:
             volumes += 1
+            distinct_digests.add(v["_sha256"])
             if "IsBox" in v:
                 is_box[str(v["IsBox"])] += 1
             if "BlendMode" in v:
@@ -309,14 +346,16 @@ def summarize(path: str, jobs: int = 1) -> dict:
             "z": [round(min(axes[2]), 4), round(max(axes[2]), 4)],
         }
 
-    return {
+    out = {
         "resources": resources,
         "volumes": volumes,
+        "distinct_serialized_volumes": len(distinct_digests),
         "volumes_per_resource": {
             "min": min(per_res) if per_res else 0,
             "max": max(per_res) if per_res else 0,
             "median": sorted(per_res)[len(per_res) // 2] if per_res else 0,
         },
+        "resources_by_volume_count": dict(sorted(by_vol_count.items(), key=lambda kv: int(kv[0]))),
         "offset_range": [hex(min(offsets)), hex(max(offsets))] if offsets else None,
         "is_box": dict(sorted(is_box.items())),
         "blend_mode": dict(sorted(blend_mode.items())),
@@ -335,6 +374,8 @@ def summarize(path: str, jobs: int = 1) -> dict:
         "position_offset_range": _rng(po_axes),
         "scale_range": _rng(sc_axes),
     }
+    out.update(scan_stats)
+    return out
 
 
 def _write_json_atomic(path: str, doc: dict) -> None:

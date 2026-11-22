@@ -153,8 +153,30 @@ class FogVolumesTests(unittest.TestCase):
                 doc = json.load(f)
             self.assertEqual(doc["resources"], 1)
             self.assertEqual(doc["volumes"], 1)
+            self.assertEqual(doc["distinct_serialized_volumes"], 1)
             self.assertEqual(doc["offset_range"], ["0x10", "0x10"])
             self.assertEqual(doc["position_offset_nonzero"], 1)
+
+    def test_large_resource_exceeding_256kib_and_dedup(self):
+        # 520 * 512 = 266,240 bytes (> 256 KiB): exercises uncapped 0x7a inflation and distinct record counting.
+        base_vols = [
+            {"IsBox": 1, "PositionOffset": (float(i), -1.0, 0.5), "ProfileIndex": 12}
+            for i in range(260)
+        ]
+        raw = build_synthetic_fog_0x7a(base_vols + base_vols)
+        self.assertGreater(len(raw), 262144)
+        comp = zlib.compress(raw)
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "large.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + b"\x00" * 12 + comp + b"\x00" * 64)
+            doc = fv.summarize(rpf, jobs=1)
+            self.assertEqual(doc["resources"], 1)
+            self.assertEqual(doc["volumes"], 520)
+            self.assertEqual(doc["distinct_serialized_volumes"], 260)
+            self.assertEqual(doc["resources_by_volume_count"], {"520": 1})
+            self.assertEqual(doc["scanned_0x7a_complete"], 1)
+            self.assertEqual(doc["scanned_0x7a_incomplete"], 0)
 
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as td:

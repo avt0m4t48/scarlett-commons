@@ -229,6 +229,11 @@ void test_classification() {
     check(cls("xaudio2_9redist.dll", "XAudio2Create") == ReturnClass::HResult,
           "the redist name gets the same class");
     check(cls("gameinput.dll", "GameInputCreate") == ReturnClass::HResult, "GameInputCreate is hresult");
+    check(cls("xaudio2_9.dll", "#1") == ReturnClass::HResult, "xaudio2_9 ordinal 1 is XAudio2Create");
+    check(cls("xaudio2_9redist.dll", "#1") == ReturnClass::HResult, "the redist ordinal gets the same class");
+    check(cls("gameinput.dll", "#1") == ReturnClass::HResult, "gameinput ordinal 1 is GameInputCreate");
+    check(cls("xaudio2_9.dll", "#2") == ReturnClass::Other, "another xaudio2_9 ordinal stays other");
+    check(cls("gameinput.dll", "#2") == ReturnClass::Other, "another gameinput ordinal stays other");
     check(cls("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
           "the console dstorage name is hresult");
     check(cls("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other, "unmeasured xg_xs import is other");

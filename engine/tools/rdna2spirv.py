@@ -1988,7 +1988,7 @@ class Gen:
         ptr, p, init = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
-        self.emit(f"{init} = OpLoad %uint {p} Aligned 4")
+        self.emit(f"{init} = OpAtomicLoad %uint {p} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_hdr} = OpLabel")
         cur, cur_f, new_f, new_u, got, done = (self.tmp() for _ in range(6))

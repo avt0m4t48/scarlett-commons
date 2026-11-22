@@ -169,7 +169,7 @@ def scan_file(path, source):
                 rows.append(row)
                 last = match.start() + row["size"]
                 pos = last
-            trailer = trailer_size if 0 < trailer_size <= len(data) - max(last, start) else 0
+            trailer = trailer_size if 0 < trailer_size <= len(data) - last else 0
             z, u = _gap(data, last, len(data) - trailer)
             zero += z
             unread += u

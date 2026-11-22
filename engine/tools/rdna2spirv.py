@@ -38,12 +38,14 @@ import shader_meta as _shader_meta  # noqa: E402
 import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
-# Deeper structured trees are emitted in the flat dispatch-loop form instead. `spirv-val`'s selection/loop
-# checking cost grows with the nesting depth: over the 1.0.2.1 corpus (26,503 modules) the deepest block of a
-# module is nested 118 constructs deep and 85% of the validation time is in modules nested 20 or deeper, while
-# the dispatch-loop form validates a depth-20 module 1.4x faster, a depth-50 one 2.3x and a depth-77 one 4.5x
-# (SHADER-299, docs/design.md "Control flow"). Both forms are equivalent; only the routing differs.
-MAX_STRUCTURED_DEPTH = 16
+# Deeper structured trees are emitted in the flat dispatch-loop form instead (--max-structured-depth, 0 = never).
+# `spirv-val`'s selection/loop checking cost grows with the nesting depth, and before cfg_structure hoisted tails
+# (#1904) the 1.0.2.1 corpus nested up to 118 deep, where the flat form validates 2.3x (depth 50-64) to 10x (118)
+# faster (SHADER-299). Since #1904 the corpus's deepest tree is 29 and the flat form saves only 12% of `spirv-val`
+# time on the modules deeper than 16, while NVIDIA compiles it 1.7-2x slower (SHADER-427). The bound sits above
+# the corpus, as a guard for depths where validation really grows. Both forms are equivalent; only the routing
+# differs. docs/design.md "Control flow" has the numbers.
+MAX_STRUCTURED_DEPTH = 64
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
@@ -10683,7 +10685,7 @@ def assemble(gen):
             else None)
     if tree is not None:
         nesting = cfg_structure.depth(tree)
-        if nesting > MAX_STRUCTURED_DEPTH:
+        if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
             tree = None                              # too deep to validate cheaply: use the flat form
         gen.nesting = nesting
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
@@ -12619,8 +12621,19 @@ def _shard_arg(text):
     return si, sn
 
 
+def _depth_arg(text):
+    """--max-structured-depth N: 0 (never fall back to the dispatch loop) or a positive nesting depth."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 (no bound) or a positive depth")
+    return value
+
+
 def main():
-    global MAX_SHARED_BYTES
+    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -12673,8 +12686,13 @@ def main():
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
                          "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "
                          "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
+    ap.add_argument("--max-structured-depth", type=_depth_arg, default=MAX_STRUCTURED_DEPTH, metavar="N",
+                    help="a shader whose structured control flow nests deeper than N is emitted in the dispatch-loop "
+                         "form instead (default %(default)s; 0 = never): that form validates faster at great depth "
+                         "but compiles 1.7-2x slower on NVIDIA (SHADER-427, docs/design.md \"Control flow\")")
     a = ap.parse_args()
     MAX_SHARED_BYTES = a.max_shared_memory
+    MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop

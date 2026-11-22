@@ -1103,6 +1103,14 @@ def test_deep_structured_nesting_uses_the_dispatch_loop(make_shader, monkeypatch
     assert rdna2spirv.translate.last_gen.control_flow == "structured"
     assert "OpSwitch" not in structured
 
+    # SHADER-427: 0 (--max-structured-depth 0) never falls back, whatever the depth.
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", 0)
+    unbounded = shader.translate()
+    shader.validate(unbounded)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert rdna2spirv.translate.last_gen.nesting == gen.nesting
+    assert unbounded == structured
+
 
 MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
 

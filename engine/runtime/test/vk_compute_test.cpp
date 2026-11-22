@@ -25,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -85,6 +86,33 @@ int main(int argc, char** argv) {
     const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
     const char* out_words_env = std::getenv("VKC_OUT_WORDS");
     const char* dump_path = std::getenv("VKC_DUMP");
+    // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
+    // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
+    // offset; addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every other heap buffer here.
+    const char* heap_file_env = std::getenv("VKC_HEAP_FILE");
+    std::string heap_file_path;
+    uint64_t heap_file_at = 0;
+    std::vector<char> heap_file;
+    if (heap_file_env) {
+        const std::string spec(heap_file_env);
+        const std::size_t at_sign = spec.rfind('@');
+        heap_file_path = spec.substr(0, at_sign);
+        if (at_sign != std::string::npos) {
+            const char* digits = spec.c_str() + at_sign + 1;
+            char* end = nullptr;
+            heap_file_at = std::strtoull(digits, &end, 0);
+            if (end == digits || *end || heap_file_path.empty()) {
+                std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+        }
+        std::ifstream hf(heap_file_path, std::ios::binary);
+        heap_file.assign(std::istreambuf_iterator<char>(hf), {});
+        if (heap_file.empty()) {
+            std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
+            return 2;
+        }
+    }
     uint32_t out_words = 0;
     if (out_words_env) {
         char* end;
@@ -184,6 +212,11 @@ int main(int argc, char** argv) {
     // Output buffer = heap. Host-visible so the result can be read back directly.
     VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
     if (out_words > words) words = out_words;
+    // The heap file may need more than the dispatch's own output words; round its end up to a word.
+    if (!heap_file.empty()) {
+        const VkDeviceSize need = VkDeviceSize(heap_file_at + heap_file.size() + 3) / 4;
+        if (need > words) words = need;
+    }
     // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
     // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
     const bool bvh = !std::strcmp(argv[3], "bvh");
@@ -208,6 +241,11 @@ int main(int argc, char** argv) {
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
     std::memset(map, workgroup_yz || !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
+    if (!heap_file.empty()) {
+        std::memcpy(static_cast<char*>(map) + heap_file_at, heap_file.data(), heap_file.size());
+        std::printf("heap file: %s at 0x%llx (%zu bytes)\n", heap_file_path.c_str(),
+                    static_cast<unsigned long long>(heap_file_at), heap_file.size());
+    }
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray

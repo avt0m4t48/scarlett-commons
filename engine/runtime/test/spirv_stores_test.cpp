@@ -29,18 +29,21 @@ void inst(Words& words, std::uint16_t op, std::initializer_list<std::uint32_t> o
 
 // Opcodes and enumerants, from the SPIR-V specification.
 constexpr std::uint16_t OpTypeInt = 21, OpTypeImage = 25, OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32,
-                        OpTypeArray = 28, OpVariable = 59, OpDecorate = 71, OpMemberDecorate = 72;
+                        OpTypeArray = 28, OpVariable = 59, OpDecorate = 71, OpMemberDecorate = 72, OpDecorationGroup = 73,
+                        OpGroupDecorate = 74, OpGroupMemberDecorate = 75;
+constexpr std::uint32_t Dim2D = 1, DimSubpassData = 6;
 constexpr std::uint32_t Block = 2, BufferBlock = 3, NonWritable = 24;
 constexpr std::uint32_t UniformConstant = 0, Uniform = 2, StorageBuffer = 12;
 // ids
 constexpr std::uint32_t uint_t = 1, image_t = 2, array_t = 3, pointer_t = 4, var = 5, struct_t = 6, length_c = 7;
 
-// %image = OpTypeImage %uint 2D 0 0 0 <sampled> R32ui; `sampled` 2 is a storage image, 1 a sampled one.
-Words image_module(std::uint32_t sampled, bool arrayed, bool runtime, bool non_writable) {
+// %image = OpTypeImage %uint <dim> 0 0 0 <sampled> <format>; `sampled` 2 is a storage image (or, with SubpassData, an
+// input attachment), 1 a sampled one.
+Words image_module(std::uint32_t sampled, bool arrayed, bool runtime, bool non_writable, std::uint32_t dim = Dim2D) {
     Words w = header();
     if (non_writable) inst(w, OpDecorate, {var, NonWritable});
     inst(w, OpTypeInt, {uint_t, 32, 0});
-    inst(w, OpTypeImage, {image_t, uint_t, 1, 0, 0, 0, sampled, 33});
+    inst(w, OpTypeImage, {image_t, uint_t, dim, 0, 0, 0, sampled, dim == DimSubpassData ? 0u : 33u});
     std::uint32_t pointee = image_t;
     if (arrayed) {
         if (runtime) {
@@ -86,6 +89,45 @@ int main() {
           "a NonWritable array of storage images does not");
     check(!spirv_declares_writable_storage(image_module(1, false, false, false)), "a sampled image does not");
     check(!spirv_declares_writable_storage(image_module(1, true, true, false)), "an array of sampled images does not");
+    // An input attachment (subpassInput) is Sampled 2 with Dim SubpassData, and read-only: no feature.
+    check(!spirv_declares_writable_storage(image_module(2, false, false, false, DimSubpassData)),
+          "an input attachment does not");
+    check(!spirv_declares_writable_storage(image_module(2, true, false, false, DimSubpassData)),
+          "an array of input attachments does not");
+
+    // NonWritable through a decoration group (OpDecorationGroup + OpGroupDecorate) counts like a direct one.
+    {
+        constexpr std::uint32_t group = 20;
+        const auto grouped = [&](std::uint32_t target) {
+            Words w = header();
+            inst(w, OpDecorate, {group, NonWritable});
+            inst(w, OpDecorationGroup, {group});
+            inst(w, OpGroupDecorate, {group, target});
+            inst(w, OpTypeInt, {uint_t, 32, 0});
+            inst(w, OpTypeImage, {image_t, uint_t, Dim2D, 0, 0, 0, 2, 33});
+            inst(w, OpTypePointer, {pointer_t, UniformConstant, image_t});
+            inst(w, OpVariable, {pointer_t, var, UniformConstant});
+            return w;
+        };
+        check(!spirv_declares_writable_storage(grouped(var)),
+              "a storage image made NonWritable through a decoration group does not");
+        check(spirv_declares_writable_storage(grouped(var + 100)),
+              "a group that targets another id does not cover the variable");
+    }
+    // And OpGroupMemberDecorate for every member of a storage buffer block.
+    {
+        constexpr std::uint32_t group = 20;
+        Words w = header();
+        inst(w, OpDecorate, {group, NonWritable});
+        inst(w, OpDecorationGroup, {group});
+        inst(w, OpDecorate, {struct_t, Block});
+        inst(w, OpGroupMemberDecorate, {group, struct_t, 0, struct_t, 1});
+        inst(w, OpTypeInt, {uint_t, 32, 0});
+        inst(w, OpTypeStruct, {struct_t, uint_t, uint_t});
+        inst(w, OpTypePointer, {pointer_t, StorageBuffer, struct_t});
+        inst(w, OpVariable, {pointer_t, var, StorageBuffer});
+        check(!spirv_declares_writable_storage(w), "a block whose members are NonWritable through a group does not");
+    }
 
     // Storage buffers: read-only when the variable or every member is.
     check(spirv_declares_writable_storage(buffer_module(StorageBuffer, Block, 0, false)),
@@ -130,6 +172,6 @@ int main() {
 
     if (failures) return 1;
     std::printf("spirv_stores_test: OK (storage images, arrays of them, storage buffers in both forms, framing, a "
-                "self-referential array)\n");
+                "self-referential array, input attachments, decoration groups)\n");
     return 0;
 }

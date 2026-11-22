@@ -17,6 +17,7 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -24,8 +25,10 @@ namespace leonida {
 inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words) {
     constexpr std::uint32_t magic = 0x07230203;
     constexpr std::uint16_t op_type_image = 25, op_type_array = 28, op_type_runtime_array = 29, op_type_struct = 30,
-                            op_type_pointer = 32, op_variable = 59, op_decorate = 71, op_member_decorate = 72;
+                            op_type_pointer = 32, op_variable = 59, op_decorate = 71, op_member_decorate = 72,
+                            op_group_decorate = 74, op_group_member_decorate = 75;
     constexpr std::uint32_t decoration_buffer_block = 3, decoration_non_writable = 24;
+    constexpr std::uint32_t dim_subpass_data = 6;  // an input attachment: Sampled 2 as well, but read-only
     constexpr std::uint32_t class_uniform_constant = 0, class_uniform = 2, class_storage_buffer = 12;
     if (words.size() < 5 || words[0] != magic) return false;
 
@@ -42,6 +45,10 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
     std::unordered_set<std::uint32_t> non_writable, buffer_blocks;     // decorated ids
     std::unordered_map<std::uint32_t, std::unordered_set<std::uint32_t>> non_writable_members;
     std::vector<Variable> variables;
+    // OpGroupDecorate / OpGroupMemberDecorate: a decoration group's decorations reach these targets. Resolved after
+    // the scan, once every OpDecorate of the group has been seen.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> group_targets;                      // group, target
+    std::vector<std::pair<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>>> group_members;  // group, (type, member)
 
     for (std::size_t at = 5; at < words.size();) {
         const std::uint32_t count = words[at] >> 16;
@@ -50,7 +57,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
         const std::uint32_t* w = &words[at];
         switch (op) {
         case op_type_image:  // result, sampled type, dim, depth, arrayed, ms, sampled, format
-            if (count >= 9 && w[7] == 2) storage_images.insert(w[1]);
+            if (count >= 9 && w[7] == 2 && w[3] != dim_subpass_data) storage_images.insert(w[1]);
             break;
         case op_type_array:
         case op_type_runtime_array:
@@ -72,11 +79,24 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
         case op_member_decorate:
             if (count >= 4 && w[3] == decoration_non_writable) non_writable_members[w[1]].insert(w[2]);
             break;
+        case op_group_decorate:  // group, targets...
+            for (std::uint32_t i = 2; i < count; ++i) group_targets.push_back({w[1], w[i]});
+            break;
+        case op_group_member_decorate:  // group, (target, member) pairs
+            for (std::uint32_t i = 2; i + 1 < count; i += 2) group_members.push_back({w[1], {w[i], w[i + 1]}});
+            break;
         default:
             break;
         }
         at += count;
     }
+
+    for (const auto& [group, target] : group_targets) {
+        if (non_writable.count(group)) non_writable.insert(target);
+        if (buffer_blocks.count(group)) buffer_blocks.insert(target);
+    }
+    for (const auto& [group, member] : group_members)
+        if (non_writable.count(group)) non_writable_members[member.first].insert(member.second);
 
     for (const Variable& variable : variables) {
         const auto pointer = pointers.find(variable.pointer_type);

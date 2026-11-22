@@ -11,6 +11,10 @@ and TRI3 (2,4,0). Byte `type` of the word at +60 holds two selectors: bits [1:0]
 the second, where 0/1/2 name the triangle's vertex 0/1/2. The weights below are written by hand and checked against
 a plain-Python solve of the 2x2 system.
 
+The descriptor dword0 is 0x1030: the game's byte base 0x1000 with flags 0x30 in the low byte. The emulation masks the
+flags, so the node at 0x1040 is reached; treating the field as 256-byte units (0x1030 << 8) or shifting the flags
+misses it, and this test fails.
+
     python -m unittest tests/semantic/test_image_bvh_tri.py -v
 """
 import struct
@@ -20,7 +24,7 @@ from support import mrt0_words, translate_lines
 
 INF = float("inf")
 SLOTS = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0.5, 2, 0)]
-NODE = 0x1040                     # descriptor base 0x10 (256-byte units) = 0x1000; node id 0x08 | type -> +0x40
+NODE = 0x1040                     # descriptor dword0 0x1030 = byte base 0x1000 with flags 0x30; node id 0x08 | type -> +0x40
 
 
 def f2u(x):
@@ -39,7 +43,7 @@ def run(node_type, tri_id, x, y, slots=SLOTS):
     mov(3, f2u(100.0))                                                 # ray extent
     for i, v in enumerate([f2u(x), f2u(y), f2u(-1.0), 0, 0, f2u(1.0), 0x7F800000, 0x7F800000, f2u(1.0)]):
         mov(4 + i, v)                                                  # origin, direction, inverse direction
-    lines += ["s_mov_b32 s4, 0x10", "s_mov_b32 s5, 0", "s_mov_b32 s6, -1", "s_mov_b32 s7, 0",
+    lines += ["s_mov_b32 s4, 0x1030", "s_mov_b32 s5, 0", "s_mov_b32 s6, -1", "s_mov_b32 s7, 0",
               "image_bvh64_intersect_ray v[20:23], [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12], s[4:7]",
               "exp mrt0 v20, v21, v22, v23 done vm", "s_endpgm"]
     spv = translate_lines(f"ps_bvh_tri{node_type}", lines)

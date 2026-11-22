@@ -9388,8 +9388,9 @@ class Gen:
         """One BVH traversal step against AMD's hardware node format, emulated over buffer reads. Semantics follow
         Mesa RADV's software path (radv_nir_rt_common.c: intersect_ray_amd_software_box / _tri), which RADV uses
         in place of this instruction. Node id = byte address >> 3 with the node type in bits [2:0]: 0..3 triangle,
-        4 box16, 5 box32. Address = descriptor base + ((node & ~7) << 3); the base is BVH descriptor bits [39:0]
-        taken in 256-byte units (ASSUMPTION: RADV only ever uses base 0). Box nodes return the four child ids
+        4 box16, 5 box32. Address = descriptor base + ((node & ~7) << 3); the game builds the descriptor base as
+        a byte address with flags in the low bits ((ptr & ~0xFF) | 0x30), so the base is base40 & 0xFFFFFFFF00.
+        Box nodes return the four child ids
         (misses and inactive boxes = 0xFFFFFFFF), sorted by entry distance when the descriptor's box_sort_enable
         (bit 63) is set. Triangle nodes read the vertex slots of their type (TRI0 0,1,2; TRI1 1,3,2; TRI2 2,3,4;
         TRI3 2,4,0) and return (t/|det|, sign(det), b_i/|det|, b_j/|det|), or (inf, 1, 0, 0) on a miss, with i and j
@@ -9419,11 +9420,16 @@ class Gen:
             e(f"{r} = OpBitwiseOr %ulong {sh} {l}")
             return r
 
-        # descriptor base (bits [39:0], 256-byte units) and sort flag
+        # descriptor base (byte address with flags in the low bits) and sort flag.
+        # The game builds the BVH descriptor base as (ptr & ~0xFF) | 0x30, i.e. a
+        # byte address with flags in the low bits, not the 256-byte-unit field the
+        # emulation previously assumed (base40 << 8). Masking off the low byte
+        # recovers the address; validated by the header-at-VA-0 layout arithmetic
+        # (ptr 0 -> dword0 0x30 -> base 0).
         bhi, base40, base = T(), T(), T()
         e(f"{bhi} = OpBitwiseAnd %uint {desc[1]} {self.cu(0xFF)}")
         base40 = u64(desc[0], bhi)
-        e(f"{base} = OpShiftLeftLogical %ulong {base40} {self.cl(8)}")
+        e(f"{base} = OpBitwiseAnd %ulong {base40} {self.cl(0xFFFFFFFF00)}")
         sortb, sort = T(), T()
         e(f"{sortb} = OpShiftRightLogical %uint {desc[1]} {self.cu(31)}")
         e(f"{sort} = OpINotEqual %bool {sortb} {self.cu(0)}")

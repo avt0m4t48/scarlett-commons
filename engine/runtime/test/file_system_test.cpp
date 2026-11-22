@@ -245,6 +245,27 @@ int main() {
             if (n != L"." && n != L"..") ++files;
         check(files == 300 && count(names, L"f7.bin") == 1 && count(names, L"f299.bin") == 1,
               "a folder without markers lists all 300 files, with the overlay's copy once");
+
+        // Once the folder has a marker folder, the listing reads it once: a delete under another ASCII case hides
+        // exactly that file and every other file stays.
+        check(delete_w(L"GAME:\\many\\F3.BIN") != FALSE, "DeleteFileW hides f3.bin under another case");
+        const std::vector<std::wstring> after = list(first_w, next_w, find_close, L"GAME:\\many\\*");
+        int left = 0;
+        for (const auto& n : after)
+            if (n != L"." && n != L"..") ++left;
+        check(left == 299 && !contains(after, L"f3.bin") && count(after, L"f30.bin") == 1,
+              "with a marker folder the listing hides only the deleted file");
+    }
+
+    // Names with non-ASCII letters keep the file system's case rule: deleting U+00E9 hides the package's U+00C9.
+    {
+        write_path(package / "names" / L"Éclair.txt", "package");
+        write_path(package / "names" / "plain.txt", "package");
+        check(delete_w(L"GAME:\\names\\éclair.txt") != FALSE, "DeleteFileW takes a name that differs in a non-ASCII case");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\names\\*");
+        check(std::find(names.begin(), names.end(), std::wstring(L"Éclair.txt")) == names.end() &&
+                  contains(names, L"plain.txt"),
+              "and the listing hides it, as the file system's compare does");
     }
 
     // A delete hides the package file without removing it.

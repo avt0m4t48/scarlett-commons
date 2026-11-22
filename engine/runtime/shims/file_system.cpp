@@ -480,10 +480,52 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return false;
     }
 
-    // Every deletion marker for an entry of this folder lives inside its marker folder, so when that folder is missing
-    // nothing here is deleted and the per-entry probes (two file checks each) can be skipped.
-    std::error_code ec;
-    const bool has_markers = !r.overlay.empty() && std::filesystem::is_directory(marker(r.overlay, dirs), ec);
+    // Every deletion marker for an entry of this folder lives inside its marker folder, so that folder is read once
+    // instead of probing it twice per package entry (deleted()). An entry is deleted when its marker is a file, or a
+    // folder holding kRemovedDirMarker: the rule deleted() applies. The lookup folds ASCII letters only, which matches
+    // the file system's case-insensitive compare exactly when both names are ASCII. Any other name, a non-ASCII entry
+    // or a marker that is not plain ASCII or is a reparse point, goes through deleted() and the file system's rule.
+    auto ascii = [](const wchar_t* s) {
+        for (; *s; ++s)
+            if (*s > 0x7f) return false;
+        return true;
+    };
+    auto ascii_key = [](const wchar_t* s) {
+        std::wstring k = s;
+        for (auto& c : k)
+            if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+        return k;
+    };
+    bool has_markers = false;
+    bool markers_exact = true;
+    std::unordered_set<std::wstring> deleted_here;
+    if (!r.overlay.empty()) {
+        const std::filesystem::path marks = marker(r.overlay, dirs);
+        WIN32_FIND_DATAW m{};
+        const HANDLE mh = ::FindFirstFileW((marks / L"*").c_str(), &m);
+        if (mh != INVALID_HANDLE_VALUE) {
+            has_markers = true;
+            do {
+                if (same_name(m.cFileName, L".") || same_name(m.cFileName, L"..")) continue;
+                if (!ascii(m.cFileName) || (m.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    markers_exact = false;
+                    continue;
+                }
+                std::error_code ec;
+                const bool dir = (m.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (!dir || std::filesystem::is_regular_file(marks / m.cFileName / kRemovedDirMarker, ec))
+                    deleted_here.insert(ascii_key(m.cFileName));
+            } while (::FindNextFileW(mh, &m));
+            ::FindClose(mh);
+        }
+    }
+    auto entry_deleted = [&](const wchar_t* name) {
+        if (!has_markers) return false;
+        if (markers_exact && ascii(name)) return deleted_here.count(ascii_key(name)) != 0;
+        std::vector<std::wstring> entry_parts = dirs;
+        entry_parts.push_back(name);
+        return deleted(r.overlay, entry_parts);
+    };
     // Names already listed, folded the way same_name (_wcsicmp) compares them: _wcslwr_s uses the same locale rule.
     std::unordered_set<std::wstring> seen;
     auto key = [](const wchar_t* name) {
@@ -503,11 +545,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
-            if (!overlay_root && !dot && has_markers) {
-                std::vector<std::wstring> entry_parts = dirs;
-                entry_parts.push_back(found.cFileName);
-                if (deleted(r.overlay, entry_parts)) continue;
-            }
+            if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
             if (seen.insert(key(found.cFileName)).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
         ::FindClose(h);

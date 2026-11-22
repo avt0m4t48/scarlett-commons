@@ -21,10 +21,12 @@
 // clamp of image_sample_d_cl) are enabled when the device has them. A fragment shader that declares the MinLod
 // capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
+// LEONIDA_VK_VALIDATION=1 (env): a validation error from VK_LAYER_KHRONOS_validation fails the run (vk_validation.h).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -80,7 +82,7 @@ static int cube_alpha_self_test() {
     return 0;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
         return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
@@ -154,12 +156,15 @@ int main(int argc, char** argv) {
     LI(vkCreateInstance);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     const VkResult instance_result = vkCreateInstance(&ici, nullptr, &inst);
     if (instance_result == VK_ERROR_INCOMPATIBLE_DRIVER) return 77;  // no ICD, as on a GPU-less runner
     if (instance_result != VK_SUCCESS) {
         std::fprintf(stderr, "FAILED vkCreateInstance -> %d (line %d)\n", instance_result, __LINE__);
         return 1;
     }
+    CHECK(validation.attach(gipa, inst));
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
     uint32_t n = 0;
@@ -635,4 +640,8 @@ int main(int argc, char** argv) {
                     r, g, b, a);
     }
     return 0;
+}
+
+int main(int argc, char** argv) {
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

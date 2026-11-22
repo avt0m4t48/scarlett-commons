@@ -1,5 +1,8 @@
 """Measure the component types of the vertex streams in `42 40 00 00` blocks (follow-up to ASSET-57).
 
+A stream can hold several blocks back to back, with their meshlet groups after the whole run in the same order
+(group i belongs to block i); every paired block is measured.
+
 docs/restofworld.md measures each tag's bytes per vertex on `42 40 00 00` blocks: 8 for 0x42, 4 for 0x21, 0x25,
 0x26, 0x27 and 0x28, 16 for 0x8c. This tool tests what those bytes are, using checks that need no textures and no
 other file: the vertex count and the triangle edges come from the meshlet group that follows the streams (validated
@@ -83,18 +86,61 @@ def vertex_count(slots, order):
     return span // 8
 
 
-def find_group(data, at, slots, order, n):
-    """The meshlet group after the last stream: end of the last stream, padded to 16 bytes, over zero words."""
-    last = order[-1]
-    end = at + slots[last][1] + stride(slots[last][0]) * n
-    pos = (end + 15) & ~15
+def skip_padding(data, pos):
+    """Round up to 16 bytes, then step over zero words."""
+    pos = (pos + 15) & ~15
     while pos + 4 <= len(data) and struct.unpack_from("<I", data, pos)[0] == 0:
         pos += 4
+    return pos
+
+
+def block_end(data, at, slots, order, n):
+    """End of a block: its last stream, sized by that tag's width, padded to 16 bytes, over zero words."""
+    last = order[-1]
+    return skip_padding(data, at + slots[last][1] + stride(slots[last][0]) * n)
+
+
+def find_group(data, at, slots, order, n):
+    """The meshlet group right after a block's last stream."""
+    pos = block_end(data, at, slots, order, n)
     try:
         group, _ = parse_group(data, pos)
     except PageError as exc:
         raise BlockError(f"no group: {exc}")
     return pos, group
+
+
+def block_run(data, at=0):
+    """The `42 40 00 00` blocks stored back to back from `at`, as (offset, slots, order, count), and the offset
+    after the last one. Each next header starts exactly at the previous block's end."""
+    run = []
+    while True:
+        slots, order, _ = parse_slots(data, at)
+        n = vertex_count(slots, order)
+        run.append((at, slots, order, n))
+        at = block_end(data, at, slots, order, n)
+        if at + 4 > len(data) or struct.unpack_from("<I", data, at)[0] != MAGIC:
+            return run, at
+
+
+def measure_stream(data, T, rng, errors):
+    """Measure every block of the run that starts a stream. The meshlet groups follow the whole run in the same
+    order: group i belongs to block i, and each pair must still pass the dense-coverage check."""
+    run, pos = block_run(data)
+    add(T, "run_blocks", len(run))
+    for i, (at, _, _, _) in enumerate(run):
+        try:
+            group, end = parse_group(data, pos)
+        except PageError as exc:
+            if i == 0:
+                raise BlockError(f"no group: {exc}")
+            add(errors, "no group in the stream for a later block of the run", len(run) - i)
+            return
+        try:
+            measure_block(data, at, T, rng, (pos, group))
+        except BlockError as exc:
+            add(errors, str(exc).split(":")[0])
+        pos = skip_padding(data, end)
 
 
 def group_edges(data, gat, group):
@@ -220,10 +266,10 @@ def add(d, k, v=1):
     d[k] = d.get(k, 0) + v
 
 
-def measure_block(data, at, T, rng):
+def measure_block(data, at, T, rng, found=None):
     slots, order, flags = parse_slots(data, at)
     n = vertex_count(slots, order)
-    gat, group = find_group(data, at, slots, order, n)
+    gat, group = found or find_group(data, at, slots, order, n)
     if group["vertex_span"] != n or group["unique_refs"] != n:
         raise BlockError("group does not cover the block densely")
     tris = group_edges(data, gat, group)
@@ -337,15 +383,23 @@ def measure_block(data, at, T, rng):
 
 
 def iter_blocks(path, limit):
-    """Yield (archive, stream offset, inflated bytes) for zlib streams in an RPF9 data area starting 42 40 00 00."""
+    """Yield (archive, stream offset, inflated bytes) for zlib streams in an RPF9 data area starting 42 40 00 00.
+
+    The RPF9 archive contract matches rpf9_names.scan_archive: at least 8 bytes, magic b'RPF9' or b'9FPR', and
+    8 <= data_start <= size (an empty but valid header-only archive stays valid)."""
     found = 0
     with open(path, "rb") as fh:
-        if not os.fstat(fh.fileno()).st_size:
-            return
+        if os.fstat(fh.fileno()).st_size < 8:
+            raise ValueError("not an RPF9 archive")
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             size = len(m)
-            pos = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
+            if m[:4] not in (b"RPF9", b"9FPR"):
+                raise ValueError("not an RPF9 archive")
+            data_start = struct.unpack_from("<I", m, 4)[0]
+            if not 8 <= data_start <= size:
+                raise ValueError("RPF9 data start is outside the archive")
+            pos = data_start
             while pos < size:
                 match = ZHDR.search(m, pos)
                 if not match:
@@ -408,6 +462,15 @@ def summarise(T):
     return out
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help=".rpf archives or folders of them")
@@ -429,27 +492,50 @@ def main(argv=None):
                 archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
         else:
             archives.append(p)
+    # The report is written after the whole scan, so check its path first: an archive given as --json used to be
+    # replaced by the report (exit 0), and a directory ended the run in a traceback.
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"error: --json {args.json} is a directory", file=sys.stderr)
+            return 2
+        for path in archives:
+            if same_output_path(args.json, path):
+                print(f"error: --json would overwrite the input {path}", file=sys.stderr)
+                return 2
     rng = random.Random(args.seed)
     T = {"streams": 0}
     errors = {}
     for path in archives:
-        for _, _, data in iter_blocks(path, args.limit):
-            T["streams"] += 1
-            try:
-                measure_block(data, 0, T, rng)
-            except BlockError as exc:
-                add(errors, str(exc).split(":")[0])
-            except (struct.error, IndexError):
-                add(errors, "truncated")
+        try:
+            for _, _, data in iter_blocks(path, args.limit):
+                T["streams"] += 1
+                try:
+                    measure_stream(data, T, rng, errors)
+                except BlockError as exc:
+                    add(errors, str(exc).split(":")[0])
+                except (struct.error, IndexError):
+                    add(errors, "truncated")
+        except (ValueError, OSError) as exc:
+            print(f"error: {path}: {exc}", file=sys.stderr)
+            return 2
         print(f"{os.path.basename(path)}: {T['streams']} streams so far, {T.get('blocks', 0)} blocks measured", file=sys.stderr)
     out = summarise(T)
     out["skipped"] = errors
     print(json.dumps(out, indent=1))
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump(out, fh, indent=1)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(out, fh, indent=1)
+        except OSError as exc:
+            print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

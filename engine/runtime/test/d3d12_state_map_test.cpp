@@ -4,7 +4,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_replay.h"
-#include "../src/vulkan_memory.h"  // resizable_bar
+#include "../src/vulkan_memory.h"  // resizable_bar, memory_type_order
 
 #ifdef _WIN32
 #include <windows.h>
@@ -191,6 +191,11 @@ int main() {
     CHECK(layout(s::generic_read) == VK_IMAGE_LAYOUT_GENERAL);
 
     // Accesses and stages.
+    const auto cb = vulkan_access(s::vertex_and_constant_buffer, false);
+    CHECK(cb.access & VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_UNIFORM_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_SHADER_READ_BIT);  // root CBV loaded through a physical storage buffer
+    CHECK(cb.stages & VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
     const auto rt = vulkan_access(s::render_target, false);
     CHECK(rt.access == (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
     CHECK(rt.stages == VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -304,6 +309,9 @@ int main() {
           (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
     CHECK(vulkan_sync(y::raytracing) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     CHECK(vulkan_barrier_access(a::no_access) == VK_ACCESS_2_NONE);
+    const auto cb_scope = vulkan_barrier_scope(y::pixel_shading, a::constant_buffer);
+    CHECK(cb_scope.access == (VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+    CHECK(cb_scope.stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     CHECK(vulkan_barrier_access(a::common) == (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
     CHECK(vulkan_barrier_access(a::copy_source | a::shader_resource) ==
           (VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT));
@@ -398,6 +406,30 @@ int main() {
     CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, pieces) && pieces.size() == 4);
     CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, pieces) && pieces.size() == 1);
     CHECK(pieces[0].layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && pieces[0].range.levelCount == 2);
+    // LayoutPieces (what replay uses): the same pieces, inline for one or two, spilling to the heap for four, and
+    // reused after clear() from either state.
+    {
+        std::vector<LayoutPiece> four;
+        LayoutPieces inline_pieces;
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, four) && four.size() == 4);
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 4);
+        bool same = true;
+        std::size_t index = 0;
+        for (const LayoutPiece& piece : inline_pieces) {
+            same = same && piece.layout == four[index].layout && piece.range.aspectMask == four[index].range.aspectMask &&
+                   piece.range.baseMipLevel == four[index].range.baseMipLevel;
+            ++index;
+        }
+        CHECK(same && index == 4);
+        CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 1);
+        CHECK(inline_pieces[0].range.levelCount == 2 && inline_pieces.end() - inline_pieces.begin() == 1);
+        inline_pieces.clear();
+        CHECK(inline_pieces.empty());
+        for (std::uint32_t i = 0; i < 3; ++i)
+            inline_pieces.push_back({{VK_IMAGE_ASPECT_COLOR_BIT, i, 1, 0, 1}, VK_IMAGE_LAYOUT_GENERAL});
+        CHECK(inline_pieces.size() == 3 && inline_pieces[0].range.baseMipLevel == 0 &&
+              inline_pieces[2].range.baseMipLevel == 2);  // the inline two kept when it spilled
+    }
     merged.set(1, {depth_stencil.aspects, 1, 1, 0, 1}, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     CHECK(merged.layout(1, 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && merged.layout(1, 3) == merged.layout(1, 1));
     CHECK(!merged.pieces(2, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, pieces));  // untracked
@@ -434,6 +466,62 @@ int main() {
         CHECK(past.discard({3, 4, 3, false}));
         CHECK(past.close());
         CHECK(prepare(past, resolve, ReplayFunctions{}, prepared) == ReplayResult::invalid_subresource);
+    }
+
+    // Indirect argument and count resources can occupy different slices of one Vulkan buffer.
+    {
+        ResourceBinding arguments{}, counts{};
+        arguments.buffer = counts.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{1});
+        arguments.buffer_offset = 256;
+        arguments.size = 128;
+        counts.buffer_offset = 512;
+        counts.size = 16;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 1) return &arguments;
+            if (id == 2) return &counts;
+            return nullptr;
+        };
+
+        static std::vector<VkDeviceSize> offsets;
+        ReplayFunctions vk{};
+        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+        };
+        vk.draw_indexed_indirect = vk.draw_indirect;
+        vk.draw_indirect_count = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkBuffer,
+                                    VkDeviceSize count_offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+            offsets.push_back(count_offset);
+        };
+        vk.draw_indexed_indirect_count = vk.draw_indirect_count;
+        vk.dispatch_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset) {
+            offsets.push_back(offset);
+        };
+
+        CommandList list;
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
+        CHECK(list.close());
+        CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
+        const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
+        CHECK(offsets == expected);
+
+        // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
+        const auto rejected = [&](const ExecuteIndirect& command) {
+            CommandList invalid;
+            return invalid.execute_indirect(command) && invalid.close() &&
+                   replay(invalid, VK_NULL_HANDLE, resolve, vk) == ReplayResult::invalid_indirect_arguments;
+        };
+        CHECK(rejected({IndirectKind::draw, 12, 1, 1, 0, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
+        arguments.buffer_offset = UINT64_MAX - 3;
+        CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
+        CHECK(offsets == expected);
     }
 
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
@@ -474,7 +562,87 @@ int main() {
         CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
     }
 
-    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges and BAR "
-                "detection OK\n");
+    // Memory type choice. Heaps as an RTX 3090 without Resizable BAR reports them: VRAM, system memory, and the
+    // 214 MiB BAR heap that holds the only DEVICE_LOCAL | HOST_VISIBLE type.
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkPhysicalDeviceMemoryProperties memory{};
+        memory.memoryHeapCount = 3;
+        memory.memoryHeaps[0] = {24ull << 30, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryHeaps[1] = {32ull << 30, 0};
+        memory.memoryHeaps[2] = {224395264, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryTypeCount = 4;
+        memory.memoryTypes[0] = {local, 0};
+        memory.memoryTypes[1] = {host, 1};
+        memory.memoryTypes[2] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+        memory.memoryTypes[3] = {local | host, 2};
+        using order = std::vector<std::uint32_t>;
+        constexpr VkDeviceSize mib = 1 << 20;
+        CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{1, 2}));     // the 256 MiB arena
+        CHECK(memory_type_order(memory, 0xF, host, local, 128 * mib) == (order{3, 1, 2}));  // fits the BAR heap
+        CHECK(memory_type_order(memory, 0xF, host, local, 224395264) == (order{3, 1, 2}));  // exactly fits
+        CHECK(memory_type_order(memory, 0x7, host, local, 128 * mib) == (order{1, 2}));     // type 3 not allowed
+        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
+        CHECK(memory_type_order(memory, 0xF, host, local, 64ull << 30).empty());           // nothing that large
+        memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
+        CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
+    }
+
+    // block_format: bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as a copy lays a
+    // subresource out in a buffer. Each expected size is the format's own texel/block size, derived independently of
+    // the table under test, so a mistyped entry (a wrong byte count or a missed 4x4 block) is caught before it
+    // silently corrupts a copy. Covers every VkFormat the DXGI format map can produce.
+    {
+        struct BlockCase {
+            VkFormat format;
+            std::uint32_t bytes;
+            std::uint32_t block;
+        };
+        static constexpr BlockCase block_cases[] = {
+            {VK_FORMAT_R32G32B32A32_SFLOAT, 16, 1}, {VK_FORMAT_R32G32B32A32_UINT, 16, 1},
+            {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1},  {VK_FORMAT_R16G16B16A16_UNORM, 8, 1},
+            {VK_FORMAT_R32G32_SFLOAT, 8, 1},        {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, 1},
+            {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 1}, {VK_FORMAT_R8G8B8A8_UNORM, 4, 1},
+            {VK_FORMAT_R8G8B8A8_SRGB, 4, 1},        {VK_FORMAT_R8G8B8A8_UINT, 4, 1},
+            {VK_FORMAT_B8G8R8A8_UNORM, 4, 1},       {VK_FORMAT_B8G8R8A8_SRGB, 4, 1},
+            {VK_FORMAT_R16G16_SFLOAT, 4, 1},        {VK_FORMAT_R32_SFLOAT, 4, 1},
+            {VK_FORMAT_R32_UINT, 4, 1},             {VK_FORMAT_R8G8_UNORM, 2, 1},
+            {VK_FORMAT_R16_SFLOAT, 2, 1},           {VK_FORMAT_R16_UNORM, 2, 1},
+            {VK_FORMAT_R8_UNORM, 1, 1},
+            // Block-compressed: one 4x4 block is 8 bytes (BC1, BC4) or 16 bytes (BC2, BC3, BC5, BC6H, BC7).
+            {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8, 4},
+            {VK_FORMAT_BC4_UNORM_BLOCK, 8, 4},      {VK_FORMAT_BC4_SNORM_BLOCK, 8, 4},
+            {VK_FORMAT_BC2_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC2_SRGB_BLOCK, 16, 4},
+            {VK_FORMAT_BC3_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC3_SRGB_BLOCK, 16, 4},
+            {VK_FORMAT_BC5_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC5_SNORM_BLOCK, 16, 4},
+            {VK_FORMAT_BC6H_UFLOAT_BLOCK, 16, 4},   {VK_FORMAT_BC6H_SFLOAT_BLOCK, 16, 4},
+            {VK_FORMAT_BC7_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC7_SRGB_BLOCK, 16, 4},
+        };
+        for (const auto& c : block_cases) {
+            const BlockFormat bf = block_format(c.format, VK_IMAGE_ASPECT_COLOR_BIT);
+            CHECK(bf.bytes == c.bytes && bf.block == c.block);
+        }
+
+        // Depth plane keeps the format's size; depth is never block-compressed.
+        CHECK(block_format(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 2);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT).block == 1);
+
+        // The stencil plane is one byte, whatever the format value is: the aspect decides it, not the format.
+        CHECK(block_format(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_STENCIL_BIT).block == 1);
+
+        // A format copies cannot lay out yet is the {0, 1} sentinel, never a silent wrong size.
+        CHECK(block_format(VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT).bytes == 0);
+        CHECK(block_format(VK_FORMAT_R64G64B64A64_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT).bytes == 0);
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, block formats, "
+                "BAR detection and memory types OK\n");
     return 0;
 }

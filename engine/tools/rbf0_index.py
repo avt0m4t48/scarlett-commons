@@ -464,11 +464,11 @@ def write_output(path, records, summary, all_strings=False):
             doc["sample_strings"] = r["_all_strings"] if all_strings else r["sample"]
             doc["sample_truncated"] = not all_strings and r["strings"] > len(r["sample"])
             docs.append(doc)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": docs}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(COLUMNS)
         for r in records:
             sample = "; ".join(r["sample"])
@@ -502,6 +502,16 @@ def byte_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -512,6 +522,8 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
     if a.strings < 0:
         ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
@@ -544,4 +556,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

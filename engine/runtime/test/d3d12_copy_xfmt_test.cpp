@@ -1,6 +1,7 @@
 // Copies between two formats of one D3D12 copy family (depth <-> colour of the same size, BC <-> its uncompressed
 // equivalent), on the Vulkan-backed device and on host D3D12 (default adapter and WARP). Bytes read back compared.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
@@ -47,7 +48,7 @@ struct Case {
     const char* name;
     D3D12_RESOURCE_DESC src, dst;
     bool whole;  // CopyResource, else CopyTextureRegion of subresource 0 with no box
-    bool depth_values;  // also marks the depth <-> colour cases, reported apart from the BC ones
+    bool depth_values;  // also marks the depth <-> colour cases, counted apart from the BC ones (both fail the test)
     UINT x = 0, y = 0;  // CopyTextureRegion destination offset
     bool has_box = false;
     D3D12_BOX box{};
@@ -189,6 +190,14 @@ int main() {
         {"CopyTextureRegion D32_FLOAT -> R32_FLOAT", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R32_FLOAT, 16, 16), false, true},
         {"CopyResource R32_FLOAT -> D32_FLOAT", tex(DXGI_FORMAT_R32_FLOAT, 16, 16), tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), true, true},
         {"CopyResource D16_UNORM -> R16_UNORM", tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), tex(DXGI_FORMAT_R16_UNORM, 16, 16), true, true},
+        {"CopyResource R16_UNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_UNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), true, true},
+        {"CopyTextureRegion D32_FLOAT -> R32_UINT", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R32_UINT, 16, 16), false, true},
+        // A depth-stencil side is copied whole (no box, offset 0), as D3D12 requires of CopyTextureRegion.
+        {"CopyTextureRegion R16_UNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_UNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), false, true},
+        {"CopyResource D16_UNORM -> R16_UINT", tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), tex(DXGI_FORMAT_R16_UINT, 16, 16), true, true},
+        {"CopyTextureRegion R16_SNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_SNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), false, true},
+        {"CopyResource D32_FLOAT -> R32_FLOAT, 3 mips", mips(tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), 3), mips(tex(DXGI_FORMAT_R32_FLOAT, 16, 16), 3), true, true},
+        {"negative control: CopyResource D32_FLOAT -> R16_UNORM", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R16_UNORM, 16, 16), true, true},
         {"CopyTextureRegion R32G32_UINT 4x4 -> BC1 16x16", tex(DXGI_FORMAT_R32G32_UINT, 4, 4), tex(DXGI_FORMAT_BC1_UNORM, 16, 16), false, false},
         {"CopyTextureRegion BC1 16x16 -> R32G32_UINT 4x4", tex(DXGI_FORMAT_BC1_UNORM, 16, 16), tex(DXGI_FORMAT_R32G32_UINT, 4, 4), false, false},
         {"negative control: CopyResource R32_FLOAT -> R16_FLOAT", tex(DXGI_FORMAT_R32_FLOAT, 16, 16), tex(DXGI_FORMAT_R16_FLOAT, 16, 16), true, false},
@@ -208,6 +217,7 @@ int main() {
         {"CopyResource R32G32B32A32_UINT 4x4 -> BC7 16x16", tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), tex(DXGI_FORMAT_BC7_UNORM, 16, 16), true, false},
     };
 
+    if (hostwine::host_is_wine()) return 77;  // vkd3d runs copies WARP refuses, so the controls can't hold
     Ref<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;
     unsigned differ = 0, differ_depth = 0, compared = 0;
@@ -257,5 +267,5 @@ int main() {
         std::printf("%u Vulkan validation errors\n", vk.validation_errors());
         return 1;
     }
-    return differ ? 1 : 0;
+    return differ || differ_depth ? 1 : 0;
 }

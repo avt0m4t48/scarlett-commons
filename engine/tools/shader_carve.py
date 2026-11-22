@@ -116,10 +116,13 @@ def main(argv=None) -> int:
                 f.write(data)
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
                           "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
+    if not index:
+        print(f"ERROR: no shaders carved from {src} (rejected candidates: {bad}).", file=sys.stderr)
+        return 1
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
     with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
         tmp = os.path.join(staging, "index.json")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
@@ -133,4 +136,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

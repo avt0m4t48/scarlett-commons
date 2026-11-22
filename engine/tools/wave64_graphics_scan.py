@@ -96,10 +96,10 @@ def scan_directory(disasm):
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
-    for name in sorted(os.listdir(disasm)):
-        if not name.endswith(".s"):
-            continue
-        path = os.path.join(disasm, name)
+    with os.scandir(disasm) as entries:
+        paths = sorted(entry.path for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())
+    for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
         wave64 = wave64_rule(stage, info["insns"])
@@ -126,14 +126,25 @@ def scan_directory(disasm):
     return {"per_stage": per_stage, "other_stages": other}
 
 
-def main():
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Count candidate cross-half wave ops in wave64 graphics shaders (counts only, no names)")
     ap.add_argument("src", help="<work>/shaders/dxbc/disasm from the shaders stage")
     ap.add_argument("--out", help="write the same aggregates to a JSON file")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not os.path.isdir(args.src):
-        raise SystemExit("not a directory: %s" % args.src)
+        ap.error(f"not a directory: {args.src}")
+    if args.out:
+        if os.path.isdir(args.out):
+            ap.error(f"{args.out} is a directory, not a JSON file")
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        if not os.path.isdir(out_dir):
+            ap.error(f"output directory does not exist: {out_dir}")
+        try:
+            if os.path.samefile(os.path.abspath(args.src), os.path.abspath(args.out)):
+                ap.error("output must not overwrite the source directory")
+        except (FileNotFoundError, OSError):
+            pass
     report = scan_directory(args.src)
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"
@@ -147,10 +158,15 @@ def main():
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
         print("wrote %s" % args.out)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+    sys.exit(main())

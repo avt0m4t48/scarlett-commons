@@ -7,6 +7,7 @@ import glob
 import math
 import os
 import re
+import struct
 
 import pytest
 
@@ -64,6 +65,53 @@ def test_gpu_samples_translate_and_validate(path, make_shader):
 def test_supported_instruction(case, make_shader):
     shader = make_shader(program(SUPPORTED[case]))
     shader.validate(shader.translate())
+
+
+# VOP1/VOP2 DPP source controls. The source lane is a shuffle followed by row/bank masking; a lane that the
+# instruction leaves unwritten keeps its old destination, including for non-mov ops.
+DPP_CASES = {
+    "quad_perm": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "quad_perm_masked": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0x1 bank_mask:0x3",
+    "row_shl": "v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf",
+    "row_shr_bound": "v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "row_ror": "v_mov_b32_dpp v1, v0 row_ror:4 row_mask:0xf bank_mask:0xf",
+    "row_share": "v_mov_b32_dpp v1, v0 row_share:2 row_mask:0xf bank_mask:0xf",
+    "row_xmask": "v_mov_b32_dpp v1, v0 row_xmask:4 row_mask:0xf bank_mask:0xf",
+    "row_mirror": "v_mov_b32_dpp v1, v0 row_mirror row_mask:0xf bank_mask:0xf",
+    "row_half_mirror": "v_mov_b32_dpp v1, v0 row_half_mirror row_mask:0xf bank_mask:0xf",
+    "dpp8": "v_mov_b32_dpp v1, v0 dpp8:[7,6,5,4,3,2,1,0] fi:1",
+    "vop1_not_bank": "v_not_b32_dpp v1, v0 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0x1",
+    "vop2_add_shr": "v_add_nc_u32_dpp v1, v0, v2 row_shr:1 row_mask:0xf bank_mask:0xf",
+}
+
+
+@pytest.mark.parametrize("case", sorted(DPP_CASES))
+def test_dpp_controls_translate_and_validate(case, make_shader):
+    shader = make_shader(program("v_mov_b32 v0, v0\n" + DPP_CASES[case]))
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniformShuffle" in spvasm
+
+
+@pytest.mark.parametrize("mods", [[], ["row_share:20"], ["row_shl:0"], ["row_shl:1", "row_shr:2"]])
+def test_dpp_bad_control_is_rejected(mods):
+    """A missing, out-of-range or duplicate DPP control must fail instead of guessing."""
+    gen = rdna2spirv.Gen("ps")
+    ins = {"op": "v_mov_b32_dpp", "args": [{"k": "vgpr", "r": 1}, {"k": "vgpr", "r": 0}], "mods": mods}
+    with pytest.raises(rdna2spirv.Unsupported):
+        gen.insn(ins)
+
+
+def test_dpp_wave64_emulation_goes_through_workgroup_memory(make_shader, monkeypatch):
+    """--wave64-emulate must not leave a subgroup shuffle in a DPP shader."""
+    shader = make_shader("s_mov_b64 exec, -1\n"
+                         "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                         "s_endpgm\n", name="cs_dpp_w64")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniform" not in spvasm and "%sg_lane" not in spvasm
+    assert "%x_buf" in spvasm and "OpControlBarrier" in spvasm
 
 
 def test_translation_is_deterministic(make_shader):
@@ -342,6 +390,7 @@ def test_vs_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert [int(x) for x in chains] == list(range(n_comp))
     assert _vgpr_to_index_map(spvasm, "%out_clip", "%_ptr_Output_float") == {i: 10 + i for i in range(n_comp)}
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["clip_distance_count"] == n_comp
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" not in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -363,8 +412,13 @@ def test_ms_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert "OpMemberDecorate %ms_vtx_blk 1 BuiltIn ClipDistance" in spvasm
     assert f"%ms_arr_clip = OpTypeArray %float %c{n_comp}" in spvasm
     chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
-    assert [int(x) for x in chains] == list(range(n_comp))
+    assert [int(x) for x in chains] == list(range(n_comp)) * 2   # the export writes, then the copy to the output
     assert _vgpr_to_index_map(spvasm, "%ms_clip", "%_ptr_Function_float") == {i: 10 + i for i in range(n_comp)}
+    # Copied to the mesh output one float at a time: SPIRV-Cross turns a whole-array store there into a C array
+    # assignment that Metal rejects (SHADER-155).
+    out_chains = re.findall(r"OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli %c1 %c(\d+)", spvasm)
+    assert [int(x) for x in out_chains] == list(range(n_comp))
+    assert "OpLoad %ms_arr_clip" not in spvasm
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -392,6 +446,8 @@ def test_vs_clip_and_cull_distances_across_pos1_pos2(make_shader):
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" in meta["features"]
+    assert meta["clip_distance_count"] == 2
+    assert meta["cull_distance_count"] == 3
     assert not ({1, 2} & set(meta.get("outputs", [])))
     assert not ({1, 2} & set(meta.get("params", [])))
 
@@ -420,6 +476,7 @@ def test_pos1_without_osg1_is_ignored(make_shader):
     assert "OpCapability ClipDistance" not in vs_spv
     assert "BuiltIn ClipDistance" not in vs_spv
     vs_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, vs_spv)
+    assert "clip_distance_count" not in vs_meta
     assert "shaderClipDistance" not in vs_meta["features"]
     assert 1 not in vs_meta.get("outputs", [])
 
@@ -714,6 +771,12 @@ def _count(text, op):
     return len(re.findall(rf"= {op} ", text))
 
 
+def _gather_address_bit_offsets(text: str) -> list[int]:
+    constants = {name: int(value) for name, value in re.findall(r"(%\w+) = OpConstant %uint (\d+)", text)}
+    fields = re.findall(r"OpBitFieldUExtract %uint %\w+ (%\w+) (%\w+)", text)
+    return [constants[offset] for offset, width in fields if constants[width] == 3]
+
+
 @pytest.mark.parametrize("mx", range(4))
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
@@ -725,7 +788,7 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
-    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+    assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
 
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
@@ -768,14 +831,63 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+    assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
+    # OpSLessThan: 4 for mirror, 8 for the border-mode range tests (SHADER-348: two per texel coordinate)
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 12 and _count(text, "OpSGreaterThanEqual") == 4
 
 
-@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
-def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+@pytest.mark.parametrize("word0", [4, 0x28, 0x8000])
+def test_gather4_l_literal_half_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
     with pytest.raises(rdna2spirv.Unsupported):
         make_shader(_gather_l(word0)).translate()
+
+
+# SHADER-348: modes 6 (clamp border) and 7 (mirror once border) give a tap outside the image the border colour's
+# channel, BORDER_COLOR_TYPE = S# word 3 [31:30] (0 transparent black, 1 opaque black, 2 opaque white, 3 table).
+def _gather_l_border(word0, word3, dynamic=False, dmask=1):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, {word3}\n"
+        + ("s_add_u32 s16, s16, 0\ns_add_u32 s19, s19, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        f"image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:{dmask:#x} dim:SQ_RSRC_IMG_2D")
+
+
+def _float_bits(text, name):
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    expr = defs[name].split()
+    if expr[:2] == ["OpBitcast", "%float"]:
+        expr = defs[expr[2]].split()
+    assert expr[:2] in (["OpConstant", "%uint"], ["OpConstant", "%float"]), expr
+    return int(expr[2]) if expr[1] == "%uint" else struct.unpack("<I", struct.pack("<f", float(expr[2])))[0]
+
+
+@pytest.mark.parametrize("word0, taps", [(0x6, 4), (0x30, 4), (0x36, 4), (0x7, 4), (0x38, 4)])
+# Word 3 keeps BORDER_COLOR_PTR = 0x100 so llvm-mc prints it as an integer: 0x40000000 alone is the inline float 2.0,
+# which the translator reads at run time (covered by the run-time test below).
+@pytest.mark.parametrize("word3, dmask, one", [(0x100, 1, False), (1 << 30 | 0x100, 1, False), (1 << 30 | 0x100, 8, True),
+                                               (2 << 30 | 0x100, 1, True)])
+def test_gather4_l_literal_border_mode_selects_the_border_colour(word0, taps, word3, dmask, one, make_shader):
+    shader = make_shader(_gather_l_border(word0, word3, dmask=dmask))
+    text = shader.translate()
+    shader.validate(text)
+    selects = re.findall(r"= OpSelect %float %\w+ (%\w+) %\w+$", text, re.M)
+    assert len(selects) == taps                     # each of the four taps can leave the image
+    assert {_float_bits(text, s) for s in selects} == {0x3F800000 if one else 0}
+
+
+def test_gather4_l_literal_border_colour_from_the_table_is_unsupported(make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l_border(0x36, 3 << 30 | 0x100)).translate()
+
+
+def test_gather4_l_run_time_sampler_reads_the_border_type_from_word3(make_shader):
+    shader = make_shader(_gather_l_border(0x36, 2 << 30, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert re.search(r"= OpShiftRightLogical %uint %\w+ (%\w+)$", text, re.M)
+    assert len(re.findall(r"= OpSelect %float %\w+ %\w+ %\w+$", text, re.M)) >= 4
 
 
 # SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon
@@ -913,6 +1025,29 @@ def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
     assert meta_struct["control_flow"] == "structured"
     assert "OpLoopMerge" in spv_struct
     assert "OpSwitch" not in spv_struct
+
+
+def test_deep_structured_nesting_uses_the_dispatch_loop(make_shader, monkeypatch):
+    """SHADER-299: a tree nested deeper than MAX_STRUCTURED_DEPTH is emitted in the flat dispatch-loop form, which
+    validates at the same depth in a fraction of the time; raising the bound brings the structured form back."""
+    # cfg_structure hoists tails past 16 guards deep (#1904), so a chain never structures deeper than 16; the bound is
+    # set below that here so the chain still exceeds it.
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", 8)
+    n = 24
+    body = "".join(f"s_cmp_eq_u32 s0, {i}\ns_cbranch_scc0 {3 + 2 * (n - i - 1)}\n" for i in range(n))
+    shader = make_shader(body + "v_mov_b32 v8, s0\nexp mrt0 v8, v8, v8, v8 done vm\ns_endpgm\n",
+                         name="ps_nesting_bound")
+    asm = shader.translate()
+    shader.validate(asm)
+    gen = rdna2spirv.translate.last_gen
+    assert gen.nesting > rdna2spirv.MAX_STRUCTURED_DEPTH
+    assert gen.control_flow == "dispatch loop" and "OpSwitch %pcv" in asm
+
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", gen.nesting)
+    structured = shader.translate()
+    shader.validate(structured)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert "OpSwitch" not in structured
 
 
 MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
@@ -1054,6 +1189,22 @@ def test_repeated_tbuffer_loads_share_normalization(make_shader):
     assert spv.count("FindUMsb") == 2
 
 
+def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
+    shader = make_shader(
+        "v_mov_b32_e32 v1, 1\n"
+        "image_get_resinfo v[4:7], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\n"
+        "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+        name="ps_array_resinfo",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpDecorate %images_arr Binding 3" in asm
+    size = re.search(r"(%\w+) = OpImageQuerySizeLod %v3int (%\w+) %\w+", asm)
+    assert size and f"OpImageQueryLevels %int {size[2]}" in asm
+    for axis in range(3):
+        assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
@@ -1082,7 +1233,8 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
+    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+        assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
@@ -1201,6 +1353,122 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
     mem = {base: 0}
     si.run_fragment(spv, memory=mem)
     assert mem[base] == expected_word
+
+
+@pytest.mark.parametrize("fmt, expected", [(56, 0x80000000), (57, 0x40810000)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_normalized_buffer_store_nan(fmt, expected, packed, make_shader):
+    # RGBA = positive signaling NaN, negative quiet NaN, -infinity, +0.5.
+    # gfx1036 stored zero for both NaNs, clamped infinity and rounded 0.5 to even.
+    if packed:
+        inputs = "v_mov_b32 v4, 0xfe017c01\nv_mov_b32 v5, 0x3800fc00\n"
+        store = "buffer_store_format_d16_xyzw v[4:5]"
+    else:
+        inputs = ("v_mov_b32 v4, 0x7f800001\nv_mov_b32 v5, 0xffc01000\n"
+                  "v_mov_b32 v6, 0xff800000\nv_mov_b32 v7, 0.5\n")
+        store = "buffer_store_format_xyzw v[4:7]"
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n" + inputs +
+           f"{store}, off, s[0:3], 0\ns_waitcnt vmcnt(0)\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_nan")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xDEADBEEF}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert memory[0x1000] == expected
+
+
+@pytest.mark.parametrize("fmt", [22, 20])  # 32_FLOAT, 32_UINT
+def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n"
+           "v_mov_b32 v4, 0xffc01000\nbuffer_store_format_x v4, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_raw_store_nan")
+    memory = {0x1000: 0}
+    _load_mini_interp().run_fragment(shader.translate(), memory=memory)
+    assert memory[0x1000] == 0xFFC01000
+
+
+# GFX10 32-bit integer formats by component count: UINT code, SINT code (gfx10_formats.json).
+INT32_FORMATS = [(1, 20, 21), (2, 62, 63), (3, 72, 73), (4, 75, 76)]
+
+
+@pytest.mark.parametrize("n, uint_fmt, sint_fmt", INT32_FORMATS)
+def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, make_shader):
+    """SHADER-257: the 32-bit SINT typed-buffer formats (and 32_32_32_UINT) load and store each dword unchanged, as
+    their UINT twins do. Negative values and NaN-like patterns must survive both ways; a load's missing channels
+    repeat the format's own, as for every other format (SHADER-86)."""
+    si = _load_mini_interp()
+    words = [0xFFFFFFFF, 0x80000000, 0x7FC01000, 0x00000005][:n]
+    for fmt in (uint_fmt, sint_fmt):
+        desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n")
+        load = desc + ("buffer_load_format_xyzw v[4:7], off, s[0:3], 0\ns_waitcnt vmcnt(0)\n"
+                       "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+        shader = make_shader(load, name=f"ps_int32_load_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: w for i, w in enumerate(words)}
+        out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
+        assert list(out) == [words[c % n] for c in range(4)], fmt
+
+        setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
+        regs = "v4" if n == 1 else f"v[4:{3 + n}]"
+        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        shader = make_shader(store, name=f"ps_int32_store_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
+        si.run_fragment(spv, memory=memory)
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
+
+
+@pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),
+                                                (50, (0, 10, 20, 30), (256, 512, 767, 3))])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("components", [1, 4])
+@pytest.mark.parametrize("bgra", [False, True])
+def test_buffer_store_format_bgra(fmt, shifts, channels, packed, components, bgra, make_shader):
+    # gfx1036 writes the red source into the third field of the BGRA view, even for store_format_x.
+    values = (0x38003400, 0x3c003a00) if packed else (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000)
+    order = (2, 1, 0, 3) if bgra else (0, 1, 2, 3)
+    selectors = sum((4 + channel) << (3 * i) for i, channel in enumerate(order))
+    inputs = "".join(f"v_mov_b32 v{4 + i}, {value:#x}\n" for i, value in enumerate(values))
+    regs = "v4" if components == 1 else ("v[4:5]" if packed else "v[4:7]")
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + inputs +
+           f"{op} {regs}, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_bgra")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xdeadbeef}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    expected = sum(channels[c] << shift for c, shift in zip(order, shifts) if c < components)
+    assert memory[0x1000] == expected
+
+
+@pytest.mark.parametrize("fmt, packed, inputs, expected", [
+    (60, True, (0x01000101, 0x00fe00ff), (0xfeffffff,)),
+    (27, False, (65536, 65537), (0xffffffff,)),
+    (69, False, (65534, 65535, 65536, 0xffffffff), (0xfffffffe, 0xffffffff)),
+    (75, False, (65534, 65535, 65536, 0xffffffff), (65534, 65535, 65536, 0xffffffff)),
+])
+def test_uint_buffer_store_saturation(fmt, packed, inputs, expected, make_shader):
+    # Native gfx1036 clips each channel to the destination's width. The 32-bit control keeps every bit.
+    setup = "".join(f"v_mov_b32 v{4 + i}, {v:#x}\n" for i, v in enumerate(inputs))
+    selectors = 0x22c if fmt == 27 else 0xfac  # XY01 for RG16, XYZW for RGBA
+    components = 4 if packed else len(inputs)
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 16\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + setup +
+           f"{op} v[4:{3 + len(inputs)}], off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_uint")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000 + 4 * i: 0xdeadbeef for i in range(4)}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert tuple(memory[0x1000 + 4 * i] for i in range(4)) == expected + (0xdeadbeef,) * (4 - len(expected))
 
 
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):

@@ -6,9 +6,13 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
+#
+# The default -Dest is outside AppData on purpose: `python` from the Python install manager (the app execution alias
+# in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
+# there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
     [string]$Version = "21.1.8",
-    [string]$Dest = (Join-Path $env:LOCALAPPDATA "Leonida\llvm-mc"),
+    [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user
     [switch]$Keep     # keep the sources and build folder (faster rebuilds)
@@ -48,7 +52,9 @@ $out = Join-Path $Temp "build"
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if (Test-Path $src) { Remove-Item -Recurse -Force $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
-    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse https://github.com/llvm/llvm-project $src
+    # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
+    # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
+    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
     & git -C $src sparse-checkout set llvm cmake third-party
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }

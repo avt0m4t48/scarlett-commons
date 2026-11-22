@@ -9,6 +9,10 @@
 //     process-wide atexit table also holds gta6rt's own).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
+// The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
+// title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets that the
+// umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
+// import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
 #include <windows.h>
 
 #include <atomic>
@@ -16,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "process_shim.h"
@@ -41,29 +46,30 @@ std::atomic<bool> g_exited{false};
 std::atomic<int> g_exit_code{0};
 HANDLE g_done = nullptr;
 
-std::string quote(const std::string& a) {
-    if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
-    std::string out = "\"";
+std::wstring quote(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+    std::wstring out = L"\"";
     size_t slashes = 0;  // CommandLineToArgvW: backslashes are literal unless they precede a quote
-    for (char c : a) {
-        if (c == '\\') {
+    for (wchar_t c : a) {
+        if (c == L'\\') {
             ++slashes;
         } else {
-            if (c == '"') out.append(slashes + 1, '\\');
+            if (c == L'"') out.append(slashes + 1, L'\\');
             slashes = 0;
         }
         out += c;
     }
-    return out.append(slashes, '\\') + "\"";  // a trailing run is doubled before the closing quote
+    return out.append(slashes, L'\\') + L"\"";  // a trailing run is doubled before the closing quote
 }
 
-// The narrow arguments are ANSI code page text (main.cpp passes std::filesystem::path::string(), and the CRT's
-// narrow argv is ACP too); under a UTF-8 activeCodePage CP_ACP is UTF-8 anyway.
-std::wstring widen(const std::string& s) {
-    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
-    if (n > 1) MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
-    return w;
+// The narrow arguments are ANSI code page text, like the CRT's narrow argv; under a UTF-8 activeCodePage CP_ACP is
+// UTF-8 anyway. A character the code page has no mapping for becomes the code page's default character (or a
+// best-fit one), as in the CRT, instead of failing: std::filesystem::path::string() throws there (RT-84).
+std::string narrow(const std::wstring& w) {
+    int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1) WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    return s;
 }
 
 [[noreturn]] void end_run(int code) {
@@ -106,6 +112,24 @@ wchar_t** __cdecl game_p_wcmdln_storage() {
     return &p;
 }
 
+// What the UCRT's _get_narrow/_get_wide_winmain_command_line return, and the CRT's WinMain startup passes as
+// lpCmdLine: the command line after the program name and the blanks that follow it. The program name ends at the
+// first character up to ' ' outside quotes, the UCRT's own scan. The comparison is unsigned, so a non-ASCII byte of
+// the narrow line is part of the name; a DBCS trail byte is never '"' or a blank, so it needs no lead-byte step.
+template <typename C>
+C* after_program_name(C* p) {
+    using U = std::make_unsigned_t<C>;
+    bool quoted = false;
+    while (U(*p) > U(' ') || (*p && quoted)) {
+        if (*p == C('"')) quoted = !quoted;
+        ++p;
+    }
+    while (*p && U(*p) <= U(' ')) ++p;
+    return p;
+}
+char* __cdecl game_get_narrow_winmain_command_line() { return after_program_name(g_cmdline.data()); }
+wchar_t* __cdecl game_get_wide_winmain_command_line() { return after_program_name(g_wcmdline.data()); }
+
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
 int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
     *argc = g_argc;
@@ -134,18 +158,18 @@ DWORD WINAPI game_thread(void* p) {
 
 }  // namespace
 
-void set_command_line(const std::string& program, const std::vector<std::string>& args) {
-    g_args.clear();
-    g_args.push_back(program);
-    g_args.insert(g_args.end(), args.begin(), args.end());
+void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
     g_wargs.clear();
-    g_cmdline.clear();
-    for (auto& a : g_args) {
-        g_wargs.push_back(widen(a));
-        if (!g_cmdline.empty()) g_cmdline += ' ';
-        g_cmdline += quote(a);
+    g_wargs.push_back(program);
+    g_wargs.insert(g_wargs.end(), args.begin(), args.end());
+    g_args.clear();
+    g_wcmdline.clear();
+    for (auto& a : g_wargs) {
+        g_args.push_back(narrow(a));
+        if (!g_wcmdline.empty()) g_wcmdline += L' ';
+        g_wcmdline += quote(a);
     }
-    g_wcmdline = widen(g_cmdline);
+    g_cmdline = narrow(g_wcmdline);
     g_argv.clear();
     g_wargv.clear();
     for (auto& a : g_args) g_argv.push_back(a.data());
@@ -196,7 +220,13 @@ using namespace rt::process;
     {dll, "_configure_narrow_argv", reinterpret_cast<void*>(&game_configure_argv)}, \
     {dll, "_configure_wide_argv", reinterpret_cast<void*>(&game_configure_argv)}, \
     {dll, "__p__acmdln", reinterpret_cast<void*>(&game_p_acmdln_storage)}, \
-    {dll, "__p__wcmdln", reinterpret_cast<void*>(&game_p_wcmdln_storage)}
+    {dll, "__p__wcmdln", reinterpret_cast<void*>(&game_p_wcmdln_storage)}, \
+    {dll, "_get_narrow_winmain_command_line", reinterpret_cast<void*>(&game_get_narrow_winmain_command_line)}, \
+    {dll, "_get_wide_winmain_command_line", reinterpret_cast<void*>(&game_get_wide_winmain_command_line)}
+#define EXIT_PROCESS(dll) {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}
+#define COMMAND_LINE(dll) \
+    {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
+    {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -208,7 +238,10 @@ SHIM_TABLE(process,
     {"msvcrt.dll", "abort", reinterpret_cast<void*>(&game_abort)},
     {"msvcrt.dll", "__getmainargs", reinterpret_cast<void*>(&game_getmainargs)},
     {"msvcrt.dll", "__wgetmainargs", reinterpret_cast<void*>(&game_wgetmainargs)},
-    {"kernel32.dll", "ExitProcess", reinterpret_cast<void*>(&game_exit_process)},
-    {"kernel32.dll", "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)},
-    {"kernel32.dll", "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)},
+    EXIT_PROCESS("kernel32.dll"),
+    EXIT_PROCESS("kernelbase.dll"),
+    EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
+    COMMAND_LINE("kernel32.dll"),
+    COMMAND_LINE("kernelbase.dll"),
+    COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
 );

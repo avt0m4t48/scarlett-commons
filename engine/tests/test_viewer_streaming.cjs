@@ -6,6 +6,7 @@ const { test } = require('node:test');
 
 // Exercise the viewer's actual loading and streaming code without WebGL, a network or game data.
 const html = readFileSync(join(__dirname, '..', 'viewer', 'index.html'), 'utf8');
+const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
 const worldBegin = html.indexOf('// ---------- world description ----------');
 const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
@@ -40,6 +41,12 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
         ['bad bounds', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, bounds: [0, 0, 0, -1, 1, 1] }] },
             /chunks\[0\]\.bounds/],
         ['duplicate chunk ID', { spawn: [0, 0, 0], chunks: [worldChunk, worldChunk] }, /chunks\[1\]\.id/],
+        ['LOD tier without a band', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] },
+            /chunks\[0\]\.lod/],
+        ['LOD band out of order', { spawn: [0, 0, 0], lod_bands: { hd: [5, 1] },
+            chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
+        ['LOD chunk without a cell', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: 'hd' }] }, /chunks\[0\]\.cell/],
     ];
     for (const [label, manifest, field] of cases) {
         await t.test(label, async () => {
@@ -63,8 +70,21 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('a WebGL startup error replaces the fly prompt and preserves the original error', async () => {
+    const error = new Error('Error creating WebGL context.');
+    const attributes = new Map();
+    const start = { textContent: 'Click to fly', style: {}, setAttribute: (name, value) => attributes.set(name, value) };
+    const startup = vm.runInNewContext(`(async () => { ${viewerModule} })()`, {
+        THREE: { WebGLRenderer: class { constructor() { throw error; } } },
+        document: { getElementById: id => { assert.equal(id, 'start'); return start; } },
+    });
+    await assert.rejects(startup, actual => actual === error);
+    assert.match(start.textContent, /Could not start WebGL/);
+    assert.equal(start.style.cursor, 'default');
+    assert.equal(attributes.get('role'), 'alert');
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
-    const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
     const boundsGroup = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn boundsGroup; })()`, {
@@ -419,3 +439,49 @@ test('generated test terrain loads without network requests', () => {
     assert(f.state.live.get('chunk_0').obj);
     assert.equal(f.state.live.get('chunk_0').loading, false);
 });
+
+test('a valid LOD manifest is accepted', async () => {
+    const manifest = { spawn: [0, 0, 0], lod_bands: { hd: [0, 130], lod: [130, 450] },
+        chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 256, 256] }] };
+    const world = await loadWorld(manifestResponse(manifest));
+    assert.equal(world.test, false);
+});
+
+test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
+    const f = fixture(0);
+    const cell = [0, 0, 256, 256];
+    f.context.world = { test: false, lod_bands: { hd: [0, 130], lod: [130, 450], slod1: [450, 1000] }, chunks: [
+        { id: 'hd', url: 'hd.glb', bounds: [0, 0, 0, 256, 50, 256], lod: 'hd', cell },
+        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell },
+        { id: 'slod1', url: 'slod1.glb', bounds: [0, 0, 0, 256, 90, 256], lod: 'slod1', cell },
+    ] };
+    const pos = f.context.camera.position;
+    Object.assign(pos, { x: 300, y: 500, z: 100 });          // 44 m east of the cell, high up: still HD
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['hd.glb']);
+    const hd = Object.assign(f.object(), { visible: true });
+    const lod = Object.assign(f.object(), { visible: true });
+    await f.succeed(0, hd);
+    Object.assign(pos, { x: 256 + 150, y: 0, z: 100 });      // 150 m: LOD replaces HD (HD kept inside the slack)
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
+    assert.ok(f.state.live.has('hd'));
+    await f.succeed(1, lod);
+    f.frame();
+    assert.equal(hd.visible, false);
+    assert.equal(lod.visible, true);
+    pos.x = 256 + 120;                                    // back inside HD, with LOD retained
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(lod.visible, false);
+    assert.equal(f.requests.length, 2);
+    Object.assign(pos, { x: 256 + 200, y: 0, z: 100 });      // past the slack: HD unloads
+    f.frame();
+    assert.ok(!f.state.live.has('hd'));
+    assert.ok(f.state.live.has('lod'));
+    Object.assign(pos, { x: 256 + 600, y: 0, z: 100 });      // 600 m: SLOD1 only
+    f.frame();
+    assert.ok(!f.state.live.has('lod'));
+    assert.equal(f.requests.at(-1).url, 'slod1.glb');
+});
+

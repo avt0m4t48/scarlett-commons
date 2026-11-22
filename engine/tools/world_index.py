@@ -19,10 +19,11 @@ reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype
 
 ``--entities-out`` writes one JSON line per complete ``CEntityDef`` (archetype hash and 64-bit key, position,
 stored rotation, scales and LOD fields), the placement input of ``world_build.py --placements``. The rows are
-derived from your own copy of the game: keep the file in your local work folder.
+derived from your own copy of the game: keep the file in your local work folder. The placement report is
+replaced after the scan and other report writes succeed.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
-JSON summary.
+JSON summary. Place reports outside a directory input if you want to overwrite them on a later run.
 """
 import argparse
 import csv
@@ -30,9 +31,13 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
+import unicodedata
 import zlib
+from contextlib import contextmanager
 
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
@@ -390,40 +395,102 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                       "scan_end": end, "scanned_bytes": scanned, "streams": streams}
 
 
-def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None):
+def _directory_files(path):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # A partial walk must fail before the caller starts writing reports.
+    for root, _, files in os.walk(path, onerror=scan_failed):
+        for name in sorted(files):
+            yield os.path.join(root, name)
+
+
+def _carve_successors(folder):
+    """{file: next file} for streams that were contiguous in the archive, from rpf9_carve.py's index.json in
+    `folder` (each file is <offset>.bin; the next stream starts at the 16-byte boundary after `stored`). Empty
+    when there is no readable index, so files are then parsed one by one."""
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            entries = json.load(f).get("files", [])
+        by_off = {int(e["off"]): int(e["stored"]) for e in entries}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    return {f"{off:012x}.bin": f"{(off + stored + 15) & ~15:012x}.bin"
+            for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
+
+
+def _read_carved(path, max_inflate):
+    """Read a carved file within the cap, or return None if it is too large."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size > max_inflate:
+            return None
+        data = f.read(max_inflate + 1)  # detect growth after fstat
+    return data if len(data) <= max_inflate else None
+
+
+def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
-    if os.path.isdir(path):
+    if directory_files is not None or os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
-        for root, _, files in os.walk(path):
-            for name in sorted(files):
-                p = os.path.join(root, name)
-                with open(p, "rb") as f:
-                    head = f.read(4)
-                if head == b"9FPR":
-                    more, sub = scan_rpf(p, start, limit, max_inflate, collect)
-                    rows.extend(more)
-                    stats["files"] += 1
-                    stats["scanned_bytes"] += sub["scanned_bytes"]
-                    continue
-                if os.path.getsize(p) > max_inflate:
-                    continue
-                with open(p, "rb") as f:
-                    b = f.read(max_inflate + 1)
-                row = parse_resource(b, collect)
+        if directory_files is None:
+            directory_files = _directory_files(path)
+        directory_files = list(directory_files)
+        listed = set(directory_files)
+        successors = {}   # folder -> _carve_successors(folder)
+        consumed = set()
+        for p in directory_files:
+            if p in consumed:
+                continue
+            with open(p, "rb") as f:
+                head = f.read(4)
+            if head == b"9FPR":
+                more, sub = scan_rpf(p, start, limit, max_inflate, collect)
+                rows.extend(more)
                 stats["files"] += 1
-                stats["scanned_bytes"] += len(b)
-                if row is not None:
-                    row["offset"] = 0
-                    row["size"] = len(b)
-                    row["file"] = os.path.relpath(p, path).replace("\\", "/")
-                    rows.append(row)
+                stats["scanned_bytes"] += sub["scanned_bytes"]
+                continue
+            b = _read_carved(p, max_inflate)
+            if b is None:
+                continue
+            stats["files"] += 1
+            stats["scanned_bytes"] += len(b)
+            # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
+            # carve's index.json shows that stream started right after this one.
+            root = os.path.dirname(p)
+            if root not in successors:
+                successors[root] = _carve_successors(root)
+            nxt = successors[root]
+            current = os.path.basename(p)
+            for _ in range(2):
+                if b[0x10:0x15] != b"0DRPz" or (parse_resource(b) is not None and not _needs_continuation(b)):
+                    break
+                follow = nxt.get(current)
+                q = os.path.join(root, follow) if follow is not None else None
+                if q is None or q not in listed:
+                    break
+                if len(b) + os.path.getsize(q) > max_inflate:
+                    break
+                with open(q, "rb") as f:
+                    more = f.read()
+                b += more
+                consumed.add(q)
+                stats["files"] += 1
+                stats["scanned_bytes"] += len(more)
+                current = follow
+            row = parse_resource(b, collect)   # collect once, on the joined resource
+            if row is not None:
+                row["offset"] = 0
+                row["size"] = len(b)
+                row["file"] = os.path.relpath(p, path).replace("\\", "/")
+                rows.append(row)
         return rows, stats
     with open(path, "rb") as f:
         magic = f.read(4)
     if magic == b"9FPR":
         return scan_rpf(path, start, limit, max_inflate, collect)
-    with open(path, "rb") as f:
-        b = f.read(max_inflate + 1)
+    b = _read_carved(path, max_inflate)
+    if b is None:
+        return [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
     row = parse_resource(b, collect)
     return ([dict(row, offset=0, size=len(b), file=os.path.basename(path))] if row else [],
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})
@@ -512,6 +579,134 @@ def _count(minimum):
     return parse
 
 
+def _file_identity(path):
+    try:
+        stat = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def _resolve_report_path(path):
+    if os.name != "nt":
+        return os.path.realpath(path)
+    if not path.startswith("\\\\?\\"):
+        # GetFullPathName normalizes ordinary Windows paths the same way opening them does.
+        return os.path.realpath(os.path.abspath(path))
+
+    # realpath can trim literal trailing dots and spaces from missing verbatim components.
+    # Resolve the existing ancestor and append the missing components as written.
+    missing = []
+    while not os.path.lexists(path):
+        parent, name = os.path.split(path)
+        if not name:
+            break
+        missing.append(name)
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(missing))
+
+
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `out/R.json` and `out/r.json` would pass as two
+    reports and the second write would replace the first."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _pending_path_key(path):
+    path = os.path.normcase(_resolve_report_path(path))
+    if os.name != "nt":
+        if _case_insensitive_volume(path):
+            # APFS and HFS+ also treat composed and decomposed accents as one name.
+            path = unicodedata.normalize("NFD", path.casefold())
+        return path
+
+    # Drive and UNC paths can also be spelled using the extended-length prefix.
+    extended_prefix = "\\\\?\\"
+    unc_prefix = extended_prefix + "unc\\"
+    if path.startswith(unc_prefix):
+        return "\\\\" + path[len(unc_prefix):]
+    drive, _ = os.path.splitdrive(path)
+    if drive.startswith(extended_prefix) and len(drive) == len(extended_prefix) + 2 and drive.endswith(":"):
+        return path[len(extended_prefix):]
+    return path
+
+
+def _check_report_paths(parser, reports, source, directory_files):
+    existing, pending = {}, {}
+    for flag, path in reports:
+        if not path:
+            continue
+        key = _file_identity(path)
+        if key is None:
+            key = _pending_path_key(path)
+            destinations = pending
+        else:
+            destinations = existing
+        if other := destinations.get(key):
+            parser.error(f"{other} and {flag} must use different paths")
+        destinations[key] = flag
+
+    source_id = _file_identity(source)
+    if source_id is None:
+        flag = pending.get(_pending_path_key(source))
+    else:
+        flag = existing.get(source_id)
+    if flag:
+        parser.error(f"{flag} would overwrite the input {source}")
+
+    if existing and directory_files is not None:
+        for path in directory_files:
+            if flag := existing.get(_file_identity(path)):
+                parser.error(f"{flag} would overwrite the input {path}")
+
+
+@contextmanager
+def _staged_entity_report(path):
+    if not path:
+        yield None
+        return
+
+    destination = _resolve_report_path(path)
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        raise OSError(f"placement report destination is not a regular file: {path}")
+
+    # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
+    directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
+    staged = os.path.join(directory, "entities.jsonl")
+    try:
+        with open(staged, "w", encoding="utf-8", newline="\n") as handle:
+            yield EntityRows(handle)
+        if mode is not None:
+            os.chmod(staged, mode & 0o777)
+        os.replace(staged, destination)
+    finally:
+        if os.path.exists(staged):
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
+            os.unlink(staged)
+        os.rmdir(directory)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved file, or a directory of carved files")
@@ -527,24 +722,27 @@ def main(argv=None):
     ap.add_argument("--entities-out",
                     help="also write one JSON line per complete entity (world_build --placements input; local only)")
     a = ap.parse_args(argv)
+    reports = (("--out", a.out), ("--csv", a.csv), ("--archetypes-out", a.archetypes_out),
+               ("--entities-out", a.entities_out))
     agg = ArchetypeCounts() if a.archetypes_out else None
-    ent_handle = ent = None
-    if a.entities_out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
-        ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
-        ent = EntityRows(ent_handle)
     try:
-        sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink)
-    except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
+        # Check the same inputs the directory scan will read, before the streaming report exists.
+        directory_files = list(_directory_files(a.path)) if os.path.isdir(a.path) else None
+        _check_report_paths(ap, reports, a.path, directory_files)
+        with _staged_entity_report(a.entities_out) as ent:
+            sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
+            rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink, directory_files=directory_files)
+            summary = _write_reports(a, rows, stats, agg)
+            if ent is not None:
+                summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
+    except (OSError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        if ent_handle is not None:
-            ent_handle.close()
-            os.remove(a.entities_out)       # no partial placement file
         return 2
-    finally:
-        if ent_handle is not None:
-            ent_handle.close()
+    print(json.dumps(summary, indent=1))
+    return 0
+
+
+def _write_reports(a, rows, stats, agg):
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")
@@ -553,7 +751,7 @@ def main(argv=None):
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
+    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
@@ -563,7 +761,7 @@ def main(argv=None):
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)
         with open(a.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)
@@ -574,14 +772,15 @@ def main(argv=None):
                 w.writerow(r)
     if agg is not None:
         os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
-        with open(a.archetypes_out, "w", encoding="utf-8") as f:
+        with open(a.archetypes_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
-    if ent is not None:
-        summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
-    print(json.dumps(summary, indent=1))
-    return 0
+    return summary
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

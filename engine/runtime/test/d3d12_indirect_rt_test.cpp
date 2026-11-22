@@ -8,6 +8,7 @@
 
 #include "../shims/d3d12_com.h"
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <cmath>
 #include <cstdint>
@@ -80,7 +81,7 @@ int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");
-        return 0;
+        return 77;  // ctest skips, as in the other GPU tests
     }
     const auto create_inst = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
     const auto enum_layers =
@@ -133,7 +134,13 @@ int main() {
     }
 
     VkInstance instance = VK_NULL_HANDLE;
-    if (create_inst(&ici, nullptr, &instance) != VK_SUCCESS) return fail("vkCreateInstance");
+    const VkResult inst_result = create_inst(&ici, nullptr, &instance);
+    if (inst_result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+        // The loader is present but there is no ICD (CI runners, headless machines): ctest skips.
+        std::printf("SKIP: no Vulkan driver (vkCreateInstance returned VK_ERROR_INCOMPATIBLE_DRIVER)\n");
+        return 77;
+    }
+    if (inst_result != VK_SUCCESS) return fail("vkCreateInstance");
     const auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"));
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance, "vkGetDeviceProcAddr"));
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
@@ -165,10 +172,11 @@ int main() {
     std::uint32_t family = 0;
     VkPhysicalDeviceProperties chosen{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    int best_rank = -1;
     for (auto cand : physicals) {
         VkPhysicalDeviceProperties props{};
         get_props(cand, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
@@ -182,7 +190,10 @@ int main() {
         get_qf(cand, &fcnt, fams.data());
         for (std::uint32_t i = 0; i < fcnt; ++i) {
             if (!(fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            // the runtime's pick: the first usable device of the highest rank (native driver over Dozen, #915)
+            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+                rank > best_rank) {
+                best_rank = rank;
                 physical = cand;
                 family = i;
                 chosen = props;
@@ -192,10 +203,13 @@ int main() {
         }
     }
     if (!physical) {
-        std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        const std::string filter = leonida::vulkan_device_filter();
+        if (filter.empty()) std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        else std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 GPU matches\n", filter.c_str());
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
-        return 0;
+        if (!filter.empty()) return 1;  // a filter matching nothing fails, never skips
+        return 77;  // ctest skips, as in the other GPU tests
     }
 
     bool rt_supported = false;
@@ -336,7 +350,8 @@ int main() {
 
         // Verify COM command-list recording of ExecuteIndirect with CountBuffer.
         D3D12_HEAP_PROPERTIES up_hp{D3D12_HEAP_TYPE_UPLOAD};
-        auto b256 = make_buf_desc(256);
+        constexpr VkDeviceSize buffer_size = 256, argument_base = 64, count_base = 128;
+        auto b256 = make_buf_desc(buffer_size);
         ID3D12Resource* arg_buf = nullptr;
         ID3D12Resource* count_buf = nullptr;
         if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &b256, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -346,21 +361,26 @@ int main() {
             return fail("CreateCommittedResource(indirect bufs)");
 
         void* p = nullptr;
-        arg_buf->Map(0, nullptr, &p);
-        auto* draws = static_cast<D3D12_DRAW_ARGUMENTS*>(p);
+        if (FAILED(arg_buf->Map(0, nullptr, &p))) return fail("Map(indirect arguments)");
+        std::memset(p, 0, buffer_size);
+        auto* draws = reinterpret_cast<D3D12_DRAW_ARGUMENTS*>(static_cast<std::uint8_t*>(p) + argument_base);
         draws[0] = {3, 1, 0, 0};
         draws[1] = {3, 1, 0, 0};
         arg_buf->Unmap(0, nullptr);
 
-        count_buf->Map(0, nullptr, &p);
-        auto* counts = static_cast<std::uint32_t*>(p);
+        if (FAILED(count_buf->Map(0, nullptr, &p))) return fail("Map(indirect count)");
+        // Counts at unadjusted offsets are deliberately reversed.
+        auto* unadjusted = static_cast<std::uint32_t*>(p);
+        unadjusted[0] = 1u;
+        unadjusted[1] = 0u;
+        auto* counts = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(p) + count_base);
         counts[0] = 0u;  // draw 0 triangles
         counts[1] = 1u;  // draw 1 fullscreen triangle
         count_buf->Unmap(0, nullptr);
 
         alloc->Reset();
         cl->Reset(alloc, nullptr);
-        cl->ExecuteIndirect(cmd_sig, 2, arg_buf, 0, count_buf, 4);
+        cl->ExecuteIndirect(cmd_sig, 2, arg_buf, argument_base, count_buf, count_base + sizeof(std::uint32_t));
         if (FAILED(cl->Close())) return fail("ExecuteIndirect COM record Close");
 
 #if defined(LEONIDA_TEST_VS_TRI_SPV) && defined(LEONIDA_TEST_FS_SOLID_SPV)
@@ -523,11 +543,14 @@ int main() {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
 
                 const auto resolver = [&](leonida::ResourceId id) -> const leonida::ResourceBinding* {
+                    // Treat the two upload buffers as backing stores for slices that start after a prefix.
                     static leonida::ResourceBinding arg_b{}, cnt_b{};
                     arg_b.buffer = rt::d3d12::vulkan_buffer(arg_buf);
-                    arg_b.size = 256;
+                    arg_b.buffer_offset = argument_base;
+                    arg_b.size = buffer_size - argument_base;
                     cnt_b.buffer = rt::d3d12::vulkan_buffer(count_buf);
-                    cnt_b.size = 256;
+                    cnt_b.buffer_offset = count_base;
+                    cnt_b.size = buffer_size - count_base;
                     if (id == rt::d3d12::resource_id(arg_buf)) return &arg_b;
                     if (id == rt::d3d12::resource_id(count_buf)) return &cnt_b;
                     return nullptr;
@@ -585,7 +608,8 @@ int main() {
             vkDestroyPipelineLayout(vk_dev, pl, nullptr);
             rb->Release();
             rt->Release();
-            std::printf("  [PASS] ExecuteIndirect with CountBuffer (count=0 skipped, count=1 rendered)\n");
+            std::printf("  [PASS] ExecuteIndirect with suballocated argument and count buffers "
+                        "(count=0 skipped, count=1 rendered)\n");
         }
 #endif
         count_buf->Release();

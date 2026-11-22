@@ -441,6 +441,136 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(pe_inspect.main([bad, "--out", os.path.join(self.dir, "reports2")]), 1)
         self.assertIn("not a PE image", err.getvalue())
 
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.dir, "test.exe")
+        self.assertTrue(pe_inspect.same_output_path(a, a))
+        b = os.path.join(self.dir, "other.exe")
+        self.assertFalse(pe_inspect.same_output_path(a, b))
+
+    def test_cli_refuses_to_overwrite_input_file_with_report(self):
+        out = os.path.join(self.dir, "reports_collision")
+        os.makedirs(out, exist_ok=True)
+        colliding_file = os.path.join(out, "sample.dll.json")
+        with open(colliding_file, "w", encoding="utf-8") as f:
+            f.write("original preserved text")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([self.image, colliding_file, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", err.getvalue())
+        with open(colliding_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "original preserved text")
+
+    def test_cli_refuses_existing_file_as_out_dir(self):
+        file_out = os.path.join(self.dir, "some_file.txt")
+        with open(file_out, "w", encoding="utf-8") as f:
+            f.write("file not dir")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.image, "--out", file_out]), 1)
+        self.assertIn("path is a file, not a directory", err.getvalue())
+
+
+OPT = 0x58   # where build_image puts the optional header
+
+
+class DirectoryCountTest(unittest.TestCase):
+    """NumberOfRvaAndSizes counts the data directories; a slot past it is not one, whatever it holds."""
+
+    def report(self, count, is64=True):
+        image = bytearray(build_image(is64=is64))
+        struct.pack_into("<I", image, OPT + (108 if is64 else 92), count)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "counted.dll")
+            with open(path, "wb") as f:
+                f.write(image)
+            return pe_inspect.inspect(path, tmp)
+
+    def test_slots_past_the_count_are_not_directories(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                # export (0) and import (1) stay; exception (3), relocations (5), TLS (9) and delay import (13)
+                # are stale bytes now
+                r = self.report(2, is64)
+                self.assertEqual(r["export_count"], 3)
+                self.assertEqual([e["kind"] for e in r["imports"]], ["normal", "normal"])
+                self.assertEqual((r["pdata_functions"], r["tls_callbacks"], r["has_relocs"]), (0, 0, False))
+
+    def test_the_count_cuts_between_two_used_slots(self):
+        r = self.report(pe_inspect.DIR_BASERELOC)          # slots 0-4: the relocation directory is the first one out
+        self.assertEqual((r["pdata_functions"], r["has_relocs"]), (3, False))
+        r = self.report(pe_inspect.DIR_BASERELOC + 1)
+        self.assertEqual((r["pdata_functions"], r["has_relocs"], r["tls_callbacks"]), (3, True, 0))
+
+    def test_a_count_above_16_reads_the_16_there_are(self):
+        full, more = self.report(16), self.report(0x1000)
+        self.assertEqual(full, more)
+        self.assertEqual((full["pdata_functions"], full["tls_callbacks"], full["has_relocs"]), (3, 2, True))
+
+    def test_no_directories(self):
+        r = self.report(0)
+        self.assertEqual((r["imports"], r["exports"], r["has_relocs"]), ([], [], False))
+
+
+class SectionSpanTest(unittest.TestCase):
+    """An RVA belongs to the section whose virtual span holds it, not to an earlier section's raw tail."""
+
+    @staticmethod
+    def two_sections(a_vsize, a_raw):
+        """`.a` at RVA 0x1000 (raw 0x200) and `.b` at RVA 0x2000 (raw 0x200 + a_raw), each with a marker."""
+        b_raw = 0x200 + a_raw
+        image = bytearray(build_image(with_directories=False)[:0x200]) + bytearray(a_raw + 0x200)
+        struct.pack_into("<H", image, 0x46, 2)                                   # NumberOfSections
+        table = OPT + 240
+        struct.pack_into("<IIII", image, table + 8, a_vsize, 0x1000, a_raw, 0x200)
+        image[table + 40:table + 48] = b".b\0\0\0\0\0\0"
+        struct.pack_into("<IIII", image, table + 48, 0x200, 0x2000, 0x200, b_raw)
+        struct.pack_into("<I", image, table + 76, 0x40000040)
+        struct.pack_into("<I", image, OPT + 56, 0x3000)                          # SizeOfImage
+        image[0x200:0x20A] = b"NAME_IN_A\0"
+        image[b_raw:b_raw + 10] = b"NAME_IN_B\0"
+        return pe_inspect.PeImage(bytes(image)), b_raw
+
+    def test_raw_data_longer_than_the_virtual_span_does_not_shadow_the_next_section(self):
+        img, b_raw = self.two_sections(a_vsize=0x1000, a_raw=0x2000)
+        self.assertEqual(img.offset(0x1000), 0x200)
+        self.assertEqual(img.offset(0x1FFF), 0x11FF)
+        self.assertEqual(img.offset(0x2000), b_raw)
+        self.assertEqual((img.string_at(0x1000), img.string_at(0x2000)), ("NAME_IN_A", "NAME_IN_B"))
+
+    def test_virtual_bytes_past_the_raw_data_have_no_file_offset(self):
+        img, _ = self.two_sections(a_vsize=0x1000, a_raw=0x400)
+        self.assertEqual(img.offset(0x13FF), 0x5FF)
+        self.assertIsNone(img.offset(0x1400))
+
+    def test_virtual_size_zero_uses_the_raw_size(self):
+        img, b_raw = self.two_sections(a_vsize=0, a_raw=0x400)
+        self.assertEqual(img.offset(0x13FF), 0x5FF)
+        self.assertIsNone(img.offset(0x1400))
+        self.assertEqual(img.offset(0x2000), b_raw)
+
+
+class LongNameTest(unittest.TestCase):
+    def test_a_long_decorated_import_name_is_read_whole(self):
+        # the section is 0x1000 bytes, so the longest name that fits after the fixtures is used: 1,200 characters
+        name = "?Long@" + "V" * 1190 + "@@QE"
+        self.assertEqual(len(name), 1200)
+        image = bytearray(build_image())
+        place(image, 0x1B00, struct.pack("<H", 0) + name.encode() + b"\0")
+        place(image, 0x1200, struct.pack("<QQ", 0x1B00, 0))                       # the first import's lookup entry
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "long.dll")
+            with open(path, "wb") as f:
+                f.write(image)
+            r = pe_inspect.inspect(path, tmp)
+        self.assertEqual(r["imports"][0]["functions"], [name])
+
+    def test_an_unterminated_name_is_still_bounded(self):
+        data = b"A" * (3 * pe_inspect.NAME_LIMIT)
+        self.assertIsNone(pe_inspect._cstring(data, 0))
+        self.assertEqual(pe_inspect._cstring(b"A" * 4096 + b"\0", 0), "A" * 4096)
+
 
 class TruncatedImageTest(unittest.TestCase):
     """A file cut off inside a header or table is a bad image, not a struct.error that stops the run."""
@@ -505,6 +635,34 @@ class TruncatedImageTest(unittest.TestCase):
         exports = pe_inspect.inspect(path, None)["exports"]
         self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
 
+
+class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
+    """Reject optional headers smaller than the fields the parser reads."""
+
+    def test_declared_optional_header_too_small(self):
+        for is64 in (False, True):
+            for declared_size in (0, 2, 71):
+                with self.subTest(is64=is64, declared_size=declared_size):
+                    data = bytearray(build_image(is64=is64))
+                    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                    struct.pack_into("<H", data, pe_offset + 20, declared_size)
+
+                    with self.assertRaisesRegex(
+                        pe_inspect.PeFormatError, "truncated optional header"
+                    ):
+                        pe_inspect.PeImage(bytes(data))
+
+    def test_declared_optional_header_extends_beyond_file(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                data = bytearray(build_image(is64=is64))
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                struct.pack_into("<H", data, pe_offset + 20, 0xFFFF)
+
+                with self.assertRaisesRegex(
+                    pe_inspect.PeFormatError, "truncated optional header"
+                ):
+                    pe_inspect.PeImage(bytes(data))
 
 if __name__ == "__main__":
     unittest.main()

@@ -358,12 +358,38 @@ def _loose_limit(nblocks):
     return max(2, nblocks // 1024)
 
 
-def _bc1_blocks(lanes, nblocks, provisional):
+def _unknown_blocks(e_roots, i_roots, unknown_e, unknown_i):
+    """Blocks whose endpoint or index history root is an unknown entry. A block can depend on one of each, and
+    it is one undetermined block, not two, against `_loose_limit`."""
+    return sum(1 for e, i in zip(e_roots, i_roots) if e in unknown_e or i in unknown_i)
+
+
+def _resolve_bc_history(codec, default_confirmed, default_provisional, history):
+    """Merge or replace BC1/BC3/BC4/BC5 history tables when external `history` is provided."""
+    loaded = _bptc.load_bc_history(codec, history)
+    if loaded is None:
+        return default_confirmed, default_provisional
+    ext_conf, ext_prov, replace = loaded
+    if replace:
+        confirmed = dict(ext_conf)
+        loose = {k: v for k, v in ext_prov.items() if k not in confirmed}
+        return confirmed, loose
+    confirmed = dict(default_confirmed)
+    confirmed.update(ext_conf)
+    loose = {k: v for k, v in default_provisional.items() if k not in confirmed}
+    for k, v in ext_prov.items():
+        if k not in confirmed:
+            loose[k] = v
+    return confirmed, loose
+
+
+def _bc1_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC1 lane 1 is non-zero (unexpected)")
     quad = _tables.BC1_QUADRANT
-    confirmed = _tables.BC1_HISTORY_CONFIRMED
-    loose = _tables.BC1_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        1, _tables.BC1_HISTORY_CONFIRMED, _tables.BC1_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     mods = (32, 64, 32, 32, 64, 32)
@@ -418,13 +444,14 @@ _BC3_MODS = (256, 256, 32, 64, 32, 32, 64, 32)
 _BC3_NONE = (128, 128, 0, 0, 0, 0, 0, 0)
 
 
-def _bc3_blocks(lanes, nblocks, provisional):
+def _bc3_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC3 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC3_ALPHA_PAIR
     quads = _tables.BC3_COLOUR_QUADRANT
-    confirmed = _tables.BC3_HISTORY_CONFIRMED
-    loose = _tables.BC3_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        3, _tables.BC3_HISTORY_CONFIRMED, _tables.BC3_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -496,12 +523,13 @@ def _bc3_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc4_blocks(lanes, nblocks, provisional):
+def _bc4_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC4 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC4_PAIR
-    confirmed = _tables.BC4_HISTORY_CONFIRMED
-    loose = _tables.BC4_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        4, _tables.BC4_HISTORY_CONFIRMED, _tables.BC4_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     l0, l2, l3 = lanes[0], lanes[2], lanes[3]
@@ -539,12 +567,13 @@ def _bc4_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc5_blocks(lanes, nblocks, provisional):
+def _bc5_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC5 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC5_PAIR
-    confirmed = _tables.BC5_HISTORY_CONFIRMED
-    loose = _tables.BC5_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        5, _tables.BC5_HISTORY_CONFIRMED, _tables.BC5_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -865,10 +894,7 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             )
         return bytes(out)
 
-    lost = (
-        sum(c for k, c in ends.items() if eclass[k] == 0)
-        + sum(c for k, c in idxs.items() if iclass[k] == 0)
-    )
+    lost = _unknown_blocks(eroot, iroot, {k for k in ends if eclass[k] == 0}, {k for k in idxs if iclass[k] == 0})
     missing = sorted(
         {f"endpoint {k}" for k in ends if eclass[k] == 0}
         | {f"index {k}" for k in idxs if iclass[k] == 0}
@@ -1238,7 +1264,8 @@ def _bc7_blocks(lanes, nblocks, provisional, *, history=None):
             er[i] = -1 if de == 0 else (256 + i - de if de > i else er[i - de])
             ir[i] = -1 if di == 0 else (256 + i - di if di > i else ir[i - di])
         counts = [(kinds, k, (er if kinds == "endpoint" else ir).count(k)) for kinds, k in unknown]
-        total = sum(c for _, _, c in counts)
+        total = _unknown_blocks(er, ir, {k for kinds, k in unknown if kinds == "endpoint"},
+                                {k for kinds, k in unknown if kinds == "index"})
         if total > _loose_limit(nblocks):
             names = ", ".join(f"{kinds} {k}" for kinds, k, _ in counts[:6])
             if len(counts) > 6:
@@ -1285,9 +1312,9 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
 
     When `allow_provisional` is False (strict mode), any unconfirmed or unknown
     built-in history reference raises `BcpackProvisionalError` and the returned
-    set is always empty. For BC6H (`codec 6`) and BC7 (`codec 7`), `history`
-    may point to a locally generated JSON file, directory, or dict supplying
-    the built-in initial history tables.
+    set is always empty. `history` may point to a locally generated JSON file,
+    directory, or dict supplying initial history tables for BC6H/BC7 (and
+    optional overrides for BC1-BC5).
     """
     rebuilder = _REBUILDERS.get(codec)
     if rebuilder is None:
@@ -1296,10 +1323,7 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None
-    if codec in (6, 7):
-        data = rebuilder(lanes, nblocks, prov, history=history)
-    else:
-        data = rebuilder(lanes, nblocks, prov)
+    data = rebuilder(lanes, nblocks, prov, history=history)
     return data, (prov if prov is not None else set())
 
 

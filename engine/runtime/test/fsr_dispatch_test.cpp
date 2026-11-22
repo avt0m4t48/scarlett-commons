@@ -4,8 +4,9 @@
 //
 //   LEONIDA_GAME_DIR=<package root>   (contains amd_fidelityfx_upscaler_xbox.dll)
 //   LEONIDA_FSR_WARP=1                (optional: use the WARP adapter instead of the default hardware adapter)
+//   LEONIDA_FSR_DEVICE=vulkan         (optional: use the Vulkan-backed ID3D12Device instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // Steps, each one only if the previous worked:
 //   1. map: the console imports bind to the shims and nothing is unimplemented
@@ -27,7 +28,7 @@
 // driver refuses one of its textures (DXGI_FORMAT_R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS); on WARP the
 // context is created as is. The other backend ids are controls: they end in FFX_API_RETURN_ERROR before the device
 // is touched. In step 7 the dispatch is recorded up to the DLL's compute pipeline, which a PC device cannot create
-// (slot 67 is console-only and refused; slot 62's code is not a PC shader). The INFO lines are the measurement; the
+// (slot 67 and 62 codes are not PC shaders). The INFO lines are the measurement; the
 // PASS/FAIL checks only cover what is known to work.
 #include <windows.h>
 
@@ -45,6 +46,9 @@
 #include <utility>
 
 #include "../shims/d3d12_xs_device.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/d3d12_com.h"
+#endif
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
 #include "ffx_api_min.h"
@@ -620,7 +624,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "amd_fidelityfx_upscaler_xbox.dll";
@@ -722,8 +726,20 @@ int main() {
         check(!c.faulted && c.rc == ffx::RETURN_OK && rw == 2560 && rh == 1440, "QUALITY at 3840x2160 renders at 2560x1440");
 
         // 5/6 need a device.
-        ID3D12Device* pc = create_pc_device(env("LEONIDA_FSR_WARP") == "1");
-        check(pc != nullptr, "PC D3D12 device created");
+        ID3D12Device* pc = nullptr;
+        const bool on_vulkan = env("LEONIDA_FSR_DEVICE") == "vulkan";
+        if (on_vulkan) {
+#ifdef LEONIDA_VULKAN_DEVICE
+            const HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
+                                                                           reinterpret_cast<void**>(&pc));
+            note("LEONIDA_FSR_DEVICE=vulkan -> " + hex(static_cast<uint32_t>(vhr)));
+#else
+            check(false, "LEONIDA_FSR_DEVICE=vulkan needs a build with the Vulkan SDK (gta6rt_d3d12_com)");
+#endif
+        } else {
+            pc = create_pc_device(env("LEONIDA_FSR_WARP") == "1");
+        }
+        check(pc != nullptr, on_vulkan ? "Vulkan-backed D3D12 device created" : "PC D3D12 device created");
         if (!pc) return 1;
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device), &proxy);
@@ -942,16 +958,20 @@ int main() {
                     note("  device slot 62 (compute pipeline from a D3D12_COMPUTE_PIPELINE_STATE_DESC) called " +
                          std::to_string(g_slot62_calls) + "x, last HRESULT " + hex(static_cast<uint32_t>(g_slot62_hr)));
                     if (g_formatted) note("  the DLL formatted HRESULT " + hex(g_first_formatted));
-                    // On a PC device both pipeline paths fail (67 is refused, 62's code is not a PC shader), the
-                    // dispatch goes on with a null pipeline and faults when it records it (RVA 0x65ff reads the
-                    // pipeline's +0x10, the same pointer it passes to SetPipelineState):
-                    // the documented end of what a PC device can run, not a test failure.
+                    // On a PC device both pipeline paths fail (neither slot 67's nor 62's code is a PC shader); on the
+                    // Vulkan device CreateRootSignature (slot 16) is not implemented yet. Either way the dispatch goes
+                    // on with a null pipeline and faults when it records it (RVA 0x65ff reads the pipeline's +0x10,
+                    // the same pointer it passes to SetPipelineState): a documented stop, not a test failure.
                     pipeline_stop = c.faulted && c.code == EXCEPTION_ACCESS_VIOLATION && g_slot62_calls > 0 &&
                                     FAILED(g_slot62_hr);
+                    const bool vulkan_stop = on_vulkan && c.faulted && c.code == EXCEPTION_ACCESS_VIOLATION;
                     if (pipeline_stop)
                         note("ffxDispatch stopped where the PC refused the DLL's compute pipeline, not a crash");
-                    check(!c.faulted || pipeline_stop || (c.code == kMsvcCppException && g_formatted > 0),
-                          "ffxDispatch returns, or stops at a documented PC limit");
+                    else if (vulkan_stop)
+                        note("ffxDispatch stopped where the Vulkan device returned E_NOTIMPL for CreateRootSignature");
+                    check(!c.faulted || pipeline_stop || vulkan_stop ||
+                              (c.code == kMsvcCppException && g_formatted > 0),
+                          "ffxDispatch returns, or stops at a documented limit");
                     note("ffxDispatch: device slots below are the ones it called");
                     print_list_hits();
                     note("command list Close -> " + hex(static_cast<uint32_t>(list->Close())));

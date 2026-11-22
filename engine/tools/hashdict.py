@@ -3,9 +3,11 @@
 Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs everywhere), shader names, and
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
+The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
+      <carve dir> holds one folder per archive (<work>/carve), or is one archive's folder (<work>/carve/common).
     python -I hashdict.py --lookup <hashes.json> 0x28cca8df ...
 """
 import argparse
@@ -16,6 +18,9 @@ import sys
 
 # A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
 STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# For --min below 3 the run matcher must also accept one- and two-character identifiers, so the same
+# identifier syntax (first byte [A-Za-z_], the rest of the run [A-Za-z0-9_./:\\-]) is used with no minimum tail.
+SHORT_STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]*")
 # A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
 # The old pattern cut every run at 201 characters, so no entry was ever longer than this.
 MAX_NAME_LEN = 201
@@ -37,7 +42,8 @@ def joaat(s: str) -> int:
 
 
 def harvest(data: bytes, out: set, minlen: int):
-    for m in STR.finditer(data):
+    run = STR if minlen >= 3 else SHORT_STR
+    for m in run.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
             if len(s) <= MAX_NAME_LEN:
@@ -87,11 +93,38 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
+    # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
+    if os.path.isfile(os.path.join(a.carve, "index.json")):
+        archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
+    else:
+        archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
+    # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
+    # samefile also catches a case-only difference on Windows and macOS's default volume.
+    if os.path.exists(a.out):
+        inputs = [x for x in a.extra if os.path.isfile(x)]
+        inputs += [os.path.join(d, "index.json") for _, d in archives]
+        for x in inputs:
+            try:
+                same = os.path.isfile(x) and os.path.samefile(a.out, x)
+            except OSError:
+                same = False
+            if same:
+                print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
+                      file=sys.stderr)
+                return 2
+    # A report can also alias a harvested <offset>.bin, including through a hard link.
+    # Snapshot its file identity once; compare against the input's already-open handle
+    # rather than statting every carve path (there may be millions of entries).
+    try:
+        output_stat = os.stat(a.out)
+    except OSError:
+        output_stat = None
     strings = set()
     full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
-    for arch in sorted(os.listdir(a.carve)):
-        p = os.path.join(a.carve, arch, "index.json")
+    for arch, arch_dir in archives:
+        p = os.path.join(arch_dir, "index.json")
         if not os.path.isfile(p):
             continue
         try:
@@ -108,9 +141,13 @@ def main():
                 continue
             meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
             if arch in full or meta:
-                blob = os.path.join(a.carve, arch, f"{r['off']:012x}.bin")
+                blob = os.path.join(arch_dir, f"{r['off']:012x}.bin")
                 try:
                     with open(blob, "rb") as f:
+                        if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):
+                            print(f"ERROR: --out {a.out} is one of the inputs ({blob}); choose another output file",
+                                  file=sys.stderr)
+                            return 2
                         data = f.read()
                 except OSError:
                     missing.append(blob)
@@ -126,14 +163,15 @@ def main():
                 for fn in files:
                     strings.add(os.path.splitext(fn)[0])
         elif os.path.isfile(x):
-            harvest(open(x, "rb").read(), strings, a.min)
+            with open(x, "rb") as f:
+                harvest(f.read(), strings, a.min)
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
     # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
     try:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(d, f)
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
@@ -143,4 +181,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

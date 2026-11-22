@@ -135,9 +135,10 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
             if name == "cs_cmpx_class_f32":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CMPX_CLASS_WORDS)) + "\n"
-            if name == "cs_global_neg_offset":
-                self.assertEqual(args[0], "40")
-                return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
+            if name in {n for n, _, _ in check.GLOBAL_OFFSET}:
+                groups, words = next((g, w) for n, g, w in check.GLOBAL_OFFSET if n == name)
+                self.assertEqual(args[0], groups)
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"

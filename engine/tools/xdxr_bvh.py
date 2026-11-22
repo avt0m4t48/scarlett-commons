@@ -737,15 +737,31 @@ def _case_names(directory):
     return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
 
 
+class CaseError(Exception):
+    """A <case>.json / <case>.bin pair that is missing, unreadable or not a case description."""
+
+
 def _load_case(directory, name):
+    """desc, data for one <name>.json and <name>.bin pair. CaseError names the .json at fault: any *.json in the
+    directory counts as a case (check-build is run on a build folder that may hold other reports), so a stray or
+    half-written file there must say which one it is, not end in a traceback."""
     import json
-    with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
-        desc = json.load(fh)
-    with open(f"{directory}/{name}.bin", "rb") as fh:
-        data = fh.read()
+    js = f"{directory}/{name}.json"
     fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
-    if desc["kind"] == "blas":
-        desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+    try:
+        with open(js, encoding="utf-8") as fh:
+            desc = json.load(fh)
+        with open(f"{directory}/{name}.bin", "rb") as fh:
+            data = fh.read()
+        kind = desc["kind"]
+        if kind == "blas":
+            desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+        elif kind != "tlas":
+            raise CaseError(f"{js}: kind {kind!r} is neither 'blas' nor 'tlas'")
+    except KeyError as error:
+        raise CaseError(f"{js}: the case has no {error} key") from None
+    except (OSError, ValueError, TypeError, IndexError) as error:
+        raise CaseError(f"{js}: {error}") from None
     return desc, data
 
 
@@ -881,7 +897,14 @@ def main(argv=None):
         if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
-        problems = check_build(a.dir, a.rays)
+        try:
+            problems = check_build(a.dir, a.rays)
+        except CaseError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        except (KeyError, ValueError, IndexError, TypeError) as error:
+            print(f"ERROR: a case in {a.dir} does not describe a build: {error}", file=sys.stderr)
+            return 2
         for e in problems:
             print(e)
         print("all cases match" if not problems else f"{len(problems)} problems")

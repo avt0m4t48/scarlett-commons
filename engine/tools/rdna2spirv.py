@@ -6618,15 +6618,27 @@ class Gen:
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
                 raise Unsupported(op + " form")
+            vsel = "p0"
             if op == "v_interp_mov_f32":
                 sel = a[1] if len(a) > 1 else None
-                if not (sel and sel.get("k") == "interp" and sel.get("t") == "p0"):
-                    what = sel.get("t") if sel is not None and sel.get("k") == "interp" else "operand"
-                    raise Unsupported(f"v_interp_mov_f32 vertex select {what}: only p0 is modelled")
+                vsel = sel.get("t") if sel is not None and sel.get("k") == "interp" else "operand"
+                if vsel not in ("p0", "p10", "p20"):
+                    raise Unsupported(f"v_interp_mov_f32 vertex select {vsel}")
             else:
                 self.interp_pair_src(op, a, ins)
-            f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32", ij=self.interp_weights(ins))
-            if self.pixel_interpolants is not None and (self.pixel_interpolants[1] >> attr["a"]) & 1:
+            half16 = self.pixel_interpolants is not None and (self.pixel_interpolants[1] >> attr["a"]) & 1
+            if vsel != "p0":
+                # P10 = P1 - P0 and P20 = P2 - P0, the deltas the hardware keeps beside P0 for the p1/p2 pair
+                # (RDNA2 ISA, VINTRP: D = {P10, P20, P0}[S]): one f32 subtraction of the PerVertexKHR words.
+                if attr["a"] not in self.per_vertex:
+                    raise Unsupported(f"v_interp_mov_f32 vertex select {vsel} without per-vertex inputs")
+                if half16:
+                    raise Unsupported(f"v_interp_mov_f32 vertex select {vsel} of a 16-bit interpolant")
+                f = self.attribute(attr["a"], attr["c"], vertex_delta=1 if vsel == "p10" else 2)
+            else:
+                f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32",
+                                   ij=self.interp_weights(ins))
+            if half16 and vsel == "p0":
                 # 16-bit interpolant (FSSM table flag bit 4) read through a 32-bit op: the stored value only
                 # has f16 precision, so round to nearest f16 and back. Reads through the *_f16 opcodes already
                 # narrow to f16 and are unchanged.
@@ -8771,7 +8783,7 @@ class Gen:
         self.emit(f"{t} = OpBitcast %float {u}")
         return t
 
-    def attribute(self, n, comp, flat=False, half=None, ij=None):
+    def attribute(self, n, comp, flat=False, half=None, ij=None, vertex_delta=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
 
         An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
@@ -8779,6 +8791,7 @@ class Gen:
         word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
         BaryCoordKHR.y, .z, or vertex 0's taken when `flat`. `ij` overrides the weights with the given SPIR-V
         values (computed-I/J sites, SHADER-177: the pair the program wrote into the operand registers).
+        `vertex_delta` 1/2 returns P1 - P0 / P2 - P0 instead (v_interp_mov_f32 p10/p20; n must be in per_vertex).
 
         --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
@@ -8817,6 +8830,10 @@ class Gen:
             pv.append(v)
         if flat:
             return pv[0]
+        if vertex_delta is not None:
+            d = self.tmp()
+            self.emit(f"{d} = OpFSub %float {pv[vertex_delta]} {pv[0]}")
+            return d
         if ij is not None:
             i, j = ij
         else:
@@ -11404,10 +11421,13 @@ def translate(path):
         f16_read = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
                                                                   "v_interp_p2_f16")
                     for x in i["args"] if x["k"] == "attr"}
+        mov_delta = {x["a"] for i in insns if base_op(i["op"]) == "v_interp_mov_f32"
+                     and any(x.get("k") == "interp" and x.get("t") in ("p10", "p20") for x in i["args"])
+                     for x in i["args"] if x["k"] == "attr"}
         if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
             g.f16_halves = f16_read
         elif not BARY_FALLBACK:
-            g.per_vertex = f16_read
+            g.per_vertex = f16_read | mov_delta
         for r in layout:
             g.cu(r)
         # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the

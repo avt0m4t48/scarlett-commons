@@ -1146,6 +1146,7 @@ def run_suite(a, work: str) -> int:
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
                 # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
                 "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3F800000),
+                "ps_far_branch": (0x00000007, 0x00000013, 0x00000051, 0x0000000B),   # far branches (.asm header)
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
                 "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),

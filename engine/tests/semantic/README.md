@@ -10,7 +10,8 @@ not a regression test. `tests/test_semantic_translator_use.py` enforces this; th
 files whose subject is hand-written SPIR-V are listed there with a reason. The guard checks that a file reaches the
 translator, not that every assertion depends on it.
 
-What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
+What they check (`tools/rdna2spirv.py` on pixel, vertex, compute and other stages, wave32 and wave64, mostly one
+instruction family per file; the list below describes some of them, not every file):
 
 - `test_ps_semantics.py` translates `ps_sdwa`, `ps_ops`, `ps_ops2`, `ps_ops3`, `ps_ops4` and `ps_legacy_mul` and
   *executes* the SPIR-V with `spirv_mini_interp.py`, then compares every `mrt0` word with the expected value. Each

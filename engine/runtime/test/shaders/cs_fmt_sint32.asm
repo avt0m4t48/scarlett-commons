@@ -3,9 +3,8 @@
 ; MTBUF loads at out[12..23] use a bound 32_FLOAT descriptor and take width and identity selectors from the
 ; instruction (XY00, XYZ0, XYZW). D16 loads at out[24..27] check signed saturation, including -3, for both forms.
 ; Single-channel SINT MUBUF/MTBUF loads place -3 in out[28..29].
-; MUBUF stores at 0x90/0xa0/0xb0 write the low 2/3/4 original words, except that a two-component format takes channels x and w
-; through a V#, so the _xy store at 0x90 into 32_32_SINT writes (x, 0) (gfx1150 and gfx1036, #2022; was (x, y) before). The D16 store at 0xc0 sign-extends
-; 0xfffd to a dword and, being two-component, writes 0 for y (that d16 form is unmeasured on RDNA2). The single-channel store at 0xc8 writes -3. Unwritten words retain 0xeeeeeeee.
+; MUBUF stores at 0x90/0xa0/0xb0 write the low 2/3/4 original words. The D16 store at 0xc0 sign-extends
+; 0xfffd and 0x8000 to dwords. The single-channel store at 0xc8 writes -3. Unwritten words retain 0xeeeeeeee.
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v1, 0x80000000
 v_mov_b32_e32 v2, 0x7fffffff
@@ -65,8 +64,8 @@ tbuffer_load_format_x v9, v5, s[4:7], 0 format:[BUF_FMT_32_SINT] offen offset:8
 v_mov_b32_e32 v6, 0x70
 buffer_store_dwordx2 v[8:9], v6, s[0:3], 0 offen
 
-; MUBUF store via format 63.
-s_mov_b32 s7, 0x3103ffac
+; MUBUF store via format 63 (DST_SEL XY01, standard 2-component RG).
+s_mov_b32 s7, 0x3103f22c
 v_mov_b32_e32 v6, 0x90
 buffer_store_format_xy v[1:2], v6, s[4:7], 0 offen
 
@@ -81,7 +80,7 @@ v_mov_b32_e32 v6, 0xb0
 buffer_store_format_xyzw v[1:4], v6, s[4:7], 0 offen
 
 ; A signed packed store must extend both halves.
-s_mov_b32 s7, 0x3103ffac
+s_mov_b32 s7, 0x3103f22c
 v_mov_b32_e32 v6, 0xc0
 v_mov_b32_e32 v7, 0x8000fffd
 buffer_store_format_d16_xy v7, v6, s[4:7], 0 offen

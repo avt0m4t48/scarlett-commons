@@ -865,6 +865,17 @@ class Ieee754SpecialValuesShaderExecutionTests(unittest.TestCase):
         got_ninf_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_POS_INF, H_NEG_INF) & 0xFFFF
         self.assertEqual(got_ninf_clamp, H_POS_ZERO)
 
+    def test_vop3_omod_and_clamp(self):
+        # 1.5 - 1.0 = 0.5. mul:2 scales to 1.0.
+        got = run("v_subrev_f16_e64 v0, v1, v2 mul:2", H_ONE, f2h(1.5)) & 0xFFFF
+        self.assertEqual(got, H_ONE)
+        # 2.0 - 1.0 = 1.0. div:2 scales to 0.5.
+        got_div = run("v_subrev_f16_e64 v0, v1, v2 div:2", H_ONE, H_TWO) & 0xFFFF
+        self.assertEqual(got_div, H_HALF)
+        # 1.5 - 1.0 = 0.5. mul:4 scales to 2.0, clamp saturates to 1.0.
+        got_clamp = run("v_subrev_f16_e64 v0, v1, v2 mul:4 clamp", H_ONE, f2h(1.5)) & 0xFFFF
+        self.assertEqual(got_clamp, H_ONE)
+
 
 if __name__ == "__main__":
     unittest.main()

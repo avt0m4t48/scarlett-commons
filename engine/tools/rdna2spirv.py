@@ -6779,6 +6779,7 @@ class Gen:
             # VOP3 has bits [31:26] = 0b110101 (0x35): 8 bytes without a literal or 12 bytes with a 32-bit literal.
             # VOP2 has bit 31 = 0: 4 bytes or 8 bytes with a literal/SDWA/DPP. LLVM 21 prints VOP3 16-bit integer
             # ops without the _e64 suffix, so check the VOP3 prefix rather than byte length alone.
+            # v_add_i16 / v_sub_i16 are strictly VOP3.
             enc = ins.get("enc")
             e64 = ins["op"].endswith("_e64") or (bool(enc) and len(enc) >= 16 and (int(enc[6:8], 16) >> 2) == 0x35)
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
@@ -6845,6 +6846,8 @@ class Gen:
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             if e64 and sb[2]:
                 # op_sel destination bit: the result goes to the high half, the low half is kept.
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported("op_sel destination")
                 old, keep, sh16, v = (self.tmp() for _ in range(4))
                 self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
                 self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")

@@ -64,6 +64,32 @@ class CacheTest(unittest.TestCase):
                 bink_play.load_names(archive, mount, use_cache=False)
                 self.assertEqual(len(calls), 3, "--no-cache names again")
 
+    def test_a_different_mount_source_names_the_streams_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, old, new = d / "movies.rpf", d / "old.xml", d / "new.xml"
+            archive.write_bytes(b"x" * 16)
+            old.write_bytes(b"<old/>")
+            new.write_bytes(b"<new/>")
+            cache = d / "cache" / "bink_names.csv"
+
+            def fake_names(argv):
+                name = "OLD.bk2" if Path(argv[argv.index("--mount") + 1]).name == "old.xml" else "NEW.bk2"
+                Path(argv[argv.index("--out") + 1]).write_text(
+                    "source,offset,size,path,confidence,width,height,frames\n"
+                    f"movies.rpf,4096,10,Stinger/{name},anchored,3840,2160,450\n", encoding="utf-8", newline="\n")
+                return 0
+
+            with mock.patch.object(bink_play, "cache_path", return_value=cache), \
+                    mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names):
+                self.assertEqual(bink_play.load_names(archive, old)[0][0], "Stinger/OLD.bk2")
+                self.assertEqual(bink_play.load_names(archive, new)[0][0], "Stinger/NEW.bk2",
+                                 "names from another mount source are not served from the cache")
+                # a table written before the mount source was part of the key is a miss, not a crash
+                cache.write_text("# " + bink_play.stamp(archive) + "\npath,offset,width,height,frames\n"
+                                 "Stinger/STALE.bk2,4096,3840,2160,450\n", encoding="utf-8", newline="\n")
+                self.assertEqual(bink_play.load_names(archive, new)[0][0], "Stinger/NEW.bk2")
+
 
 if __name__ == "__main__":
     unittest.main()

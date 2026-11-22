@@ -11,7 +11,8 @@ Usage:
 
 ``--game-dir`` defaults to ``LEONIDA_GAME_DIR``. Naming the streams takes about half a minute, so the name table
 (names, offsets and frame sizes only, no movie data) is kept in ``%LOCALAPPDATA%\\Leonida\\bink_names.csv`` and rebuilt
-when the archive changes; ``--no-cache`` skips it. The names are a local work product: don't commit or post them.
+when the archive or the mount source changes; ``--no-cache`` skips it. The names are a local work product: don't
+commit or post them.
 """
 import argparse
 import csv
@@ -39,7 +40,7 @@ def stamp(archive):
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
     cache = cache_path()
-    key = stamp(archive)
+    key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
     if use_cache and cache.is_file():
         with cache.open(encoding="utf-8", newline="") as f:
             first = f.readline().rstrip("\r\n")

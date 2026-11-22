@@ -1587,6 +1587,7 @@ public:
                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
         HRESULT support = device_.check_image_support(create.info);
         if (FAILED(support)) return support == E_INVALIDARG ? E_NOTIMPL : support;
+        device_.share(create.info);
         auto sparse = std::make_shared<leonida::SparseResource>(device_.info.device, vk);
         const auto result = vk.vkCreateImage(device_.info.device, &create.info, nullptr, &sparse->image);
         if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return E_NOTIMPL;

@@ -44,19 +44,24 @@ def events(chunk: bytes) -> list:
 
 
 def iter_banks(fh, size: int):
-    """Every `ADAT` bank of an open file in offset order; bytes inside a parsed bank are not searched."""
-    pos = 0
+    """Every `ADAT` bank of an open file in offset order; bytes inside a parsed bank are not searched.
+
+    The file is searched a window at a time, and a window is kept while the next search starts inside it, so a
+    run of small banks is read about once and not once per bank.
+    """
+    base, buf, pos = 0, b"", 0
     while pos < size:
-        fh.seek(pos)
-        buf = fh.read(WINDOW + 3)           # +3: a magic that starts in this window and ends in the next
-        bank, at = None, buf.find(b"ADAT")
+        if not (buf and base <= pos < base + WINDOW):
+            fh.seek(pos)
+            base, buf = pos, fh.read(WINDOW + 3)    # +3: a magic that starts in this window and ends in the next
+        bank, at = None, buf.find(b"ADAT", pos - base)
         while 0 <= at < WINDOW:
-            bank = parse_adat_at_file(fh, pos + at, size)
+            bank = parse_adat_at_file(fh, base + at, size)
             if bank is not None:
                 break
             at = buf.find(b"ADAT", at + 4)
         if bank is None:
-            pos += WINDOW
+            pos = base + WINDOW
             continue
         yield bank
         pos = max(bank["end"], bank["offset"] + 4)

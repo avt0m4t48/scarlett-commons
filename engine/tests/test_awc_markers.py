@@ -156,6 +156,25 @@ class ScanTest(unittest.TestCase):
         report = awc_markers.scan(self.write("edge.rpf", b"\0" * (awc_markers.WINDOW - 2) + bank))
         self.assertEqual((report["banks"], report["other"]["events"]), (1, 1))
 
+    def test_many_small_banks_are_read_about_once(self):
+        class Counting(io.BytesIO):
+            total = 0
+
+            def read(self, n=-1):
+                buf = super().read(n)
+                self.total += len(buf)
+                return buf
+
+        bank = speech_bank(3, 64, event(TICK, 1.0, 2))
+        totals = {}
+        for count in (128, 512):
+            fh = Counting(bank * count)
+            self.assertEqual(sum(1 for _ in awc_markers.iter_banks(fh, len(bank) * count)), count)
+            totals[count] = fh.total
+        # Four times the banks: about four times the bytes. Reading a fresh window per bank gave 16 times.
+        self.assertLess(totals[512], 5 * totals[128])
+        self.assertLess(totals[512], 8 * len(bank) * 512)
+
     def test_directory_and_report_file(self):
         folder = os.path.join(self.tmp.name, "banks", "nested")
         os.makedirs(folder)

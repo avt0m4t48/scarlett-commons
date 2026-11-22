@@ -721,6 +721,8 @@ struct OcclusionResult {
 // A D3D12 query heap on Vulkan. The host tracks which queries hold a result. A resolve of a query that
 // was never ended writes zeros instead of waiting on it.
 struct QueryPool {
+    // Null for a stream-output statistics heap: the layer has no stream output (PSOs with StreamOutput entries are
+    // refused), so every SO_STATISTICS_STREAMn query counts 0 written and 0 needed, and a resolve fills zeros.
     VkQueryPool pool = VK_NULL_HANDLE;
     std::uint32_t heap_type = 0;  // d3d12_query_heap
     std::uint32_t count = 0;
@@ -2121,7 +2123,8 @@ inline void plan_statistics_segments(PreparedList& out) {
         const Command& command = out.list->commands()[i];
         const auto range = query_range(command);
         if (std::holds_alternative<ResolveQueries>(command)) {
-            if (begin && range.type != d3d12_query::timestamp)
+            // A stream-output resolve only fills zeros (no dispatch), so it needs no split.
+            if (begin && range.type != d3d12_query::timestamp && !is_so_statistics(range.type))
                 inner.push_back({&query.statistics_end, &query.statistics_begin});
         } else if (range.type == d3d12_query::pipeline_statistics) {
             if (std::holds_alternative<BeginQuery>(command)) {
@@ -2646,6 +2649,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else if (range.type == d3d12_query::binary_occlusion) {
                     overlaps |= begin && (ordinary_active || binary_active);
                     if (begin) ++binary_active; else --binary_active;
+                } else if (is_so_statistics(range.type)) {
+                    // No Vulkan query runs for it (QueryPool::pool is null), so it overlaps nothing.
                 } else {
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
@@ -2918,6 +2923,9 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         begin_statistics();
         return;
     }
+    // A heap without a Vulkan pool (stream-output statistics: the layer has no stream output) runs nothing for
+    // BeginQuery and EndQuery; its resolves were planned as zero fills.
+    if (!heap.pool && !std::holds_alternative<ResolveQueries>(command)) return;
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
         const bool precise = begin->type == d3d12_query::occlusion && heap.precise;

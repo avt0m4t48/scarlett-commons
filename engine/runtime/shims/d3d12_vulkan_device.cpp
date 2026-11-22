@@ -3726,7 +3726,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, Devic
 // A query heap: one VkQueryPool, registered with the context so that lists can resolve it by ID
 // (docs/d3d12_vulkan.md section 4.6). Occlusion heaps hold both OCCLUSION and BINARY_OCCLUSION queries; timestamp
 // and copy-queue timestamp heaps are timestamp pools; pipeline-statistics heaps count all eleven Vulkan
-// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS.
+// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS. Stream-output
+// statistics heaps have no pool: without stream output every such query is zero.
 class QueryHeap final
     : public Child<QueryHeap, ID3D12QueryHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12QueryHeap> {
@@ -3737,9 +3738,9 @@ public:
     explicit QueryHeap(DeviceState& device) : device_(device) {}
 
     ~QueryHeap() override {
-        if (!pool_) return;
+        if (!registered_) return;
         device_.context->remove_query_pool(id());
-        device_.context->vk.vkDestroyQueryPool(device_.info.device, pool_, nullptr);
+        if (pool_) device_.context->vk.vkDestroyQueryPool(device_.info.device, pool_, nullptr);
     }
 
     leonida::QueryHeapId id() const { return query_heap_id(this); }
@@ -3760,6 +3761,12 @@ public:
             }
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
+        case h::so_statistics:
+            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
+            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
+            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
+            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
+            return register_pool(desc);
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -3769,7 +3776,7 @@ public:
             info.pipelineStatistics = kPipelineStatistics;
             break;
         default:
-            // Stream output, video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            // Video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
             log_once("query heap type not supported:", desc.Type);
             return E_NOTIMPL;
         }
@@ -3777,6 +3784,11 @@ public:
             pool_ = VK_NULL_HANDLE;
             return E_OUTOFMEMORY;
         }
+        return register_pool(desc);
+    }
+
+private:
+    HRESULT register_pool(const D3D12_QUERY_HEAP_DESC& desc) {
         leonida::QueryPool pool{};
         pool.pool = pool_;
         pool.heap_type = desc.Type;
@@ -3784,10 +3796,10 @@ public:
         pool.precise = device_.info.occlusion_query_precise;
         pool.ended.assign(desc.Count, false);
         device_.context->add_query_pool(id(), pool);
+        registered_ = true;
         return S_OK;
     }
 
-private:
     // VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400):
     // IAVertices, IAPrimitives, VSInvocations, GSInvocations, GSPrimitives, CInvocations, CPrimitives,
     // PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
@@ -3795,7 +3807,8 @@ private:
     static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
 
     DeviceState& device_;
-    VkQueryPool pool_ = VK_NULL_HANDLE;
+    VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
+    bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.

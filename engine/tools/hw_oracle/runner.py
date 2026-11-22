@@ -124,26 +124,6 @@ def find_cc():
     raise Unavailable("no C compiler for hw_oracle.c: MinGW gcc or Visual Studio's C++ tools (set LEONIDA_HOST_CC)")
 
 
-def _batch_path(path):
-    """A spelling of path that cmd.exe reads correctly from a batch file. cmd.exe decodes a batch file with the OEM
-    code page, so a path with non-ASCII letters (a user folder named in Cyrillic, say) goes in as its 8.3 short
-    name, which is ASCII. A file that doesn't exist yet (the .exe) keeps its own name under a shortened folder;
-    a volume with 8.3 names turned off keeps the long path."""
-    if path.isascii() or os.name != "nt":
-        return path
-    import ctypes
-    head, tail = path, ""
-    while head and not os.path.exists(head):
-        head, part = os.path.split(head)
-        if not part:
-            break
-        tail = os.path.join(part, tail) if tail else part
-    buf = ctypes.create_unicode_buffer(32768)
-    n = ctypes.windll.kernel32.GetShortPathNameW(head, buf, len(buf)) if head else 0
-    short = buf.value if 0 < n < len(buf) else head
-    return os.path.join(short, tail) if tail else short
-
-
 def build_command(kind, cc, src, out, workdir):
     """argv that compiles src into out; MSVC's objects and the vcvars script go to workdir."""
     if kind == "gcc":
@@ -156,10 +136,10 @@ def build_command(kind, cc, src, out, workdir):
     installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                              "Microsoft Visual Studio", "Installer")
     script = os.path.join(workdir, "build_hw_oracle.cmd")
-    # The script's paths can hold the user folder; until 2026-11-22 an "ascii" write raised UnicodeEncodeError there.
-    cl = ["cl", "/nologo", "/O1", _batch_path(src), f"/Fe{_batch_path(out)}", f"/Fo{os.path.join(_batch_path(workdir), '')}"]
-    with open(script, "w", encoding="oem" if os.name == "nt" else "utf-8", newline="\n") as f:
-        f.write(f'@echo off\r\nset "PATH={_batch_path(installer)};%PATH%"\r\ncall "{_batch_path(cc)}" >nul || exit /b 1\r\n'
+    # Written as UTF-8, with chcp 65001 so cmd.exe reads it as UTF-8 on any console code page: the checkout, %TEMP%
+    # and Visual Studio paths in here reach cl intact when one has a character outside ASCII (a user name, say).
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f'@echo off\r\nchcp 65001 >nul\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
                 + subprocess.list2cmdline(cl) + "\r\n")
     return ["cmd.exe", "/d", "/c", script]
 
@@ -222,8 +202,9 @@ class Oracle:
             # cl appends .exe to an /Fe name without one, so the temporary name keeps the extension last
             tmp = exe[:-4] + f".{os.getpid()}.exe" if os.name == "nt" else exe + f".{os.getpid()}"
             kind, cc = find_cc()
+            # The compiler's messages are only quoted in the error below; one in another code page must not raise.
             r = subprocess.run(build_command(kind, cc, src, tmp, self.workdir), capture_output=True, text=True,
-                               cwd=self.workdir)
+                               encoding="utf-8", errors="replace", cwd=self.workdir)
             if r.returncode:
                 # cl reports compile errors on stdout
                 raise Unavailable("hw_oracle.c did not build: " + (r.stderr.strip() or r.stdout.strip())[:300])

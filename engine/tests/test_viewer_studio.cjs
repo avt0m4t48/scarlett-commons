@@ -16,19 +16,36 @@ function fakeElement() {
     };
 }
 
+class Vector3 { set() { return this; } sub() { return this; } }
+
 function loadStudio() {
-    const elements = new Map();
+    const elements = new Map(), loads = [], alerts = [];
     const document = {
         getElementById: id => elements.get(id) ?? elements.set(id, fakeElement()).get(id),
         createElement: fakeElement,
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, localStorage: { getItem: () => null }, window: {},
-        THREE: { MeshStandardMaterial: class {}, MeshNormalMaterial: class {} },
+        document, localStorage: { getItem: () => null }, window: {}, setTimeout() {},
+        alert: message => alerts.push(message), console: { error() {} },
+        THREE: {
+            MeshStandardMaterial: class {}, MeshNormalMaterial: class {}, Vector3,
+            Box3: class { setFromObject() { return this; } getCenter(v) { return v; } getSize(v) { return v; } },
+            GLTFLoader: class { load(url, onLoad, onProgress, onError) { loads.push({ url, onLoad, onError }); } },
+        },
     });
     vm.runInContext(script, context);
-    return { context, elements, run: code => vm.runInContext(code, context) };
+    vm.runInContext(`
+        scene = { objects: new Set(), add(o) { this.objects.add(o); }, remove(o) { this.objects.delete(o); } };
+        camera = { position: new THREE.Vector3() };
+        controls = { target: new THREE.Vector3(), update() {} };`, context);
+    return { context, elements, loads, alerts, run: code => vm.runInContext(code, context) };
+}
+
+function fakeModel() {
+    const geometry = { attributes: { position: { count: 3 } }, index: null };
+    const mesh = { isMesh: true, geometry, material: {}, userData: {} };
+    return { position: new Vector3(), traverse(visit) { visit(this); visit(mesh); } };
 }
 
 const HOSTILE = '"><img src=x onerror=alert(1)>';
@@ -63,4 +80,20 @@ test('hostile model and texture file names render as text, not as elements or at
         assert.deepEqual(tagShape(hostile), tagShape(render('plain name')));
         assert.ok(visibleText(hostile).includes(HOSTILE), `${render.name} must still show the name`);
     }
+});
+
+test('a download that finishes or fails after a later click does not replace the model last clicked', () => {
+    const studio = loadStudio();
+    studio.run(`loadModel('/models/a.glb', 'a.glb', '', 1);
+        loadModel('/models/b.glb', 'b.glb', '', 1);
+        loadModel('/models/c.glb', 'c.glb', '', 1);`);
+    const [a, b, c] = studio.loads;
+    const modelC = fakeModel();
+    c.onLoad({ scene: modelC });
+    b.onError(new Error('late failure'));
+    a.onLoad({ scene: fakeModel() });
+    assert.equal(studio.run('currentMesh'), modelC);
+    assert.deepEqual([...studio.run('scene.objects')], [modelC]);
+    assert.equal(studio.elements.get('stat-name').innerText, 'c.glb');
+    assert.deepEqual(studio.alerts, []);
 });

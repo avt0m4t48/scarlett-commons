@@ -352,6 +352,71 @@ def mad_log(ratios):
     return dev[len(dev) // 2]
 
 
+def tangent_0x27(w):
+    """(unit vector, sign) from one tag-0x27 u32, read as the mesh shaders read it: a 2_10_10_10 UNORM element
+    (tbuffer_load_format_xyzw BUF_FMT_2_10_10_10_UNORM) with each component mapped by v * 2 - 1, so
+    xyz = bits 0-9, 10-19, 20-29 over 1023 and w = bits 30-31 over 3. docs/restofworld.md measures xyz as a
+    tangent along u of a second texture-coordinate stream and w as its bitangent sign."""
+    x, y, z = (((w >> s) & 1023) / 1023 * 2 - 1 for s in (0, 10, 20))
+    return _norm(x, y, z), (w >> 30) / 3 * 2 - 1
+
+
+def tangent27_checks(data, at, slots, n, mpos, tris, face_normals):
+    """Counts for each tag-0x27 slot, keyed "<slot>:<check>".
+
+    Over all vertices: vertices, unit (|xyz| within 3% of 1), w0 / w3 (the 2-bit field at 0 or 3).
+    Over the sampled triangles' vertices: perp_face_n / perp_face (|cos(xyz, face normal)| < 0.2); and per
+    0x28 stream s (texture coordinates, read as int16 pairs): uv<s>_n / uv<s>_along_u (cos(xyz, dP/du) > 0.8,
+    dP/du projected into the triangle's plane), and of those, uv<s>_w_plus_minus_v (w > 0 exactly when
+    cross(face normal, xyz) points along -dP/dv; the face normal follows the triangle's winding)."""
+    out = {}
+    uvsets = [(i, struct.unpack_from(f"<{2 * n}h", data, at + off)) for i, (tag, off) in sorted(slots.items())
+              if tag == 0x28 and i]
+    for si, (tag, off) in sorted(slots.items()):
+        if tag != 0x27 or not si:
+            continue
+        words = struct.unpack_from(f"<{n}I", data, at + off)
+        dec = [tangent_0x27(w) for w in words]
+        add(out, f"{si}:vertices", n)
+        add(out, f"{si}:unit", sum(1 for w in words if abs(math.sqrt(sum(
+            (((w >> s) & 1023) / 1023 * 2 - 1) ** 2 for s in (0, 10, 20))) - 1) < 0.03))
+        add(out, f"{si}:w0", sum(1 for w in words if w >> 30 == 0))
+        add(out, f"{si}:w3", sum(1 for w in words if w >> 30 == 3))
+        for (a, b, c), fn in zip(tris, face_normals):
+            if fn is None:
+                continue
+            for v in (a, b, c):
+                t = dec[v][0]
+                if t is not None:
+                    add(out, f"{si}:perp_face_n")
+                    add(out, f"{si}:perp_face", int(abs(t[0] * fn[0] + t[1] * fn[1] + t[2] * fn[2]) < 0.2))
+            e1 = [mpos[b][k] - mpos[a][k] for k in range(3)]
+            e2 = [mpos[c][k] - mpos[a][k] for k in range(3)]
+            for ui, uv in uvsets:
+                du1, dv1 = uv[2 * b] - uv[2 * a], uv[2 * b + 1] - uv[2 * a + 1]
+                du2, dv2 = uv[2 * c] - uv[2 * a], uv[2 * c + 1] - uv[2 * a + 1]
+                det = du1 * dv2 - du2 * dv1
+                if not det:
+                    continue
+                gu = [(e1[k] * dv2 - e2[k] * dv1) / det for k in range(3)]
+                gv = [(e2[k] * du1 - e1[k] * du2) / det for k in range(3)]
+                d = sum(gu[k] * fn[k] for k in range(3))
+                pu = _norm(*(gu[k] - d * fn[k] for k in range(3)))
+                if pu is None:
+                    continue
+                for v in (a, b, c):
+                    t, sign = dec[v]
+                    if t is None:
+                        continue
+                    add(out, f"{si}:uv{ui}_n")
+                    if t[0] * pu[0] + t[1] * pu[1] + t[2] * pu[2] > 0.8:
+                        add(out, f"{si}:uv{ui}_along_u")
+                        bt = (fn[1] * t[2] - fn[2] * t[1], fn[2] * t[0] - fn[0] * t[2], fn[0] * t[1] - fn[1] * t[0])
+                        minus_v = bt[0] * gv[0] + bt[1] * gv[1] + bt[2] * gv[2] < 0
+                        add(out, f"{si}:uv{ui}_w_plus_minus_v", int(minus_v == (sign > 0)))
+    return out
+
+
 def add(d, k, v=1):
     d[k] = d.get(k, 0) + v
 
@@ -436,6 +501,9 @@ def measure_block(data, at, T, rng, found=None):
     k = struct.unpack_from("<I", data, at + 0x6C)[0]
     mpos = [(p[1], p[2], p[0]) if k == 1 else (p[2], p[1], p[0]) if k == 0 else p for p in pos]
     face_normals = [face_normal(mpos[a], mpos[b], mpos[c]) for a, b, c in stris]
+    t27 = T.setdefault("tag27", {})
+    for key, val in tangent27_checks(data, at, slots, n, mpos, stris, face_normals).items():
+        add(t27, key, val)
     if edges:
         e = sum(math.dist(pos[p], pos[q]) for p, q in edges) / len(edges)
         r = sum(math.dist(pos[p], pos[q]) for p, q in pairs) / max(len(pairs), 1)

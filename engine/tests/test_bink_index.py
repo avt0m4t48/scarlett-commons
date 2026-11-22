@@ -226,6 +226,25 @@ class TestCommandLine(unittest.TestCase):
                              [f"bink_index: error: cannot read {source}: input is locked"])
             self.assertFalse(os.path.exists(out))
 
+    def test_incomplete_directory_walk_does_not_replace_the_report(self):
+        target = self.tmp.name
+        blocked = os.path.join(target, "blocked")
+        out = os.path.join(target, "report.json")
+        with open(out, "wb") as f:
+            f.write(b"old report")
+
+        def walk(root, onerror=None):
+            yield root, ["blocked"], ["one.bk2"]
+            if onerror:
+                onerror(PermissionError(13, "directory is locked", blocked))
+
+        with mock.patch.object(bink.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(bink.main([target, "--out", out]), 2)
+        self.assertIn(f"cannot read {blocked}: directory is locked", err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"old report")
+
     def test_output_write_failure_is_an_error(self):
         for extension in ("csv", "json"):
             with self.subTest(extension=extension):

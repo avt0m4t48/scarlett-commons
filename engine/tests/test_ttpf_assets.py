@@ -1,5 +1,7 @@
 """Exercise the assets stage, existing C# catalogs and downstream texture lookup."""
+import contextlib
 from contextlib import ExitStack
+import io
 import json
 import os
 from pathlib import Path
@@ -109,10 +111,39 @@ class TextureAssets(unittest.TestCase):
                 raise PermissionError(13, "The process cannot access the file because it is being used")
             return unlink(path, *args, **kwargs)
 
-        with mock.patch.object(Path, "unlink", in_use):
+        stderr = io.StringIO()
+        with mock.patch.object(Path, "unlink", in_use), contextlib.redirect_stderr(stderr):
             self.build()
         self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
         self.assertTrue(old.exists())
+        # Not hidden: a folder that stays double-sized has its reason on screen.
+        self.assertIn("pool: 1 replaced DDS file(s) could not be removed", stderr.getvalue())
+
+    def complete_with_row_file(self, file):
+        """Run the pass on a manifest whose row names `file`; returns the folder's file names afterwards."""
+        self.upgrade()
+        manifest = json.loads(self.catalog.read_bytes())
+        manifest["Textures"][0]["File"] = file
+        self.assertEqual(ttpf_assets.complete_pool(self.pool, self.folder, manifest, ("v1-strict", None)), (1, 0))
+        return sorted(p.name for p in self.folder.iterdir())
+
+    def test_a_row_that_named_the_new_file_in_other_letter_case_keeps_it(self):
+        # On Windows and macOS that name is the file the pass has just published; removing it removed the export.
+        names = self.complete_with_row_file("000000_BCPACK_V1-STRICT.DDS")
+        row = self.row_after_export()
+        self.assertEqual(row["File"], "000000_bcpack_v1-strict.dds")
+        self.assertTrue((self.folder / row["File"]).is_file(), names)
+        self.assertGreater((self.folder / row["File"]).stat().st_size, 148)
+
+    def test_a_row_that_named_the_manifest_does_not_remove_it(self):
+        names = self.complete_with_row_file("manifest.json")
+        self.assertIn("manifest.json", names)
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+
+    def test_only_dds_files_are_removed(self):
+        (self.folder / "notes.txt").write_text("mine", encoding="utf-8")
+        names = self.complete_with_row_file("notes.txt")
+        self.assertIn("notes.txt", names)
 
     def test_only_a_file_in_the_pool_folder_is_removed(self):
         # A row is trusted for a file name, not for a path: nothing outside the pool's folder is touched.

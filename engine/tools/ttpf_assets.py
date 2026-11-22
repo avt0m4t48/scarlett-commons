@@ -47,6 +47,15 @@ def publish(path, data):
         tmp.unlink(missing_ok=True)
 
 
+def same_file(first, second):
+    """Whether two paths are one file on disk (another spelling, a case-insensitive volume); False if either is
+    missing."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def candidate(row, profile):
     if row.get("DxgiFormat") not in ttpf.BC_FORMATS:
         return False
@@ -100,7 +109,7 @@ def complete_pool(source, directory, manifest, settings):
                 # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
                 name = f"{index:06d}_bcpack_{method[:19]}.dds"
                 publish(directory / name, blob)
-                if row.get("File") and row["File"] != name:
+                if isinstance(row.get("File"), str) and row["File"] != name:
                     superseded.add(row["File"])
                 row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
                 row.pop("BCPackLimitation", None)
@@ -113,11 +122,21 @@ def complete_pool(source, directory, manifest, settings):
     # Only now that the manifest names the full chains: the files they replace would otherwise stay in the folder,
     # named by no row, so every completed texture would be stored twice. A file another row still names is kept,
     # and so is one that can't be removed (in use): the export is complete either way.
-    still_named = {row.get("File") for row in manifest["Textures"]}
-    for name in superseded - still_named:
-        if Path(name).name == name:          # a name inside this pool's folder, nothing else
-            try:
-                (directory / name).unlink(missing_ok=True)
-            except OSError:
-                pass
+    still_named = {os.path.normcase(row["File"]) for row in manifest["Textures"] if isinstance(row.get("File"), str)}
+    left = 0
+    for name in sorted(superseded):
+        # Only a .dds file by its bare name in this pool's folder, never manifest.json; and not a name that differs
+        # from a file some row names in letter case only, which on Windows and macOS is that very file.
+        if (Path(name).name != name or not name.lower().endswith(".dds")
+                or os.path.normcase(name) in still_named
+                or any(same_file(directory / name, directory / row["File"])
+                       for row in manifest["Textures"] if isinstance(row.get("File"), str))):
+            continue
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError:
+            left += 1
+    if left:
+        print(f"assets: {directory.name}: {left} replaced DDS file(s) could not be removed (in use?) and stay next "
+              "to the full-chain files", file=sys.stderr)
     return written, blocked

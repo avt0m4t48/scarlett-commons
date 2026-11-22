@@ -42,8 +42,10 @@ REPO_RULE_TESTS = [
     "tests/test_docs_table_rows.py",
     "tests/test_docs_design_rows.py",
     "tests/test_design_contract_rows.py",
+    "tests/test_design_contracts.py",
     "tests/test_docs_list_items.py",
     "tests/test_docs_python_deps.py",
+    "tests/test_preflight_pr.py",
 ]
 
 

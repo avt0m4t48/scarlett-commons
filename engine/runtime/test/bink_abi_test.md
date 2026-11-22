@@ -38,7 +38,7 @@ GPU is involved. The field table is in [`docs/movies.md`](../../docs/movies.md#a
 ## Gaps
 
 - Only fields whose value appears in the stream header can be found this way. The rest of the `HBINK` (after
-  `+0x38`) and of the 144-byte `BINKSUMMARY` is not named.
+  `+0x38`) and of the bytes `BINKSUMMARY` writes (+0x00..+0x8F) is not named.
 - The forced frame rate was checked on one stream.
 - The async, GPU and audio paths are not exercised; the audio track API is covered by
   [`bink_audio_test`](bink_audio_test.md).

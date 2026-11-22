@@ -138,6 +138,12 @@ std::string offsets(const Mask& m) {
     return s.empty() ? "(none)" : s;
 }
 
+std::string hex(size_t v) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "%zx", v);
+    return b;
+}
+
 // Bytes of a sentinel-filled buffer that a call replaced: the highest one is a lower bound on the struct size.
 size_t written_extent(const std::vector<uint8_t>& buf, uint8_t sentinel) {
     for (size_t i = buf.size(); i-- > 0;)
@@ -171,7 +177,7 @@ constexpr uint32_t kFileOffset = 0x20;  // BinkOpen flag: start at the offset Bi
 // rate fields (RAD's Bink 1 header has BINKFRAMERATE at 0x00080000; that bit changes nothing here).
 constexpr uint32_t kFrameRate = 0x1000;
 constexpr size_t kSummaryBytes = 1024;
-constexpr size_t kSummaryWritten = 144;  // bytes BinkGetSummary writes, measured on all 515 streams
+constexpr size_t kSummaryWritten = 144;  // BinkGetSummary writes bytes 0..143, every one, on all 515 streams
 
 // One field, matched on every stream: the word offsets where the structure held the stream's value each time.
 // hbink_at/summary_at are the measured offsets (docs/movies.md section 5); -1 when the structure has no such field.
@@ -236,7 +242,7 @@ int main() {
         uint32_t goto_streams = 0;
         std::map<std::string, uint32_t> returns;
         size_t hbink_min = kWords * 4, summary_min = kSummaryBytes, summary_max = 0;
-        uint32_t opened = 0, sentinel_replaced = 0;
+        uint32_t opened = 0, sentinel_replaced = 0, summary_gaps = 0;  // streams with an unwritten byte below extent
 
         std::vector<uint8_t> frame, sum(kSummaryBytes);
         for (uint64_t offset : index) {
@@ -260,18 +266,23 @@ int main() {
             }
             Mask fn = equal_to(open_words, 1);
 
-            // Two sentinels: a byte the call wrote with the sentinel's own value still counts as written once.
+            // Two sentinels: a byte the call writes differs from at least one of them (a value can't equal both), so
+            // a byte that kept the sentinel in both calls was not written. That gives the written bytes exactly,
+            // not only the highest one; it says nothing about padding the structure may have past them.
             size_t extent = 0;
+            std::vector<bool> written(kSummaryBytes, false);
             Words sum_words;
             for (uint8_t sentinel : {(uint8_t)0xCD, (uint8_t)0x5A}) {
                 std::fill(sum.begin(), sum.end(), sentinel);
                 api.summary(bink, sum.data());
                 extent = std::max(extent, written_extent(sum, sentinel));
+                for (size_t i = 0; i < kSummaryBytes; ++i) written[i] = written[i] || sum[i] != sentinel;
                 sum_words.assign(kWords, 0);
                 std::memcpy(sum_words.data(), sum.data(), kWords * 4);
             }
             summary_min = std::min(summary_min, extent);
             summary_max = std::max(summary_max, extent);
+            if (std::count(written.begin(), written.begin() + extent, false)) ++summary_gaps;
             for (size_t i = 0; i < std::size(fields); ++i) fields[i].summary &= equal_to(sum_words, values[i]);
 
             frame.assign((size_t)s.width * 4 * s.height, 0xCD);
@@ -330,8 +341,8 @@ int main() {
         std::printf("streams: %zu in the index, %u opened, %u with BinkGoto checked\n", index.size(), opened,
                     goto_streams);
         std::printf("HBINK readable prefix: at least %zu bytes on every stream\n", hbink_min);
-        std::printf("BINKSUMMARY bytes written: %zu..%zu (of a %zu-byte buffer)\n", summary_min, summary_max,
-                    kSummaryBytes);
+        std::printf("BINKSUMMARY: highest written byte +1 is %zu..%zu (of a %zu-byte buffer); %u streams leave a "
+                    "byte below it unwritten\n", summary_min, summary_max, kSummaryBytes, summary_gaps);
         for (const Field& f : fields)
             std::printf("  %-12s HBINK %-24s BINKSUMMARY %s\n", f.name, offsets(f.hbink).c_str(),
                         offsets(f.summary).c_str());
@@ -359,8 +370,8 @@ int main() {
             }
         }
         check(has(frame_num, 0x0c), "the 1-based current frame number is at HBINK +0x0c");
-        check(summary_min == kSummaryWritten && summary_max == kSummaryWritten,
-              "BinkGetSummary writes " + std::to_string(kSummaryWritten) + " bytes");
+        check(summary_min == kSummaryWritten && summary_max == kSummaryWritten && summary_gaps == 0,
+              "BinkGetSummary writes every byte of +0x00..+0x" + hex(kSummaryWritten - 1) + " and none after");
         check(has(forced_num, 0x14) && has(forced_den, 0x18), "BinkSetFrameRate's rate lands at HBINK +0x14/+0x18");
         check(has(sum_forced_num, 0x3c) && has(sum_forced_den, 0x40) && has(sum_file_num, 0x34) &&
                   has(sum_file_den, 0x38),

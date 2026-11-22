@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "../shims/d3d12_com.h"
+#include "host_adapter.h"
 
 namespace copycmp {
 
@@ -66,31 +67,17 @@ inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LU
     if (!create || !create_factory) return false;
     Ptr<IDXGIFactory4> factory;
     if (FAILED(create_factory(IID_PPV_ARGS(&factory.p)))) return false;
-    char want[128] = {};
-    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
+    // The variable and the name match are host_adapter.h's, shared with the tests that create their host devices
+    // themselves.
+    const std::string needle = hostadapter::wanted();
     Ptr<IDXGIAdapter1> adapter;
     if (luid) {
         if (FAILED(factory->EnumAdapterByLuid(*luid, IID_PPV_ARGS(&adapter.p)))) return false;
-    } else if (want[0]) {
-        std::string needle(want);
-        std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        if (needle == "warp") {
-            if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) return false;
-        } else {
-            for (UINT i = 0;; ++i) {
-                Ptr<IDXGIAdapter1> candidate;
-                if (FAILED(factory->EnumAdapters1(i, &candidate.p))) return false;
-                DXGI_ADAPTER_DESC1 desc{};
-                candidate->GetDesc1(&desc);
-                std::string text;
-                for (const wchar_t* c = desc.Description; *c; ++c) text += char(std::tolower(*c < 128 ? *c : '?'));
-                if (text.find(needle) != std::string::npos) {
-                    adapter.p = candidate.p;
-                    candidate.p = nullptr;
-                    break;
-                }
-            }
-        }
+    } else if (needle == "warp") {
+        if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) return false;
+    } else if (!needle.empty()) {
+        adapter.p = hostadapter::named(factory.p, needle);
+        if (!adapter.p) return false;
     }
     if (FAILED(create(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return false;
     Ptr<IDXGIAdapter1> used;
@@ -508,7 +495,6 @@ struct MixCase {
     bool has_box;
     D3D12_BOX box;
     UINT dx, dy;
-    bool bc_gap;  // block-compressed: the host copies whole blocks, the layer cannot (known difference)
 };
 
 // Copies one subresource of A into one of D (both prefilled), reads D back. `out.error` is set when the list was
@@ -702,19 +688,24 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported) {
     both("buffers", [&](Run& r, Outcome& o) { run_buffers(r, o); });
 
     // Different mips of one texture. Both sides must refuse what does not fit; what the host copies the layer must
-    // copy the same, except block-compressed copies of sizes that are no block multiple (known difference).
+    // copy the same. A block-compressed copy whose mip edge falls inside a block on one side only is staged through
+    // transfer scratch by the layer (vulkan_replay.h, prepare_texture_copy).
     constexpr D3D12_BOX no_box{};
     const MixCase mixes[] = {
-        {"mip 0 box 12x12 into mip 1", 0, 1, true, {0, 0, 0, 12, 12, 1}, 0, 0, false},
-        {"mip 1 into mip 0 at 8,8", 1, 0, false, no_box, 8, 8, false},
-        {"mip 1 box 4..12 into mip 0", 1, 0, true, {4, 4, 0, 12, 12, 1}, 0, 0, false},
-        {"mip 0 box 8x8 into the 6x6 mip 2", 0, 2, true, {0, 0, 0, 8, 8, 1}, 0, 0, true},
-        {"mip 2 (6x6) into mip 0 at 4,4", 2, 0, false, no_box, 4, 4, true},
-        {"mip 2 (6x6) into mip 1", 2, 1, false, no_box, 0, 0, true},
-        {"mip 0 box 4x4 into the 3x3 mip 3", 0, 3, true, {0, 0, 0, 4, 4, 1}, 0, 0, true},
-        {"mip 0 box 16x16 into the 3x3 mip 3 (does not fit)", 0, 3, true, {0, 0, 0, 16, 16, 1}, 0, 0, false},
-        {"mip 0 box 16x16 into the 6x6 mip 2 (does not fit)", 0, 2, true, {0, 0, 0, 16, 16, 1}, 0, 0, false},
-        {"mip 1 into mip 0 at 16,16 (does not fit)", 1, 0, false, no_box, 16, 16, false},
+        {"mip 0 box 12x12 into mip 1", 0, 1, true, {0, 0, 0, 12, 12, 1}, 0, 0},
+        {"mip 1 into mip 0 at 8,8", 1, 0, false, no_box, 8, 8},
+        {"mip 1 box 4..12 into mip 0", 1, 0, true, {4, 4, 0, 12, 12, 1}, 0, 0},
+        {"mip 0 box 8x8 into the 6x6 mip 2", 0, 2, true, {0, 0, 0, 8, 8, 1}, 0, 0},
+        {"mip 2 (6x6) into mip 0 at 4,4", 2, 0, false, no_box, 4, 4},
+        {"mip 2 (6x6) into mip 1", 2, 1, false, no_box, 0, 0},
+        {"mip 0 box 4x4 into the 3x3 mip 3", 0, 3, true, {0, 0, 0, 4, 4, 1}, 0, 0},
+        // The source's mip edge inside the block: the box 4..8 of the 6x6 mip 2 (2x2 texels) into the 3x3 mip 3.
+        {"mip 2 (6x6) box 4..8 into the 3x3 mip 3", 2, 3, true, {4, 4, 0, 8, 8, 1}, 0, 0},
+        // Both mip edges inside one block, at an offset: the 3x3 mip 3 into the 6x6 mip 2 at 4,4 (2x2 texels land).
+        {"mip 3 (3x3) into mip 2 at 4,4", 3, 2, false, no_box, 4, 4},
+        {"mip 0 box 16x16 into the 3x3 mip 3 (does not fit)", 0, 3, true, {0, 0, 0, 16, 16, 1}, 0, 0},
+        {"mip 0 box 16x16 into the 6x6 mip 2 (does not fit)", 0, 2, true, {0, 0, 0, 16, 16, 1}, 0, 0},
+        {"mip 1 into mip 0 at 16,16 (does not fit)", 1, 0, false, no_box, 16, 16},
     };
     Run ours_run, host_run;  // one queue each for every mixed-mip case
     const bool ours_ok = ours_run.init(ours, true), host_ok = host_run.init(host.p, false);
@@ -738,14 +729,10 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported) {
                 std::fprintf(stderr, "copy case %s: the HOST run failed (%s); fix the case\n", name.c_str(), b.error.c_str());
                 ++bad;
             } else if (host_run.refused != ours_run.refused) {
-                if (!host_run.refused && bc && mc.bc_gap) {
-                    std::printf("copy case %s: known difference: the host copies whole blocks, the layer refuses it\n", name.c_str());
-                } else {
-                    std::fprintf(stderr, "copy case %s: the host %s the copy, the layer %s it (%s)\n", name.c_str(),
-                                 host_run.refused ? "refuses" : "does", ours_run.refused ? "refuses" : "does",
-                                 ours_run.refused ? a.error.c_str() : "accepted");
-                    ++bad;
-                }
+                std::fprintf(stderr, "copy case %s: the host %s the copy, the layer %s it (%s)\n", name.c_str(),
+                             host_run.refused ? "refuses" : "does", ours_run.refused ? "refuses" : "does",
+                             ours_run.refused ? a.error.c_str() : "accepted");
+                ++bad;
             } else if (!host_run.refused) {
                 const int r = compare(name.c_str(), a, b);
                 bad += r;

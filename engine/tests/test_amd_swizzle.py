@@ -136,39 +136,53 @@ class AmdSwizzleCliGuardTests(unittest.TestCase):
                     self.assertNotIn("Traceback", stderr.getvalue())
                     load_mock.assert_not_called()
 
+    def _run_with_save_side_effect(self, tmp, out_name, side_effect):
+        blob = os.path.join(tmp, "blob.bin")
+        with open(blob, "wb") as f:
+            f.write(b"\x00" * 64)
+        out_path = os.path.join(tmp, "nested", out_name)
+
+        fake_lin = mock.MagicMock()
+        fake_lin.size = 64
+        fake_lin.tobytes.return_value = b"\x00" * 64
+        fake_img = mock.MagicMock()
+        fake_img.reshape.return_value = fake_img
+
+        fake_pil = types.ModuleType("PIL")
+        fake_pil_image = types.ModuleType("PIL.Image")
+        fake_opened = mock.MagicMock()
+        fake_opened.convert.return_value.save.side_effect = side_effect
+        fake_pil_image.open = mock.Mock(return_value=fake_opened)
+        fake_pil.Image = fake_pil_image
+
+        fake_tables = {"GFX10_SW_64K_S_PATINFO": [(0, 0, 0, 0, 0, "1 pipes 8 bpe")]}
+        with mock.patch.dict(sys.modules, {"PIL": fake_pil, "PIL.Image": fake_pil_image}), \
+             mock.patch.object(self.mod, "load", return_value=({}, fake_tables)), \
+             mock.patch.object(self.mod, "equation", return_value=[]), \
+             mock.patch.object(self.mod, "detile", return_value=fake_lin), \
+             mock.patch.object(self.mod, "feature", return_value=fake_img), \
+             mock.patch("tile_probe.score", return_value=1.0):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                rc = self.mod.main([blob, "--width", "8", "--height", "8", "--out", out_path])
+        return rc, stderr.getvalue()
+
     def test_write_oserror_returns_2_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
-            blob = os.path.join(tmp, "blob.bin")
-            with open(blob, "wb") as f:
-                f.write(b"\x00" * 64)
-            out_path = os.path.join(tmp, "nested", "best.png")
+            rc, err = self._run_with_save_side_effect(tmp, "best.png", PermissionError("denied"))
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR:", err)
+        self.assertNotIn("Traceback", err)
 
-            fake_lin = mock.MagicMock()
-            fake_lin.size = 64
-            fake_lin.tobytes.return_value = b"\x00" * 64
-            fake_img = mock.MagicMock()
-            fake_img.reshape.return_value = fake_img
-
-            fake_pil = types.ModuleType("PIL")
-            fake_pil_image = types.ModuleType("PIL.Image")
-            fake_opened = mock.MagicMock()
-            fake_opened.convert.return_value.save.side_effect = PermissionError("denied")
-            fake_pil_image.open = mock.Mock(return_value=fake_opened)
-            fake_pil.Image = fake_pil_image
-
-            fake_tables = {"GFX10_SW_64K_S_PATINFO": [(0, 0, 0, 0, 0, "1 pipes 8 bpe")]}
-            with mock.patch.dict(sys.modules, {"PIL": fake_pil, "PIL.Image": fake_pil_image}), \
-                 mock.patch.object(self.mod, "load", return_value=({}, fake_tables)), \
-                 mock.patch.object(self.mod, "equation", return_value=[]), \
-                 mock.patch.object(self.mod, "detile", return_value=fake_lin), \
-                 mock.patch.object(self.mod, "feature", return_value=fake_img), \
-                 mock.patch("tile_probe.score", return_value=1.0):
-                stdout, stderr = io.StringIO(), io.StringIO()
-                with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
-                    rc = self.mod.main([blob, "--width", "8", "--height", "8", "--out", out_path])
-            self.assertEqual(rc, 2)
-            self.assertIn("ERROR:", stderr.getvalue())
-            self.assertNotIn("Traceback", stderr.getvalue())
+    def test_write_value_error_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._run_with_save_side_effect(
+                tmp, "best.unknown", ValueError("unknown file extension: .unknown")
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR:", err)
+        self.assertIn("unknown file extension: .unknown", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":

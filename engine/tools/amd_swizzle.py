@@ -249,8 +249,9 @@ def main(argv=None):
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
             preview.save(a.out)
-        except OSError as e:
-            print(f"ERROR: {a.out}: {e.strerror or e}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            msg = getattr(e, "strerror", None) or str(e)
+            print(f"ERROR: {a.out}: {msg}", file=sys.stderr)
             return 2
         print("best ->", a.out)
     return 0

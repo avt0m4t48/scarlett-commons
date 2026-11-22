@@ -49,7 +49,6 @@ DEBT = {
     "test_ballot_votes.py": "private SPIR-V interpreter; should translate a hand-written listing instead",
     "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
     "test_alu_cndmask_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_alu_u16_clamp.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_int_to_float.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_interp_p1_p2_f32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_lds_add_sub_src2_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",

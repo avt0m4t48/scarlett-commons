@@ -8,6 +8,7 @@ mocked: no GPU, no LLVM, no Vulkan SDK and no game data are needed.
 """
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -131,46 +132,98 @@ class TranslatorFlagsSettingTest(unittest.TestCase):
                          "--bary-fallback --no-float-controls")
 
 
-class DisassemblyMatchesTest(TempWorkTest):
-    """disassembly_matches(): a disassembly folder counts only with the marker of the llvm-mc that made it."""
+class DisassemblyStatusTest(TempWorkTest):
+    """disassembly_status(): a disassembly folder counts only with the marker of the llvm-mc that made it,
+    and only when the listings on disk agree with the unpack inventory."""
+
+    INACTIVE = (False, False, set())
 
     def setUp(self):
         super().setUp()
         os.makedirs(self.disasm)
         self.marker = os.path.join(self.dxbc, "disasm.done")
+        self.write(os.path.join(self.dxbc, "index.json"), json.dumps([{"file": "s0.dxbc"}]))
+        self.write(os.path.join(self.dxbc, "fssm_index.json"), json.dumps([{"name": "s0"}]))
+        self.write(os.path.join(self.disasm, "s0.s"), "synthetic listing\n")
 
-    def test_a_matching_marker_is_a_match(self):
+    def status(self):
+        return make_game.disassembly_status(self.dxbc, SIGNATURE)
+
+    def test_a_matching_done_marker_is_complete(self):
+        # The pre-inventory marker recorded only the llvm-mc signature: it is complete when every
+        # unpacked shader has a listing, and it cannot resume.
         self.write(self.marker, SIGNATURE + "\n")
-        self.assertTrue(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), (True, False, set()))
 
     def test_surrounding_whitespace_in_the_marker_is_ignored(self):
         self.write(self.marker, "  " + SIGNATURE + "  \n\n")
-        self.assertTrue(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), (True, False, set()))
 
     def test_a_marker_for_another_llvm_mc_is_not_a_match(self):
         self.write(self.marker, SIGNATURE + "\n")
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, '["llvm-mc", "LLVM version 18.0.0"]'))
+        self.assertEqual(make_game.disassembly_status(self.dxbc, '["llvm-mc", "LLVM version 18.0.0"]'),
+                         self.INACTIVE)
 
     def test_a_missing_marker_is_not_a_match(self):
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), self.INACTIVE)
 
     def test_a_missing_disassembly_folder_is_not_a_match(self):
         # The marker alone is not proof: a stopped or failed run can leave it without the .s files.
         self.write(self.marker, SIGNATURE + "\n")
+        os.remove(os.path.join(self.disasm, "s0.s"))
         os.rmdir(self.disasm)
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), self.INACTIVE)
+
+    def test_a_missing_listing_is_not_complete(self):
+        self.write(self.marker, SIGNATURE + "\n")
+        os.remove(os.path.join(self.disasm, "s0.s"))
+        self.assertEqual(self.status(), self.INACTIVE)
 
     def test_a_folder_where_the_marker_belongs_is_not_a_match(self):
         os.makedirs(self.marker)
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), self.INACTIVE)
 
     def test_an_empty_marker_is_not_a_match(self):
         self.touch(self.marker)
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertEqual(self.status(), self.INACTIVE)
+
+    def test_a_started_marker_offers_resume(self):
+        self.write(os.path.join(self.dxbc, "disasm.started"), SIGNATURE + "\n")
+        self.assertEqual(self.status(), (False, True, set()))
+
+    def test_an_inventory_marker_reports_what_it_expects(self):
+        recorded = json.dumps({"llvm": SIGNATURE, "listings": ["s0"]})
+        self.write(self.marker, recorded + "\n")
+        self.assertEqual(self.status(), (True, True, {"s0"}))
+
+    def test_an_inventory_started_marker_resumes_against_the_record(self):
+        recorded = json.dumps({"llvm": SIGNATURE, "listings": ["s0", "s1"]})
+        self.write(os.path.join(self.dxbc, "index.json"),
+                   json.dumps([{"file": "s0.dxbc"}, {"file": "s1.dxbc"}]))
+        self.write(os.path.join(self.dxbc, "fssm_index.json"),
+                   json.dumps([{"name": "s0"}, {"name": "s1"}]))
+        self.write(self.marker.replace("done", "started"), recorded + "\n")
+        # s1.s was never written before the stop: resume is offered, complete is not.
+        self.assertEqual(self.status(), (False, True, {"s0", "s1"}))
+
+    def test_an_inventory_outside_the_unpack_set_is_rejected(self):
+        recorded = json.dumps({"llvm": SIGNATURE, "listings": ["s0", "removed"]})
+        self.write(self.marker, recorded + "\n")
+        self.assertEqual(self.status(), self.INACTIVE)
+
+    def test_a_symlinked_listing_disqualifies_the_folder(self):
+        target = self.touch(os.path.join(self.work, "elsewhere.s"))
+        try:
+            os.symlink(target, os.path.join(self.disasm, "linked.s"))
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform cannot create symbolic links")
+        self.write(self.marker, SIGNATURE + "\n")
+        self.assertEqual(self.status(), self.INACTIVE)
 
 
-class ClearShaderDisassemblyTest(TempWorkTest):
-    """clear_shader_disassembly(): drop generated assembly, but nothing else and nowhere outside the work folder."""
+class PrepareShaderDisassemblyTest(TempWorkTest):
+    """prepare_shader_disassembly(): drop generated assembly before a fresh run — nothing else, and
+    nowhere outside the work folder. A resumed run keeps the listings that finished."""
 
     def setUp(self):
         super().setUp()
@@ -184,10 +237,16 @@ class ClearShaderDisassemblyTest(TempWorkTest):
             self.touch(path)
         os.makedirs(os.path.join(self.disasm, "nested.s"))   # a folder, not a file: left alone
 
-        make_game.clear_shader_disassembly(self.work, self.disasm)
+        make_game.prepare_shader_disassembly(self.work, self.disasm, resume=False)
 
         self.assertEqual(sorted(os.listdir(self.disasm)),
                          ["nested.s", "notes.txt", "shader.spv"])
+
+    def test_a_resumed_run_keeps_its_listings(self):
+        for name in ("a.s", "b.s"):
+            self.touch(os.path.join(self.disasm, name))
+        make_game.prepare_shader_disassembly(self.work, self.disasm, resume=True)
+        self.assertEqual(sorted(os.listdir(self.disasm)), ["a.s", "b.s"])
 
     def test_symlinked_assembly_is_removed_without_following_it(self):
         target = self.touch(os.path.join(self.work, "elsewhere.s"))
@@ -196,19 +255,19 @@ class ClearShaderDisassemblyTest(TempWorkTest):
             os.symlink(target, link)
         except (OSError, NotImplementedError):
             self.skipTest("this platform cannot create symbolic links")
-        make_game.clear_shader_disassembly(self.work, self.disasm)
+        make_game.prepare_shader_disassembly(self.work, self.disasm, resume=False)
         self.assertFalse(os.path.lexists(link))
         self.assertTrue(os.path.isfile(target), "the symlink's target must survive")
 
     def test_a_missing_disassembly_folder_is_fine(self):
         os.rmdir(self.disasm)
-        make_game.clear_shader_disassembly(self.work, self.disasm)
+        make_game.prepare_shader_disassembly(self.work, self.disasm, resume=False)
 
     def test_a_folder_outside_the_work_folder_is_refused(self):
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         victim = self.touch(os.path.join(outside.name, "a.s"))
-        self.assert_fails(make_game.clear_shader_disassembly, self.work, outside.name,
+        self.assert_fails(make_game.prepare_shader_disassembly, self.work, outside.name, False,
                           match="must be inside the work folder")
         self.assertTrue(os.path.isfile(victim), "nothing outside the work folder may be removed")
 
@@ -216,14 +275,14 @@ class ClearShaderDisassemblyTest(TempWorkTest):
         sibling = os.path.join(self.dxbc, "disasm-old")
         os.makedirs(sibling)
         victim = self.touch(os.path.join(sibling, "a.s"))
-        self.assert_fails(make_game.clear_shader_disassembly, self.work, sibling,
+        self.assert_fails(make_game.prepare_shader_disassembly, self.work, sibling, False,
                           match="must be inside the work folder")
         self.assertTrue(os.path.isfile(victim))
 
     def test_another_spelling_of_the_same_folder_is_accepted(self):
         victim = self.touch(os.path.join(self.disasm, "a.s"))
         roundabout = os.path.join(self.work, "shaders", "dxbc", "..", "dxbc", "disasm")
-        make_game.clear_shader_disassembly(self.work, roundabout)
+        make_game.prepare_shader_disassembly(self.work, roundabout, resume=False)
         self.assertFalse(os.path.exists(victim))
 
     def test_a_link_to_a_folder_outside_is_refused(self):
@@ -235,7 +294,7 @@ class ClearShaderDisassemblyTest(TempWorkTest):
             os.symlink(outside.name, self.disasm)
         except (OSError, NotImplementedError):
             self.skipTest("this platform cannot create symbolic links")
-        self.assert_fails(make_game.clear_shader_disassembly, self.work, self.disasm,
+        self.assert_fails(make_game.prepare_shader_disassembly, self.work, self.disasm, False,
                           match="must be inside the work folder")
         self.assertTrue(os.path.isfile(victim))
 
@@ -251,14 +310,16 @@ class ShaderOutputsReusableTest(TempWorkTest):
         """Write the files a finished shaders stage leaves; markers=False writes none of them."""
         if not markers:
             return
-        for path in (os.path.join(self.dxbc, "index.json"),
-                     os.path.join(self.dxbc, "fssm_index.json"),
-                     os.path.join(self.spirv, "index.json")):
-            self.write(path, "{}")
+        for path, text in ((os.path.join(self.dxbc, "index.json"), json.dumps([{"file": "s0.dxbc"}])),
+                           (os.path.join(self.dxbc, "fssm_index.json"), json.dumps([{"name": "s0"}])),
+                           (os.path.join(self.spirv, "index.json"), "{}")):
+            self.write(path, text)
+        self.write(os.path.join(self.disasm, "s0.s"), "synthetic listing\n")
         self.write(os.path.join(self.spirv, "wave64_emulate.txt"), mode + "\n")
         self.write(os.path.join(self.spirv, "translator_flags.txt"), flags + "\n" if flags else "")
         self.write(os.path.join(self.spirv, "translation_sources.sha256"), digest + "\n")
-        self.write(os.path.join(self.dxbc, "disasm.done"), signature + "\n")
+        self.write(os.path.join(self.dxbc, "disasm.done"),
+                   json.dumps({"llvm": signature, "listings": ["s0"]}) + "\n")
 
     def reusable(self, emulate=False, keep_emulated=False, fallbacks=()):
         with mock.patch.object(make_game, "llvm_mc_signature", return_value=SIGNATURE), \
@@ -293,6 +354,7 @@ class ShaderOutputsReusableTest(TempWorkTest):
 
     def test_a_missing_disassembly_folder_is_not_reusable(self):
         self.state()
+        os.remove(os.path.join(self.disasm, "s0.s"))
         os.rmdir(self.disasm)
         self.assertFalse(self.reusable())
 

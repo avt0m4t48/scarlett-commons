@@ -53,6 +53,7 @@ struct Module {
     // Windows for a DLL Windows loads: a block, no DLL_THREAD_ATTACH, and DLL_THREAD_DETACH when it ends.
     uint32_t tls_index = kNoTlsIndex;
     uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
+    uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
     uint32_t tls_block_size = 0;       // raw template + zero fill
@@ -101,7 +102,8 @@ public:
     // and for every other thread running at the time, and the thread events for threads started after it, so on any
     // of those both are no-ops. They remain for a thread load() could not reach (pe_loader.cpp, "Threads that
     // existed before load()", lists the cases): install before mapped code runs there, uninstall before the thread
-    // exits. These do not run TLS callbacks (use run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
+    // exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several modules. These do
+    // not run TLS callbacks (use run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 
@@ -129,6 +131,11 @@ private:
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
 };
+
+// Frees the TLS helper clones load() created and deletes their files (Module::tls_index background). load()
+// registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
+// skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
+void cleanup_tls_clones();
 
 std::string lower(std::string s);
 

@@ -243,9 +243,6 @@ def store_inputs(name, rng):
         elems.append([row[1], v, row[3], row[2]])
         elems.append([row[2], row[3], v, row[1]])
         elems.append([row[3], row[2], row[1], v])
-    if len(widths) == 2:        # a two-component format stores (x, w) on gfx1150: y and w carry one value
-        for r in elems:
-            r[3] = r[1]
     return elems
 
 
@@ -285,9 +282,10 @@ def load_lines(uid, family, ref, path, elems):
     return lines + _longs(words)
 
 
-def store_lines(uid, family, ref, path, rows):
-    """Lane i reads its four register values from the table, stores them with `buffer_store_format_xyzw` / tbuffer
-    into the output buffer at i * 16 (a V# whose base is the output pointer)."""
+def store_lines(uid, family, ref, path, rows, instr="xyzw"):
+    """Lane i reads its four register values from the table, stores them with `buffer_store_format_<instr>` / tbuffer
+    (instr xyzw or xy: the first two registers) into the output buffer at i * 16 (a V# whose base is the output pointer)."""
+    regs = "v[8:11]" if instr == "xyzw" else "v[8:9]"
     code = ref if path == "mubuf" else 22
     w3 = v_sharp_word3(family, code)
     lines = ["s_getpc_b64 s[4:5]", f".Lpc{uid}:", f"s_add_u32 s4, s4, .Ldat{uid}-.Lpc{uid}", "s_addc_u32 s5, s5, 0",
@@ -295,9 +293,9 @@ def store_lines(uid, family, ref, path, rows):
              "s_mov_b32 s8, s2", "s_and_b32 s9, s3, 0xffff", "s_mov_b32 s10, 0x100000", f"s_mov_b32 s11, 0x{w3:08x}",
              "v_lshlrev_b32 v1, 4, v0", "buffer_load_dwordx4 v[8:11], v1, s[12:15], 0 offen", "s_waitcnt vmcnt(0)"]
     if path == "mubuf":
-        lines.append("buffer_store_format_xyzw v[8:11], v1, s[8:11], 0 offen")
+        lines.append(f"buffer_store_format_{instr} {regs}, v1, s[8:11], 0 offen")
     else:
-        lines.append(f"tbuffer_store_format_xyzw v[8:11], v1, s[8:11], 0 format:[BUF_FMT_{ref}] offen")
+        lines.append(f"tbuffer_store_format_{instr} {regs}, v1, s[8:11], 0 format:[BUF_FMT_{ref}] offen")
     lines += ["s_endpgm", ".p2align 4", f".Ldat{uid}:"]
     words = []
     for r in rows:
@@ -440,17 +438,26 @@ def encode_field(nfmt, w, reg):
     raise ValueError(nfmt)
 
 
-def encode_element(name, regs):
-    """The bytes a store of registers x, y, z, w writes (the element's size; nothing else is touched)."""
+def encode_element(name, regs, instr="xyzw", route="translator"):
+    """The bytes a store of registers x, y, z, w writes (the element's size; nothing else is touched). instr "xy" gives
+    only x and y (z and w are 0). route "translator": component c takes channel c, as Gen.encode_format does; route "hw":
+    the Radeon 880M's `buffer_store_format_*`, which differs for a two-component format only: it takes channels x and w
+    (KNOWN DIFFERENCE, RDNA2 unmeasured, docs/buffer_formats.md). `tbuffer_store_format_*` takes (x, y) on the 880M too."""
     widths, nfmt = parse_name(name)
+    chan = list(regs[:4]) if instr == "xyzw" else list(regs[:2]) + [0, 0]
+    if route == "hw" and len(widths) == 2:
+        chan = [chan[0], chan[3]]
     big, bit = 0, 0
     for c, w in enumerate(widths):
-        big |= encode_field(nfmt, w, regs[c]) << bit
+        big |= encode_field(nfmt, w, chan[c]) << bit
         bit += w
     return big.to_bytes(bit // 8, "little")
 
 
-def run_stores(oracle, family, fmts, path, rng):
+def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
+    """-> {code: [elements, mismatches, known]}. A mismatch is a store that differs from the hardware model (route "hw").
+    known counts the stores of a two-component format whose bytes differ between the hardware route and the translator's
+    (x, y): the hardware did what the model says, the translator will not. Those are not part of the validated count."""
     from hw_oracle import asm
     jobs, kernels = [], []
     for code, name in fmts:
@@ -460,12 +467,12 @@ def run_stores(oracle, family, fmts, path, rng):
         for lo in range(0, len(rows), CHUNK):
             part = rows[lo:lo + CHUNK]
             uid = len(kernels)
-            kernels.append(asm.Kernel(store_lines(uid, family, ref, path, part), 32, len(part), len(part) * 4, raw=True))
+            kernels.append(asm.Kernel(store_lines(uid, family, ref, path, part, instr), 32, len(part), len(part) * 4, raw=True))
             jobs.append((code, name, part))
     results = oracle.run(kernels, words=CHUNK * 4)
     out = {}
     for (code, name, part), res in zip(jobs, results):
-        rec = out.setdefault(code, [0, []])
+        rec = out.setdefault(code, [0, [], 0])
         if isinstance(res, str):
             rec[1].append((b"", b"", res.encode()))
             continue
@@ -473,10 +480,13 @@ def run_stores(oracle, family, fmts, path, rng):
         for i, row in enumerate(part):
             got = struct.pack("<4I", *res[4 * i:4 * i + 4])
             want = bytearray(struct.pack("<4I", *([PREFILL] * 4)))
-            want[:size] = encode_element(name, row)
+            route = "hw" if path == "mubuf" else "translator"      # tbuffer stores take (x, y) like the translator
+            want[:size] = encode_element(name, row, instr, route)
             rec[0] += 1
             if bytes(want) != got:
                 rec[1].append((row, bytes(want), got))
+            elif encode_element(name, row, instr, route) != encode_element(name, row, instr):
+                rec[2] += 1
     return out
 
 
@@ -559,17 +569,21 @@ def negative_control(oracle, family, rng):
 
 
 def report(title, results, fmts):
-    bad_total = cases_total = 0
+    """Prints a line per format; returns (validated elements, mismatches, known-difference elements)."""
+    bad_total = cases_total = known_total = 0
     for code, name in fmts:
-        cases, bad = results[code]
-        cases_total += cases
+        cases, bad, *rest = results[code]
+        known = rest[0] if rest else 0
+        cases_total += cases - known
+        known_total += known
         bad_total += len(bad)
-        print(f"  {title:<12} {code:>3} {name:<22} {cases:>7} elements  {'ok' if not bad else f'MISMATCH {len(bad)}'}")
+        note = f"  (+{known} known difference: hardware (x, w), translator (x, y))" if known else ""
+        print(f"  {title:<14} {code:>3} {name:<22} {cases - known:>7} validated  {'ok' if not bad else f'MISMATCH {len(bad)}'}{note}")
         for first, want, got in bad[:3]:
             shown = first.hex() if isinstance(first, bytes) else [f"{w:08x}" for w in first]
             print("      ", shown, want if isinstance(want, bytes) else [f"{w:08x}" for w in want],
                   got if isinstance(got, bytes) else [f"{w:08x}" if isinstance(w, int) else w for w in got])
-    return cases_total, bad_total
+    return cases_total, bad_total, known_total
 
 
 def main():
@@ -611,15 +625,17 @@ def main():
         if a.negative_control:
             return negative_control(oracle, family, rng)
         paths = ("mubuf", "mtbuf") if a.path == "both" else (a.path,)
-        total = bad = 0
+        total = bad = known = 0
         for path in paths:
             if a.mode in ("load", "all"):
-                c, b_ = report(f"load {path}", run_loads(oracle, family, fmts, path, rng, a.budget), fmts)
-                total, bad = total + c, bad + b_
+                c, b_, k = report(f"load {path}", run_loads(oracle, family, fmts, path, rng, a.budget), fmts)
+                total, bad, known = total + c, bad + b_, known + k
             if a.mode in ("store", "all"):
-                c, b_ = report(f"store {path}", run_stores(oracle, family, fmts, path, rng), fmts)
-                total, bad = total + c, bad + b_
-        print(f"{total} elements, {bad} mismatches")
+                for instr in ("xyzw", "xy"):
+                    c, b_, k = report(f"store {instr} {path}", run_stores(oracle, family, fmts, path, rng, instr), fmts)
+                    total, bad, known = total + c, bad + b_, known + k
+        print(f"{total} validated elements, {bad} mismatches; plus {known} known-difference elements "
+              "(two-component buffer_store_format_*: hardware (x, w), translator (x, y); RDNA2 unmeasured)")
         return 1 if bad else 0
     finally:
         oracle.close()

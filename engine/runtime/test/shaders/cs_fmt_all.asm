@@ -4,7 +4,7 @@
 ; own format; a channel the format lacks repeats component (c mod n) through the V# and is 0 through tbuffer. Words
 ; 256..315: 15 buffer_store_format_xyzw into 0x400.., the rest of each 16 bytes left at 0xeeeeeeee.
 ; The expected words are the MODEL of tools/buffer_format_fuzz.py, which the Radeon 880M (gfx1150, RDNA3.5, not RDNA2)
-; reproduced for 1.26 million elements of every format here that GFX11 has (only 10_10_10_2_USCALED/SSCALED, GFX10 codes
+; reproduced for 1.33 million validated elements of every format here that GFX11 has (only 10_10_10_2_USCALED/SSCALED, GFX10 codes
 ; 46 and 47, and the 10_11_11/11_11_10 non-FLOAT codes have no GFX11 spelling and no measurement).
 ; Run: VKC_OUT_WORDS=316 VKC_DUMP=<file> vk_compute_test cs_fmt_all.spv 1 dump; check.py compares all 316 words.
 v_cmpx_eq_u32_e32 0, v0

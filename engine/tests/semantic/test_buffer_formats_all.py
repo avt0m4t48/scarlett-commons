@@ -1,7 +1,7 @@
 """Every GFX10 buffer data format the translator knows, decoded and encoded, against tools/buffer_format_fuzz.py's MODEL.
 
 MODEL (decode_element / encode_element there) is what the Radeon 880M (gfx1150, RDNA3.5, not RDNA2) did for every
-pattern of tools/buffer_format_fuzz.py --oracle hw: 1.26 million elements over 63 formats, loads through a V# and
+pattern of tools/buffer_format_fuzz.py --oracle hw: 1.33 million validated elements over 63 formats, loads through a V# and
 through tbuffer's own format, stores through both (docs/buffer_formats.md, docs/design.md "Typed buffer formats"). This
 file holds the translated SPIR-V to it: the SPIR-V mini interpreter runs `buffer_load_format_xyzw` (the V# format and
 tbuffer's own) and `buffer_store_format_xyzw` of every format added with the SCALED / SINT / 10_11_11 / 11_11_10 /
@@ -9,7 +9,8 @@ tbuffer's own) and `buffer_store_format_xyzw` of every format added with the SCA
 
 Existing formats are only checked for their table entry (size, kind, widths against the GFX10 name): their decode and
 encode is unchanged and covered by test_buffer_load_format.py, test_norm_decode.py and the GPU fixtures. Two places
-where an existing store differs from the 880M are pinned at the end as expected failures (OlderStoresDifferFromTheGpu).
+where an existing store differs from the 880M, and the two-component buffer_store_format_* routing (x, w) that the
+translator does not do, are pinned at the end as expected failures (OlderStoresDifferFromTheGpu).
 """
 import os
 import random
@@ -55,10 +56,10 @@ def translate_load(code, path):
     return support.translate_lines("cs_fmt_all_load", lines, fssm=tv.CS_BOUNDS_FSSM)
 
 
-def translate_store(code):
+def translate_store(code, instr="xyzw"):
     lines = ["v_cmpx_eq_u32_e32 0, v0", *v_sharp_lines(4, OUT_BASE, code), *v_sharp_lines(8, IN_BASE, 22),
              "v_mov_b32 v1, 0", "buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen", "s_waitcnt vmcnt(0)",
-             "buffer_store_format_xyzw v[2:5], v1, s[4:7], 0 offen", "s_endpgm"]
+             f"buffer_store_format_{instr} v[2:{5 if instr == 'xyzw' else 3}], v1, s[4:7], 0 offen", "s_endpgm"]
     return support.translate_lines("cs_fmt_all_store", lines, fssm=tv.CS_BOUNDS_FSSM)
 
 
@@ -233,11 +234,19 @@ class OlderStoresDifferFromTheGpu(unittest.TestCase):
     (docs/buffer_formats.md). They are left as they were, so these assertions of the hardware's words fail today; when
     someone fixes the store the expected failure turns into an unexpected success and says so."""
 
-    def store(self, code, regs):
+    def store(self, code, regs, instr="xyzw"):
         memory = {IN_BASE + 4 * i: w for i, w in enumerate(regs)}
         memory.update({OUT_BASE + 4 * i: SENTINEL for i in range(4)})
-        run(translate_store(code), memory)
+        run(translate_store(code, instr), memory)
         return memory[OUT_BASE]
+
+    @unittest.expectedFailure
+    def test_two_component_mubuf_store_takes_x_and_w_on_the_880m(self):
+        # KNOWN DIFFERENCE, RDNA2 unmeasured: buffer_store_format_xyzw of (1, 2, 3, 4) into 8_8_SINT writes 01 04 on the
+        # Radeon 880M and buffer_store_format_xy writes 01 00; the translator writes (x, y) = 01 02 for both.
+        # (tbuffer_store_format_* takes (x, y) on the 880M too, so there it agrees.)
+        self.assertEqual(self.store(19, [1, 2, 3, 4]) & 0xFFFF, 0x0401)
+        self.assertEqual(self.store(19, [1, 2, 3, 4], "xy") & 0xFFFF, 0x0001)
 
     @unittest.expectedFailure
     def test_16_float_store_rounds_toward_zero_and_saturates(self):

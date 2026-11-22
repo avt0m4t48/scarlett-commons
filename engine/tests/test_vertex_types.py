@@ -154,6 +154,31 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(out["pos_header_finite"], 1)
 
 
+class BlockRunTests(unittest.TestCase):
+    """Blocks stored back to back, with their groups after the whole run in the same order."""
+
+    def test_two_blocks_then_two_groups(self):
+        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group() + padded_group(8)
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), T["vertices"], T["run_blocks"], errors), (2, 100 + 64, 2, {}))
+
+    def test_groups_out_of_order_fail_the_density_check(self):
+        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group(8) + padded_group()
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), errors), (None, {"group does not cover the block densely": 2}))
+
+    def test_blocks_without_a_group_in_the_stream_are_counted(self):
+        data = block(with_group=False) + block(with_group=False) + block(with_group=False) + padded_group()
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), errors), (1, {"no group in the stream for a later block of the run": 2}))
+
+    def test_single_block_unchanged(self):
+        T, errors = measure_stream(block())
+        self.assertEqual((T.get("blocks"), T["run_blocks"], errors), (1, 1, {}))
+        with self.assertRaises(vt.BlockError):
+            measure_stream(block(with_group=False))
+
+
 def block_with_streams(extra, grid=GRID):
     """block() with more (slot, tag, per-vertex bytes) streams appended after its own, before the group."""
     n = grid * grid
@@ -209,31 +234,6 @@ class SkinTests(unittest.TestCase):
     def test_joint_slot_without_weights_is_unpaired(self):
         _, out = measure(block_with_streams([(8, 0x25, bytes((1, 2, 3, 4)))]))
         self.assertEqual(out["skin"], {"unpaired": 1})
-
-
-class BlockRunTests(unittest.TestCase):
-    """Blocks stored back to back, with their groups after the whole run in the same order."""
-
-    def test_two_blocks_then_two_groups(self):
-        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group() + padded_group(8)
-        T, errors = measure_stream(data)
-        self.assertEqual((T.get("blocks"), T["vertices"], T["run_blocks"], errors), (2, 100 + 64, 2, {}))
-
-    def test_groups_out_of_order_fail_the_density_check(self):
-        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group(8) + padded_group()
-        T, errors = measure_stream(data)
-        self.assertEqual((T.get("blocks"), errors), (None, {"group does not cover the block densely": 2}))
-
-    def test_blocks_without_a_group_in_the_stream_are_counted(self):
-        data = block(with_group=False) + block(with_group=False) + block(with_group=False) + padded_group()
-        T, errors = measure_stream(data)
-        self.assertEqual((T.get("blocks"), errors), (1, {"no group in the stream for a later block of the run": 2}))
-
-    def test_single_block_unchanged(self):
-        T, errors = measure_stream(block())
-        self.assertEqual((T.get("blocks"), T["run_blocks"], errors), (1, 1, {}))
-        with self.assertRaises(vt.BlockError):
-            measure_stream(block(with_group=False))
 
 
 class ArchiveTests(unittest.TestCase):

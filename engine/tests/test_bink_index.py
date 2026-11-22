@@ -121,6 +121,16 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
 
+    def test_nested_sources_use_slashes_and_sort_alike_everywhere(self):
+        # "movies/x.bk2" sorts before "movies0.bk2" ("/" < "0"); with "\" it would sort after.
+        os.mkdir(os.path.join(self.dir, "movies"))
+        for name, frames in (("movies0.bk2", 3), (os.path.join("movies", "x.bk2"), 5)):
+            with open(os.path.join(self.dir, name), "wb") as fh:
+                fh.write(make_stream(frames=frames))
+        rows, _summary = bink.scan_target(self.dir)
+        self.assertEqual([(r["source"], r["frames"]) for r in rows],
+                         [("movies/x.bk2", 5), ("movies0.bk2", 3), ("one.bk2", 7)])
+
     def test_short_file_bytes_are_accounted_for(self):
         path = os.path.join(self.dir, "tiny.bk2")
         with open(path, "wb") as fh:

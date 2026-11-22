@@ -13717,7 +13717,7 @@ def translate(path):
         for i in range(user, user + 3):
             g.cu(i)
     if stage == "ps":
-        # Pixel-shader system VGPRs (11,980 of 11,983 PS exact; docs/design.md): v0-v1 = barycentrics (modelled through
+        # Pixel-shader system VGPRs (12,098 of 12,101 PS exact; docs/design.md): v0-v1 = barycentrics (modelled through
         # v_interp -> attributes), then v2.. = the SV_Position components the shader reads, packed in order.
         # Anything else a PS reads before writing is an input layout we haven't confirmed: reject it.
         sig = input_signature_full(path, info["name"])

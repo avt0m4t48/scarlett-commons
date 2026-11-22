@@ -2878,6 +2878,35 @@ HRESULT fence(ID3D12Device* device, D3D12_FENCE_FLAGS flags, REFIID riid = __uui
     return released(device->CreateFence(0, flags, riid, &out), &out);
 }
 
+HRESULT command_allocator(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, bool output = true,
+                          REFIID riid = __uuidof(ID3D12CommandAllocator)) {
+    void* out = nullptr;
+    return released(device->CreateCommandAllocator(type, riid, output ? &out : nullptr), &out);
+}
+
+// CreateCommandList with a fresh allocator of `allocator_type` (or none when it is -2).
+HRESULT command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                     int allocator_type, bool output = true) {
+    void* allocator = nullptr;
+    if (allocator_type != -2)
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(allocator_type), __uuidof(ID3D12CommandAllocator),
+                                       &allocator);
+    void* out = nullptr;
+    const HRESULT hr = device->CreateCommandList(node_mask, type, static_cast<ID3D12CommandAllocator*>(allocator),
+                                                 nullptr, __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr);
+    released(S_OK, &allocator);
+    return released(hr, &out);
+}
+
+HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool output = true) {
+    Ref<ID3D12Device4> device4;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
+    void* out = nullptr;
+    return released(device4->CreateCommandList1(node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
+                                                __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
+                    &out);
+}
+
 // A 64 KiB heap description for the CreateHeap cases (D3D-238).
 D3D12_HEAP_DESC heap_desc_of(UINT64 alignment, D3D12_HEAP_PROPERTIES properties = {D3D12_HEAP_TYPE_DEFAULT},
                              D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE, UINT64 size = 64 * 1024) {
@@ -3829,6 +3858,94 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: high priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_HIGH});
+         }},
+        // Command allocators and lists (video list types are only created here, not compared: the host hands out
+        // a video list, which is not an ID3D12GraphicsCommandList). Types past VIDEO_ENCODE and nodes other than 0
+        // are refused first; a null output is then E_UNEXPECTED.
+        {"command allocator: type direct", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(0));
+         }},
+        {"command allocator: type bundle", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(1));
+         }},
+        {"command allocator: type compute", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(2));
+         }},
+        {"command allocator: type copy", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(3));
+         }},
+        {"command allocator: type video encode", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
+         }},
+        {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
+        {"command allocator: type 99", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99));
+         }},
+        {"command allocator: type -1", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(-1));
+         }},
+        {"command allocator: null output", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command allocator: null output, type 99", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99), false);
+         }},
+        {"command allocator: null output, wrong interface", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, false, __uuidof(ID3D12Fence));
+         }},
+        {"command allocator: wrong interface", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, true, __uuidof(ID3D12Fence));
+         }},
+        {"command list: direct", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0); }},
+        {"command list: bundle", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, 1); }},
+        {"command list: node mask 1", [](ID3D12Device* d) {
+             return command_list(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: node mask 2", [](ID3D12Device* d) {
+             return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: node mask 3", [](ID3D12Device* d) {
+             return command_list(d, 3, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: compute allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 2);
+         }},
+        {"command list: no allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, -2);
+         }},
+        {"command list: type 99", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE(99), 0); }},
+        {"command list: null output", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, false);
+         }},
+        {"command list: null output, node mask 2", [](ID3D12Device* d) {
+             return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, false);
+         }},
+        {"command list: null output, no allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, -2, false);
+         }},
+        {"command list1: type direct", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(0)); }},
+        {"command list1: type bundle", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(1)); }},
+        {"command list1: type compute", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(2));
+         }},
+        {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
+        {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
+        {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
+        {"command list1: type -1", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1)); }},
+        {"command list1: node mask 1", [](ID3D12Device* d) {
+             return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
+         }},
+        {"command list1: node mask 2", [](ID3D12Device* d) {
+             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT);
+         }},
+        {"command list1: null output", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command list1: null output, node mask 2", [](ID3D12Device* d) {
+             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command list1: null output, type 99", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99), false);
          }},
         // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
         // compared.

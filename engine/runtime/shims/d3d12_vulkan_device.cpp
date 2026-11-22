@@ -4430,20 +4430,27 @@ public:
         return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
     }
 
-    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
-                                                ID3D12PipelineState* state, REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                ID3D12CommandAllocator* allocator, ID3D12PipelineState* state,
+                                                REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
+        if (out) *out = nullptr;
+        if (node_mask & ~1u) return d3d12_trace::result(method, E_INVALIDARG);  // one node, as the host answers
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
         HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
         return d3d12_trace::result(method, hr);
     }
 
     // Device4: a list created closed, without an allocator.
-    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS,
-                                                 REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                 D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        if (!out) return d3d12_trace::result(method, E_POINTER);
-        *out = nullptr;
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
+        // output is E_UNEXPECTED.
+        if (out) *out = nullptr;
+        if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12CommandAllocator* allocator = nullptr;
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
         if (FAILED(hr)) return d3d12_trace::result(method, hr);

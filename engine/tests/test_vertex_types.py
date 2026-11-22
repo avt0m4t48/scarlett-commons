@@ -294,6 +294,63 @@ class BlockRunTests(unittest.TestCase):
             measure_stream(block(with_group=False))
 
 
+def block_with_streams(extra, grid=GRID):
+    """block() with more (slot, tag, per-vertex bytes) streams appended after its own, before the group."""
+    n = grid * grid
+    buf = bytearray(block(grid=grid, with_group=False))
+    for slot, tag, data in extra:
+        struct.pack_into("<I", buf, 4 * slot, tag | ((len(buf) // 2) << 8))
+        buf += data * n
+    buf += b"\0" * (-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
+def skin_block(weights, joints, pairs=1):
+    """block() with weight slots 6(/7) (tag 0x26) and joint slots 8(/9) (tag 0x25); weights and joints are
+    8-byte lists (two slots' worth), the first four bytes used when pairs == 1."""
+    extra = [(6, 0x26, bytes(weights[:4])), (8, 0x25, bytes(joints[:4]))]
+    if pairs == 2:
+        extra = [(6, 0x26, bytes(weights[:4])), (7, 0x26, bytes(weights[4:])),
+                 (8, 0x25, bytes(joints[:4])), (9, 0x25, bytes(joints[4:]))]
+    return block_with_streams(extra)
+
+
+class SkinTests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_two_pairs_of_sorted_weights_summing_to_255(self):
+        _, out = measure(skin_block([100, 80, 40, 20, 10, 5, 0, 0], [3, 7, 1, 2, 9, 4, 0, 0], pairs=2))
+        sk = out["skin"]
+        self.assertEqual(sk["blocks"], 1)
+        self.assertEqual(sk["pairs_2"], 1)
+        for k in ("weight_sum_255", "weight_sum_247_255", "weights_descending", "nonzero_indices_distinct",
+                  "zero_weight_zero_index"):
+            self.assertEqual(sk[k], self.N, k)
+        self.assertEqual(sk["index_max_0-15"], 1)
+        self.assertEqual(sk["colour_vertices"], self.N)
+        self.assertEqual(sk["colour_sum_255"], 0)
+
+    def test_failures_are_counted(self):
+        # sum 250, not descending, joint 40 repeated, a zero weight with a non-zero index
+        _, out = measure(skin_block([50, 100, 100, 0], [40, 40, 2, 5]))
+        sk = out["skin"]
+        self.assertEqual(sk["pairs_1"], 1)
+        self.assertEqual(sk["weight_sum_255"], 0)
+        self.assertEqual(sk["weight_sum_247_255"], self.N)
+        self.assertEqual(sk["weights_descending"], 0)
+        self.assertEqual(sk["nonzero_indices_distinct"], 0)
+        self.assertEqual(sk["zero_weight_zero_index"], 0)
+        self.assertEqual(sk["index_max_32-47"], 1)
+
+    def test_no_joint_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["skin"], {})
+
+    def test_joint_slot_without_weights_is_unpaired(self):
+        _, out = measure(block_with_streams([(8, 0x25, bytes((1, 2, 3, 4)))]))
+        self.assertEqual(out["skin"], {"unpaired": 1})
+
+
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end_on_a_fake_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

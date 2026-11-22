@@ -356,6 +356,52 @@ def add(d, k, v=1):
     d[k] = d.get(k, 0) + v
 
 
+SKIN_PAIRS = ((6, 8), (7, 9))  # (weight slot, tag 0x26; joint-index slot, tag 0x25), four influences per pair
+
+
+def skin_checks(data, at, slots, n):
+    """Counts that test the skin reading of a block: slots 6/7 (tag 0x26) are four unorm8 weights each and
+    slots 8/9 (tag 0x25) the four matching joint indices. Empty when slot 8 is not tag 0x25.
+
+    Keys: blocks, vertices, pairs_<k> (blocks with k weight/index slot pairs), unpaired (a 0x25 slot without
+    its 0x26 slot), weight_sum_255 / weight_sum_247_255 (per vertex, over all weight slots), weights_descending,
+    nonzero_indices_distinct (no joint repeats among the non-zero weights), zero_weight_zero_index (every
+    zero weight has index 0), index_max_<b> (blocks by highest index used by a non-zero weight, in bands of
+    16), and the control colour_sum_255 (slot 1, tag 0x26, the same byte sum on the colour stream)."""
+    out = {}
+    if slots.get(8, (None,))[0] != 0x25:
+        return out
+    pairs = []
+    for ws, js in SKIN_PAIRS:
+        if slots.get(js, (None,))[0] != 0x25:
+            continue
+        if slots.get(ws, (None,))[0] != 0x26:
+            add(out, "unpaired")
+            return out
+        pairs.append((at + slots[ws][1], at + slots[js][1]))
+    add(out, "blocks")
+    add(out, "vertices", n)
+    add(out, f"pairs_{len(pairs)}")
+    top = 0
+    for v in range(n):
+        w = [b for wo, _ in pairs for b in data[wo + 4 * v:wo + 4 * v + 4]]
+        j = [b for _, jo in pairs for b in data[jo + 4 * v:jo + 4 * v + 4]]
+        s = sum(w)
+        add(out, "weight_sum_255", int(s == 255))
+        add(out, "weight_sum_247_255", int(247 <= s <= 255))
+        add(out, "weights_descending", int(all(w[k] >= w[k + 1] for k in range(len(w) - 1))))
+        live = [j[k] for k in range(len(w)) if w[k]]
+        add(out, "nonzero_indices_distinct", int(len(set(live)) == len(live)))
+        add(out, "zero_weight_zero_index", int(all(j[k] == 0 for k in range(len(w)) if not w[k])))
+        top = max([top] + live)
+    add(out, f"index_max_{top // 16 * 16}-{top // 16 * 16 + 15}")
+    if slots.get(1, (None,))[0] == 0x26:
+        c = at + slots[1][1]
+        add(out, "colour_vertices", n)
+        add(out, "colour_sum_255", sum(1 for v in range(n) if sum(data[c + 4 * v:c + 4 * v + 4]) == 255))
+    return out
+
+
 def measure_block(data, at, T, rng, found=None):
     slots, order, flags = parse_slots(data, at)
     n = vertex_count(slots, order)
@@ -372,6 +418,9 @@ def measure_block(data, at, T, rng, found=None):
     add(T, "blocks")
     add(T, "vertices", n)
     add(T, "edges", len(edges))
+    sk = T.setdefault("skin", {})
+    for key, val in skin_checks(data, at, slots, n).items():
+        add(sk, key, val)
     pos, bias, scale = positions(data, at, slots, n)
     if all(math.isfinite(c) for c in bias + scale) and min(scale) >= 0:
         add(T, "pos_header_finite")

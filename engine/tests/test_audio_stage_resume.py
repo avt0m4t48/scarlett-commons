@@ -15,8 +15,10 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 import awc_opus  # noqa: E402
 import make_game  # noqa: E402
+import winbatch  # noqa: E402
 
 
 class WriteFileTest(unittest.TestCase):
@@ -203,17 +205,6 @@ with open(sys.argv[-1], "w", encoding="utf-8") as f:
 """
 
 
-def _batch_path(path):
-    """A spelling of path that cmd.exe reads correctly from a batch file: as is when ASCII, else its 8.3 short name
-    (cmd.exe decodes a batch file with the OEM code page, not UTF-8)."""
-    if path.isascii():
-        return path
-    import ctypes
-    buf = ctypes.create_unicode_buffer(32768)
-    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
-    return buf.value if 0 < n < len(buf) else path
-
-
 class DecodeXmaStdinTest(unittest.TestCase):
     """ffmpeg reads stdin for key commands. Given the build's stdin, it stops a build in the background of a terminal
     ("Stopped (tty output)") at the first XMA2 stream and swallows input piped to make_game.py."""
@@ -227,10 +218,7 @@ class DecodeXmaStdinTest(unittest.TestCase):
             with open(script, "w", encoding="utf-8") as f:
                 f.write(STDIN_FFMPEG)
             if os.name == "nt":
-                ffmpeg = os.path.join(d, "ffmpeg.cmd")
-                # cmd.exe reads a batch file in the OEM code page: non-ASCII paths go in as their 8.3 short names.
-                with open(ffmpeg, "w", encoding="oem") as f:
-                    f.write(f'@"{_batch_path(sys.executable)}" "{_batch_path(script)}" %*\n')
+                ffmpeg = winbatch.write_python_cmd(os.path.join(d, "ffmpeg.cmd"), sys.executable, script)
             else:
                 ffmpeg = os.path.join(d, "ffmpeg")
                 with open(ffmpeg, "w", encoding="utf-8") as f:

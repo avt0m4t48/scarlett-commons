@@ -488,7 +488,8 @@ class MeshletCentreTests(unittest.TestCase):
 class SlotTagTests(unittest.TestCase):
     def test_tag_stride(self):
         self.assertEqual([mp.tag_stride(x) for x in (0x63, 0x42, 0x26, 0x28, 0x21, 0x27)], [12, 8, 4, 4, 4, 4])
-        self.assertIsNone(mp.tag_stride(0x25))   # type 5 is not seen
+        self.assertEqual(mp.tag_stride(0x25), 4)  # joint indices
+        self.assertIsNone(mp.tag_stride(0x2f))   # unknown type
         self.assertIsNone(mp.tag_stride(0x02))   # stride 0
         self.assertEqual(mp.tag_stride(0x46), 8)  # RGBA8-type tag with an 8-byte stride: sized by the rule
 
@@ -500,9 +501,19 @@ class SlotTagTests(unittest.TestCase):
         self.assertEqual([c["kind"] for c in chunks], ["block4240", "group"])
         self.assertEqual(chunks[1]["offset"] - chunks[0]["offset"], 0x80 + 10 * (8 + 4 + 8 + 4))
         # a type that is not seen is still not a block: such a page is not a mesh page
-        bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x25, 4))), group([(10, 6)]))
+        bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x2f, 4))), group([(10, 6)]))
         self.assertFalse(mp.is_mesh_page(bad))
         self.assertIn("error", mp.summarise_page(bad, "x"))
+
+    def test_joint_index_stream_before_another_slot(self):
+        tags = ((0, 0x42, 8), (6, 0x26, 4), (8, 0x25, 4), (1, 0x26, 4))
+        vertices = other_block(5, tags=tags)
+        data = page(vertices, group([(5, 3)]))
+        self.assertTrue(mp.is_mesh_page(data))
+        block, meshlets = mp.parse_page(data)
+        self.assertEqual(block["vertices"], 5)
+        self.assertIn([8, 0x25, 0x80 + 5 * 12], block["slots"])
+        self.assertEqual((meshlets["kind"], meshlets["offset"]), ("group", (len(vertices) + 15) & ~15))
 
 
 class CliTests(unittest.TestCase):

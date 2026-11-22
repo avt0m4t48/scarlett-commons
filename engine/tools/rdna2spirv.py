@@ -13360,8 +13360,9 @@ def mix_literal(raw, printed, op):
     A v_fma_mix source read as f16 (op_sel_hi set) takes the half op_sel names, so one literal can feed one source its
     low half and another its high half (seen in the FidelityFX DLL's FSPX code: src0 low, src2 high, op_sel:[0,0,1]
     op_sel_hi:[1,0,1]). llvm-mc prints that literal as its low 16 bits and re-encodes it with a zero high half, which
-    would read the high half as +0.0. Only that half may differ: the 8 instruction bytes must match (same_encoding)
-    and the printed literal must be the stored one's low half. That the hardware hands op_sel's high half of the
+    would read the high half as +0.0. Only that half may differ: the 8 instruction bytes must match (same_encoding
+    with all three sources counted as used, so nothing is forgiven and a live s0 can't pass as an inline 0) and the
+    printed literal must be the stored one's low half. That the hardware hands op_sel's high half of the
     literal to that source is not measured; Mesa's ACO relies on it (optimize_constants() in aco_optimizer.cpp packs
     two constants as the two f16 halves of one literal for v_fma_mix), and the console compiler emitted it here."""
     if not op.startswith("v_fma_mix") or len(raw) != 12 or len(printed) != 12 or raw[3] != 0xCC:

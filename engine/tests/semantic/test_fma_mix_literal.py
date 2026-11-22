@@ -37,8 +37,8 @@ def lit(value):
     return struct.pack("<I", value).hex(" ")
 
 
-def program(literal, words=MIX_WORDS):
-    return [MOV, (MIX_TEXT, f"{words} {lit(literal)}"), EXP, END]
+def program(literal, words=MIX_WORDS, text=MIX_TEXT):
+    return [MOV, (text, f"{words} {lit(literal)}"), EXP, END]
 
 
 def listing(prog, invalid=False):
@@ -92,6 +92,28 @@ class FmaMixLiteralTest(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported) as cm:
             self.run_ps(listing(PRINTED), blob(other))
         self.assertIn("dropped", str(cm.exception))
+
+    def test_a_live_source_printed_as_inline_zero_is_refused(self):
+        # Stored SRC1 0x000 (s0, a source v_fma_mix reads) against a printed inline 0 (0x080). same_encoding forgives
+        # that for an unused source field; the repair must not, since all three v_fma_mix sources are live.
+        text = "v_fma_mix_f32 v1, 0x4200, 0, 0x4200 op_sel:[0,0,1] op_sel_hi:[1,0,1]"
+        printed = program(0x00004200, words="01 60 20 cc ff 00 fd 0b", text=text)
+        stored = program(0x40004200, words="01 60 20 cc ff 00 fc 0b", text=text)
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            self.run_ps(listing(printed), blob(stored))
+        self.assertIn("v_fma_mix_f32 at 0x104", str(cm.exception))
+
+    def test_an_inline_constant_with_the_printed_value_keeps_it(self):
+        # src0 = v2 (2.0) as f32, src1 = the inline integer 1 as f32, src2 = the literal's high half (op_sel:[0,0,1]
+        # op_sel_hi:[0,0,1]). The stored literal 0x3c000001 prints as 0x1, the same value as src1, so only the
+        # SRC field (0xff) tells the literal's user apart. Hand-written text: llvm-mc 23.1.5 prints this literal as
+        # lit(0x3c000001). fma(2.0, 1.4e-45, 1.0) = 1.0, also with the denormal flushed; src1 overwritten with the
+        # literal would give 2 * 0.0078125 + 1.0.
+        text = "v_fma_mix_f32 v1, v2, 1, 0x1 op_sel:[0,0,1] op_sel_hi:[0,0,1]"
+        words = "01 60 20 cc 02 03 fd 03"
+        printed = program(0x00000001, words=words, text=text)
+        stored = program(0x3C000001, words=words, text=text)
+        self.assertEqual(self.run_ps(listing(printed), blob(stored)), [f2u(1.0)] * 4)
 
 
 if __name__ == "__main__":

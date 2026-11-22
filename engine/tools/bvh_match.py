@@ -198,6 +198,11 @@ def score(src, candidate, groups, transform, header_offset=0):
     return C.check(src, geometries, header_offset)
 
 
+def export_buffer_names(count):
+    """The (vertex, index) buffer names write_export gives each of `count` matched geometries."""
+    return [("g%d_f3.bin" % i, "g%d_tri.bin" % i) for i in range(count)]
+
+
 def write_export(directory, candidate, groups, transform):
     """Write the matched geometries as float3/uint32 buffers plus the export.json tools/bvh_rehydrate.py is given.
 
@@ -206,10 +211,11 @@ def write_export(directory, candidate, groups, transform):
     """
     os.makedirs(directory, exist_ok=True)
     rows = []
+    names = export_buffer_names(len(candidate["used"]))
     for k in candidate["used"]:
         mesh = candidate["kept"][k]
         geometry = build_geometry(groups[mesh[0]])
-        vb, ib = "g%d_f3.bin" % len(rows), "g%d_tri.bin" % len(rows)
+        vb, ib = names[len(rows)]
         with open(os.path.join(directory, vb), "wb") as f:
             f.write(geometry.vertices)
         with open(os.path.join(directory, ib), "wb") as f:
@@ -324,6 +330,14 @@ def main(argv=None):
             print("nothing written: no candidate is consistent")
         else:
             match = consistent[0][3]
+            if a.json:
+                # The report is written after the export, so it must not land on one of the buffers the
+                # export is about to write either. Their names depend on the match, hence the check here.
+                for vb, ib in export_buffer_names(len(match["used"])):
+                    for name in (vb, ib):
+                        if same_report_path(a.json, os.path.join(a.write, name)):
+                            print("error: --json would overwrite --write's %s: %s" % (name, a.json), file=sys.stderr)
+                            return 2
             rows = write_export(a.write, match, groups[os.path.join(models_dir, match["item"]["File"])], transform)
             print("wrote %d geometries to %s%s" % (len(rows), a.write,
                   "; pass the transform in export.json to bvh_rehydrate.py with --transform" if transform else ""))

@@ -206,6 +206,47 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("--write's export.json", err)
 
+    def test_json_over_a_write_vertex_buffer_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g0_f3.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g0_f3.bin", err)
+        # Refused before the export runs: no buffer and no export.json were written.
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_over_a_write_index_buffer_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g0_tri.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g0_tri.bin", err)
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_over_a_later_geometry_buffer_is_refused(self):
+        # Two matched geometries: the report must not land on the second one's buffers either.
+        src, _, _ = build([(0, 0x81, 0, 1, 0x09), (1, 0x81, 0, 1, 0x09)], bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2, 2])], {"a.obj": [group(2), group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g1_tri.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g1_tri.bin", err)
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_beside_the_write_buffers_still_works(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        report = os.path.join(self.dir, "report.json")
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", report])
+        self.assertEqual(status, 0, out)
+        with open(os.path.join(out_dir, "g0_f3.bin"), "rb") as f:
+            self.assertEqual(len(f.read()), 4 * 12)
+        with open(report, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["consistent"])
+
     def test_json_to_its_own_path_still_writes_the_report(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         report = os.path.join(self.dir, "report.json")

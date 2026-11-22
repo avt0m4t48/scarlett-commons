@@ -2,7 +2,8 @@
 
     python -I tests/test_xcl_compare.py
 
-Pure functions only: nothing here starts XCL, gta6rt or a title, and no game files are read.
+Nothing here starts XCL or gta6rt, and no game files are read. The run tests start a small Python script that
+prints the test title's line format in place of a title.
 """
 import os
 import sys
@@ -67,6 +68,16 @@ class Report(unittest.TestCase):
         self.assertEqual((b["leonida"], b["unimplemented"]), ("FAIL", ["kernelx.dll!XMemAlloc"]))
         self.assertEqual(r["checks"][2]["stack"], ["main: XTaskQueueTerminate"])
 
+    def test_same_status_different_reason_differs(self):
+        x, l = xc.Run("XCL"), xc.Run("Leonida")
+        x.set("a", status="FAIL", reason="E_NOTIMPL")
+        l.set("a", status="FAIL", reason="null pointer")
+        x.set("b", status="FAIL", reason="same")
+        l.set("b", status="FAIL", reason="same")
+        r = xc.make_report(x, l, list(x.order), "gta6rt.exe", ".")
+        self.assertEqual([row["same"] for row in r["checks"]], [False, True])
+        self.assertEqual(r["differences"], 1)
+
 
 class Transcript(unittest.TestCase):
     """run_title streams the title's output to the transcript file and keeps none of it on the Run."""
@@ -89,6 +100,61 @@ class Transcript(unittest.TestCase):
         self.assertTrue(lines[0].startswith("--- "))
         self.assertEqual(lines[1:4], ["[RUN] a", "x" * 256, "[PASS] a"])
         self.assertFalse(hasattr(run, "log"))
+
+
+class Sink:
+    def put(self, event):
+        pass
+
+
+# A stand-in title: checks a, b and c; b hangs unless XCL_TESTTITLE_SKIP names it (or HONOUR_SKIP is 0).
+FAKE_TITLE = """
+import os, sys, time
+skip = os.environ.get("XCL_TESTTITLE_SKIP", "").split(";")
+honour = os.environ.get("HONOUR_SKIP", "1") == "1"
+for name in ("a", "b", "c"):
+    if honour and name in skip:
+        print("[SKIP] " + name, flush=True)
+        continue
+    print("[RUN] " + name, flush=True)
+    if name == "b":
+        time.sleep(60)
+    print("[PASS] " + name, flush=True)
+"""
+
+
+class Restart(unittest.TestCase):
+    """run_with_restarts: a hung check is recorded as HANG and the title is run again with it skipped."""
+
+    def run_fake(self, honour):
+        env = dict(os.environ, HONOUR_SKIP="1" if honour else "0")
+        cmd = [sys.executable, "-I", "-c", FAKE_TITLE]
+        attempts = []
+
+        def cmd_for(attempt):
+            attempts.append(attempt)
+            return cmd
+
+        run = xc.Run("synthetic")
+        with tempfile.TemporaryDirectory() as tmp:
+            skip = xc.run_with_restarts(cmd_for, env, tmp, run, ["a", "b", "c"], 2, None, Sink(), [], 3,
+                                        os.path.join(tmp, "out.txt"))
+        return run, skip, attempts
+
+    def test_hang_then_restart_with_the_check_skipped(self):
+        run, skip, attempts = self.run_fake(honour=True)
+        self.assertEqual(skip, ["b"])
+        self.assertEqual(attempts, [0, 1])
+        self.assertEqual(run.checks["b"]["status"], "HANG")
+        self.assertEqual(run.checks["b"]["reason"], "no output for 2 s")
+        self.assertEqual((run.checks["a"]["status"], run.checks["c"]["status"]), ("PASS", "PASS"))
+
+    def test_stops_when_a_skipped_check_hangs_again(self):
+        run, skip, attempts = self.run_fake(honour=False)
+        self.assertEqual(skip, ["b"])
+        self.assertEqual(attempts, [0, 1])
+        self.assertEqual(run.checks["b"]["status"], "HANG")
+        self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
 
 
 if __name__ == "__main__":

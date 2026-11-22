@@ -127,8 +127,12 @@ def thread_stacks(cdb, pid):
     return useful or stacks
 
 
-def kill_tree(pid):
-    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+def kill_tree(proc):
+    """Stop the title and every process it started (taskkill /T on Windows, the process alone elsewhere)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
 
 
 def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=None):
@@ -144,8 +148,9 @@ def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=
     lines = queue.Queue()
 
     def pump():
-        for line in proc.stdout:
-            lines.put(line.rstrip("\r\n"))
+        with proc.stdout:
+            for line in proc.stdout:
+                lines.put(line.rstrip("\r\n"))
         lines.put(None)
 
     threading.Thread(target=pump, daemon=True).start()
@@ -170,7 +175,7 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
             if time.monotonic() - last > timeout:
                 hung = current or next((n for n in known if n not in done_names), "(before the first check)")
                 stacks = thread_stacks(cdb, proc.pid)
-                kill_tree(proc.pid)
+                kill_tree(proc)
                 proc.wait()
                 run.set(hung, status="HANG", reason="no output for %d s" % timeout, stack=stacks,
                         seconds=round(time.monotonic() - started, 2))
@@ -244,38 +249,50 @@ def run_all(args, events):
     known = list(xcl.order)
 
     # 2. gta6rt, restarted with a hung check skipped, up to --max-restarts times.
-    skip = list(args.skip)
-    for attempt in range(args.max_restarts + 1):
+    def leonida_cmd(attempt):
         if (work / "leonida").exists():
             shutil.rmtree(work / "leonida")
         game = work / "leonida" / "game"
         prepare_game(xcl_dir, bins, game)
         trace = work / "leonida" / ("trace_%d.jsonl" % attempt)
-        cmd = [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
-               "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
-        hung = run_title(cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events, skip,
-                         transcripts["leonida"])
-        if not hung:
-            break
-        if hung in skip:
-            # The title ignored XCL_TESTTITLE_SKIP (it was built without that local change), so a restart would
-            # only hang at the same check again.
-            events.put(("line", "Leonida", "--- %s hung again although skipped: the title does not support "
-                        "XCL_TESTTITLE_SKIP, so the checks after it are not run ---" % hung))
-            break
-        skip.append(hung)
-        events.put(("line", "Leonida", "--- %s hung; restarting with it skipped ---" % hung))
+        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
+                "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+
+    run_with_restarts(leonida_cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events,
+                      list(args.skip), args.max_restarts, transcripts["leonida"])
     for name in known:
         if name not in leo.checks:
             leo.set(name)
     report = make_report(xcl, leo, known, gta6rt, xcl_dir)
     report["transcripts"] = {k: str(v) for k, v in transcripts.items()}
     out = Path(args.out) if args.out else work / "report.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
         f.write("\n")
     events.put(("done", report, str(out)))
     return report, out
+
+
+def run_with_restarts(cmd_for, env, cwd, run, known, timeout, cdb, events, skip, max_restarts, transcript=None):
+    """Run the title, and after a hang run it again with the hung check in XCL_TESTTITLE_SKIP.
+
+    cmd_for(attempt) returns the command line for each attempt (it may also reset the work folder). Stops when a run
+    ends without a hang, after max_restarts restarts, or when a skipped check hangs again. Returns the skip list."""
+    skip = list(skip)
+    for attempt in range(max_restarts + 1):
+        hung = run_title(cmd_for(attempt), env, cwd, run, known, timeout, cdb, events, skip, transcript)
+        if not hung:
+            break
+        if hung in skip:
+            # The title ignored XCL_TESTTITLE_SKIP (it was built without that local change), so a restart would
+            # only hang at the same check again.
+            events.put(("line", run.label, "--- %s hung again although skipped: the title does not support "
+                        "XCL_TESTTITLE_SKIP, so the checks after it are not run ---" % hung))
+            break
+        skip.append(hung)
+        events.put(("line", run.label, "--- %s hung; restarting with it skipped ---" % hung))
+    return skip
 
 
 def git_head(path):
@@ -293,7 +310,9 @@ def make_report(xcl, leo, known, gta6rt, xcl_dir):
         l = leo.checks.get(name, {"status": "NOT RUN", "reason": "", "unimplemented": [], "stack": []})
         rows.append({"check": name, "xcl": x["status"], "xcl_reason": x["reason"], "leonida": l["status"],
                      "leonida_reason": l["reason"], "unimplemented": l.get("unimplemented", []),
-                     "stack": l.get("stack", []), "same": x["status"] == l["status"]})
+                     "stack": l.get("stack", []),
+                     # A check that fails in both runs for different reasons still differs.
+                     "same": (x["status"], x["reason"]) == (l["status"], l["reason"])})
     count = lambda run, s: sum(1 for r in rows if r[run] == s)
     return {
         "leonida_commit": git_head(REPO), "xcl_commit": git_head(xcl_dir), "gta6rt": str(gta6rt),
@@ -309,7 +328,9 @@ def print_report(report, out):
     for r in report["checks"]:
         mark = " " if r["same"] else "*"
         line = "%s %-*s  XCL %-7s  Leonida %-7s" % (mark, w, r["check"][:w], r["xcl"], r["leonida"])
-        if r["leonida_reason"] and not r["same"]:
+        if not r["same"] and r["xcl"] == r["leonida"]:
+            line += "  XCL: %s / Leonida: %s" % (r["xcl_reason"][:60], r["leonida_reason"][:60])
+        elif r["leonida_reason"] and not r["same"]:
             line += "  " + r["leonida_reason"][:120]
         print(line)
         for imp in r["unimplemented"]:

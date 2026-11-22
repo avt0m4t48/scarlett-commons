@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <thread>
 #include <vector>
@@ -783,6 +784,22 @@ int main() {
         if (h != INVALID_HANDLE_VALUE) find_close(h);
         check(list(first_w, next_w, find_close, L"GAME:\\listing\\*").size() == 2,
               "and the emptied parent lists only . and ..");
+
+        // A listing whose folder is a file is neither: the host answers ERROR_DIRECTORY. One level further down the
+        // path is simply missing again. (Case measured on the host and reported in review by shdann.)
+        write_path(package / "listing" / "file.txt", "package");
+        for (const wchar_t* pattern : {L"GAME:\\listing\\file.txt\\*", L"GAME:\\listing\\file.txt\\x"}) {
+            SetLastError(0);
+            h = first_w(pattern, &found);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_DIRECTORY,
+                  "FindFirstFileW below a file fails with ERROR_DIRECTORY, as the host does");
+            if (h != INVALID_HANDLE_VALUE) find_close(h);
+        }
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\file.txt\\sub\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "and two levels below a file with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
     }
 
     // A move onto the same name succeeds and changes nothing; a rename that changes only the case renames.

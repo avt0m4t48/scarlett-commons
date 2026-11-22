@@ -469,9 +469,11 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return false;
     }
     // The folder being listed has to exist in the title's view. The host would still enumerate a package folder the
-    // title removed (its "." and ".."), and a folder that is missing is a missing path, not a missing file.
-    if (!is_folder(r, dirs)) {
-        error = ERROR_PATH_NOT_FOUND;
+    // title removed (its "." and ".."), and a folder that is missing is a missing path, not a missing file. A listing
+    // below a file is a third answer on the host, ERROR_DIRECTORY.
+    const Kind listed = view(r, dirs).kind;
+    if (listed != Kind::Directory) {
+        error = listed == Kind::File ? ERROR_DIRECTORY : ERROR_PATH_NOT_FOUND;
         return false;
     }
 

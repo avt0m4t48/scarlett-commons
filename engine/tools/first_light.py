@@ -40,9 +40,17 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+from compute_fixture import find_test_program  # noqa: E402
+
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
+DEFAULT_TEXTURED_PS = "PS_Copy_3ea4b38a_Wrapped"
+DEFAULT_TSHARP_VA = 0x100
+DEFAULT_PTR_SGPR = 9
+DEFAULT_SSHARP = [0x92, 0xC00000, 0x14500000, 0]
 MESH_HEADER = struct.Struct("<II")
+TEX_HEADER = struct.Struct("<II")
 
 
 def run(argv, **kwargs):
@@ -72,13 +80,14 @@ def ensure_carve(game: str, work: str) -> str:
 def choose(index_path: str, vs: str, ps: str) -> list[dict]:
     with open(index_path, encoding="utf-8") as f:
         entries = json.load(f)
-    by_name = {e["name"]: e for e in entries}
-    missing = [n for n in (vs, ps) if n not in by_name]
+    by_stage_and_name = {(entry["stage"], entry["name"]): entry for entry in entries}
+    requested = (("vs", vs), ("ps", ps))
+    missing = [f"{stage} {name}" for stage, name in requested if (stage, name) not in by_stage_and_name]
     if missing:
         raise SystemExit(
             f"shader not in the carve index: {', '.join(missing)} (use --list)"
         )
-    return [by_name[vs], by_name[ps]]
+    return [by_stage_and_name[key] for key in requested]
 
 
 def translate(work: str, picked: list[dict]) -> dict:
@@ -121,14 +130,33 @@ def translate(work: str, picked: list[dict]) -> dict:
         meta = json.load(f)
     result = {}
     for entry in picked:
-        key = entry["name"]
-        item = meta.get(key)
-        if item is None:  # a duplicate name gets a ~1 suffix
-            item = next((v for k, v in meta.items() if k.startswith(key)), None)
+        stem = os.path.splitext(entry["file"])[0]
+        item = meta.get(stem)
         if item is None or item.get("stage") != entry["stage"]:
-            raise SystemExit(f"translator has no {entry['stage']} result for {key}")
+            raise SystemExit(f"translator has no {entry['stage']} result for {stem}")
         result[entry["stage"]] = item
     return result
+
+
+def _obj_lines(handle):
+    """Yield logical OBJ lines with trailing-backslash continuations joined and # comments stripped."""
+    pending = ""
+    for raw_line in handle:
+        stripped = raw_line.rstrip("\r\n")
+        if stripped.endswith("\\"):
+            pending += stripped[:-1]
+            continue
+        yield (pending + stripped).split("#", 1)[0]
+        pending = ""
+    if pending:
+        yield pending.split("#", 1)[0]
+
+
+def _parse_obj_int(token: str, path: str, kind: str) -> int:
+    try:
+        return int(token)
+    except ValueError:
+        raise SystemExit(f"{path}: invalid {kind} index {token!r}") from None
 
 
 def read_obj(
@@ -137,20 +165,44 @@ def read_obj(
     """Positions, UVs and triangles as (x, y, z, u, v) vertices plus a u32 index list."""
     positions, uvs, faces = [], [], []
     with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line in _obj_lines(f):
             p = line.split()
             if not p:
                 continue
             if p[0] == "v":
-                positions.append(tuple(float(x) for x in p[1:4]))
+                if len(p) < 4:
+                    raise SystemExit(f"{path}: short vertex line: {line.strip()!r}")
+                try:
+                    positions.append(tuple(float(x) for x in p[1:4]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid vertex coordinates: {line.strip()!r}") from None
             elif p[0] == "vt":
-                uvs.append(tuple(float(x) for x in p[1:3]))
+                if len(p) < 3:
+                    raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
+                try:
+                    uvs.append(tuple(float(x) for x in p[1:3]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:
                     parts = word.split("/")
-                    vi = int(parts[0]) - 1
-                    ti = int(parts[1]) - 1 if len(parts) > 1 and parts[1] else -1
+                    raw_vi = _parse_obj_int(parts[0], path, "vertex")
+                    if raw_vi == 0:
+                        raise SystemExit(f"{path}: vertex index 0 is out of range (OBJ indices are 1-based)")
+                    vi = len(positions) + raw_vi if raw_vi < 0 else raw_vi - 1
+                    if raw_vi < 0 and vi < 0:
+                        raise SystemExit(f"{path}: vertex index {raw_vi} is out of range for {len(positions)} vertex(es)")
+                    if len(parts) > 1 and parts[1]:
+                        raw_ti = _parse_obj_int(parts[1], path, "texture-coordinate")
+                        if raw_ti == 0:
+                            ti = -1
+                        else:
+                            ti = len(uvs) + raw_ti if raw_ti < 0 else raw_ti - 1
+                            if raw_ti < 0 and ti < 0:
+                                ti = -1
+                    else:
+                        ti = -1
                     face.append((vi, ti))
                 for k in range(1, len(face) - 1):
                     faces.extend((face[0], face[k], face[k + 1]))
@@ -158,6 +210,8 @@ def read_obj(
         raise SystemExit(f"no vertices or faces in {path}")
     unique, vertices, indices = {}, [], []
     for vi, ti in faces:
+        if not 0 <= vi < len(positions):
+            raise SystemExit(f"{path}: vertex index {vi + 1} is out of range for {len(positions)} vertex(es)")
         key = (vi, ti)
         if key not in unique:
             unique[key] = len(vertices)
@@ -175,7 +229,7 @@ def fit(vertices, width: int, height: int, fit_xy: bool, flatten_z: bool):
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     span = max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
     scale = 1.8 / span
-    cz = (min(zs) + max(zs)) / 2 if flatten_z else 0.0
+    cz = (min(zs) + max(zs)) / 2 if not flatten_z else 0.0
     aspect = width / height if height else 1.0
     out = []
     for x, y, z, u, v in vertices:
@@ -191,6 +245,83 @@ def write_mesh(path: str, vertices, indices) -> None:
         f.write(MESH_HEADER.pack(len(vertices), len(indices)))
         f.writelines(struct.pack("<5f", *v) for v in vertices)
         f.write(struct.pack(f"<{len(indices)}I", *indices))
+
+
+def decode_dds_to_rgba(path: str) -> tuple[int, int, bytes, str]:
+    """Decode a DDS texture (BC1/BC3/BC7/RGBA8/etc.) via tools/dds_png.py."""
+    if TOOLS not in sys.path:
+        sys.path.insert(0, TOOLS)
+    import dds_png
+
+    with open(path, "rb") as f:
+        raw = f.read()
+    width, height, rgba = dds_png.decode_dds(raw)
+    return width, height, rgba, hashlib.sha256(raw).hexdigest()
+
+
+def write_texture_rgba(path: str, width: int, height: int, rgba: bytes) -> None:
+    if len(rgba) != width * height * 4:
+        raise ValueError(f"expected {width * height * 4} RGBA bytes, got {len(rgba)}")
+    with open(path, "wb") as f:
+        f.write(TEX_HEADER.pack(width, height))
+        f.write(rgba)
+
+
+def sample_rgba_bilinear(
+    width: int, height: int, rgba: bytes, u: float, v: float
+) -> list[float]:
+    """Bilinear sample of an R8G8B8A8_UNORM texture with clamp-to-edge addressing."""
+    u = max(0.0, min(1.0, u))
+    v = max(0.0, min(1.0, v))
+    fx = u * width - 0.5
+    fy = v * height - 0.5
+    x0 = max(0, min(width - 1, int(fx) if fx >= 0 else 0))
+    y0 = max(0, min(height - 1, int(fy) if fy >= 0 else 0))
+    x1 = min(width - 1, x0 + 1)
+    y1 = min(height - 1, y0 + 1)
+    tx = max(0.0, min(1.0, fx - x0))
+    ty = max(0.0, min(1.0, fy - y0))
+
+    def texel(x: int, y: int) -> tuple[float, float, float, float]:
+        off = (y * width + x) * 4
+        return (
+            rgba[off] / 255.0,
+            rgba[off + 1] / 255.0,
+            rgba[off + 2] / 255.0,
+            rgba[off + 3] / 255.0,
+        )
+
+    c00, c10 = texel(x0, y0), texel(x1, y0)
+    c01, c11 = texel(x0, y1), texel(x1, y1)
+    out = []
+    for c in range(4):
+        top = c00[c] * (1.0 - tx) + c10[c] * tx
+        bot = c01[c] * (1.0 - tx) + c11[c] * tx
+        out.append(round(top * (1.0 - ty) + bot * ty, 6))
+    return out
+
+
+def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> dict:
+    """Build the environment variables for vk_harness from a first_light manifest."""
+    env = dict(os.environ if base_env is None else base_env)
+    env["VKH_DRAW_MESH"] = os.path.join(out_dir, manifest["files"]["mesh"])
+    env["VKH_VERTEX_LAYOUT"] = "0:3f,1:2f"
+    tex = manifest.get("texture")
+    if tex:
+        tex_file = manifest["files"]["texture"]
+        ptr_sgpr = int(tex["ptr_sgpr"])
+        tsharp_va = int(tex["tsharp_va"])
+        ssharp = tex["ssharp"]
+        sgprs = ["0"] * (ptr_sgpr + 1)
+        sgprs[ptr_sgpr] = hex(tsharp_va)
+        env["VKH_TEX_RGBA"] = os.path.join(out_dir, tex_file)
+        env["VKH_TSHARP_VA"] = hex(tsharp_va)
+        env["VKH_SSHARP"] = ",".join(hex(int(w)) for w in ssharp)
+        env["VKH_SGPRS"] = ",".join(sgprs)
+        ps_sg = manifest.get("ps", {}).get("subgroup_size")
+        if ps_sg:
+            env["VKH_SUBGROUP_SIZE"] = str(int(ps_sg))
+    return env
 
 
 def pixel_ndc(px: int, py: int, width: int, height: int) -> tuple[float, float]:
@@ -255,16 +386,20 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
 
 
 def find_harness(explicit: str | None) -> str:
-    exe = ".exe" if os.name == "nt" else ""
+    executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
+    build = os.path.join(ROOT, "runtime", "build")
+    build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
-        os.path.join(ROOT, "runtime", "build", "linux", f"vk_harness{exe}"),
-        os.path.join(ROOT, "runtime", "build", "windows", f"vk_harness{exe}"),
-        os.path.join(ROOT, "runtime", "build", f"vk_harness{exe}"),
+        *(os.path.join(folder, executable) for folder in build_dirs),
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+    for folder in build_dirs:
+        configured = find_test_program(folder, "vk_harness")
+        if configured:
+            return os.path.join(configured, executable)
     raise SystemExit(
         "vk_harness not found: build runtime/build/linux or runtime/build/windows (target vk_harness), "
         "or set --harness/LEONIDA_VK_HARNESS"
@@ -303,7 +438,16 @@ def check_image(data: bytes, manifest: dict) -> dict:
             raise AssertionError(
                 f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
             )
-    if (uv := manifest.get("centre_uv")) is not None:
+    if (rgba := manifest.get("centre_rgba")) is not None:
+        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
+        i = (centre[1] * width + centre[0]) * 4
+        tol = manifest.get("rgba_tolerance", 0.02)
+        for c, want in enumerate(rgba):
+            if abs(pixels[i + c] - want) > tol:
+                raise AssertionError(
+                    f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
+                )
+    elif (uv := manifest.get("centre_uv")) is not None:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
@@ -311,23 +455,39 @@ def check_image(data: bytes, manifest: dict) -> dict:
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
-    for probe in manifest.get("uv_probes", []):
-        px, py = probe["pixel"]
-        i = (py * width + px) * 4
-        u, v = probe["uv"]
-        for c, want in enumerate((u, v, 0.0, 1.0)):
-            if abs(pixels[i + c] - want) > 2e-3:
-                raise AssertionError(
-                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
-                )
+    if (rgba_probes := manifest.get("rgba_probes")) is not None:
+        tol = manifest.get("rgba_tolerance", 0.02)
+        for probe in rgba_probes:
+            px, py = probe["pixel"]
+            i = (py * width + px) * 4
+            want_rgba = probe["rgba"]
+            for c, want in enumerate(want_rgba):
+                if abs(pixels[i + c] - want) > tol:
+                    raise AssertionError(
+                        f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
+                    )
+    else:
+        for probe in manifest.get("uv_probes", []):
+            px, py = probe["pixel"]
+            i = (py * width + px) * 4
+            u, v = probe["uv"]
+            for c, want in enumerate((u, v, 0.0, 1.0)):
+                if abs(pixels[i + c] - want) > 2e-3:
+                    raise AssertionError(
+                        f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                    )
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
 
 def write_ppm(path: str, pixels, width: int, height: int) -> None:
+    """Write RGB bytes, saturating infinities and rendering NaN as zero."""
+    def channel_byte(value: float) -> int:
+        return round(min(1.0, value) * 255) if value > 0.0 else 0
+
     with open(path, "wb") as f:
         f.write(f"P6\n{width} {height}\n255\n".encode())
         f.writelines(
-            bytes(max(0, min(255, round(pixels[i + c] * 255))) for c in range(3))
+            bytes(channel_byte(pixels[i + c]) for c in range(3))
             for i in range(0, len(pixels), 4)
         )
 
@@ -339,11 +499,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         os.unlink(
             raw
         )  # a harness that exits 0 without writing must not pass on a stale file
-    env = dict(
-        os.environ,
-        VKH_DRAW_MESH=os.path.join(out_dir, "mesh.bin"),
-        VKH_VERTEX_LAYOUT="0:3f,1:2f",
-    )
+    env = harness_env(manifest, out_dir)
     cmd = [
         harness,
         os.path.join(out_dir, "vs.spv"),
@@ -378,6 +534,47 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     return result
 
 
+def load_json(
+    path: str,
+    kind: str,
+    expect: type,
+    keys: tuple[str, ...] = (),
+    entry_keys: tuple[str, ...] = (),
+):
+    """Read a JSON file from the user's folders; a bad read exits naming it, never a traceback.
+
+    Invalid or truncated JSON, non-UTF-8 bytes, the wrong top-level shape, a missing required
+    key, and an array entry that is not an object or lacks one are the user's broken files, so
+    they fail like the tool's other errors: one SystemExit line with the path and the reason.
+    """
+    wanted = "an object" if expect is dict else "an array"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"the {kind} {path} is not valid UTF-8 ({e.reason})") from e
+    except json.JSONDecodeError as e:
+        raise SystemExit(
+            f"the {kind} {path} is not valid JSON ({e.msg} at line {e.lineno} column {e.colno})"
+        ) from e
+    if not isinstance(data, expect):
+        raise SystemExit(f"the {kind} {path} is a {type(data).__name__}, expected {wanted}")
+    if expect is dict:
+        if gaps := [k for k in keys if k not in data]:
+            raise SystemExit(f"the {kind} {path} has no key {', '.join(repr(k) for k in gaps)}")
+    else:
+        for i, entry in enumerate(data):
+            if not isinstance(entry, dict):
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} is a {type(entry).__name__}, expected an object"
+                )
+            if gaps := [k for k in entry_keys if k not in entry]:
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} has no key {', '.join(repr(k) for k in gaps)}"
+                )
+    return data
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Draw one real game model with its own translated VS/PS."
@@ -394,7 +591,11 @@ def main(argv=None) -> int:
         "--vs", default=DEFAULT_VS, help="vertex shader name in the carve index"
     )
     ap.add_argument(
-        "--ps", default=DEFAULT_PS, help="pixel shader name in the carve index"
+        "--ps", default=None, help="pixel shader name in the carve index (default untextured, or PS_Copy with --dds)"
+    )
+    ap.add_argument(
+        "--dds",
+        help="an exported DDS texture (e.g. BCPack-decoded TTPF albedo) to bind via set-0 T# and sampler S#",
     )
     ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--height", type=int, default=128)
@@ -433,15 +634,14 @@ def main(argv=None) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
-        with open(ensure_carve(os.path.abspath(a.game), work), encoding="utf-8") as f:
-            for e in json.load(f):
-                if e["stage"] in ("vs", "ps"):
-                    print(f"{e['stage']} {e['name']}")
+        index = ensure_carve(os.path.abspath(a.game), work)
+        for e in load_json(index, "carve index", list, entry_keys=("stage", "name")):
+            if e["stage"] in ("vs", "ps"):
+                print(f"{e['stage']} {e['name']}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
-        with open(existing, encoding="utf-8") as f:
-            manifest = json.load(f)
+        manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0
     if not a.game:
@@ -449,19 +649,21 @@ def main(argv=None) -> int:
     game = os.path.abspath(os.path.expanduser(a.game))
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
+    if a.dds and not a.obj:
+        raise SystemExit("--dds requires --obj so textured probes can be checked")
 
     index = ensure_carve(game, work)
-    picked = choose(index, a.vs, a.ps)
+    ps_name = a.ps if a.ps is not None else (DEFAULT_TEXTURED_PS if a.dds else DEFAULT_PS)
+    picked = choose(index, a.vs, ps_name)
     meta = translate(work, picked)
     os.makedirs(out_dir, exist_ok=True)
-    shutil.copy(
-        os.path.join(work, "first_light", "spirv", f"{picked[0]['name']}.spv"),
-        os.path.join(out_dir, "vs.spv"),
-    )
-    shutil.copy(
-        os.path.join(work, "first_light", "spirv", f"{picked[1]['name']}.spv"),
-        os.path.join(out_dir, "ps.spv"),
-    )
+    for entry in picked:
+        stem = os.path.splitext(entry["file"])[0]
+        stage = entry["stage"]
+        shutil.copy(
+            os.path.join(work, "first_light", "spirv", f"{stem}.spv"),
+            os.path.join(out_dir, f"{stage}.spv"),
+        )
     # For d3d12_first_light_test: the game's containers (the PSO finds each stage by the FSSM hash inside) and
     # the translator's index entries, keyed vs/ps so the runtime's shader library reads vs.spv and ps.spv here.
     for entry in picked:
@@ -497,6 +699,7 @@ def main(argv=None) -> int:
         "ps": {
             "name": picked[1]["name"],
             "fssm_sha256": meta["ps"].get("fssm_sha256"),
+            "subgroup_size": meta["ps"].get("subgroup_size"),
             "verified": True,
         },
         "vertex_count": len(vertices),
@@ -521,12 +724,51 @@ def main(argv=None) -> int:
             "index": "index.json",
         },
     }
+    if a.dds:
+        tw, th, rgba, dds_sha = decode_dds_to_rgba(a.dds)
+        write_texture_rgba(os.path.join(out_dir, "texture.rgba"), tw, th, rgba)
+        ps_meta = meta["ps"]
+        ptr_sgpr = next(
+            (
+                int(r["sgpr"])
+                for r in (ps_meta.get("user_sgpr_reads") or [])
+                if r.get("kind") in ("ptr32_lo", "ptr64_lo")
+            ),
+            DEFAULT_PTR_SGPR,
+        )
+        lit_samplers = ps_meta.get("literal_samplers") or []
+        ssharp = list(lit_samplers[0]) if lit_samplers else list(DEFAULT_SSHARP)
+        manifest["texture"] = {
+            "width": tw,
+            "height": th,
+            "dds_sha256": dds_sha,
+            "ptr_sgpr": ptr_sgpr,
+            "tsharp_va": DEFAULT_TSHARP_VA,
+            "ssharp": ssharp,
+        }
+        manifest["files"]["texture"] = "texture.rgba"
+        manifest["rgba_tolerance"] = 0.02
+        if centre_uv is not None:
+            manifest["centre_rgba"] = sample_rgba_bilinear(
+                tw, th, rgba, centre_uv[0], centre_uv[1]
+            )
+        if probes:
+            manifest["rgba_probes"] = [
+                {
+                    "pixel": p["pixel"],
+                    "uv": p["uv"],
+                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
+                }
+                for p in probes
+            ]
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
     if not (a.run or a.check):
+        env_preview = harness_env(manifest, out_dir, base_env={})
+        env_str = " ".join(f"{k}={v}" for k, v in env_preview.items())
         print(
-            f"run: VKH_DRAW_MESH={os.path.join(out_dir, 'mesh.bin')} VKH_VERTEX_LAYOUT=0:3f,1:2f "
+            f"run: {env_str} "
             f"<vk_harness> {os.path.join(out_dir, 'vs.spv')} {os.path.join(out_dir, 'ps.spv')} "
             f"{os.path.join(out_dir, 'image.raw')} {a.width} {a.height}"
         )

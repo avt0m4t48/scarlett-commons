@@ -29,7 +29,8 @@ NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_c
                "s_store", "s_buffer_store", "image_store", "ds_write")
 # DS ops that write args[0]; every other DS op without "_rtn" (atomics, ds_write*, src2 and GWS forms) only reads its
 # operands. Same rule as tools/lane_masks.py.
-DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume", "ds_ordered_count")
+DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume", "ds_ordered_count",
+              "ds_nop")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
 
 

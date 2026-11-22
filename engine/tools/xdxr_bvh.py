@@ -791,6 +791,24 @@ def node_census(data):
     return count
 
 
+def pair_rotations(data):
+    """The (TRI0 remap byte, TRI1 remap byte) of every paired leaf reachable in a valid bottom-level BVH: which of
+    the three rotations each triangle of a pair was stored in."""
+    seen = set()
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind == TRI1:
+            remap = struct.unpack_from("<I", data, ptr_offset(p) + 60)[0]
+            seen.add((remap & 0xFF, (remap >> 8) & 0xFF))
+        elif kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return seen
+
+
 def count_pairs(data):
     """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
     return node_census(data).get(TRI1, 0)
@@ -841,6 +859,11 @@ def check_build(directory, rays=300, seed=1):
             errs.append("built with pairing, but no TRI1 node is reachable")
         if desc.get("pairs") is False and pairs:
             errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
+        if desc.get("all_rotations") and not errs:   # every (first, sibling) rotation of a pair is exercised
+            rotations = pair_rotations(data)
+            if len(rotations) < 9:
+                errs.append(f"paired leaves use {len(rotations)} of the 9 (TRI0, TRI1) rotations: "
+                            f"{sorted(rotations)}")
         if "box16" in desc and not errs:          # the node type the build was asked for, so no check runs vacuously
             census = node_census(data)
             want, other = (BOX16, BOX32) if desc["box16"] else (BOX32, BOX16)

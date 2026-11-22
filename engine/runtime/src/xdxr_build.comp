@@ -462,7 +462,8 @@ void pair_children(uint n, out uint kids[4]) {
         for (uint k = 0u; k < 3u; ++k) v[c][k] = leaf_vertex(e[c], k);
         vec3 lo, hi;
         load_box(e[c], lo, hi);
-        live[c] = !box_empty(lo, hi);                    // a triangle with a NaN vertex is inactive: never paired
+        live[c] = !box_empty(lo, hi);   // inactive (NaN vertex): never paired. Conservative only: its box is empty,
+                                        // so a pair with it would never be traversed anyway
     }
     for (uint c = 0u; c < count; ++c) {
         if (used[c] || !live[c]) continue;
@@ -515,6 +516,7 @@ void build_node(uint n) {
             if (child != INVALID) {
                 uint at = ptr_unit(child) * 64u;
                 if (ptr_is_node(child)) {
+                    // the child's own type gives its node size (it is what the structure holds, whatever the flags)
                     load_box(pc.elements + (at - pc.nodes_off) / ((child & 7u) == BOX16 ? 64u : 128u), lo, hi);
                 } else {
                     uint e = (at - pc.elements_off) / element_size();

@@ -189,7 +189,8 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
                                  (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
                                  (pair && !moved ? (expect_no_pairs ? ", \"pairs\": false" : ", \"pairs\": true")
                                                  : "") +
-                                 (box16 ? ", \"box16\": true" : "") +
+                                 (box16 ? ", \"box16\": true" : ", \"box16\": false") +
+                                 (name == "blas_paired_rotations" ? ", \"all_rotations\": true" : "") +
                                  ", \"triangles\": " + tris_json(tris) + "}\n";
         return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());
@@ -442,6 +443,18 @@ int main(int argc, char** argv) {
             return 1;
         if (build_blas(gpu, builder, dir, "blas_unpaired_same_direction", {same_dir}, q1, 0, nullptr, false, false,
                        true, true))
+            return 1;
+        // Every triangle of a grid starts at another of its vertices (the same winding), so pairs come in all nine
+        // combinations of the first triangle's rotation k and the sibling's kd (check-build asserts it).
+        Geometry rotated = grid(16, 3, false);
+        for (std::size_t t = 0; t + 2 < rotated.indices.size(); t += 3) {
+            const std::uint32_t r = std::uint32_t((t / 3) * 7 / 3 % 3), i0 = rotated.indices[t],
+                                i1 = rotated.indices[t + 1], i2 = rotated.indices[t + 2];
+            const std::uint32_t v[3] = {i0, i1, i2};
+            for (std::uint32_t k = 0; k < 3; ++k) rotated.indices[t + k] = v[(k + r) % 3];
+        }
+        Built p5;
+        if (build_blas(gpu, builder, dir, "blas_paired_rotations", {rotated}, p5, 0, nullptr, false, false, true))
             return 1;
         // 7,200 triangles: the radix-sort path
         if (build_blas(gpu, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,

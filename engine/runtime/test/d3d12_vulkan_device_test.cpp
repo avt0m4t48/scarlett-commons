@@ -6491,6 +6491,45 @@ int main() {
             }
         }
 
+        // D3D-71: a default-heap buffer outside the arena (this device has none) starts zeroed, as D3D12 committed
+        // resources do. Its memory is first dirtied through an earlier buffer, which is then released so the next
+        // allocation is likely to reuse it. CREATE_NOT_ZEROED skips the fill; a copy into the same list still lands.
+        {
+            constexpr UINT64 bytes = 4096;
+            const D3D12_HEAP_PROPERTIES default_buffer_heap{D3D12_HEAP_TYPE_DEFAULT};
+            std::memset(up, 0xab, std::size_t(bytes));
+            {
+                Ref<ID3D12Resource> dirty;
+                EXPECT(SUCCEEDED(create(default_buffer_heap, buffer_desc(bytes), D3D12_RESOURCE_STATE_COMMON, dirty)));
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->CopyBufferRegion(dirty.p, 0, upload.p, 0, bytes);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(submit_and_wait());
+            }
+            Ref<ID3D12Resource> fresh, not_zeroed;
+            EXPECT(SUCCEEDED(create(default_buffer_heap, buffer_desc(bytes), D3D12_RESOURCE_STATE_COMMON, fresh)));
+            const D3D12_RESOURCE_DESC zero_desc = buffer_desc(bytes);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_buffer_heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+                                                             &zero_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&not_zeroed.p))));
+            std::memset(down, 0xcd, std::size_t(2 * bytes));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->CopyBufferRegion(readback.p, 0, fresh.p, 0, bytes);
+            list->CopyBufferRegion(not_zeroed.p, 0, upload.p, 0, bytes);  // written before it is read
+            auto readable = transition(not_zeroed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable);
+            list->CopyBufferRegion(readback.p, bytes, not_zeroed.p, 0, bytes);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(submit_and_wait());
+            const std::uint8_t zero[4] = {}, written[4] = {0xab, 0xab, 0xab, 0xab};
+            for (UINT64 i = 0; i < bytes; i += 4) report("zero-filled buffer byte", UINT(i), down + i, zero, 4);
+            for (UINT64 i = 0; i < bytes; i += 4)
+                report("NOT_ZEROED buffer byte after a copy", UINT(i), down + bytes + i, written, 4);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);

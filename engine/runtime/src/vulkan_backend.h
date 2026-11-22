@@ -991,6 +991,14 @@ public:
         storage_pending_.insert(id);
     }
 
+    // A device-local buffer D3D12 says starts zeroed (D3D-71): the host cannot write it, so the next submission on
+    // any queue fills it with zeros ahead of its lists. That submission publishes the same initialisation semaphore as
+    // the storage images above, so a list on another queue that uses the buffer first waits for the fill.
+    void zero_on_next_submit(ResourceId id, VkBuffer buffer) {
+        std::lock_guard lock(storage_mutex_);
+        zero_pending_.push_back({id, buffer});
+    }
+
     void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
@@ -1007,6 +1015,10 @@ public:
             unindex_buffer(id, it->second);
             resources_.erase(it);
             sparse_buffers_.erase(id);
+        }
+        {
+            std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
             std::lock_guard vlock(views_mutex_);
@@ -1347,8 +1359,13 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
-    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
     std::unordered_set<ResourceId> storage_pending_;
+    struct PendingZero {
+        ResourceId id;
+        VkBuffer buffer;
+    };
+    std::vector<PendingZero> zero_pending_;  // zero_on_next_submit
     // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
     // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
     // the zero-fill that put it in GENERAL has run.
@@ -1489,6 +1506,12 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+        }
+        if (progress_) {
+            // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
+            // finished: the next submission on another queue must not wait on a semaphore that is about to go.
+            std::lock_guard lock(context_.storage_mutex_);
+            if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1872,6 +1895,7 @@ private:
                 runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
                                 std::holds_alternative<ExecuteIndirect>(command);
         std::vector<ResourceId> storage_images;
+        std::vector<VulkanContext::PendingZero> zero_buffers;
         {
             std::lock_guard lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
@@ -1883,6 +1907,16 @@ private:
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
+            zero_buffers.swap(context_.zero_pending_);  // any queue can fill a buffer
+        }
+        for (const auto& zero : zero_buffers)
+            context_.vk.vkCmdFillBuffer(command_buffer, zero.buffer, 0, VK_WHOLE_SIZE, 0);
+        if (!zero_buffers.empty()) {
+            VkMemoryBarrier filled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            filled.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr);
         }
         for (const ResourceId id : storage_images) {
             const ResourceBinding* image = context_.resolve(id);
@@ -1938,11 +1972,13 @@ private:
             wait_values_.push_back(submitted_);
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
-        if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
+        if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
+            // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
+            context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
         }
-        if (submitted && !storage_images.empty()) {
+        if (submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_init_semaphore_ = progress_;
             context_.storage_init_value_ = submitted_;

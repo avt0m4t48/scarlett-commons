@@ -1,6 +1,8 @@
 """CPU tests for tools/mad_denorm_probe.py (SHADER-340): RDNA1 mad/mac pre- and post-omod denormal flush.
 Standard library only; no GPU, no LLVM, no game files.
 """
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -34,6 +36,42 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(by_what["mac 2^-126 * 0.5 + 2^-126"], probe.FLT_MIN)
         self.assertEqual(by_what["subnorm * +inf + -1 -> -1"], probe.NEG_ONE)
         self.assertEqual(by_what["subnorm * qNaN + 1 -> 1"], probe.ONE)
+
+
+class HardwareSkipTests(unittest.TestCase):
+    """--oracle hw on a GPU without the GFX10.1 mad opcodes is a skip (77), not a traceback."""
+
+    def _main_with_arch(self, arch):
+        from hw_oracle import runner
+
+        class Stub:
+            device = "stub"
+            closed = False
+
+            def __init__(self):
+                self.arch = arch
+
+            def run(self, programs, words=4):
+                raise AssertionError("no kernel may run on " + arch)
+
+            def close(self):
+                Stub.closed = True
+
+        saved = runner.open_oracle
+        runner.open_oracle = lambda **kw: Stub()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = probe.main(["--oracle", "translator,hw"])
+        finally:
+            runner.open_oracle = saved
+        return rc, out.getvalue(), Stub.closed
+
+    def test_rdna2_and_gfx11_skip(self):
+        for arch in ("gfx1030", "gfx1036", "gfx1100"):
+            rc, out, closed = self._main_with_arch(arch)
+            self.assertEqual(rc, 77, arch)
+            self.assertIn("hardware oracle unavailable: v_mad_f32", out)
+            self.assertTrue(closed, arch)
 
 
 if __name__ == "__main__":

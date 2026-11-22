@@ -692,7 +692,9 @@ def narrow_subgroup_skip(out):
 
 def unpinned_subgroup_skip(out):
     """A Skip when vk_compute_test says the VKC_SUBGROUP_SIZE it was given can't be pinned on this device, else None.
-    Output without the line (an older vk_compute_test) is judged as before."""
+    Output without the line (an older vk_compute_test) is judged as before. "compute subgroup size: 32 (observed: ...)"
+    (MoltenVK: not requirable, but its probe saw 32 lanes) is judged, and "observed wrong" comes with exit 1, a
+    failure."""
     m = re.search(r"^compute subgroup size: (\d+) not available$", out, re.MULTILINE)
     if m:
         return Skip(f"SKIP (the device can't run this shader at {m.group(1)} lanes on request)")

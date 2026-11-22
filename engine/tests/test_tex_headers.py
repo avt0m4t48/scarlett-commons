@@ -56,8 +56,8 @@ class TestGFX10FormatMapping(unittest.TestCase):
             (14, 49, "R8G8_UNORM"),
             (22, 41, "R32_FLOAT"),
             (29, 34, "R16G16_FLOAT"),
-            (43, 26, "R11G11B10_FLOAT"),
-            (44, 24, "R10G10B10A2_UNORM"),
+            (36, 26, "R11G11B10_FLOAT"),
+            (50, 24, "R10G10B10A2_UNORM"),
             (56, 28, "R8G8B8A8_UNORM"),
             (130, 29, "R8G8B8A8_UNORM_SRGB"),
             (64, 16, "R32G32_FLOAT"),
@@ -69,6 +69,20 @@ class TestGFX10FormatMapping(unittest.TestCase):
                 dxgi_id, name = tex_headers.map_gfx10_format(gfx10_code)
                 self.assertEqual(dxgi_id, expected_dxgi)
                 self.assertEqual(name, expected_name)
+
+    def test_packed_formats_follow_top_bit_first_names(self):
+        # GFX10 names list widths from the top bit: 2_10_10_10 is R10G10B10A2, 10_11_11 is R11G11B10.
+        with open(os.path.join(TOOLS_DIR, "gfx10_formats.json"), encoding="utf-8") as f:
+            names = json.load(f)
+        for gfx10, dxgi, name in ((36, 26, "10_11_11_FLOAT"), (50, 24, "2_10_10_10_UNORM"),
+                                  (54, 25, "2_10_10_10_UINT")):
+            with self.subTest(gfx10=gfx10):
+                self.assertEqual(names[str(gfx10)], "GFX10_FORMAT_" + name)
+                self.assertEqual(tex_headers.map_gfx10_format(gfx10)[0], dxgi)
+                self.assertEqual(tex_headers.dxgi_to_gfx10(dxgi), gfx10)
+        for gfx10 in (43, 44, 48):   # 11_11_10_FLOAT, 10_10_10_2_*: no DXGI format has these layouts
+            with self.subTest(gfx10=gfx10), self.assertRaises(ValueError):
+                tex_headers.map_gfx10_format(gfx10)
 
     def test_unsupported_gfx10_raises(self):
         for invalid in [0, 9999, -1, 400]:
@@ -571,7 +585,38 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         info = tex_headers.parse_dds_header(hdr)
         self.assertTrue(info["caps2"] & tex_headers.DDSCAPS2_CUBEMAP_ALLFACES)
         self.assertEqual(info["misc_flags"], tex_headers.D3D10_RESOURCE_MISC_TEXTURECUBE)
-        self.assertEqual(info["array_size"], 6)
+        self.assertEqual(info["array_size"], 1)
+
+    def test_dds_cubemap_array_size_matches_payload(self):
+        # DDS_HEADER_DXT10.arraySize counts cubes, each containing six faces:
+        # https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dds-header-dxt10
+        # Check the serialized field directly, independently of our header parser.
+        for cubes in (1, 2, 6):
+            with self.subTest(cubes=cubes):
+                # One RGBA texel per face, with distinct values for every face.
+                payload = b"".join(bytes((face, 0, 0, 255)) for face in range(cubes * 6))
+                dds = tex_headers.dds_bytes(1, 1, fmt=28, payload=payload,
+                                            is_cube=True, array_size=cubes)
+                fmt, dimension, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((fmt, dimension, misc), (28, 3, 4))
+                self.assertEqual(array_size, cubes)
+                self.assertEqual(len(dds) - 148, array_size * 6 * 4)
+                self.assertEqual(dds[148:], payload)
+
+    def test_dds_bytes_describes_the_top_subresource(self) -> None:
+        cases = (
+            # 6x5 RGBA8 top level (120 bytes) and 3x2 next level (24 bytes).
+            (6, 5, 28, bytes(range(144)), 0x8, 24),
+            # 9x5 BC1 top level (six blocks) and 4x2 next level (one block).
+            (9, 5, 71, bytes(range(56)), 0x80000, 48),
+        )
+        for width, height, fmt, payload, expected_flags, expected_size in cases:
+            with self.subTest(dxgi_format=fmt):
+                dds = tex_headers.dds_bytes(width, height, fmt, payload, mips=2)
+                self.assertEqual(dds[148:], payload)
+                _, flags, got_height, got_width, pitch_or_size, _, mips = struct.unpack_from("<7I", dds, 4)
+                self.assertEqual((got_width, got_height, mips), (width, height, 2))
+                self.assertEqual((flags & (0x8 | 0x80000), pitch_or_size), (expected_flags, expected_size))
 
     def test_dds_header_2d_array(self):
         hdr = tex_headers.dds_header(256, 256, depth=1, mips=1, fmt=83, is_cube=False, array_size=5)
@@ -585,7 +630,7 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         self.assertEqual(tex_headers.parse_dds_header(blob)["array_size"], 4)
 
     def test_dds_bytes_payload(self):
-        payload = b"\xAA\xBB\xCC\xDD" * 64
+        payload = b"\xAA\xBB\xCC\xDD" * 32  # Sixteen BC1 blocks at eight bytes each.
         data = tex_headers.dds_bytes(16, 16, fmt=71, payload=payload)
         self.assertEqual(len(data), 148 + len(payload))
         self.assertEqual(data[148:], payload)
@@ -633,7 +678,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         self.arch_dir = os.path.join(self.carve, self.arch)
         os.makedirs(self.arch_dir, exist_ok=True)
 
-    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9):
+    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9, *, dtype: int = 0x980):
         cpu_off = 0x1000
         gpu_off = 0x2000
 
@@ -651,7 +696,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
 
         k = 10
         qwords[k - 2] = 0xCAFEBABE00000001
-        qwords[k - 1] = 0x980
+        qwords[k - 1] = dtype
         qwords[k] = 0x60000000 + data_off
         d_bytes = struct.pack("<HHHBB", w, h, depth, 0x42, fmt)
         qwords[k + 4] = struct.unpack("<Q", d_bytes)[0]
@@ -706,9 +751,30 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         results = tex_headers.scan_archive(self.carve, self.arch)
         self.assertEqual(len(results), 0)
 
+    def test_cli_indexes_a_small_texture_with_its_gpu_location(self) -> None:
+        cpu_off, gpu_off, index = self._make_synthetic_texture_blobs(w=2, h=3, fmt=28, mips=2)
+        output = os.path.join(self.carve, "textures.json")
+        with mock.patch.object(sys, "argv", ["tex_headers.py", self.carve, "--out", output]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            tex_headers.main()
+        with open(output, encoding="utf-8") as handle:
+            entries = json.load(handle)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry["w"], entry["h"], entry["depth"], entry["mips"]), (2, 3, 1, 2))
+        self.assertEqual(entry["fmt_name"], "R8G8B8A8_UNORM")
+        self.assertEqual((entry["cpu"], entry["gpu"], entry["data_off"], entry["q_index"]),
+                         (cpu_off, gpu_off, 0x1000, index))
+
+    def test_narrow_texture_requires_a_known_type_and_valid_mips(self) -> None:
+        for dtype, mips in ((0x900, 1), (0x980, 0), (0x980, 3)):
+            with self.subTest(dtype=dtype, mips=mips):
+                self._make_synthetic_texture_blobs(w=1, h=2, fmt=28, mips=mips, dtype=dtype)
+                self.assertEqual(tex_headers.scan_archive(self.carve, self.arch), [])
+
     def test_scan_archive_invalid_dimensions_rejected(self):
-        # Width < 4
-        self._make_synthetic_texture_blobs(w=2, h=256)
+        # Zero width
+        self._make_synthetic_texture_blobs(w=0, h=256)
         self.assertEqual(len(tex_headers.scan_archive(self.carve, self.arch)), 0)
 
         # Height > 16384
@@ -831,6 +897,19 @@ class CliInputTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
                               capture_output=True, text=True, timeout=60)
 
+    def test_out_in_a_missing_folder_is_created(self):
+        # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "no", "such", "textures.json")
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
+
     def test_bad_carve_folders_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "carve", "a"))
@@ -851,6 +930,62 @@ class CliInputTest(unittest.TestCase):
             p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("0 textures", p.stdout)
+
+    def test_malformed_index_is_one_error_line(self):
+        # An index.json of the wrong shape ended in a KeyError/TypeError traceback after the carve had finished;
+        # gamedata_index.py already reports this as one ERROR line with exit 2.
+        cases = {"no files key": {}, "files not a list": {"files": "oops"}, "files null": {"files": None},
+                 "row not an object": {"files": [1, 2]}, "row without head": {"files": [{"off": 0}, {"off": 16}]}}
+        for label, index in cases.items():
+            with self.subTest(index=label), tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, "carve", "a"))
+                with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                    json.dump(index, f)
+                out = os.path.join(tmp, "t.json")
+                p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn("ERROR: cannot read", p.stderr)
+                self.assertIn("index.json", p.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_out_overwriting_input_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            manifest = os.path.join(tmp, "carve", "a", "index.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", manifest)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("output would overwrite an input manifest", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"files": []})
+
+    def test_output_parent_creation_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            archive = os.path.join(carve, "a")
+            os.makedirs(archive)
+            with open(os.path.join(archive, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            blocker = os.path.join(tmp, "not-a-directory")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("existing file")
+            result = self.run_tool(carve, "--out", os.path.join(blocker, "out.json"))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR: cannot write", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", tmp)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("is a directory", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

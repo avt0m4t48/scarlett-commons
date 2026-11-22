@@ -31,13 +31,23 @@ import tempfile
 import zlib
 from collections import defaultdict
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CARVER = os.path.join(ROOT, "rpf9_carve.py")
 BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+# Tag-like text inside these cannot open or close an element.
+XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
+# A resource whose page directory starts the stream carries "0DRP" at +16 (docs/animation.md, "0DRP page marker").
+# Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
+# holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").
+PAGE_MARKER, PAGE_MARKER_AT = b"0DRP", 16
 
 
 def printable(data: bytes) -> float:
@@ -49,9 +59,10 @@ def printable(data: bytes) -> float:
 
 
 def has_xml_decl(data: bytes) -> bool:
-    if data.startswith(BOM) and XML_DECL.match(data[3:]):
-        return True
-    return bool(XML_DECL.match(data) or XML_DECL.match(data.lstrip(b" \t\r\n")))
+    # xml_root() drops the BOM before looking for the declaration; do the same here, or a BOM followed by
+    # whitespace makes the two disagree and the stream is grouped by the 64 KiB binary rule instead.
+    text = data[3:] if data.startswith(BOM) else data
+    return bool(XML_DECL.match(text) or XML_DECL.match(text.lstrip(b" \t\r\n")))
 
 
 def xml_root(data: bytes) -> str:
@@ -82,13 +93,23 @@ def tail_root(data: bytes) -> str:
 
 
 def xml_complete(root: str, data: bytes) -> bool:
+    """True when every <root> in data is closed, not merely when a </root> occurs somewhere in the tail.
+
+    A nested element with the same name as the root used to satisfy the old substring test, so a truncated
+    document was reported complete and its continuation streams were not absorbed into the payload.
+    """
     if not root:
         return False
-    close = b"</" + root.encode("ascii", "replace") + b">"
-    if close in data[-65536:]:
-        return True
-    return bool(re.search(rb"<" + re.escape(root.encode("ascii", "replace")) + rb"\b[^>]*/>\s*$",
-                          data[-4096:]))
+    text = XML_NON_TAG.sub(b"", data)
+    name = re.escape(root.encode("ascii", "replace"))
+    # A quoted attribute value may contain '>'; consume quoted strings as one unit or a self-closing
+    # tag with such a value is mistaken for an unclosed element.
+    opens = re.findall(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", text)
+    closes = re.findall(rb"</" + name + rb"\s*>", text)
+    self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
+    if len(opens) - self_closed > len(closes):
+        return False
+    return bool(closes or self_closed)
 
 
 def standalone_xml(data: bytes) -> bool:
@@ -109,6 +130,8 @@ def stream_kind(data: bytes, row: dict) -> str:
     for magic in MAGIC:
         if data.startswith(magic):
             return "other"
+    if data[PAGE_MARKER_AT:PAGE_MARKER_AT + len(PAGE_MARKER)] == PAGE_MARKER:
+        return "other"
     if printable(data) > 0.95:
         return "text"
     return "binary"
@@ -118,6 +141,8 @@ def magic_name(data: bytes) -> str:
     for magic, name in MAGIC.items():
         if data.startswith(magic):
             return name
+    if data[PAGE_MARKER_AT:PAGE_MARKER_AT + len(PAGE_MARKER)] == PAGE_MARKER:
+        return PAGE_MARKER.decode()
     return ""
 
 
@@ -215,7 +240,10 @@ def build_rows(rows: list, source) -> list:
             group = [i]
             detail = magic_name(data)
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
+            # A resource's first stream may be any whole number of 64 KiB blocks (docs/page_directory.md: 128 and
+            # 192 KiB first streams continue in the next one). Only these headed kinds take that rule: a binary,
+            # text or XML run has no header proving a continuation, so it keeps the exact 64 KiB rule below.
+            while j < n and rows[j - 1]["size"] and rows[j - 1]["size"] % 65536 == 0:
                 nxt = source.read(rows[j])
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
@@ -229,6 +257,7 @@ def build_rows(rows: list, source) -> list:
 
         if kind in ("rbf0", "psin", "text", "binary"):
             group = [i]
+            chunks = [data] if kind == "text" and b"<" in data else None
             j = i + 1
             while j < n and rows[j - 1]["size"] == 65536:
                 nxt = source.read(rows[j])
@@ -237,13 +266,13 @@ def build_rows(rows: list, source) -> list:
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
                     break
+                if chunks is not None:
+                    chunks.append(nxt)
                 group.append(j)
                 j += 1
-            if kind == "text" and b"<" in data and tail_root(b"".join(source.read(rows[x]) for x in group)):
-                root = tail_root(b"".join(source.read(rows[x]) for x in group))
-                out.append(row_for("xml", rows, group, root=root, header=False, complete=True))
-            elif kind == "text" and b"<" in data:
-                out.append(row_for("xml", rows, group, complete=False))
+            if chunks is not None:
+                root = tail_root(b"".join(chunks))
+                out.append(row_for("xml", rows, group, root=root, header=False, complete=bool(root)))
             else:
                 out.append(row_for(kind, rows, group))
             i = j
@@ -316,11 +345,20 @@ def summarize(rows: list, source_summary: dict, target: str) -> dict:
     }
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(path: str, rows: list) -> None:
+    _make_parent(path)
     fields = ["offset", "offset_hex", "stored", "size", "type", "root", "detail", "chunks",
               "complete", "header"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
 
@@ -332,10 +370,22 @@ def main() -> int:
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
+    if a.csv and a.json and same_report_path(a.csv, a.json):
+        ap.error("--csv and --json must use different paths")
 
     if not os.path.exists(a.target):
         print(f"ERROR: {a.target} does not exist", file=sys.stderr)
         return 2
+    protected = [a.target] if os.path.isfile(a.target) else [os.path.join(a.target, "index.json")]
+    if a.carve_dir:
+        protected.append(os.path.join(a.carve_dir, "index.json"))
+    for flag, path in (("--json", a.json), ("--csv", a.csv)):
+        if path:
+            if os.path.isdir(path):
+                ap.error(f"{flag} is a directory: {path}")
+            for input_path in protected:
+                if same_report_path(path, input_path):
+                    ap.error(f"{flag} would overwrite the input {input_path}")
     source = None
     try:
         if os.path.isdir(a.target):
@@ -360,10 +410,19 @@ def main() -> int:
             source.close()
 
     if a.csv:
-        write_csv(a.csv, rows)
+        try:
+            write_csv(a.csv, rows)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.csv}: {e.strerror or e}", file=sys.stderr)
+            return 2
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
-            json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        try:
+            _make_parent(a.json)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     print(f'{summary["streams"]} streams, {summary["stored"]:,} stored, '
           f'{summary["inflated"]:,} inflated')
@@ -381,4 +440,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -36,8 +36,8 @@ MUTATIONS = [
      'f = "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wc}")',
      "test_ps_ops"),
     ("v_pk_fma_f16 multiplies src0 by itself", TRANSLATOR,
-     'OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}',
-     'OpExtInst %v2float %glsl Fma {vx} {vx} {srcs[2]}',
+     'for e_, v_ in zip(ex, (vx, vy, srcs[2])):',
+     'for e_, v_ in zip(ex, (vx, vx, srcs[2])):',
      "test_ps_ops"),
     ("v_fma_f16 ignores source op_sel half", TRANSLATOR,
      'self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")',
@@ -63,21 +63,9 @@ MUTATIONS = [
      'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")',
      'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")',
      "test_ps_ops4"),
-    ("v_sin_f16 omits turns-to-radians 2*pi factor", TRANSLATOR,
-     '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_h(a[1])\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
-     '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
-     '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
-     '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")',
-     '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_h(a[1])\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
-     '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
-     '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
-     '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(1.0)}")',
+    ("v_sin/v_cos omits turns-to-radians 2*pi factor", TRANSLATOR,
+     'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")',
+     'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
      '        elif op == "v_mul_legacy_f32":\n'
@@ -116,6 +104,24 @@ def failed_tests(output):
     return set(re.findall(r"^(?:FAIL|ERROR): (test_\w+)", output, re.M))
 
 
+def apply_mutation(path, old, new):
+    """Replace old with new in path exactly once, keeping the file's line endings.
+
+    A checkout made before .gitattributes pinned `eol=lf` (or a branch applied through a CRLF-translating
+    editor) stores tools/ with CRLF line endings, while every anchor here is written with LF. Matching the
+    anchors against the raw bytes reports the multiline anchors as missing, so normalize both sides to LF
+    and restore the file's original line-ending style on the way out.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        raw = f.read()
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    text = raw.replace("\r\n", "\n")
+    if text.count(old) != 1:
+        raise AssertionError(f"mutation anchor must occur exactly once: {old!r}")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text.replace(old, new).replace("\n", sep))
+
+
 class MutationTests(unittest.TestCase):
     def make_copy(self, tmp):
         dst = os.path.join(tmp, "tools")
@@ -132,14 +138,34 @@ class MutationTests(unittest.TestCase):
             with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
                 tools = self.make_copy(tmp)
                 path = os.path.join(tools, fname)
-                with open(path, encoding="utf-8", newline="") as f:
-                    text = f.read()
-                self.assertEqual(text.count(old), 1, f"mutation anchor must occur exactly once: {old!r}")
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    f.write(text.replace(old, new))
+                apply_mutation(path, old, new)
                 rc, out = run_semantics(tools)
                 self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
                 self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
+
+    def test_anchors_match_crlf_translator_copies(self):
+        # Regression: on a CRLF checkout of tools/ the four multiline anchors (v_bfe_i32, v_subrev_co_ci_u32,
+        # v_cmpx_eq_u64, v_mul_legacy_f32) do not occur in the raw bytes and test_each_mutation_is_caught
+        # stops before any mutation runs. apply_mutation must find every anchor in a CRLF copy, mutate it
+        # once, keep the file on CRLF and leave it valid Python.
+        with open(os.path.join(ROOT, "tools", TRANSLATOR), encoding="utf-8", newline="") as f:
+            text = f.read().replace("\r\n", "\n")
+        crlf_text = text.replace("\n", "\r\n")
+        for label, fname, old, new, expect in MUTATIONS:
+            if fname != TRANSLATOR:
+                continue
+            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, TRANSLATOR)
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(crlf_text)
+                apply_mutation(path, old, new)
+                with open(path, encoding="utf-8", newline="") as f:
+                    mutated = f.read()
+                # the copy stays on CRLF: no bare LF survives, and the injected mutation text followed suit
+                self.assertNotIn("\n", mutated.replace("\r\n", ""))
+                self.assertIn(new.replace("\n", "\r\n"), mutated)
+                self.assertNotIn(old.replace("\n", "\r\n"), mutated)
+                compile(mutated, path, "exec")
 
 
 if __name__ == "__main__":

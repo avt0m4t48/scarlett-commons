@@ -146,6 +146,10 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+inline constexpr float image_min_lod(const ImageWords& words) {
+    return float(detail::get(words[1], 8, 12)) / 256.0f;
+}
+
 // False when the dwords are not an image descriptor, or a field contradicts another: a reserved DST_SEL, a last
 // level or layer before the first, or a cube whose layers are not whole cubes.
 inline bool decode(const ImageWords& words, Image& out) {
@@ -154,7 +158,7 @@ inline bool decode(const ImageWords& words, Image& out) {
     Image image{};
     image.type = ImageType(get(words[3], 28, 4));
     image.address = ((std::uint64_t(get(words[1], 0, 8)) << 32) | words[0]) << 8;
-    image.min_lod = float(get(words[1], 8, 12)) / 256.0f;
+    image.min_lod = image_min_lod(words);
     image.format = get(words[1], 20, 9);
     image.width = (get(words[1], 30, 2) | (get(words[2], 0, 12) << 2)) + 1;
     image.height = get(words[2], 14, 14) + 1;
@@ -219,6 +223,7 @@ inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
 inline constexpr Swizzle channels_bgr{select_z, select_y, select_x, select_one};
 inline constexpr Swizzle channels_bgra{select_z, select_y, select_x, select_w};
+inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
@@ -295,6 +300,7 @@ inline constexpr FormatRow format_table[] = {
     {134, VK_FORMAT_A1R5G5B5_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_1_5_5_5_UNORM
     {136, VK_FORMAT_A4B4G4R4_UNORM_PACK16, channels_rgba},        // GFX10_FORMAT_4_4_4_4_UNORM
     {136, VK_FORMAT_A4R4G4B4_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_4_4_4_4_UNORM
+    {136, VK_FORMAT_R4G4B4A4_UNORM_PACK16, channels_abgr},        // GFX10_FORMAT_4_4_4_4_UNORM
     {141, VK_FORMAT_D24_UNORM_S8_UINT, channels_r},               // GFX10_FORMAT_8_24_UNORM
     {141, VK_FORMAT_X8_D24_UNORM_PACK32, channels_r},             // GFX10_FORMAT_8_24_UNORM
     {146, VK_FORMAT_D32_SFLOAT_S8_UINT, channels_r},              // GFX10_FORMAT_X24_8_32_FLOAT
@@ -315,6 +321,9 @@ inline constexpr FormatRow format_table[] = {
     {181, VK_FORMAT_BC7_UNORM_BLOCK, channels_rgba},              // GFX10_FORMAT_BC7_UNORM
     {182, VK_FORMAT_BC7_SRGB_BLOCK, channels_rgba},               // GFX10_FORMAT_BC7_SRGB
 };
+
+// The format of the console's separate stencil surface: what a T# of a depth-stencil texture's stencil plane names.
+inline constexpr std::uint32_t stencil_format = 5;  // GFX10_FORMAT_8_UINT
 
 inline constexpr const FormatRow* format_row(VkFormat format) {
     for (const FormatRow& row : format_table)
@@ -343,16 +352,40 @@ inline constexpr Swizzle format_swizzle(VkFormat format) {
     return row ? row->channels : identity_swizzle;
 }
 
+inline constexpr bool is_depth_stencil_format(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The format to view an image of `image_format` in when a T# names `gfx10_format`: the image's own format when
 // the codes agree, else the format of that code with the image's channel order (the sRGB view of a UNORM image,
-// say). VK_FORMAT_UNDEFINED: the table has no such format.
-inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format) {
+// say). With `allow_channel_cast`, a listed same-size cross-family cast may use the code's first Vulkan format
+// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). Depth/stencil images are only
+// compatible with their own format in Vulkan (VUID-VkImageViewCreateInfo-image-01762 / 09594), and colour
+// images can never be viewed as depth/stencil. VK_FORMAT_UNDEFINED: no compatible format exists.
+inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format,
+                                             bool allow_channel_cast = false) {
     const FormatRow* image = format_row(image_format);
     if (!image) return VK_FORMAT_UNDEFINED;
     if (image->gfx10 == gfx10_format) return image_format;
-    for (const FormatRow& row : format_table)
-        if (row.gfx10 == gfx10_format && row.channels == image->channels) return row.vulkan;
-    return VK_FORMAT_UNDEFINED;
+    if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
+    const FormatRow* fallback = nullptr;
+    for (const FormatRow& row : format_table) {
+        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
+        if (row.channels == image->channels) return row.vulkan;
+        if (!fallback) fallback = &row;
+    }
+    return allow_channel_cast && fallback ? fallback->vulkan : VK_FORMAT_UNDEFINED;
 }
 
 // DST_SEL as the component mapping of a view whose format is `view_format`: X, Y, Z, W name the hardware's
@@ -445,6 +478,7 @@ struct Sampler {
     // picks integer or float by the image's format, but Vulkan needs VK_BORDER_COLOR_INT_* in the sampler, so the
     // layer keeps it in the S# words, which are the sampler's key: see kIntegerBorderPtr.
     bool integer_border = false;
+    bool compare_never = false;  // D3D12 comparison filter with DEPTH_COMPARE_FUNC = NEVER
     bool operator==(const Sampler&) const = default;
 };
 
@@ -452,6 +486,11 @@ struct Sampler {
 // (Mesa writes it only for SQ_TEX_BORDER_COLOR_REGISTER), so with the three built-in types the field is free, and
 // the layer marks an integer border there. An integer table colour is not marked: table colours are not kept yet.
 inline constexpr std::uint32_t kIntegerBorderPtr = 0x800;
+
+// With DERIV_ADJUST_EN clear, GFX10 S# WORD3 has BORDER_COLOR_PTR in bits 0..11 and BORDER_COLOR_TYPE
+// in 30..31. Use an otherwise unused bit in layer-created samplers to distinguish a D3D12 NEVER comparison
+// from an ordinary filter: both hardware DEPTH_COMPARE_FUNC fields are zero, but Vulkan needs distinct samplers.
+inline constexpr std::uint32_t kCompareNever = 1u << 12;
 
 // As ac_build_sampler_descriptor fills it for GFX10:
 //   WORD0  CLAMP_X [2:0], CLAMP_Y [5:3], CLAMP_Z [8:6], MAX_ANISO_RATIO [11:9] = log2(anisotropy), at most 4,
@@ -479,6 +518,7 @@ inline SamplerWords encode(const Sampler& sampler) {
     const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
     words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
                field(std::uint32_t(sampler.border_color), 30, 2);
+    if (sampler.compare == CompareFunction::never && sampler.compare_never) words[3] |= kCompareNever;
     return words;
 }
 
@@ -492,6 +532,9 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.address_w = AddressMode(get(words[0], 6, 3));
     sampler.max_anisotropy = 1u << std::min(get(words[0], 9, 3), 4u);
     sampler.compare = CompareFunction(get(words[0], 12, 3));
+    // DERIV_ADJUST_EN repurposes WORD3, so its bits are not layer markers in that layout.
+    const bool deriv_adjust = get(words[2], 31, 1) != 0;
+    sampler.compare_never = !deriv_adjust && sampler.compare == CompareFunction::never && (words[3] & kCompareNever);
     sampler.unnormalized = get(words[0], 15, 1) != 0;
     sampler.filter_mode = FilterMode(get(words[0], 29, 2));
     sampler.min_lod = float(get(words[1], 0, 12)) / 256.0f;
@@ -539,7 +582,8 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 // MIP_FILTER_NONE samples the base level only, which Vulkan expresses as nearest mip filtering with the LOD held
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
-inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
+// A decoded GFX10 bias has absolute value at most 32. When creating a device sampler, pass its smaller limit.
+inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f) {
     static_assert(int(CompareFunction::never) == int(VK_COMPARE_OP_NEVER) &&
                   int(CompareFunction::less) == int(VK_COMPARE_OP_LESS) &&
                   int(CompareFunction::equal) == int(VK_COMPARE_OP_EQUAL) &&
@@ -559,10 +603,10 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = sampler.lod_bias;
+    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
-    info.compareEnable = sampler.compare != CompareFunction::never ? VK_TRUE : VK_FALSE;
+    info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
     info.minLod = sampler.min_lod;
     info.maxLod = sampler.max_lod;
@@ -571,8 +615,8 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
         info.maxLod = 0.25f;
     }
     // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
-    // integer_border. A table colour is not kept yet: transparent black.
-    const bool integer = sampler.integer_border && sampler.border_color != BorderColor::table;
+    // integer_border. A table colour falls back to transparent black matching integer_border.
+    const bool integer = sampler.integer_border;
     switch (sampler.border_color) {
     case BorderColor::opaque_black:
         info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -597,9 +641,11 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
 
 // ---- V#: SQ_BUF_RSRC_WORD0..3 ----
 
-// SQ_BUF_RSRC_WORD3.OOB_SELECT: the bounds check the hardware makes. The translator makes its own from the
-// stride (tools/rdna2spirv.py, buffer_address): stride 0 checks the byte offset against num_records, otherwise
-// the index, or the offset against num_records * stride.
+// SQ_BUF_RSRC_WORD3.OOB_SELECT: the bounds check the hardware makes, and the one the translator makes too
+// (tools/rdna2spirv.py, buffer_address; docs/design.md, Buffer bounds checking): structured_with_offset is out of
+// range at index >= num_records or offset + 4 > stride, structured at index >= num_records, disabled only at
+// num_records == 0, raw at offset + 4 > num_records (docs/buffer_bounds.md). A V# built here for a shader to read must say which: the default
+// below makes every stride-0 access out of range.
 enum class OobSelect : std::uint32_t {
     structured_with_offset = 0,
     structured = 1,

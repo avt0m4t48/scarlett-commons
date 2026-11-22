@@ -2,12 +2,16 @@
 
     python -I tests/test_shader_ir.py
 """
+import contextlib
+import errno
 import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,22 +61,71 @@ class OperandTests(unittest.TestCase):
         self.assertEqual(shader_ir.operand("1.5"), {"k": "fimm", "v": 1.5, "abs": False})
         self.assertEqual(shader_ir.operand("-2.5e1"), {"k": "fimm", "v": -25.0, "abs": False})
         self.assertEqual(shader_ir.operand("|1.0|"), {"k": "fimm", "v": 1.0, "abs": True})
+        # The regex accepts leading-zero decimals; int(core, 0) used to reject them and abort the run.
+        self.assertEqual(shader_ir.operand("010"), {"k": "imm", "v": 10})
+        self.assertEqual(shader_ir.operand("0001"), {"k": "imm", "v": 1})
+        self.assertEqual(shader_ir.operand("08"), {"k": "imm", "v": 8})
+        self.assertEqual(shader_ir.operand("-010"), {"k": "imm", "v": -10})
 
-    def test_hardware_negation_of_constants(self):
-        # The disassembler prints VOP3 inline negation as neg(0) / neg(5).
-        self.assertEqual(shader_ir.operand("neg(0)"), {"k": "fimm", "v": -0.0, "abs": False})
-        self.assertEqual(shader_ir.operand("neg(5)"), {"k": "imm", "v": -5})
-        self.assertEqual(shader_ir.operand("neg(1.0)"), {"k": "fimm", "v": -1.0, "abs": False})
+    def test_hardware_fp_modifiers_on_constants(self):
+        # LLVM AMDGPUInstPrinter::printOperandAndFPInputMods emits neg(<imm>), |<imm>|, -|<imm>| and the
+        # assembler also accepts abs(<imm>) / neg(abs(<imm>)). Keep abs/neg as VOP3 FP modifier flags rather
+        # than folding neg into two's-complement negation (neg(1) is bit-31 flip 0x80000001, not -1 = 0xffffffff)
+        # or folding outer '-' of -|x| into v before FAbs.
+        self.assertEqual(shader_ir.operand("neg(0)"), {"k": "imm", "v": 0, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(1)"), {"k": "imm", "v": 1, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(-1)"), {"k": "imm", "v": -1, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(5)"), {"k": "imm", "v": 5, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(0x3f800000)"), {"k": "imm", "v": 0x3F800000, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(1.0)"), {"k": "fimm", "v": 1.0, "abs": False, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(-1.0)"), {"k": "fimm", "v": -1.0, "abs": False, "neg": True})
+        self.assertEqual(shader_ir.operand("-|1.0|"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|-2.0|"), {"k": "fimm", "v": -2.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|0.15915494|"), {"k": "fimm", "v": 0.15915494, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(|1.0|)"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("|0xbf800000|"), {"k": "imm", "v": 0xBF800000, "abs": True})
+        self.assertEqual(shader_ir.operand("-|0x3f800000|"), {"k": "imm", "v": 0x3F800000, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|0|"), {"k": "imm", "v": 0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("|-0x10|"), {"k": "imm", "v": -16, "abs": True})
+        self.assertEqual(shader_ir.operand("abs(0xbf800000)"), {"k": "imm", "v": 0xBF800000, "abs": True})
+        self.assertEqual(shader_ir.operand("neg(abs(0x3f800000))"), {"k": "imm", "v": 0x3F800000, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("abs(1.0)"), {"k": "fimm", "v": 1.0, "abs": True})
+        self.assertEqual(shader_ir.operand("-abs(1.0)"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(neg(1.0))"), {"k": "fimm", "v": 1.0, "abs": False})
+        self.assertEqual(shader_ir.operand("-neg(0x3f800000)"), {"k": "imm", "v": 0x3F800000})
 
-    def test_negation_of_registers_toggles(self):
+    def test_negation_and_abs_of_registers_compose(self):
         self.assertTrue(shader_ir.operand("neg(v1)")["neg"])
         self.assertFalse(shader_ir.operand("neg(neg(v1))")["neg"])
+        self.assertFalse(shader_ir.operand("-neg(v1)")["neg"])
+        self.assertEqual(
+            shader_ir.operand("|neg(v1)|"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("-|neg(v1)|"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": True, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("abs(v1)"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("-abs(v1)"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": True, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("abs(neg(v1))"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
 
     def test_sign_extension(self):
         self.assertTrue(shader_ir.operand("sext(v1)")["sext"])
         self.assertFalse(shader_ir.operand("sext(v1)")["neg"])
         self.assertTrue(shader_ir.operand("-sext(v1)")["neg"])
         self.assertTrue(shader_ir.operand("sext(neg(v1))")["neg"])
+        self.assertTrue(shader_ir.operand("|sext(v1)|")["abs"])
+        self.assertTrue(shader_ir.operand("|sext(v1)|")["sext"])
 
     def test_ttmp_registers(self):
         self.assertEqual(shader_ir.operand("ttmp5"), {"k": "ttmp", "t": "ttmp5"})
@@ -135,6 +188,11 @@ class ParseLineTests(unittest.TestCase):
         self.assertEqual(ins["enc"], "0aff")
         self.assertEqual(len(ins["args"]), 2)
 
+    def test_leading_zero_decimal_operand_does_not_abort_a_line(self):
+        ins = shader_ir.parse_line("\tv_mov_b32_e32 v0, 010 ; encoding: [0x00,0x00,0x02,0x7e]")
+        self.assertEqual(ins["op"], "v_mov_b32_e32")
+        self.assertEqual(ins["args"][1], {"k": "imm", "v": 10})
+
     def test_comment_or_blank_lines_are_skipped(self):
         self.assertIsNone(shader_ir.parse_line("; only a comment"))
         self.assertIsNone(shader_ir.parse_line(""))
@@ -158,6 +216,26 @@ class ParseLineTests(unittest.TestCase):
             ["quad_perm:[1,0,3,2]", "row_mask:0xf", "bank_mask:0xf"],
         )
         self.assertEqual(len(ins["args"]), 2)
+
+    def test_ds_swizzle_offset_modifier_with_spaces_stays_intact(self):
+        for mod in (
+            "offset:swizzle(QUAD_PERM, 3, 2, 1, 0)",
+            'offset:swizzle(BITMASK_PERM, "00p01")',
+            "offset:swizzle(BROADCAST, 4, 0)",
+            "offset:swizzle(SWAP, 1)",
+            "offset:swizzle(REVERSE, 4)",
+        ):
+            with self.subTest(mod=mod):
+                ins = shader_ir.parse_line(f"\tds_swizzle_b32 v0, v1 {mod} gds")
+                self.assertEqual(ins["op"], "ds_swizzle_b32")
+                self.assertEqual(ins["mods"], [mod, "gds"])
+                self.assertEqual(
+                    ins["args"],
+                    [
+                        {"k": "vgpr", "r": 0, "n": 1, "neg": False, "abs": False},
+                        {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": False},
+                    ],
+                )
 
     def test_exp_target_is_split_from_its_operands(self):
         ins = shader_ir.parse_line("\texp mrt0 v0, v1, v2, v3")
@@ -209,6 +287,18 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual([i["pc"] for i in info["insns"]], [0x100, 0x102, 0x104])
         self.assertEqual(info["invalid"], 1)
 
+    def test_tab_between_mnemonic_and_operands(self):
+        path = self.write(
+            "; sample code 0x0..0x4 (header)\n"
+            "\ts_mov_b32\ts3, 1 ; encoding: [0x81,0x00,0x83,0xbe]\n"
+        )
+        ins = shader_ir.parse_file(path)["insns"][0]
+        self.assertEqual(ins["op"], "s_mov_b32")
+        self.assertEqual(ins["args"], [
+            {"k": "sgpr", "r": 3, "n": 1, "neg": False, "abs": False},
+            {"k": "imm", "v": 1},
+        ])
+
     def test_file_without_a_header_starts_at_zero(self):
         path = self.write("\tv_mov_b32 v0, v1 ; encoding: [0xaa,0xbb]\n")
         info = shader_ir.parse_file(path)
@@ -231,6 +321,33 @@ class CliInputTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_ir.py"), *args],
                               capture_output=True, text=True, timeout=60)
 
+    def test_census_reports_input_io_errors_without_a_partial_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.s")
+            second = os.path.join(tmp, "second.s")
+            for path in (first, second):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_endpgm\n")
+            parse_file = shader_ir.parse_file
+
+            def fail_second(path):
+                if path == second:
+                    raise PermissionError(errno.EACCES, "permission denied", second)
+                return parse_file(path)
+
+            for owner, attr, effect, path, diagnostic in (
+                    (shader_ir.os, "scandir", OSError(errno.EIO, "I/O error", tmp), tmp, "cannot list"),
+                    (shader_ir, "parse_file", fail_second, second, "cannot read")):
+                with self.subTest(operation=attr):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(owner, attr, side_effect=effect), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(shader_ir.main([tmp]), 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+                    self.assertIn(diagnostic, stderr.getvalue())
+                    self.assertIn(path, stderr.getvalue())
+
     def test_bad_arguments_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             not_a_folder = os.path.join(tmp, "one.s")
@@ -244,6 +361,15 @@ class CliInputTest(unittest.TestCase):
                     self.assertEqual(p.returncode, 2, p.stderr)
                     self.assertIn("usage:", p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
+
+    def test_s_directory_does_not_count_toward_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "a_cache.s"))
+            with open(os.path.join(tmp, "b_shader.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            result = self.run_tool(tmp, "--limit", "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 shaders, 1 instructions", result.stdout)
 
     def test_folder_with_limit_still_works(self):
         with tempfile.TemporaryDirectory() as tmp:

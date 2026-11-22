@@ -2,7 +2,10 @@
 
     python -I tests/test_gen_d3d12_stubs.py
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -193,6 +196,51 @@ class EmitClassTests(unittest.TestCase):
         self.assertIn('stub("IGuarded::Gone")', text)
 
 
+class CoverageTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.source = os.path.join(self.dir, "impl.cpp")
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write(
+                "HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n"
+                "HRESULT STDMETHODCALLTYPE GetThing(UINT i) const;\n"
+                "void NotAnOverride();\n"
+            )
+
+    def test_reports_open_methods_in_vtable_order(self):
+        report = gen.coverage(IFACES, ["IChild"], [self.source])
+        self.assertEqual(report, [{
+            "interface": "IChild",
+            "methods": 5,
+            "implemented": 2,
+            "open": ["IBase::Multi", "IBase::AfterComment", "IChild::Size"],
+        }])
+
+    def test_coverage_ignores_comments_and_quoted_examples(self) -> None:
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write(
+                "void STDMETHODCALLTYPE DoThing(UINT a, UINT b);\n"
+                "// HRESULT STDMETHODCALLTYPE Multi(UINT first, UINT second);\n"
+                "/* HRESULT STDMETHODCALLTYPE GetThing(UINT index) const; */\n"
+                'const char* example = "HRESULT STDMETHODCALLTYPE AfterComment(void);";\n'
+            )
+        report = gen.coverage(IFACES, ["IChild"], [self.source])
+        self.assertEqual(report[0]["implemented"], 1)
+        self.assertEqual(report[0]["open"],
+                         ["IBase::Multi", "IBase::AfterComment", "IChild::GetThing", "IChild::Size"])
+
+    def test_no_sources_means_every_method_is_open(self):
+        report = gen.coverage(IFACES, ["IBase"], [])
+        self.assertEqual(report[0]["implemented"], 0)
+        self.assertEqual(report[0]["open"], ["IBase::DoThing", "IBase::Multi", "IBase::AfterComment"])
+
+    def test_repeated_interface_is_reported_once(self):
+        report = gen.coverage(IFACES, ["IChild", "IChild"], [self.source])
+        self.assertEqual([row["interface"] for row in report], ["IChild"])
+
+
 class MainTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -245,6 +293,15 @@ class MainTests(unittest.TestCase):
             text = f.read()
         self.assertLess(text.index("class IBaseStubs"), text.index("class IChildStubs"))
 
+    def test_repeated_interface_is_emitted_once(self):
+        self.assertEqual(self.run_main("IChild", "IBase"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            expected = f.read()
+
+        self.assertEqual(self.run_main("IChild", "IBase", "IChild"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), expected)
+
     def test_unknown_interface_raises(self):
         with self.assertRaises(SystemExit):
             self.run_main("IWho")
@@ -258,6 +315,100 @@ class MainTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("IChild -> IBase -> IChild", result.stderr)
         self.assertFalse(os.path.exists(self.out))
+
+    def test_report_without_out(self):
+        source = os.path.join(self.dir, "impl.cpp")
+        with open(source, "w", encoding="utf-8") as f:
+            f.write("HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n")
+        report = os.path.join(self.dir, "coverage.json")
+        args = ["gen_d3d12_stubs.py", "--header", self.header, "--report", report,
+                "--source", source, "IChild"]
+        with mock.patch("sys.argv", args):
+            self.assertEqual(gen.main(), 0)
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data[0]["interface"], "IChild")
+        self.assertEqual(data[0]["open"],
+                         ["IBase::Multi", "IBase::AfterComment", "IChild::GetThing", "IChild::Size"])
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_out_or_report_is_required(self):
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header, "IChild"]):
+            with self.assertRaises(SystemExit):
+                gen.main()
+
+    def test_report_requires_a_source(self):
+        report = os.path.join(self.dir, "coverage.json")
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header,
+                                     "--report", report, "IChild"]):
+            with self.assertRaises(SystemExit):
+                gen.main()
+
+    def run_args(self, *args):
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", *args]):
+            return gen.main()
+
+    def make_source(self):
+        source = os.path.join(self.dir, "impl.cpp")
+        with open(source, "w", encoding="utf-8") as f:
+            f.write("HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n")
+        return source
+
+    def test_report_must_not_overwrite_a_source(self):
+        source = self.make_source()
+        with open(source, "rb") as f:
+            before = f.read()
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", self.header, "--report", source, "--source", source, "IChild")
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_must_not_overwrite_the_header(self):
+        with open(self.header, "rb") as f:
+            before = f.read()
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", self.header, "--out", self.header, "IChild")
+        with open(self.header, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_and_report_must_differ(self):
+        source = self.make_source()
+        same = os.path.join(self.dir, "report.json")
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", self.header, "--out", same, "--report", same,
+                          "--source", source, "IChild")
+        self.assertFalse(os.path.exists(same))
+
+    def test_out_must_be_a_file(self):
+        folder = os.path.join(self.dir, "out_folder")
+        os.makedirs(folder)
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", self.header, "--out", folder, "IChild")
+
+    def test_a_source_folder_is_refused(self):
+        source = os.path.join(self.dir, "src_folder")
+        os.makedirs(source)
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", self.header, "--report", os.path.join(self.dir, "r.json"),
+                          "--source", source, "IChild")
+
+    def test_a_missing_header_is_refused_before_writing(self):
+        with self.assertRaises(SystemExit):
+            self.run_args("--header", os.path.join(self.dir, "missing.h"), "--out", self.out, "IChild")
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_a_failed_write_is_one_line(self):
+        blocker = os.path.join(self.dir, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.run_args("--header", self.header, "--out", os.path.join(blocker, "stubs.h"), "IChild")
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
 
     def test_find_header_uses_the_include_environment(self):
         with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):

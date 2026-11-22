@@ -22,11 +22,15 @@ import json
 import mmap
 import os
 import re
+import shutil
+import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
@@ -43,7 +47,112 @@ WARMUP = 8 << 20
 JOIN_MAX = 64
 BAND_GAP = 64 << 20
 GAP_CHUNK = 4 << 20
-FORMAT = 3
+FORMAT = 5  # Format 4 shards may count warm-up streams again.
+SOURCE_SAMPLE = 4096
+
+
+class SourceChanged(Exception):
+    """The archive no longer matches the input used to plan this census."""
+
+
+def _file_stamp(f):
+    st = os.fstat(f.fileno())
+    # Some filesystems return zero file IDs. Separate distinct inputs there even when
+    # timestamps and samples agree. Only the hash of this stamp goes into the cache.
+    local_name = b"" if st.st_dev and st.st_ino else os.fsencode(os.path.realpath(f.name))
+    return (st.st_size, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, local_name)
+
+
+def _source_info(f):
+    """Read the header, size and local cache identity from one open archive."""
+    before = _file_stamp(f)
+    size = before[0]
+    digest = hashlib.sha256(str(before).encode("ascii"))
+    last = max(0, size - SOURCE_SAMPLE)
+    for pos in sorted({0, last // 2, last}):
+        f.seek(pos)
+        width = min(size - pos, SOURCE_SAMPLE)
+        sample = f.read(width)
+        if len(sample) != width:
+            raise SourceChanged("archive changed while reading its identity")
+        if pos == 0:
+            head = sample[:8]
+        digest.update(sample)
+    if _file_stamp(f) != before:
+        raise SourceChanged("archive changed while reading its identity")
+    return head, size, digest.hexdigest()
+
+
+@contextmanager
+def _mapped_source(archive, expected_id):
+    with open(archive, "rb", buffering=0) as f:
+        _, size, source_id = _source_info(f)
+        if expected_id is not None and source_id != expected_id:
+            raise SourceChanged("archive changed before scanning")
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            if len(m) != size:
+                raise SourceChanged("archive changed before scanning")
+            yield m, source_id
+        if _source_info(f)[2] != source_id:
+            raise SourceChanged("archive changed during scanning")
+
+
+@contextmanager
+def _staged_json(path, doc, **options):
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as directory:
+        tmp = os.path.join(directory, os.path.basename(path))
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, **options)
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(mode):
+                os.chmod(tmp, mode & 0o777)
+        yield tmp
+
+
+def _publish_reports(archive, source_id, summary_tmp, summary_path, maps_tmp, maps_path):
+    # Publish the smaller summary first. A failed second replace leaves maps untouched,
+    # so only the old summary needs a backup. Keep it outside the staged-file directories.
+    recovery = tempfile.mkdtemp(prefix=".census-recovery-", dir=os.path.dirname(summary_path))
+    backup = os.path.join(recovery, "summary.json")
+    keep_backup = False
+    try:
+        try:
+            mode = os.lstat(summary_path).st_mode
+        except FileNotFoundError:
+            backup = None
+        else:
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                raise OSError(f"cannot back up non-file report {summary_path}")
+            shutil.copy2(summary_path, backup, follow_symlinks=False)
+        with open(archive, "rb", buffering=0) as f:
+            if _source_info(f)[2] != source_id:
+                raise SourceChanged("archive changed before publishing reports")
+            os.replace(summary_tmp, summary_path)
+            try:
+                os.replace(maps_tmp, maps_path)
+            except OSError as publish_error:
+                try:
+                    if backup is None:
+                        os.unlink(summary_path)
+                    else:
+                        os.replace(backup, summary_path)
+                except OSError as restore_error:
+                    keep_backup = backup is not None
+                    recovery_hint = (f"previous summary saved at {backup}" if keep_backup
+                                     else f"remove {summary_path} to restore its previous absence")
+                    raise OSError(f"{publish_error}; restoring summary failed: {restore_error}; "
+                                  f"{recovery_hint}") from publish_error
+                raise
+    finally:
+        if not keep_backup:
+            try:
+                shutil.rmtree(recovery)
+            except OSError as e:
+                print(f"could not remove report backup {recovery}: {e}", file=sys.stderr)
 
 
 def inflate(m, s, size, max_inflate=CAP, keep=False):
@@ -256,16 +365,16 @@ def inspect_map(data, row, res):
     return out
 
 
-def scan_shard(job):
+def scan_shard(job, source_id=None):
     """Scan one [start, end) window and write its rows, intervals and stats to outdir."""
     archive, index, start, end, outdir, data_start = job
     t0 = time.time()
     stats = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
              "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
              "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-             "entity_unresolved": 0, "adopted": 0}
+             "entity_unresolved": 0}
     rows, intervals, raw_pages, raw_system = [], [], [], []
-    with open(archive, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+    with _mapped_source(archive, source_id) as (m, scanned_id):
         size = len(m)
         pos = max(data_start, start - WARMUP)
         search_end = min(size, end + 16)
@@ -279,15 +388,21 @@ def scan_shard(job):
             if s % 16:
                 pos = s + 1
                 continue
+            # A stream that starts in the warm-up window belongs to the previous shard, which counts it: here it
+            # only moves the scan past its bytes, so the next stream is found on a real boundary.
+            warm_up = s < start
             try:
                 res = assemble(m, s, size)
             except (zlib.error, struct.error, IndexError):
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
                 continue
             if res is None:
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
+                continue
+            if warm_up:
+                pos = max(res["end"], s + 1)
                 continue
             for a, used in res["spans"]:
                 intervals.append([a, a + used])
@@ -300,9 +415,6 @@ def scan_shard(job):
             if not res["is_meta"]:
                 continue
             res["offset"] = s
-            if s < start:
-                stats["adopted"] += 1
-                continue
             raw_system.extend([a, a + used] for a, used in res["raw_spans"])
             stats["raw_system"] += res["raw_system"]
             if not res["complete"]:
@@ -332,17 +444,15 @@ def scan_shard(job):
             if maprow["gfx_need"]:
                 raw_pages.append([(res["end"] + 15) & ~15, maprow["gfx_need"]])
     rows.sort(key=lambda r: r["offset"])
-    doc = {"index": index, "start": start, "end": end, "archive_size": size,
+    doc = {"index": index, "start": start, "end": end, "archive_size": size, "source_id": scanned_id,
            "data_start": data_start, "elapsed": round(time.time() - t0, 3),
            "complete": True, "format": FORMAT, "stats": stats, "rows": rows,
            "intervals": intervals, "raw_pages": raw_pages, "raw_system": raw_system,
            "map_first": rows[0]["offset"] if rows else None,
            "map_last": rows[-1]["offset"] if rows else None}
     path = os.path.join(outdir, "shard_%03d_%d_%d.json" % (index, start, end))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, separators=(",", ":"))
-    os.replace(tmp, path)
+    with _staged_json(path, doc, separators=(",", ":")) as tmp:
+        os.replace(tmp, path)
     return {"index": index, "start": start, "end": end, "elapsed": doc["elapsed"],
             "maps": len(rows), "entities": sum(r["entities"] for r in rows), **stats}
 
@@ -366,7 +476,7 @@ def _peek_meta(m, s, end):
     return len(out) >= 0x15 and out[0x10:0x15] == b"0DRPz"
 
 
-def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_end):
+def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_end, source_id=None):
     """Merge accepted stream spans and account for every byte in the scanned range.
 
     ``raw_pages`` are 0x6 graphics extents and ``raw_system`` are uncompressed system-continuation spans;
@@ -384,26 +494,35 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
     segments = [(a, a + need, "raw_graphics") for a, need in raw_pages]
     segments += [(a, b, "raw_system") for a, b in raw_system if b > a]
     segments.sort()
-    starts = [s[0] for s in segments]
+    max_end = []
+    hi = 0
+    for _, s1, _ in segments:
+        if s1 > hi:
+            hi = s1
+        max_end.append(hi)
     covered = sum(b - a for a, b in merged)
     result = {"covered": covered, "raw_graphics": 0, "raw_system": 0, "zero_padding": 0, "unread": 0,
               "gaps": 0, "unread_sample": [], "raw_0drp": 0,
               "raw_0drp_offsets": [], "gap_0drp": 0, "gap_0drp_other": 0,
               "raw_maps": 0, "raw_meta": 0, "missed_zlib_meta": 0,
               "missed_zlib_offsets": []}
-    with open(archive, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+    with _mapped_source(archive, source_id) as (m, _):
         cursor = scan_start
         bounds = merged + [[scan_end, scan_end]]
         for a, b in bounds:
             if cursor < a:
                 result["gaps"] += 1
                 pos = cursor
-                idx = bisect.bisect_left(starts, cursor)
+                idx = bisect.bisect_right(max_end, cursor)
                 while idx < len(segments) and segments[idx][0] < a:
                     s0, s1, kind = segments[idx]
+                    if s1 <= pos or (cursor > scan_start and s0 < cursor):
+                        idx += 1
+                        continue
                     start = max(pos, s0)
                     if start > pos:
                         _count_gap(m, pos, start, result)
+                        _audit_gap(m, pos, start, result, allow_zlib=True)
                     take = max(0, min(s1, a) - start)
                     if take:
                         result[kind] += take
@@ -449,16 +568,20 @@ def _audit_gap(m, a, b, result, allow_zlib):
         return
     p = a
     while p < b:
-        piece = m[p:min(b, p + GAP_CHUNK)]
+        end = min(b, p + GAP_CHUNK)
+        # Keep 4 bytes of lookahead so a 5-byte 0DRPz or 2-byte zlib header starting before `end`
+        # never indexes past `piece` or splits unseen across a GAP_CHUNK boundary.
+        piece = m[p:min(b, end + 4)]
         if not piece:
             break
+        limit = end - p
         q = 0
-        while True:
+        while q < limit:
             i = piece.find(SIG, q)
-            if i < 0:
+            if i < 0 or i >= limit:
                 break
             at = p + i
-            if at + 5 <= b and piece[i + 4] == VERSION:
+            if i + 4 < len(piece) and piece[i + 4] == VERSION:
                 result["gap_0drp"] += 1
                 start = at - 0x10
                 if start >= 0:
@@ -480,9 +603,9 @@ def _audit_gap(m, a, b, result, allow_zlib):
             q = i + 1
         if allow_zlib:
             q = 0
-            while True:
+            while q < limit:
                 mt = ZHDR.search(piece, q)
-                if not mt:
+                if not mt or mt.start() >= limit:
                     break
                 at = p + mt.start()
                 if at % 16:
@@ -491,7 +614,7 @@ def _audit_gap(m, a, b, result, allow_zlib):
                         if len(result["missed_zlib_offsets"]) < 50:
                             result["missed_zlib_offsets"].append(at)
                 q = mt.start() + 1
-        p += len(piece)
+        p = end
 
 
 def _expected_shards(start, end, shard_size):
@@ -512,23 +635,27 @@ def _shard_path(outdir, want):
     return os.path.join(outdir, "shard_%03d_%d_%d.json" % (want["index"], want["start"], want["end"]))
 
 
-def _shard_ok(path, want):
+def _read_shard(outdir, want, source_id):
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(_shard_path(outdir, want), encoding="utf-8") as f:
             doc = json.load(f)
     except (OSError, ValueError):
-        return False
-    return (doc.get("format") == FORMAT and doc.get("start") == want["start"]
-            and doc.get("end") == want["end"] and doc.get("complete") is True)
+        return None
+    if (isinstance(doc, dict) and doc.get("format") == FORMAT and doc.get("complete") is True
+            and source_id is not None and doc.get("source_id") == source_id
+            and all(type(doc.get(k)) is int and doc[k] == want[k] for k in ("index", "start", "end"))
+            and isinstance(doc.get("stats"), dict)
+            and all(isinstance(doc.get(k), list) for k in ("rows", "intervals", "raw_pages", "raw_system"))):
+        return doc
+    return None
 
 
-def _load_shards(outdir, expected):
+def _load_shards(outdir, expected, source_id):
     docs = {}
     for want in expected:
-        path = _shard_path(outdir, want)
-        if _shard_ok(path, want):
-            with open(path, encoding="utf-8") as f:
-                docs[want["index"]] = json.load(f)
+        doc = _read_shard(outdir, want, source_id)
+        if doc is not None:
+            docs[want["index"]] = doc
     return docs
 
 
@@ -546,7 +673,7 @@ def _duplicates(rows):
     ngroups = [v for v in by_name.values() if len(v) > 1]
     return {"content_groups": len(groups), "content_extra_maps": extra,
             "content_extra_entities": extra_entities,
-            "content_group_sample": [[v[0]["map_name"], len(v)] for v in groups[:20]],
+            "content_group_sample": [[v[0].get("map_name"), len(v)] for v in groups[:20]],
             "name_groups": len(ngroups), "name_extra_maps": sum(len(v) - 1 for v in ngroups)}
 
 
@@ -564,14 +691,21 @@ def _bands(rows):
 
 
 def summarize(archive, outdir, start, end, shard_size, data_start):
+    with open(archive, "rb", buffering=0) as f:
+        _, size, source_id = _source_info(f)
     expected = _expected_shards(start, end, shard_size)
-    docs = _load_shards(outdir, expected)
+    docs = _load_shards(outdir, expected, source_id)
+    summary, _ = _summarize(archive, start, end, data_start, size, source_id, expected, docs)
+    return summary
+
+
+def _summarize(archive, start, end, data_start, size, source_id, expected, docs):
     missing = [w for w in expected if w["index"] not in docs]
     rows, intervals, raw_pages, raw_system = [], [], [], []
     totals = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
               "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
               "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-              "entity_unresolved": 0, "adopted": 0}
+              "entity_unresolved": 0}
     shards = []
     for want in expected:
         doc = docs.get(want["index"])
@@ -603,11 +737,11 @@ def summarize(archive, outdir, start, end, shard_size, data_start):
         seen.add(r["offset"])
         unique.append(r)
     rows = unique
-    gaps = classify_gaps(archive, intervals, raw_pages, raw_system, start, end)
+    gaps = classify_gaps(archive, intervals, raw_pages, raw_system, start, end, source_id)
     exact_maps = sum(1 for r in rows if r.get("exact"))
     exact_entities = sum(r["entities"] for r in rows if r.get("exact"))
     summary = {
-        "archive": os.path.abspath(archive), "archive_size": os.path.getsize(archive),
+        "archive": os.path.abspath(archive), "archive_size": size, "source_id": source_id,
         "data_start": data_start, "scan_start": start, "scan_end": end,
         "span": end - start, "shards_expected": len(expected), "shards_complete": len(docs),
         "complete": not missing, "missing_ranges": [[m["start"], m["end"]] for m in missing],
@@ -625,7 +759,7 @@ def summarize(archive, outdir, start, end, shard_size, data_start):
                                and totals["entity_gfx"] == 0 and totals["entity_unresolved"] == 0
                                and totals["incomplete"] == 0 and totals["invalid"] == 0
                                and gaps["raw_maps"] == 0 and gaps["missed_zlib_meta"] == 0)
-    return summary
+    return summary, rows
 
 
 def positive_int(text):
@@ -651,6 +785,16 @@ def job_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -663,12 +807,14 @@ def main(argv=None):
     ap.add_argument("--merge-only", action="store_true")
     a = ap.parse_args(argv)
     try:
-        with open(a.archive, "rb") as f:
-            head = f.read(8)
-            size = os.fstat(f.fileno()).st_size
+        with open(a.archive, "rb", buffering=0) as f:
+            head, size, source_id = _source_info(f)
     except OSError as e:
         print(f"{a.archive}: {e.strerror or e}", file=sys.stderr)
         return 2
+    except SourceChanged as e:
+        print(str(e), file=sys.stderr)
+        return 1
     if head[:4] != b"9FPR":
         print("not an RPF9 archive", file=sys.stderr)
         return 2
@@ -679,25 +825,36 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    os.makedirs(a.out, exist_ok=True)
+    if same_output_path(a.archive, a.out):
+        print("error: --out must not overwrite the input archive", file=sys.stderr)
+        return 2
+    if os.path.isfile(a.out):
+        print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
+        return 2
+    for report in ("summary.json", "maps.json"):
+        if same_output_path(a.archive, os.path.join(a.out, report)):
+            print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
+            return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"error: cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     expected = _expected_shards(start, end, a.shard_size)
     t0 = time.time()
+    docs = _load_shards(a.out, expected, source_id) if a.resume or a.merge_only else {}
     if not a.merge_only:
-        jobs = []
-        for want in expected:
-            path = _shard_path(a.out, want)
-            if a.resume and _shard_ok(path, want):
-                continue
-            jobs.append((a.archive, want["index"], want["start"], want["end"], a.out, data_start))
+        pending = [w for w in expected if w["index"] not in docs]
+        jobs = [(a.archive, w["index"], w["start"], w["end"], a.out, data_start) for w in pending]
         print("census: %d shards, %d to scan, %d jobs, %.2f GiB" %
               (len(expected), len(jobs), a.jobs, (end - start) / (1 << 30)), flush=True)
-        failures = 0
+        failed = set()
         if a.jobs == 1:
             for done, job in enumerate(jobs, 1):
                 try:
-                    r = scan_shard(job)
+                    r = scan_shard(job, source_id)
                 except Exception as e:
-                    failures += 1
+                    failed.add(job[1])
                     print("[%d/%d] shard %d FAILED: %r" % (done, len(jobs), job[1], e), flush=True)
                     continue
                 print("[%d/%d] shard %03d %d..%d maps=%d entities=%d %.1fs" %
@@ -705,30 +862,35 @@ def main(argv=None):
                        r["entities"], r["elapsed"]), flush=True)
         else:
             with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-                futures = {ex.submit(scan_shard, job): job for job in jobs}
+                futures = {ex.submit(scan_shard, job, source_id): job for job in jobs}
                 for done, fut in enumerate(as_completed(futures), 1):
                     job = futures[fut]
                     try:
                         r = fut.result()
                     except Exception as e:  # keep completed shards; the rerun resumes them
-                        failures += 1
+                        failed.add(job[1])
                         print("[%d/%d] shard %d FAILED: %r" % (done, len(jobs), job[1], e), flush=True)
                         continue
                     print("[%d/%d] shard %03d %d..%d maps=%d entities=%d %.1fs" %
                           (done, len(jobs), r["index"], r["start"], r["end"], r["maps"],
                            r["entities"], r["elapsed"]), flush=True)
-        if failures:
-            print("%d shard(s) failed; writing the completed coverage" % failures, flush=True)
-    summary = summarize(a.archive, a.out, start, end, a.shard_size, data_start)
-    summary["elapsed"] = round(time.time() - t0, 3)
-    with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=1, sort_keys=True)
-    with open(os.path.join(a.out, "maps.json"), "w", encoding="utf-8") as f:
-        json.dump({"summary": {k: summary[k] for k in
-                               ("maps", "maps_exact", "entities", "entities_exact", "scan_start",
-                                "scan_end", "complete", "census_exact")},
-                   "maps": [r for d in _load_shards(a.out, expected).values() for r in d.get("rows", [])]},
-                  f, indent=1, sort_keys=True)
+        if failed:
+            print("%d shard(s) failed; writing the completed coverage" % len(failed), flush=True)
+        docs.update(_load_shards(a.out, (w for w in pending if w["index"] not in failed), source_id))
+    try:
+        summary, rows = _summarize(a.archive, start, end, data_start, size, source_id, expected, docs)
+        summary["elapsed"] = round(time.time() - t0, 3)
+        maps = {"summary": {k: summary[k] for k in
+                            ("maps", "maps_exact", "entities", "entities_exact", "scan_start",
+                             "scan_end", "complete", "census_exact", "source_id")}, "maps": rows}
+        summary_path = os.path.join(a.out, "summary.json")
+        maps_path = os.path.join(a.out, "maps.json")
+        with _staged_json(summary_path, summary, indent=1, sort_keys=True) as summary_tmp, \
+                _staged_json(maps_path, maps, indent=1, sort_keys=True) as maps_tmp:
+            _publish_reports(a.archive, source_id, summary_tmp, summary_path, maps_tmp, maps_path)
+    except (SourceChanged, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
     print(json.dumps({k: summary[k] for k in
                       ("maps", "maps_exact", "entities", "entities_exact", "complete", "census_exact",
                        "shards_complete", "shards_expected", "elapsed", "coverage", "duplicates")},
@@ -737,4 +899,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

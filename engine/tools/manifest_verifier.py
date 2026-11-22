@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable, Optional, TextIO
@@ -43,7 +44,13 @@ def below_normal() -> None:
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
+
             k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.argtypes = ()
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            k32.SetPriorityClass.restype = wintypes.BOOL
             k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
         except Exception:
             pass
@@ -53,20 +60,48 @@ class ManifestError(Exception):
     """Raised when a manifest file is missing, unparseable, or invalid."""
 
 
-def sha256_file(path: str, chunk_size: int = CHUNK) -> str:
+def _file_stamp(st: os.stat_result) -> tuple[int, int, int]:
+    return st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def sha256_file(path: str, chunk_size: int = CHUNK, *, expected_size: int | None = None) -> str:
+    """Hash a stable open file, refusing a resize, rewrite or path replacement during the read."""
     h = hashlib.sha256()
     with open(path, "rb", buffering=0) as f:
-        while chunk := f.read(chunk_size):
+        before = os.fstat(f.fileno())
+        if expected_size is not None and before.st_size != expected_size:
+            raise OSError(f"{path}: file size changed before hashing")
+        remaining = before.st_size
+        while remaining and (chunk := f.read(min(chunk_size, remaining))):
             h.update(chunk)
+            remaining -= len(chunk)
+        # Compare handle timestamps to each other; Windows may report different times by path.
+        # The final path stat checks that the name still refers to the same open file.
+        if (remaining or f.read(1) or _file_stamp(os.fstat(f.fileno())) != _file_stamp(before)
+                or not os.path.samestat(before, os.stat(path))):
+            raise OSError(f"{path}: file changed while hashing")
     return h.hexdigest()
 
 
-def walk(target_dir: str):
-    """Yields (relative_path, absolute_path) for all files in target_dir using forward slashes."""
-    for root, _, files in os.walk(target_dir):
+def walk(target_dir: str, *, exclude: str | None = None):
+    """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    excluded_dir = excluded_name = None
+    if exclude is not None:
+        directory, name = os.path.split(os.path.abspath(exclude))
+        excluded_dir = os.path.normcase(os.path.realpath(directory))
+        excluded_name = os.path.normcase(name)
+
+    # os.walk otherwise treats missing or unreadable directories as empty.
+    for root, _, files in os.walk(target_dir, onerror=scan_failed):
+        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
+            if contains_manifest and os.path.normcase(name) == excluded_name:
+                continue
             abs_p = os.path.join(root, name)
-            rel_p = os.path.relpath(abs_p, target_dir).replace("\\", "/")
+            rel_p = os.path.relpath(abs_p, target_dir).replace(os.sep, "/")
             yield rel_p, abs_p
 
 
@@ -78,13 +113,23 @@ def load_manifest(path: str) -> dict[str, dict]:
       or flat:
       {<rel_path>: {"size": <int>, "sha256": <str>}, ...}
 
-    Normalizes relative paths to forward slashes and hashes to lowercase hex.
+    Rejects repeated JSON keys and normalizes relative paths to forward
+    slashes and hashes to lowercase hex.
     """
     if not os.path.isfile(path):
         raise ManifestError(f"manifest file not found: {path}")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ManifestError(f"{path}: duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
     try:
         with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
+            doc = json.load(f, object_pairs_hook=unique_object)
     except ValueError as err:
         raise ManifestError(f"{path} is not valid JSON ({err})") from None
     except OSError as err:
@@ -93,27 +138,35 @@ def load_manifest(path: str) -> dict[str, dict]:
     if not isinstance(doc, dict):
         raise ManifestError(f"{path}: root must be a JSON object")
 
-    raw_files = doc.get("files") if "files" in doc and isinstance(doc["files"], dict) else doc
-    if not isinstance(raw_files, dict):
-        raise ManifestError(f"{path} has no valid files table")
+    nested = "files" in doc
+    if nested:
+        raw_files = doc["files"]
+        if not isinstance(raw_files, dict):
+            raise ManifestError(f"{path}: 'files' must be a JSON object")
+    else:
+        raw_files = doc
 
     entries: dict[str, dict] = {}
     for raw_rel, info in raw_files.items():
-        if raw_rel in ("created", "title", "version", "note"):
+        if not nested and raw_rel in ("created", "title", "version", "note"):
             continue
         rel = str(raw_rel).replace("\\", "/")
+        if rel in entries:
+            raise ManifestError(f"{path}: duplicate normalized path {rel!r}")
         if isinstance(info, dict):
             size = info.get("size")
             digest = info.get("sha256")
             if not isinstance(digest, str):
                 raise ManifestError(f"{path}: entry {rel!r} missing 'sha256' string")
-            if size is not None and not (isinstance(size, int) and size >= 0):
+            if size is not None and not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
                 raise ManifestError(f"{path}: entry {rel!r} has invalid integer 'size'")
-            entries[rel] = {"size": size, "sha256": digest.lower()}
         elif isinstance(info, str):
-            entries[rel] = {"size": None, "sha256": info.lower()}
+            size, digest = None, info
         else:
             raise ManifestError(f"{path}: entry {rel!r} must be an object or digest string")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise ManifestError(f"{path}: entry {rel!r} needs a SHA-256 digest of 64 hexadecimal characters")
+        entries[rel] = {"size": size, "sha256": digest.lower()}
     return entries
 
 
@@ -142,10 +195,19 @@ class ManifestReport:
     problems: dict[str, str] = field(default_factory=dict)
     bytes_verified: int = 0
     elapsed_seconds: float = 0.0
+    strict: bool = False
+
+    def count_problems(self, *, strict: Optional[bool] = None) -> int:
+        count = len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        if strict is None:
+            strict = self.strict
+        if strict:
+            count += len(self.untracked)
+        return count
 
     @property
     def problem_count(self) -> int:
-        return len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        return self.count_problems()
 
     def to_dict(self) -> dict:
         return {
@@ -177,7 +239,7 @@ def verify_manifest(
         raise ManifestError(f"target directory does not exist: {target_dir}")
 
     want = load_manifest(manifest_path)
-    have = dict(walk(target_dir))
+    have = dict(walk(target_dir, exclude=manifest_path))
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
     problems: dict[str, str] = {}
@@ -212,7 +274,7 @@ def verify_manifest(
 
     def hash_worker(rel: str, abs_p: str, size: int, expected_hash: str) -> tuple[str, int, str, Optional[str]]:
         try:
-            actual_hash = sha256_file(abs_p)
+            actual_hash = sha256_file(abs_p, expected_size=size)
             if actual_hash.lower() == expected_hash:
                 return rel, size, "OK", None
             return rel, size, "CHANGED", None
@@ -300,6 +362,7 @@ def verify_manifest(
         problems={rel: problems[rel] for rel in sorted(problems.keys())},
         bytes_verified=completed_bytes,
         elapsed_seconds=elapsed_total,
+        strict=strict,
     )
 
 
@@ -307,7 +370,7 @@ def print_report(
     report: ManifestReport,
     out: TextIO = sys.stdout,
     verbose: bool = False,
-    strict: bool = False,
+    strict: Optional[bool] = None,
 ) -> None:
     for rel in sorted(report.problems.keys()):
         kind = report.problems[rel]
@@ -315,9 +378,7 @@ def print_report(
     for rel in report.untracked:
         out.write(f"{'NEW':<10}{rel}\n")
 
-    bad = report.problem_count
-    if strict and report.untracked:
-        bad += len(report.untracked)
+    bad = report.count_problems(strict=strict)
 
     if bad == 0:
         if verbose:
@@ -361,6 +422,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not game_dir:
             parser.error("target directory required when using 'verify'")
     else:
+        if args.target_dir is not None:
+            parser.error(f"unrecognized arguments: {args.target_dir}")
         game_dir = args.cmd_or_dir
 
     below_normal()
@@ -387,10 +450,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
     else:
-        print_report(report, out=sys.stdout, verbose=args.verbose, strict=args.strict)
+        print_report(report, out=sys.stdout, verbose=args.verbose)
 
     return 0 if report.passed else 1
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

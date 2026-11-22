@@ -16,9 +16,14 @@ complete object, number of slots that point into executable sections).
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 
 
@@ -140,23 +145,33 @@ def scan_pe64_rtti(data: bytes) -> dict:
 
     # 3. Class hierarchies.
     classes = {}
+    chd_ok = set()
     for rva, col in cols.items():
         td = col["td"]
-        if td in classes:
+        if td in chd_ok:
             continue
         chd = col["chd"]
-        try:
-            _, attrs, nbase, rarr = struct.unpack_from("<4I", img, chd)
-            bases = []
-            for i in range(1, min(nbase, 256)):
-                bcd = u32(rarr + 4 * i)
-                btd = u32(bcd)
-                if btd in tds:
-                    bases.append(simple_name(tds[btd]))
-        except struct.error:
-            attrs, bases = 0, []
-        classes[td] = {"name": simple_name(tds[td]), "mangled": tds[td], "td_rva": td,
-                       "multiple": bool(attrs & 1), "virtual": bool(attrs & 2), "bases": bases}
+        valid_chd = False
+        attrs, bases = 0, []
+        if chd > 0:
+            try:
+                sig, attrs, nbase, rarr = struct.unpack_from("<4I", img, chd)
+                if sig == 0 and rarr > 0:
+                    for i in range(1, min(nbase, 256)):
+                        bcd = u32(rarr + 4 * i)
+                        btd = u32(bcd)
+                        if btd in tds:
+                            bases.append(simple_name(tds[btd]))
+                    valid_chd = True
+                else:
+                    attrs = 0
+            except struct.error:
+                attrs, bases = 0, []
+        if valid_chd or td not in classes:
+            classes[td] = {"name": simple_name(tds[td]), "mangled": tds[td], "td_rva": td,
+                           "multiple": bool(attrs & 1), "virtual": bool(attrs & 2), "bases": bases}
+        if valid_chd:
+            chd_ok.add(td)
 
     # 4. Vtables: a qword equal to (image base + COL rva), followed by code pointers.
     vtables = []
@@ -166,12 +181,12 @@ def scan_pe64_rtti(data: bytes) -> dict:
             continue
         lo = sec["virtual_address"]
         hi = min(lo + sec["virtual_size"], len(img))
-        for p in range(lo - lo % 8, hi - 8, 8):
+        for p in range((lo + 7) & ~7, hi - 8, 8):
             q = struct.unpack_from("<Q", img, p)[0]
             if q in col_vas:
                 vt = p + 8
                 n = 0
-                while vt + 8 * (n + 1) <= len(img):
+                while vt + 8 * (n + 1) <= hi:
                     f = struct.unpack_from("<Q", img, vt + 8 * n)[0] - base
                     if not (0 <= f < len(img) and is_exec(f)):
                         break
@@ -187,11 +202,41 @@ def scan_pe64_rtti(data: bytes) -> dict:
     }
 
 
+def write_report(path, text):
+    """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
+    locked range) leaves the previous report as it was instead of an empty or truncated file. The result keeps
+    the previous report's permission bits, or gets the usual ones for a new file."""
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent, prefix=".rtti-",
+                                         suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(text)
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
     ap.add_argument("--out")
     a = ap.parse_args()
+    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
+    same_path = os.path.normcase(os.path.realpath(a.image)) == os.path.normcase(os.path.realpath(path))
+    try:
+        same_path = same_path or os.path.samefile(a.image, path)
+    except OSError:
+        pass  # A missing or inaccessible path is handled by the normal read/write error path.
+    if same_path:
+        ap.error("output must not overwrite the source image")
     try:
         with open(a.image, "rb") as f:
             data = f.read()
@@ -201,9 +246,11 @@ def main():
         return 1
 
     out = {"image": a.image, **scanned}
-    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+    try:
+        write_report(path, json.dumps(out, indent=1))
+    except OSError as exc:
+        print(f"ERROR: {path}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     print(f"{a.image}: {out['type_descriptors']} type descriptors, {len(out['classes'])} classes with RTTI, {len(out['vtables'])} vtables -> {path}")
     for c in out["classes"][:5]:
         print("  ", c["name"], "<-", ", ".join(c["bases"][:4]))
@@ -211,4 +258,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

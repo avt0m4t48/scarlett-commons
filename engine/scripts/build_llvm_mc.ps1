@@ -6,14 +6,28 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
+#
+# The default -Dest is outside AppData on purpose: `python` from the Python install manager (the app execution alias
+# in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
+# there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
     [string]$Version = "21.1.8",
-    [string]$Dest = (Join-Path $env:LOCALAPPDATA "Leonida\llvm-mc"),
+    [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user
     [switch]$Keep     # keep the sources and build folder (faster rebuilds)
 )
 $ErrorActionPreference = "Stop"
+
+if (-not $Keep) {
+    # Compare directory boundaries, including when the paths do not exist yet.
+    $paths = $ExecutionContext.SessionState.Path
+    $tempDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Temp)).TrimEnd('\') + '\'
+    $destDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Dest)).TrimEnd('\') + '\'
+    if ($destDir.StartsWith($tempDir, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup would delete the installation. Choose a -Dest outside -Temp or use -Keep."
+    }
+}
 
 foreach ($t in "git", "python") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
@@ -38,11 +52,22 @@ $out = Join-Path $Temp "build"
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if (Test-Path $src) { Remove-Item -Recurse -Force $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
-    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse https://github.com/llvm/llvm-project $src
+    # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
+    # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
+    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
     & git -C $src sparse-checkout set llvm cmake third-party
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
 }
+
+# -Keep (or an interrupted build) can leave sources from another -Version.
+# Refuse that checkout rather than silently rebuilding the wrong release or resetting user files.
+$versionError = "Cannot reuse '$src' for LLVM $Version. Choose a fresh -Temp directory for this version; existing files were kept."
+if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { throw $versionError }
+$wantedCommit = & git -C $src rev-parse --verify --quiet "refs/tags/llvmorg-$Version^{commit}"
+if ($LASTEXITCODE -ne 0 -or -not $wantedCommit) { throw $versionError }
+$sourceCommit = & git -C $src rev-parse --verify --quiet HEAD
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $wantedCommit) { throw $versionError }
 
 # DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
 $body = @"
@@ -54,8 +79,25 @@ $body = @"
 "@
 New-Item -ItemType Directory -Force $out | Out-Null
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
+# Switch cmd.exe to UTF-8 before reading paths, then restore the shared console even if the build fails.
 $bat = Join-Path $Temp "_build.cmd"
-"@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+$batchText = @(
+    '@echo off'
+    'setlocal'
+    'set "_leonida_cp="'
+    'for /f "tokens=2 delims=:." %%c in (''chcp'') do set "_leonida_cp=%%c"'
+    'chcp 65001 >nul'
+    'call :build'
+    'set "_leonida_exit=%errorlevel%"'
+    'if defined _leonida_cp chcp %_leonida_cp% >nul'
+    'exit /b %_leonida_exit%'
+    ':build'
+    "set `"PATH=$installer;%PATH%`""
+    "call `"$vcvars`" >nul || exit /b 1"
+    $body
+    ''
+) -join "`r`n"
+[System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
@@ -72,9 +114,16 @@ $probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
 if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
-$final = Join-Path $Dest "llvm-mc.exe"
+# LLVM_MC is saved for future terminals, whose working directory can differ from this one.
+$final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
-if (-not $Keep) { Remove-Item -Recurse -Force $Temp }
+if (-not $Keep) {
+    try {
+        Remove-Item -LiteralPath $Temp -Recurse -Force
+    } catch {
+        Write-Warning "Installed $final, but cleanup of '$Temp' failed: $($_.Exception.Message)"
+    }
+}
 if (-not $NoEnv) {
     [Environment]::SetEnvironmentVariable("LLVM_MC", $final, "User")
     Write-Host "LLVM_MC set for this user (open a new terminal to pick it up)."

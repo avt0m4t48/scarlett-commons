@@ -6,10 +6,14 @@
 //
 //   LEONIDA_GAME_DIR=<package root>   (contains XboxBvhBuilder.dll)
 //   LEONIDA_BVH_FLAG=1                (optional: pass true as the constructor's bool argument)
-//   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter)
+//   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter; the default on an NVIDIA adapter, RT-54)
+//   LEONIDA_BVH_HARDWARE=1            (optional: keep an NVIDIA adapter instead of switching to WARP)
+//   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape)
+//   LEONIDA_BVH_DXIL=1                (optional, with RECORD62: dx.op counts and validator error kinds, needs
+//                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // The exports are C++ members (demangled): XboxBvhBuilder::XboxBvhBuilder(ID3D12Device11*, bool) and ~XboxBvhBuilder().
 // sizeof(XboxBvhBuilder) is not exported, so the object lives in a large buffer filled with a sentinel, and the
@@ -18,8 +22,10 @@
 #include <windows.h>
 
 #include <d3d12.h>
+#include <dxcapi.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -148,6 +154,9 @@ int filter(EXCEPTION_POINTERS* e, Call* c) {
 using Ctor = void* (*)(void* self, void* device, bool flag);
 using Dtor = void (*)(void* self);
 
+// Each guard returns a copy of `c`, not `c` itself: with `return c;` the local becomes the named return value, and
+// clang-cl 19 and 20 crash (exit 139, in recoverAddrOfEscapedLocal) generating the __except filter that writes it,
+// which stops the Linux cross-build (runtime/cmake/clang-cl-xwin.cmake). MSVC is fine either way.
 Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     Call c;
     __try {
@@ -155,7 +164,7 @@ Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_dtor(Dtor fn, void* self) {
@@ -165,7 +174,7 @@ Call guarded_dtor(Dtor fn, void* self) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 // main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
@@ -229,6 +238,22 @@ void print_debug_messages(ID3D12Device* device) {
     q->Release();
 }
 
+// The first hardware adapter's PCI vendor ID, 0 when there is none.
+UINT first_hardware_vendor() {
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 0;
+    UINT vendor = 0;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; !vendor && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d{};
+        adapter->GetDesc1(&d);
+        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) vendor = d.VendorId;
+        adapter->Release();
+    }
+    factory->Release();
+    return vendor;
+}
+
 ID3D12Device* create_pc_device(bool warp) {
     IDXGIFactory4* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
@@ -283,6 +308,178 @@ bool looks_like_iid(uint64_t p, const IID& iid) {
 
 uint64_t g_slot62_ok = 0, g_slot62_failed = 0;
 
+// The shape of a DXBC container, for the record: its parts (four-character code and size), the DXIL part's shader
+// model and DXIL version, the SFI0 feature flags, and whether the hash is zero (unsigned). Counts and flags only.
+std::string container_shape(const void* bytecode, size_t length) {
+    const auto* b = static_cast<const uint8_t*>(bytecode);
+    auto u32 = [&](size_t o) {
+        uint32_t v = 0;
+        if (o + 4 <= length) std::memcpy(&v, b + o, 4);
+        return v;
+    };
+    if (!b || length < 32 || std::memcmp(b, "DXBC", 4) != 0) return "not a DXBC container";
+    bool zero_hash = true;
+    for (int i = 4; i < 20; ++i) zero_hash &= b[i] == 0;
+    const uint32_t parts = u32(28);
+    std::string out = std::string(zero_hash ? "unsigned" : "signed") + ", " + std::to_string(parts) + " parts:";
+    for (uint32_t i = 0; i < parts && 32 + 4 * size_t(i) + 4 <= length; ++i) {
+        const uint32_t off = u32(32 + 4 * size_t(i));
+        if (size_t(off) + 8 > length) break;
+        const char fourcc[5] = {char(b[off]), char(b[off + 1]), char(b[off + 2]), char(b[off + 3]), 0};
+        const uint32_t size = u32(off + 4);
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s:%u", fourcc, size);
+        out += item;
+        const size_t data = size_t(off) + 8;
+        if ((!std::strcmp(fourcc, "DXIL") || !std::strcmp(fourcc, "ILDB")) && size >= 24) {
+            const uint32_t version = u32(data), dxil = u32(data + 12);
+            std::snprintf(item, sizeof(item), "(sm %u.%u kind %u dxil %u.%u)", (version >> 4) & 0xf, version & 0xf,
+                          version >> 16, (dxil >> 8) & 0xff, dxil & 0xff);
+            out += item;
+        } else if (!std::strcmp(fourcc, "SFI0") && size >= 8) {
+            std::snprintf(item, sizeof(item), "(flags %#llx)",
+                          static_cast<unsigned long long>(u32(data) | (uint64_t(u32(data + 4)) << 32)));
+            out += item;
+        }
+    }
+    return out;
+}
+
+// The module a container belongs to: the file name (without ".pdb") in its ILDN part, a DXIL debug-name record
+// (u16 flags, u16 name length, then the PDB path). Empty when there is no such part. The module names are the ones
+// listed in docs/embedded_shaders.md section 3.
+std::string container_module(const void* bytecode, size_t length) {
+    const auto* b = static_cast<const uint8_t*>(bytecode);
+    auto u32 = [&](size_t o) {
+        uint32_t v = 0;
+        if (o + 4 <= length) std::memcpy(&v, b + o, 4);
+        return v;
+    };
+    if (!b || length < 32 || std::memcmp(b, "DXBC", 4) != 0) return {};
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts && 32 + 4 * size_t(i) + 4 <= length; ++i) {
+        const size_t off = u32(32 + 4 * size_t(i));
+        if (off + 8 > length || std::memcmp(b + off, "ILDN", 4) != 0) continue;
+        const size_t size = u32(off + 4), data = off + 8;
+        if (size < 5 || data + size > length) return {};
+        std::string path(reinterpret_cast<const char*>(b + data + 4), size - 4);
+        path.resize(std::strlen(path.c_str()));
+        const size_t slash = path.find_last_of("\\/");
+        std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".pdb") == 0) name.resize(name.size() - 4);
+        return name;
+    }
+    return {};
+}
+
+// Every container the constructor has passed to slot 62 so far, to find one that is passed twice (RT-182). The bytes
+// are compared, not a hash, and nothing is printed from them.
+std::vector<std::vector<uint8_t>> g_seen_containers;
+std::vector<std::string> g_seen_modules;
+int g_repeat_first = 0, g_repeat_second = 0;  // creation numbers (1-based) of the first repeat found, 0 = none
+int g_repeats = 0;
+
+// LEONIDA_BVH_DXIL=1: what each shader uses, from dxcompiler.dll's disassembly in memory: the distinct dx.op names
+// with call counts, and a few type/feature markers. Also dxil.dll's validator verdict. Names and counts only; the
+// disassembly is not printed or written. The DLLs come from PATH or the Windows SDK, loaded at run time.
+struct DxcTools {
+    IDxcCompiler* compiler = nullptr;
+    IDxcLibrary* library = nullptr;
+    IDxcValidator* validator = nullptr;
+};
+
+DxcTools* dxc_tools() {
+    static DxcTools tools;
+    static bool tried = false;
+    if (tried) return tools.compiler ? &tools : nullptr;
+    tried = true;
+    HMODULE compiler = LoadLibraryA("dxcompiler.dll");
+    HMODULE validator = LoadLibraryA("dxil.dll");
+    auto create = [](HMODULE m) {
+        return m ? reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(m, "DxcCreateInstance")) : nullptr;
+    };
+    if (auto f = create(compiler)) {
+        f(CLSID_DxcCompiler, IID_PPV_ARGS(&tools.compiler));
+        f(CLSID_DxcLibrary, IID_PPV_ARGS(&tools.library));
+    }
+    if (auto f = create(validator)) f(CLSID_DxcValidator, IID_PPV_ARGS(&tools.validator));
+    if (!tools.compiler || !tools.library) note("LEONIDA_BVH_DXIL: dxcompiler.dll not found on PATH");
+    if (!tools.validator) note("LEONIDA_BVH_DXIL: dxil.dll not found on PATH (no validator verdict)");
+    return tools.compiler && tools.library ? &tools : nullptr;
+}
+
+std::string dxil_usage(const void* bytecode, size_t length) {
+    DxcTools* t = dxc_tools();
+    if (!t) return "no dxcompiler";
+    const std::vector<uint8_t> copy(static_cast<const uint8_t*>(bytecode), static_cast<const uint8_t*>(bytecode) + length);
+    IDxcBlobEncoding* blob = nullptr;
+    if (FAILED(t->library->CreateBlobWithEncodingFromPinned(copy.data(), static_cast<UINT32>(copy.size()), 0, &blob)))
+        return "no blob";
+    std::string out;
+    if (t->validator) {
+        IDxcOperationResult* result = nullptr;
+        HRESULT status = E_FAIL;
+        if (SUCCEEDED(t->validator->Validate(blob, DxcValidatorFlags_Default, &result)) && result)
+            result->GetStatus(&status);
+        out += std::string("validator ") + (SUCCEEDED(status) ? "ok" : "rejects (" + hex(uint32_t(status)) + ")");
+        // The kinds of error with their counts. Quoted text (names, triples, instructions) is masked as 'X', and
+        // anything after the message's first sentence is dropped, so nothing of the shader is printed.
+        IDxcBlobEncoding* errors = nullptr;
+        if (result && FAILED(status) && SUCCEEDED(result->GetErrorBuffer(&errors)) && errors) {
+            const std::string m(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
+            std::vector<std::pair<std::string, int>> kinds;
+            for (size_t p = m.find("error: "); p != std::string::npos; p = m.find("error: ", p + 1)) {
+                std::string kind;
+                bool quoted = false;
+                for (size_t i = p + 7; i < m.size(); ++i) {
+                    const char ch = m[i];
+                    if (ch == '\n' || (ch == '.' && !quoted)) break;  // the first sentence; dots in names don't end it
+                    if (ch == '\'') {
+                        if (!quoted) kind += "'X'";
+                        quoted = !quoted;
+                    } else if (!quoted) {
+                        kind += ch;
+                    }
+                }
+                auto it = std::find_if(kinds.begin(), kinds.end(), [&](auto& k) { return k.first == kind; });
+                if (it == kinds.end()) kinds.push_back({kind, 1}); else ++it->second;
+            }
+            for (auto& [kind, n] : kinds) out += "; " + kind + " x" + std::to_string(n);
+            errors->Release();
+        }
+        if (result) result->Release();
+    }
+    IDxcBlobEncoding* text = nullptr;
+    if (SUCCEEDED(t->compiler->Disassemble(blob, &text)) && text) {
+        const std::string s(static_cast<const char*>(text->GetBufferPointer()), text->GetBufferSize());
+        std::vector<std::pair<std::string, int>> ops;
+        for (size_t p = s.find("@dx.op."); p != std::string::npos; p = s.find("@dx.op.", p + 1)) {
+            const size_t line = s.rfind('\n', p);
+            const size_t call = s.find(" call ", line == std::string::npos ? 0 : line);
+            if (call == std::string::npos || call > p) continue;  // a declaration, not a call
+            const size_t end = s.find_first_of(".(", p + 7);
+            const std::string name = s.substr(p + 7, end - p - 7);
+            auto it = std::find_if(ops.begin(), ops.end(), [&](auto& o) { return o.first == name; });
+            if (it == ops.end()) ops.push_back({name, 1}); else ++it->second;
+        }
+        auto count = [&](const char* needle) {
+            int n = 0;
+            for (size_t p = s.find(needle); p != std::string::npos; p = s.find(needle, p + 1)) ++n;
+            return n;
+        };
+        out += ", " + std::to_string(s.size() / 1024) + " KiB of text, lines " + std::to_string(count("\n"));
+        out += ", i64 " + std::to_string(count(" i64 ")) + ", half " + std::to_string(count(" half ")) +
+               ", double " + std::to_string(count(" double ")) + ", phi " + std::to_string(count(" phi ")) +
+               ", switch " + std::to_string(count(" switch ")) + ", br " + std::to_string(count(" br ")) +
+               ", alloca " + std::to_string(count(" alloca ")) + ", groupshared " + std::to_string(count("addrspace(3)")) +
+               ", undef " + std::to_string(count(" undef")) + "; ops:";
+        for (auto& [name, n] : ops) out += " " + name + "x" + std::to_string(n);
+        text->Release();
+    }
+    blob->Release();
+    return out;
+}
+
 uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     const int n = g_slot62_logged++;
     if (n < 1) {
@@ -295,6 +492,34 @@ uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3,
                 std::printf("  slot62: a%d points at IID_ID3D12PipelineState\n", i + 1);
     }
     const auto* desc = reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1);
+    // Printed before the call: a driver that rejects the shader may end the process inside it.
+    if (desc) {
+        std::printf("  slot62 #%d container: %s\n", n + 1,
+                    container_shape(desc->CS.pShaderBytecode, desc->CS.BytecodeLength).c_str());
+        const std::string module = container_module(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+        std::printf("  slot62 #%d module: %s\n", n + 1, module.empty() ? "(no ILDN part)" : module.c_str());
+        const auto* bytes = static_cast<const uint8_t*>(desc->CS.pShaderBytecode);
+        std::vector<uint8_t> copy(bytes, bytes + desc->CS.BytecodeLength);
+        int same_as = 0;
+        for (size_t i = 0; i < g_seen_containers.size(); ++i)
+            if (g_seen_containers[i] == copy) {
+                same_as = static_cast<int>(i) + 1;
+                break;
+            }
+        if (same_as) {
+            std::printf("  slot62 #%d is byte-identical to #%d (module %s)\n", n + 1, same_as,
+                        g_seen_modules[same_as - 1].c_str());
+            if (!g_repeats) {
+                g_repeat_first = same_as;
+                g_repeat_second = n + 1;
+            }
+            ++g_repeats;
+        }
+        g_seen_containers.push_back(std::move(copy));
+        g_seen_modules.push_back(module);
+        if (env("LEONIDA_BVH_DXIL") == "1")
+            std::printf("  slot62 #%d uses: %s\n", n + 1, dxil_usage(desc->CS.pShaderBytecode, desc->CS.BytecodeLength).c_str());
+    }
     const uint64_t r = g_slot62(self, a1, a2, a3, a4, a5, a6);
     const auto hr = static_cast<HRESULT>(static_cast<uint32_t>(r));
     (SUCCEEDED(hr) ? g_slot62_ok : g_slot62_failed)++;
@@ -334,7 +559,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "XboxBvhBuilder.dll";
@@ -394,10 +619,40 @@ int main() {
         } else {
             const bool debug_layer = enable_debug_layer();
             note(std::string("D3D12 debug layer ") + (debug_layer ? "enabled" : "not available (Graphics Tools not installed)"));
-            pc = create_pc_device(env("LEONIDA_BVH_WARP") == "1");
+            // RT-54: the package's shaders are Xbox DXIL (target triple dxil-ms-xb2), which no PC driver has to
+            // accept. NVIDIA's DXIL reader rejects one of them (the 49th CreateComputePipelineState, the only one
+            // with a resource in a function signature) and can end the process inside the driver (0xC0000409)
+            // instead of returning an error, so the constructor can't be measured there. AMD faults the same way
+            // (0xC0000005 right after the first slot 62 call on an RX 7900 XTX, RT-89). WARP accepts all 53, so it is
+            // the default on every hardware vendor; LEONIDA_BVH_HARDWARE=1 keeps the hardware device, to check a
+            // newer driver.
+            bool warp = env("LEONIDA_BVH_WARP") == "1";
+            if (!warp && env("LEONIDA_BVH_HARDWARE") != "1") {
+                if (const UINT vendor = first_hardware_vendor()) {
+                    char id[8];
+                    std::snprintf(id, sizeof id, "%04x", vendor);
+                    note(std::string("hardware adapter (vendor ") + id + "): using WARP, since hardware DXIL readers "
+                         "reject the DLL's Xbox DXIL shaders and can end the process (RT-54 NVIDIA, RT-89 AMD); "
+                         "LEONIDA_BVH_HARDWARE=1 keeps the hardware device");
+                }
+                warp = true;
+            }
+            pc = create_pc_device(warp);
             check(pc != nullptr, "PC D3D12 device created");
         }
         if (!pc) return 1;
+        if (!on_vulkan) {
+            // The proxy answers ID3D12Device11 with a QueryInterface on the host device. The Windows 10 runtime
+            // without the Agility SDK stops before ID3D12Device11, on hardware and WARP alike (#688).
+            ID3D12Device11* host11 = nullptr;
+            if (FAILED(pc->QueryInterface(IID_PPV_ARGS(&host11))) || !host11) {
+                std::printf("SKIP (the host D3D12 runtime has no ID3D12Device11, e.g. Windows 10 without the Agility "
+                            "SDK; LEONIDA_BVH_DEVICE=vulkan runs on the Vulkan-backed device)\n");
+                pc->Release();
+                return g_failures ? 1 : 0;
+            }
+            host11->Release();
+        }
         pc->AddRef();  // kept for the debug messages; the proxy takes its own reference
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device11), &proxy);
@@ -430,6 +685,16 @@ int main() {
         note("slot 62 (Xbox CreateComputePipelineState) calls: " + std::to_string(rt::d3d12_xs::device_slot_hits(62)) +
              (g_slot62_logged ? ", succeeded " + std::to_string(g_slot62_ok) + ", failed " + std::to_string(g_slot62_failed)
                               : std::string()));
+        if (g_slot62_logged) {
+            note("slot 62 creations: " + std::to_string(g_slot62_logged) + ", distinct containers: " +
+                 std::to_string(g_slot62_logged - g_repeats) + ", repeated creations: " + std::to_string(g_repeats));
+            if (g_repeats) {
+                note("first repeat: creation #" + std::to_string(g_repeat_second) + " passes the same container as #" +
+                     std::to_string(g_repeat_first) + ", module " + g_seen_modules[g_repeat_first - 1]);
+                check(g_seen_modules[g_repeat_first - 1] == g_seen_modules[g_repeat_second - 1],
+                      "the repeated container names the same module both times");
+            }
+        }
         note("OutputDebugString calls: " + std::to_string(g_debug_strings) + ", TerminateProcess calls: " +
              std::to_string(g_terminate_calls));
         check(!c.faulted || c.code == kTerminateCalled, "constructor returns or gives up through TerminateProcess, no fault");

@@ -14,7 +14,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, __import__("os").path.dirname(__file__))
-from tile_probe import block_feature, score  # noqa: E402
+from tile_probe import block_feature, score, same_report_path  # noqa: E402
 
 
 def positions(seq, nblocks, tw, th, wblocks):
@@ -48,10 +48,11 @@ def search(data, bpe, tile_bytes, widths, ntiles):
             if wb % tw:
                 continue
             tiles_x = wb // tw
-            rows = max(1, ntiles // tiles_x)
-            n = tiles_x * rows * tw * th
-            if n > len(raw):
+            blocks_per_row = tiles_x * tw * th
+            rows = min(max(1, ntiles // tiles_x), len(raw) // blocks_per_row)
+            if not rows:
                 continue
+            n = blocks_per_row * rows
             for xs in itertools.combinations(range(bits), xbits):
                 seq = ["x" if k in xs else "y" for k in range(bits)]
                 pos = positions(seq, n, tw, th, wb)
@@ -95,11 +96,33 @@ def main():
     ap.add_argument("--bpe", type=int, default=8)
     ap.add_argument("--tile", type=int, default=65536)
     ap.add_argument("--widths", default="1024,2048")
-    ap.add_argument("--tiles", type=int, default=48)
+    ap.add_argument("--tiles", type=int, default=48, help="target number of tiles to score (default: 48)")
     ap.add_argument("--out")
     a = ap.parse_args()
-    data = open(a.blob, "rb").read()
-    res = search(data, a.bpe, a.tile, [int(w) for w in a.widths.split(",")], a.tiles)
+    if a.out and same_report_path(a.out, a.blob):
+        ap.error("--out would overwrite the input blob")
+    if a.bpe < 1:
+        ap.error("--bpe must be at least 1")
+    if a.tile < a.bpe or a.tile % a.bpe:
+        ap.error("--tile must be a multiple of --bpe and at least --bpe")
+    blocks = a.tile // a.bpe
+    if blocks & (blocks - 1):
+        ap.error("--tile / --bpe must be a power of two")
+    try:
+        widths = [int(w) for w in a.widths.split(",")]
+    except ValueError:
+        ap.error("--widths must be a comma-separated list of integers")
+    if not widths or any(w < 4 or w % 4 for w in widths):
+        ap.error("--widths must be positive multiples of 4")
+    if a.tiles < 1:
+        ap.error("--tiles must be at least 1")
+    try:
+        with open(a.blob, "rb") as f:
+            data = f.read()
+    except OSError as e:  # a missing or unreadable input: one ERROR line, as the other tools do
+        print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    res = search(data, a.bpe, a.tile, widths, a.tiles)
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
     if a.out:
@@ -111,4 +134,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

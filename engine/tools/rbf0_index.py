@@ -30,6 +30,11 @@ import struct
 import sys
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 MAGIC = b"RBF0"
 PROLOGUE = b"\xfb\xff\x01\x00"
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -236,34 +241,17 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
         blob += read(nxt)
         chunks += 1
         parsed = parse_rbf0(blob, string_limit=None)
-        if parsed["complete"] or parsed["status"] == "bad":
+        if parsed["status"] != "truncated":
             break
         j += 1
     return blob, chunks, parsed
-
-
-def _categorise(strings):
-    """Aggregate counts only: no string is returned from here."""
-    distinct = set(strings)
-    out = {
-        "distinct": len(distinct),
-        "path_like": sum(1 for s in distinct if "/" in s),
-        "identifier_like": sum(1 for s in strings if IDENT.fullmatch(s) is not None),
-        "empty": sum(1 for s in strings if not s),
-        "keywords": {},
-    }
-    lowered = [s.lower() for s in strings]
-    for word in KEYWORDS:
-        out["keywords"][word] = {"occurrences": sum(1 for s in lowered if word in s),
-                                 "distinct": sum(1 for s in distinct if word in s.lower())}
-    return out
 
 
 def resources_from_rows(rows, read, check_gap=True, string_limit=16):
@@ -366,8 +354,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
     rows = []
     if os.path.getsize(path) == 0:
         raise ValueError("empty file")
-    with open(path, "rb") as fh:
-        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         size = len(mm)
         first = struct.unpack_from("<I", mm, 4)[0] if size >= 8 else 0
         pos = start if start is not None else first
@@ -384,21 +371,20 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             if mm[s:s + 3] == b"KB2":
                 blen = (_u32(mm, s + 4) or 0) + 8
                 w, h = _u32(mm, s + 0x14), _u32(mm, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                gap = mm[last:s]
-                z = gap.count(0) == len(gap)
-                zero += len(gap) if z else 0
-                unread += 0 if z else len(gap)
+                gap_zero, gap_unread = gap_split(mm, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8]})
                 last = pos = s + blen
                 continue
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = mm[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = mm[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
@@ -411,20 +397,17 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            gap = mm[last:s]
-            z = gap.count(0) == len(gap)
-            zero += len(gap) if z else 0
-            unread += 0 if z else len(gap)
+            gap_zero, gap_unread = gap_split(mm, last, s)
+            zero += gap_zero
+            unread += gap_unread
             rows.append(_row(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        gap = mm[last:end]
-        z = gap.count(0) == len(gap)
-        zero += len(gap) if z else 0
-        unread += 0 if z else len(gap)
+        gap_zero, gap_unread = gap_split(mm, last, end)
+        zero += gap_zero
+        unread += gap_unread
         mspan = end - span_start
-        mm.close()
     with ArchiveReader(path) as reader:
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)
     summary = summarise(rows, records, mspan, zero, unread, "rpf9")
@@ -435,19 +418,27 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
 def scan_dir(path, string_limit=16):
     """Index already-carved files. Sorting by a leading hexadecimal file name keeps archive order."""
     entries = []
+    unnamed = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
         match = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(match.group(1), 16) if match else len(entries)
-        entries.append((offset, data))
+        if match:
+            entries.append((int(match.group(1), 16), data))
+        else:
+            unnamed.append(data)
+    next_offset = max((e[0] for e in entries), default=-1) + 1
+    for data in unnamed:
+        entries.append((next_offset, data))
+        next_offset += 1
     entries.sort(key=lambda e: e[0])
     rows = [_row(data, offset, len(data)) for offset, data in entries]
-    by_offset = {row["offset"]: data for row, (_, data) in zip(rows, entries)}
-    records = resources_from_rows(rows, lambda row: by_offset[row["offset"]], check_gap=False,
+    by_row = {id(row): data for row, (_, data) in zip(rows, entries)}
+    records = resources_from_rows(rows, lambda row: by_row[id(row)], check_gap=False,
                                   string_limit=string_limit)
     summary = summarise(rows, records, sum(len(d) for _, d in entries), 0, 0, "directory")
     summary["directory"] = path
@@ -465,11 +456,11 @@ def write_output(path, records, summary, all_strings=False):
             doc["sample_strings"] = r["_all_strings"] if all_strings else r["sample"]
             doc["sample_truncated"] = not all_strings and r["strings"] > len(r["sample"])
             docs.append(doc)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": docs}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(COLUMNS)
         for r in records:
             sample = "; ".join(r["sample"])
@@ -503,6 +494,16 @@ def byte_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -513,6 +514,12 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.strings < 0:
+        ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))
@@ -541,4 +548,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

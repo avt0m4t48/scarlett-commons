@@ -79,7 +79,7 @@ def compute_lds_allocation(base_dwords, ds_instructions=None):
     if ds_instructions:
         for ins in ds_instructions:
             op = ins.get("op", "")
-            if not op.startswith("ds_") or op.startswith(("ds_swizzle", "ds_bpermute")):
+            if not op.startswith("ds_") or op.startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):
                 continue
             for m in ins.get("mods", []):
                 k, _, v = m.partition(":")
@@ -675,6 +675,7 @@ class TestTranslatorLdsIntegration(unittest.TestCase):
         class MockGen:
             def __init__(self):
                 self.lds_dwords = 512
+                self.lds_bound = None       # not bounds-checked (SHADER-309)
                 self._tmp = 0
                 self.emitted = []
 
@@ -689,6 +690,8 @@ class TestTranslatorLdsIntegration(unittest.TestCase):
                 self.emitted.append(line)
 
             lds_ptr = rdna2spirv.Gen.lds_ptr
+            lds_access = rdna2spirv.Gen.lds_access
+            lds_atomic = rdna2spirv.Gen.lds_atomic
 
         gen = MockGen()
         ptr = gen.lds_ptr("%addr_reg", 16)

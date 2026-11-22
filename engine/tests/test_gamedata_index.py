@@ -6,6 +6,7 @@ Every fixture here is synthetic: small XML documents, a text list, a binary blob
 magics. The archive test builds a minimal RPF9-shaped file with a zlib stream and zero padding.
 """
 import csv
+import importlib.util
 import json
 import os
 import struct
@@ -14,14 +15,25 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_index.py")
 
 
+def load_tool():
+    spec = importlib.util.spec_from_file_location("gamedata_index_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def chunked(data: bytes, first: int = 65536):
     """Split a payload into a 64 KiB block and the remainder, the way RPF9 stores large files."""
     return [data[:first], data[first:]] if len(data) > first else [data]
+
+
+T = load_tool()
 
 
 class GamedataIndexTest(unittest.TestCase):
@@ -58,6 +70,37 @@ class GamedataIndexTest(unittest.TestCase):
     def run_tool(self, target, *args):
         return subprocess.run([sys.executable, "-I", TOOL, target, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_a_resource_continues_after_any_whole_number_of_64k_blocks(self):
+        # A 0DRP resource whose first stream is 128 KiB continues in the next stream (docs/page_directory.md);
+        # a binary run of the same shape has no header proving that, so it keeps the exact 64 KiB rule.
+        page = bytes(T.PAGE_MARKER_AT) + T.PAGE_MARKER
+        resource = page + b"\x11" * (2 * 65536 - len(page))
+        self.add(resource, [resource, b"\x22" * 1000])
+        binary = bytes(range(256)) * 512                        # 128 KiB with no header
+        self.add(binary, [binary, bytes(range(255, -1, -1)) * 4])
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual([(r["type"], r["chunks"]) for r in data["rows"]],
+                         [("other", 2), ("binary", 1), ("binary", 1)])
+
+    def test_rejects_a_shared_csv_and_json_destination(self):
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("existing report")
+        alias = os.path.join(self.root, ".", "index.json")
+
+        result = self.run_tool(self.carve, "--csv", out, "--json", alias)
+
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "existing report")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--csv and --json must use different paths", result.stderr)
 
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
@@ -127,6 +170,25 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["root"], "RootA")
         self.assertEqual(rows[0]["type"], "xml")
 
+    def test_printable_page_directory_stream_is_not_xml(self):
+        # A resource stream with the "0DRP" page marker at +16 whose first 4 KiB are over 95% printable and hold a
+        # "<": data.rpf's 337 such streams were reported as incomplete XML with no root.
+        head = bytes(8) + bytes.fromhex("80ca005000000000") + b"0DRP" + bytes(12)
+        page = head + (b"<abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ>" * 80)[:4096 - len(head)]
+        page += bytes(512)
+        tool = load_tool()
+        self.assertGreater(tool.printable(page), 0.95)      # the heuristic alone would call it text
+        self.add(page)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("xml", data["summary"]["types"])
+        self.assertEqual(data["summary"]["xml_incomplete"], 0)
+        self.assertEqual([(r["type"], r["detail"]) for r in data["rows"]], [("other", "0DRP")])
+
     def test_archive_runs_the_carver_and_reads_roots(self):
         xml = b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>'
         blob = b"\x00\x01\x02binary\xff" * 32
@@ -154,6 +216,138 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["xml"]["inflated"], len(xml))
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
+
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        self.finish()
+        blocker = os.path.join(self.root, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(self.carve, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+
+class XmlClassificationTest(unittest.TestCase):
+    """Synthetic XML classification cases; no game data, no files written."""
+
+    def setUp(self):
+        self.tool = load_tool()
+        self.bom = b"\xef\xbb\xbf"
+        self.decl = b'<?xml version="1.0"?>'
+
+    def test_declaration_after_bom_and_whitespace_is_detected(self):
+        for space in (b"", b"\n", b"   ", b"\r\n\t"):
+            with self.subTest(space=space):
+                data = self.bom + space + self.decl + b"\n<Root></Root>"
+                self.assertTrue(self.tool.has_xml_decl(data))
+                self.assertEqual(self.tool.stream_kind(data, {}), "decl")
+                self.assertEqual(self.tool.xml_root(data), "Root")
+                self.assertTrue(self.tool.standalone_xml(data))
+
+    def test_bom_only_empty_and_mid_document_declaration_have_no_leading_declaration(self):
+        for data in (b"", self.bom, self.bom + b"   ", b"<Root>" + self.decl + b"</Root>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.has_xml_decl(data))
+                self.assertEqual(self.tool.xml_root(data), "Root" if b"<Root>" in data else "")
+
+    def test_nested_same_name_root_is_not_a_closed_document(self):
+        for data in (b"<Foo><Foo></Foo>", b"<Foo><Foo></Foo>\n", b"<Foo><Foo>x</Foo>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.xml_complete("Foo", data))
+                self.assertFalse(self.tool.standalone_xml(self.decl + data))
+
+    def test_balanced_and_self_closing_roots_remain_complete(self):
+        for data in (b"<Foo></Foo>", b"<Foo>text<Foo>inner</Foo></Foo>",
+                     b"<Foo/>", b"  <Foo />\n", b"<Foo>\n</Foo>"):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.xml_complete("Foo", data))
+        self.assertFalse(self.tool.xml_complete("", b"<Foo></Foo>"))
+
+    def test_quoted_greater_than_in_attributes_does_not_end_a_tag(self):
+        for data in (b'<Foo><Foo attr="x>y"/></Foo>', b"<Foo><Foo attr='x>y'/></Foo>",
+                     b'<Foo attr="x>y">text</Foo>', b'<Foo attr="x>y"/>'):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.xml_complete("Foo", data))
+        # A real second open element still leaves the document incomplete.
+        self.assertFalse(self.tool.xml_complete("Foo", b'<Foo><Foo attr="x>y"></Foo>'))
+
+    def test_tags_inside_comments_and_cdata_do_not_count(self):
+        self.assertTrue(self.tool.xml_complete("Foo", b"<Foo><!-- <Foo> --><![CDATA[</Foo>]]></Foo>"))
+        for data in (b"<Foo><Foo><!-- </Foo> -->", b"<Foo><Foo><![CDATA[</Foo>]]>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.xml_complete("Foo", data))
+
+
+class XmlGroupingRegressionTest(GamedataIndexTest):
+    """The classification bugs must also show up in the index the tool writes."""
+
+    def test_bom_with_whitespace_is_grouped_as_an_xml_document(self):
+        doc = b"\xef\xbb\xbf\n" + b'<?xml version="1.0"?>' + b"\n<RootBom><Item/></RootBom>"
+        self.add(doc)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["type"], "xml")
+        self.assertEqual(rows[0]["root"], "RootBom")
+        self.assertTrue(rows[0]["header"])
+        self.assertTrue(rows[0]["complete"])
+
+    def test_nested_open_root_stays_incomplete_after_continuation(self):
+        head = b"\xef\xbb\xbf" + b'<?xml version="1.0"?>' + b"\n<Foo><Foo>"
+        head += b"x" * (65536 - len(head))       # a full 64 KiB stream, so the next one is absorbed
+        tail = b"</Foo>"                         # closes only the nested Foo
+        self.add(head + tail, chunked(head + tail))
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["types"]["xml"]["files"], 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["chunks"], 2)
+        self.assertTrue(row["header"])
+        self.assertFalse(row["complete"])
+
+
+class BuildRowsReadCountTest(unittest.TestCase):
+    """The XML-shaped text branch must join the chunks it already read, not reinflate the group twice."""
+
+    def test_text_group_with_late_close_reads_each_member_once(self):
+        tool = load_tool()
+        head = b"<SyntheticRoot>" + b" " * (65536 - len(b"<SyntheticRoot>"))
+        tail = b"</SyntheticRoot>"
+        rows = [
+            {"off": 0x1000, "stored": len(head), "size": 65536, "head": head[:16].hex(), "type": ""},
+            {"off": 0x2000, "stored": len(tail), "size": len(tail), "head": tail[:16].hex(), "type": ""},
+        ]
+        chunks_by_offset = {0x1000: head, 0x2000: tail}
+        source = mock.Mock()
+        source.read.side_effect = lambda row: chunks_by_offset[row["off"]]
+
+        out = tool.build_rows(rows, source)
+
+        self.assertEqual(len(out), 1)
+        row = out[0]
+        self.assertEqual(row["type"], "xml")
+        self.assertEqual(row["root"], "SyntheticRoot")
+        self.assertTrue(row["complete"])
+        self.assertFalse(row["header"])
+        self.assertEqual(row["chunks"], 2)
+        self.assertEqual(row["size"], 65536 + len(tail))
+        self.assertEqual(row["stored"], len(head) + len(tail))
+        self.assertEqual(source.read.call_count, 2)
+        self.assertEqual([call.args[0]["off"] for call in source.read.call_args_list],
+                         [0x1000, 0x2000])
 
 
 if __name__ == "__main__":

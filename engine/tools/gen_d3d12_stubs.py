@@ -7,10 +7,14 @@ methods they implement, so their vtables have exactly the SDK's method order and
 method. Run at build time (runtime/CMakeLists.txt); the output is not checked in.
 
     python -I tools/gen_d3d12_stubs.py --out <file> [--header <d3d12.h>] Interface [Interface ...]
+    python -I tools/gen_d3d12_stubs.py --report <json> --source <cpp>... [--header <d3d12.h>] Interface ...
 
 Without --header, d3d12.h is looked up in the directories of the INCLUDE environment variable (set by vcvars).
+The report mode lists each interface's methods and which names are not overridden as `STDMETHODCALLTYPE` in the
+given sources; it is a name-based coverage aid for the D3D12 layer, not a compiler check.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -94,17 +98,108 @@ def emit_class(interfaces, leaf):
     return "\n".join(lines)
 
 
+OVERRIDE = re.compile(r"\bSTDMETHODCALLTYPE\s+(\w+)\s*\(")
+
+
+def implemented_names(paths):
+    """Method names overridden as STDMETHODCALLTYPE in the given sources."""
+    names = set()
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            source = COMMENTS_OR_LITERALS.sub(" ", f.read())
+            names.update(OVERRIDE.findall(source))
+    return names
+
+
+def coverage(interfaces, leaves, sources):
+    """A JSON-serialisable method-coverage report for the requested leaf interfaces."""
+    implemented = implemented_names(sources)
+    report = []
+    for leaf in dict.fromkeys(leaves):
+        methods = []
+        for name in chain(interfaces, leaf):
+            methods.extend((name, item[2]) for item in interfaces[name][1] if item[0] == "m")
+        open_methods = [f"{owner}::{method}" for owner, method in methods if method not in implemented]
+        report.append({
+            "interface": leaf,
+            "methods": len(methods),
+            "implemented": len(methods) - len(open_methods),
+            "open": open_methods,
+        })
+    return report
+
+
+def write_if_changed(path, text):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def same_path(first, second):
+    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def write_report(path, text):
+    """write_if_changed with a one-line ERROR instead of a traceback; False when it could not write."""
+    try:
+        write_if_changed(path, text)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--out", help="generated stub header (required unless --report is given)")
+    parser.add_argument("--report", help="write a JSON method-coverage report here")
+    parser.add_argument("--source", action="append", default=[], metavar="CPP",
+                        help="source file with overrides, repeatable (for --report)")
     parser.add_argument("--header")
     parser.add_argument("interfaces", nargs="+")
     args = parser.parse_args()
+    if not args.out and not args.report:
+        parser.error("--out is required unless --report is given")
+    if args.report and not args.source:
+        parser.error("--report needs at least one --source")
+    for path in args.source:
+        if not os.path.isfile(path):
+            parser.error(f"--source {path}: no such file")
+    for path in (args.out, args.report):
+        if path and os.path.isdir(path):
+            parser.error(f"{path} is a folder, not a file")
+    if args.out and args.report and same_path(args.out, args.report):
+        parser.error("--out and --report must use different paths")
     header = args.header or find_header()
     if not header:
         raise SystemExit("d3d12.h not found: pass --header or run from a vcvars environment")
+    if not os.path.isfile(header):
+        parser.error(f"--header {header}: no such file")
+    for path in [header] + list(args.source):
+        for flag, target in (("--out", args.out), ("--report", args.report)):
+            if target and same_path(target, path):
+                parser.error(f"{flag} {target} would overwrite the input {path}")
     with open(header, encoding="utf-8", errors="replace") as f:
         interfaces = parse_interfaces(f.read())
+
+    if args.report:
+        report = coverage(interfaces, args.interfaces, args.source)
+        if not write_report(args.report, json.dumps(report, indent=2) + "\n"):
+            return 2
+    if not args.out:
+        return 0
 
     parts = [
         "// Generated by tools/gen_d3d12_stubs.py from " + os.path.basename(header) + ". Do not edit.",
@@ -114,21 +209,16 @@ def main():
         "#pragma warning(push)",
         "#pragma warning(disable : 4100)  // unreferenced parameters",
     ]
-    parts += [emit_class(interfaces, leaf) for leaf in args.interfaces]
+    parts += [emit_class(interfaces, leaf) for leaf in dict.fromkeys(args.interfaces)]
     parts.append("#pragma warning(pop)")
-    text = "\n".join(parts) + "\n"
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    try:
-        with open(args.out, encoding="utf-8") as f:
-            if f.read() == text:
-                return 0
-    except OSError:
-        pass
-    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    if not write_report(args.out, "\n".join(parts) + "\n"):
+        return 2
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -10,11 +10,12 @@ Commands
   extract <file> <outdir>        JSAV  -> index.json + blocks/NNN_<group>_<hash>.json + save.pretty.json
                                  ASAV  -> header.json + payload.bin (+ payload.json if it is text)
   pack    <extracted dir> <out>  rebuild a JSAV from an `extract` folder (blocks are taken verbatim)
+                                 follows destination symlinks; destinations with multiple hard links are refused
   verify  <JSAV file>            extract + pack in memory and check the rebuild is byte-identical
   diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
   import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
                                  copy the ASAV/JSAV payloads out of plain save folders into the on-disk layout
-                                 of the offline XGameSave shim (runtime/shims/xgameruntime_services.cpp):
+                                 of the offline XGameSave shim of the open #279 (not on main yet):
                                  DIR/local-user/<container>/<blob>, names %-encoded the same way.
                                  DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
                                  VERIFY: container/blob names are a guess until the executable shows them; by default
@@ -22,9 +23,14 @@ Commands
 """
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
@@ -42,6 +48,10 @@ def ts(v):
 def parse_asav(d):
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
+    # The fixed fields below are read at absolute offsets, so a short file must be rejected here instead of
+    # letting struct.unpack_from raise a struct.error that says nothing about the save (the JSAV parser in #923).
+    if len(d) < ASAV_HDR:
+        raise ValueError(f'header is only {len(d)} bytes, an ASAV header is {ASAV_HDR}')
     f = struct.unpack_from('<IIIIIII', d, 4)
     h = {
         'magic': 'ASAV',
@@ -61,6 +71,8 @@ def parse_asav(d):
         'file_size': len(d),
     }
     h['timestamp_utc'] = ts(h['timestamp'])
+    if h['payload_offset'] > len(d):
+        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
     return h
 
 
@@ -78,16 +90,38 @@ JSAV_SEP = b',\r\n'
 def parse_jsav(d):
     if d[:4] != b'JSAV':
         raise ValueError('not JSAV')
+    if len(d) < JSAV_HDR:
+        raise ValueError('JSAV header is only %d bytes' % len(d))
     ver, n_code, n_script = struct.unpack_from('<III', d, 4)
     n = n_code + n_script
+    table_end = JSAV_HDR + n * JSAV_ENTRY.size
+    if table_end > len(d):
+        raise ValueError('JSAV header declares %d entries but the file has %d bytes' % (n, len(d)))
     entries = []
     for i in range(n):
         hsh, flags, rsv, off, size = JSAV_ENTRY.unpack_from(d, JSAV_HDR + i * JSAV_ENTRY.size)
         entries.append({'index': i, 'group': 'code' if i < n_code else 'script',
                         'hash': '%08x' % hsh, 'flags': flags, 'reserved': rsv, 'offset': off, 'size': size})
-    table_end = JSAV_HDR + n * JSAV_ENTRY.size
-    body_off = d.index(b'{', table_end)
-    body_end = len(d.rstrip(b'\0'))
+    try:
+        body_off = d.index(b'{', table_end)
+    except ValueError:
+        raise ValueError('JSAV body marker not found after the entry table') from None
+    try:
+        body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
+        _, json_end = json.JSONDecoder().raw_decode(body_text)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
+    # raw_decode returns a character offset, while the entry table uses byte offsets.
+    # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
+    body_end = body_off + len(body_text[:json_end].encode('utf-8'))
+    for entry in entries:
+        start, end = entry['offset'], entry['offset'] + entry['size']
+        if start < body_off or end > body_end:
+            # Python slices silently truncate invalid ranges; never export or compare those as real blocks.
+            raise ValueError(f"JSAV entry {entry['index']} range {start:#x}..{end:#x} is outside "
+                             f"the JSON body {body_off:#x}..{body_end:#x}")
+    if body_text[json_end:].strip(' \t\r\n'):
+        raise ValueError('JSAV has non-padding data after the JSON body')
     return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
             'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
             'file_size': len(d)}, entries
@@ -131,13 +165,27 @@ def build_jsav(version, n_code, hashes, flags, blocks):
 
 
 # ---------------------------------------------------------------------------------------------- SLAYER1
-def parse_slayer(d):
+SLAYER1_HDR = 16           # "SLAYER1\0" + u32 version + u32 name length
+
+
+def parse_slayer(d, path=None):
     if d[:8] != b'SLAYER1\0':
         raise ValueError('not SLAYER1')
+    where = f' in {path}' if path else ''
+    # The fixed preamble holds the magic, version and name length; a short file must be rejected here instead
+    # of letting struct.unpack_from raise a struct.error that says nothing about the save (see parse_asav/#923).
+    if len(d) < SLAYER1_HDR:
+        raise ValueError(f'SLAYER1 header is only {len(d)} bytes{where}, a SLAYER1 header is at least '
+                         f'{SLAYER1_HDR}')
     ver, nlen = struct.unpack_from('<II', d, 8)
-    name = d[16:16 + nlen].decode('ascii', 'replace')
-    size = struct.unpack_from('<Q', d, 16 + nlen)[0]
-    inner = 16 + nlen + 8
+    # The name and the 8-byte payload-size field that follows it must fit before either is read.
+    size_off = SLAYER1_HDR + nlen
+    if size_off + 8 > len(d):
+        raise ValueError(f'SLAYER1{where} declares a {nlen}-byte name; with the 8-byte payload size the header '
+                         f'needs {SLAYER1_HDR + nlen + 8} bytes, but the file has only {len(d)}')
+    name = d[SLAYER1_HDR:SLAYER1_HDR + nlen].decode('ascii', 'replace')
+    size = struct.unpack_from('<Q', d, size_off)[0]
+    inner = size_off + 8
     return {'magic': 'SLAYER1', 'version': ver, 'name': name, 'payload_size': size,
             'payload_offset': inner, 'file_size': len(d)}
 
@@ -153,9 +201,9 @@ def kind_of(d):
     return None
 
 
-def read(p):
+def read(p, n=-1):
     with open(p, 'rb') as f:
-        return f.read()
+        return f.read(n)
 
 
 def info_file(p, indent=''):
@@ -179,7 +227,7 @@ def info_file(p, indent=''):
         for (g, w), sizes in groups.items():
             print(f'{indent}  {g:6} wrapper {w}: {len(sizes)} blocks, {sum(sizes)} bytes, largest {max(sizes)}')
     elif k == 'SLAYER1':
-        h = parse_slayer(d)
+        h = parse_slayer(d, p)
         for key, v in h.items():
             print(f'{indent}  {key:15} {v}')
         inner = d[h['payload_offset']:]
@@ -199,7 +247,7 @@ def info(paths):
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
-                if os.path.isfile(fp) and kind_of(read(fp)[:8]):
+                if os.path.isfile(fp) and kind_of(read(fp, 8)):
                     info_file(fp, '  ')
         else:
             info_file(p)
@@ -218,16 +266,16 @@ def extract(p, out):
             e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
             with open(os.path.join(out, e['file']), 'wb') as f:
                 f.write(b)
-        with open(os.path.join(out, 'index.json'), 'w') as f:
+        with open(os.path.join(out, 'index.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump({'header': h, 'entries': es}, f, indent=1)
         body = d[h['body_offset']:h['body_end']].decode('utf-8')
-        with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(json.loads(body), f, indent=1)
         print(f'{len(es)} blocks -> {out}')
     elif k == 'ASAV':
         h = parse_asav(d)
         pl = asav_payload(d, h)
-        with open(os.path.join(out, 'header.json'), 'w') as f:
+        with open(os.path.join(out, 'header.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(h, f, indent=1)
         with open(os.path.join(out, 'header.bin'), 'wb') as f:
             f.write(d[:h['payload_offset']])
@@ -236,7 +284,7 @@ def extract(p, out):
         if pl[:1] == b'{':
             try:
                 obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
-                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8') as f:
+                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8', newline="\n") as f:
                     json.dump(obj, f, indent=1)
             except ValueError as ex:
                 print('payload looks like text but did not parse as JSON:', ex)
@@ -246,17 +294,81 @@ def extract(p, out):
 
 
 def pack_from_dir(src):
-    idx = json.loads(read(os.path.join(src, 'index.json')))
-    h, es = idx['header'], idx['entries']
+    index_path = os.path.join(src, 'index.json')
+
+    def invalid(field, expected):
+        raise ValueError(f'{index_path}: {field} must be {expected}')
+
+    try:
+        idx = json.loads(read(index_path))
+    except ValueError as exc:
+        raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
+    if not isinstance(idx, dict):
+        invalid('index', 'an object')
+    h, es = idx.get('header'), idx.get('entries')
+    if not isinstance(h, dict):
+        invalid('header', 'an object')
+    if not isinstance(es, list):
+        invalid('entries', 'an array')
+    for field in ('version', 'code_blocks'):
+        value = h.get(field)
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            invalid('header.' + field, 'a uint32 integer')
+    if h['code_blocks'] > len(es):
+        invalid('header.code_blocks', f'between 0 and the entry count ({len(es)})')
+    hashes = []
+    for i, entry in enumerate(es):
+        prefix = f'entries[{i}]'
+        if not isinstance(entry, dict):
+            invalid(prefix, 'an object')
+        if not isinstance(entry.get('file'), str) or not entry['file']:
+            invalid(prefix + '.file', 'a nonempty path string')
+        flags = entry.get('flags')
+        if type(flags) is not int or not 0 <= flags <= 0xFFFFFFFF:
+            invalid(prefix + '.flags', 'a uint32 integer')
+        if not isinstance(entry.get('hash'), str):
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        try:
+            hashed = int(entry['hash'], 16)
+        except ValueError:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        if not 0 <= hashed <= 0xFFFFFFFF:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        hashes.append(hashed)
     blocks = [read(os.path.join(src, e['file'])) for e in es]
-    return build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
-                      [e['flags'] for e in es], blocks)
+    return build_jsav(h['version'], h['code_blocks'], hashes, [e['flags'] for e in es], blocks)
 
 
 def pack(src, out):
+    # Publish at the symlink's target, as open(out, 'wb') did, without replacing the link itself.
+    destination = os.path.realpath(out)
+    try:
+        existing = os.stat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        # Replacing one hard-link name cannot update the other aliases atomically.
+        if stat.S_ISREG(existing.st_mode) and existing.st_nlink > 1:
+            raise ValueError(f'{out}: destination has multiple hard links; choose an unlinked output path')
     data = pack_from_dir(src)
-    with open(out, 'wb') as f:
-        f.write(data)
+    parent = os.path.dirname(destination)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=parent, prefix='.saves-pack-', suffix='.tmp',
+                                         delete=False) as f:
+            tmp = f.name
+            f.write(data)
+        os.chmod(tmp, published_mode(destination))
+        os.replace(tmp, destination)
+    except BaseException:
+        if tmp is not None:
+            try:
+                # A failed replacement may leave a read-only staging file on Windows.
+                os.chmod(tmp, 0o600)
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
     print(f'wrote {out} ({len(data)} bytes)')
 
 
@@ -279,21 +391,43 @@ def verify(p):
 def diff(pa, pb):
     da, db = read(pa), read(pb)
     (_, ea), (_, eb) = parse_jsav(da), parse_jsav(db)
-    ma = {(e['group'], e['hash']): b for e, b in zip(ea, jsav_blocks(da, ea))}
-    mb = {(e['group'], e['hash']): b for e, b in zip(eb, jsav_blocks(db, eb))}
-    for k in ma.keys() - mb.keys():
-        print('only in A:', *k, len(ma[k]))
-    for k in mb.keys() - ma.keys():
-        print('only in B:', *k, len(mb[k]))
+    # A save can hold several blocks with the same (group, hash): keep them in order instead of letting
+    # later ones overwrite earlier ones in a dict, which silently dropped them from the comparison.
+    ma, mb = {}, {}
+    for entries, data, table in ((ea, da, ma), (eb, db, mb)):
+        for entry, block in zip(entries, jsav_blocks(data, entries)):
+            table.setdefault((entry['group'], entry['hash']), []).append(block)
+    for k in sorted(ma.keys() - mb.keys()):
+        for block in ma[k]:
+            print('only in A:', *k, len(block))
+    for k in sorted(mb.keys() - ma.keys()):
+        for block in mb[k]:
+            print('only in B:', *k, len(block))
     same = 0
-    for k in ma.keys() & mb.keys():
-        if ma[k] == mb[k]:
-            same += 1
-            continue
-        a, b = ma[k], mb[k]
-        n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-        print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
-              f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
+    for k in sorted(ma.keys() & mb.keys()):
+        left, right = ma[k], mb[k]
+        # Match identical blocks by content first: with duplicate keys, an unchanged block that moved
+        # position should be reported as a removal/addition of the others, not as a false "changed".
+        pending_right, matched_left = list(right), [False] * len(left)
+        for i, block in enumerate(left):
+            if block in pending_right:
+                matched_left[i] = True
+                pending_right.remove(block)
+                same += 1
+        left = [block for i, block in enumerate(left) if not matched_left[i]]
+        for i in range(max(len(left), len(pending_right))):
+            a = left[i] if i < len(left) else None
+            b = pending_right[i] if i < len(pending_right) else None
+            if a is None or b is None:
+                label, block = ('only in B:', b) if a is None else ('only in A:', a)
+                print(label, *k, len(block))
+                continue
+            if a == b:
+                same += 1
+                continue
+            n = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
+                  f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
     print(f'{same} blocks identical')
 
 
@@ -318,7 +452,7 @@ def save_slot(folder):
     found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)
-        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp)[:8]) in ('ASAV', 'JSAV'):
+        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp, 8)) in ('ASAV', 'JSAV'):
             found.append(name)
     if not found:
         raise SystemExit(f'{folder}: no ASAV/JSAV payload found')
@@ -336,7 +470,7 @@ def save_slot(folder):
     if os.path.isfile(packed):
         p = read(packed)
         if kind_of(p) == 'SLAYER1':
-            inner = p[parse_slayer(p)['payload_offset']:]
+            inner = p[parse_slayer(p, packed)['payload_offset']:]
             if inner[:4] == b'ASAV':
                 ih = parse_asav(inner)
                 slot, title = ih['slot_name'] or slot, ih['title']
@@ -344,15 +478,26 @@ def save_slot(folder):
 
 
 def import_saves(args):
+    flags = {'--out', '--map', '--with-packed', '--force', '--dry-run'}
+    for option, following in zip(args, args[1:]):
+        if option in ('--out', '--map') and following in flags:
+            raise ValueError(f'import: {option} needs a value before {following}')
+
     import hashlib
     out, maps, with_packed, force, dry = None, {}, False, False, False
     folders = []
     it = iter(args)
+
+    def value(flag):
+        v = next(it, None)
+        if v is None:
+            raise ValueError(f'import: {flag} needs a value')
+        return v
     for a in it:
         if a == '--out':
-            out = next(it)
+            out = value(a)
         elif a == '--map':
-            k, v = next(it).split('=', 1)
+            k, v = value(a).split('=', 1)
             c, _, b = v.partition('/')
             maps[k] = (c, b or None)
         elif a == '--with-packed':
@@ -407,7 +552,7 @@ def import_saves(args):
         with open(tmp, 'wb') as f:
             f.write(read(src))
         os.replace(tmp, dst)
-    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8', newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f'wrote {len(plan)} blobs under {root}')
 
@@ -417,23 +562,32 @@ def main(argv):
         print(__doc__)
         return 0
     cmd, args = argv[1], argv[2:]
-    if cmd == 'info' and args:
-        info(args)
-    elif cmd == 'extract' and len(args) == 2:
-        extract(*args)
-    elif cmd == 'pack' and len(args) == 2:
-        pack(*args)
-    elif cmd == 'verify' and args:
-        return 0 if all([verify(p) for p in args]) else 1
-    elif cmd == 'diff' and len(args) == 2:
-        diff(*args)
-    elif cmd == 'import':
-        import_saves(args)
-    else:
-        print(__doc__)
+    try:
+        if cmd == 'info' and args:
+            info(args)
+        elif cmd == 'extract' and len(args) == 2:
+            extract(*args)
+        elif cmd == 'pack' and len(args) == 2:
+            pack(*args)
+        elif cmd == 'verify' and args:
+            return 0 if all([verify(p) for p in args]) else 1
+        elif cmd == 'diff' and len(args) == 2:
+            diff(*args)
+        elif cmd == 'import':
+            import_saves(args)
+        else:
+            print(__doc__)
+            return 2
+    except (ValueError, struct.error, OSError) as e:
+        # A malformed save must report one clear line, not a traceback.
+        print('ERROR: %s' % e, file=sys.stderr)
         return 2
     return 0
 
 
 if __name__ == '__main__':
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

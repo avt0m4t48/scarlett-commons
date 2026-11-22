@@ -220,10 +220,18 @@ def required_stubs_for_meta(meta):
 def generate_for_index(spirv_dir, index):
     """Write all deduplicated partner stubs needed by `index` into <spirv_dir>/stubs/. Returns filenames written."""
     needed = set()
-    for meta in index.values():
+    for name, meta in index.items():
         if isinstance(meta, dict):
-            for spec in required_stubs_for_meta(meta):
-                needed.add(spec)
+            try:
+                for spec in required_stubs_for_meta(meta):
+                    needed.add(spec)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{name}: invalid graphics interface locations: {e}") from e
+    # Validate the entire requested set before writing any stubs: negative or
+    # oversized locations cannot be encoded as SPIR-V unsigned literals.
+    for kind, locs in needed:
+        if any(not 0 <= loc <= 0xFFFFFFFF for loc in locs):
+            raise ValueError(f"invalid Location in {kind} partner stub: {locs}")
     if not needed:
         return []
     stubs_dir = os.path.join(spirv_dir, "stubs")
@@ -240,18 +248,33 @@ def generate_for_index(spirv_dir, index):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
     if len(argv) != 1:
         sys.exit(__doc__)
     spirv_dir = argv[0]
     idx_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(idx_path):
         sys.exit(f"missing {idx_path}")
-    with open(idx_path, encoding="utf-8") as f:
-        index = json.load(f)
-    written = generate_for_index(spirv_dir, index)
+    try:
+        with open(idx_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {idx_path}: {e}")
+    if not isinstance(index, dict):
+        sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
+    try:
+        written = generate_for_index(spirv_dir, index)
+    except (OSError, ValueError, struct.error) as e:
+        sys.exit(f"cannot generate stubs from {idx_path}: {e}")
     print(f"wrote {len(written)} stubs to {os.path.join(spirv_dir, 'stubs')}")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

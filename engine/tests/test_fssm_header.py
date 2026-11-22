@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -20,10 +21,12 @@ sys.path.insert(0, TOOLS)
 import fssm_header  # noqa: E402
 
 
-def blob(records=(), directory=(0x100, 0x20, 0x120), size=0x200, first=None):
+def blob(records=(), directory=(0x100, 0x20, 0x120), size=0x200, first=None, wave_flags=0):
     """Build a synthetic FSSM header.  records are complete 8-byte input records."""
     data = bytearray(size)
     data[0:4] = b"FSSM"
+    if size >= 0xD8:
+        struct.pack_into("<I", data, 0xD4, wave_flags)
     struct.pack_into("<I", data, 0x120, directory[0])
     struct.pack_into("<I", data, 0x12C, directory[1])
     struct.pack_into("<I", data, 0x130, directory[2])
@@ -94,6 +97,34 @@ class PixelInputTest(unittest.TestCase):
         self.assertEqual(fssm_header.interpolants(b), (2, 0))
 
 
+class ReadMethodTest(unittest.TestCase):
+    """Flags bits 0-1, the read method: 1 = v_interp_mov (flat), 2 = v_interp_p1/p2 (interpolated); SHADER-181."""
+
+    def test_read_methods_by_table_position(self):
+        b = blob([record(1, 0xF, 0, 0, 0x02),
+                  record(2, 0xF, 1, 1, 0x01),
+                  record(3, 0x3, 2, 2, 0x1A),   # the corpus' 16-bit records: fp16 | bit 3 | linear
+                  record(4, 0x1, 3, 3, 0x09)])
+        self.assertEqual(fssm_header.read_methods(b), [2, 1, 2, 1])
+
+    def test_read_bits_do_not_touch_the_fp16_mask(self):
+        b = blob([record(1, 0xF, 0, 0, 0x03), record(2, 0xF, 1, 1, 0x13)])
+        self.assertEqual(fssm_header.read_methods(b), [3, 3])
+        self.assertEqual(fssm_header.interpolants(b), (2, 0b10))
+
+    def test_no_table_no_read_methods(self):
+        self.assertEqual(fssm_header.read_methods(blob(first=0)), [])
+
+    def test_names(self):
+        self.assertEqual([fssm_header.read_name(m) for m in range(4)], ["read0", "mov", "interp", "read3"])
+
+    def test_tally_counts_ps_read_methods_only(self):
+        rows = [{"stage": "ps", "directory_ok": True, "entries": 2, "fp16_mask": 0,
+                 "inputs": [{"flags": 0x02}, {"flags": 0x00}]},
+                {"stage": "vs", "directory_ok": True, "entries": 1, "fp16_mask": 0, "inputs": [{"flags": 0x01}]}]
+        self.assertEqual(fssm_header.tally(rows, True)["read_methods"], {"interp": 1, "read0": 1})
+
+
 class DirectoryTest(unittest.TestCase):
     def test_identity_holds(self):
         self.assertTrue(fssm_header.directory_ok(blob(directory=(0x100, 0x20, 0x120))))
@@ -104,6 +135,47 @@ class DirectoryTest(unittest.TestCase):
 
     def test_short_blob_is_not_ok(self):
         self.assertFalse(fssm_header.directory_ok(b"FSSM"))
+
+
+class WaveSizeTest(unittest.TestCase):
+    def test_wave64_when_bit5_clear(self):
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0)), 64)
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0x00110000)), 64)
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0x040C0004)), 64)
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0x000F0001)), 64)
+
+    def test_wave32_when_bit5_set(self):
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=fssm_header.FLAG_WAVE32)), 32)
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0x00110020)), 32)
+        self.assertEqual(fssm_header.wave_size(blob(wave_flags=0x000C0020)), 32)
+
+    def test_exact_minimum_length(self):
+        data = bytearray(0xD8)
+        data[0:4] = b"FSSM"
+        struct.pack_into("<I", data, 0xD4, 0x20)
+        self.assertEqual(fssm_header.wave_size(bytes(data)), 32)
+        struct.pack_into("<I", data, 0xD4, 0)
+        self.assertEqual(fssm_header.wave_size(bytes(data)), 64)
+        self.assertIsNone(fssm_header.wave_size(bytes(data[:0xD7])))
+
+    def test_short_or_non_fssm_blob_returns_none(self):
+        self.assertIsNone(fssm_header.wave_size(b""))
+        self.assertIsNone(fssm_header.wave_size(b"FSSM"))
+        # Zero-prefixed synthetic compute headers lack the FSSM magic and must return None.
+        self.assertIsNone(fssm_header.wave_size(bytes(0x148)))
+        bad_magic = bytearray(0x100)
+        bad_magic[0:4] = b"NOPE"
+        struct.pack_into("<I", bad_magic, 0xD4, 0x20)
+        self.assertIsNone(fssm_header.wave_size(bytes(bad_magic)))
+
+    def test_tally_counts_wave_sizes(self):
+        rows = [
+            {"stage": "cs", "directory_ok": True, "wave_size": 32, "entries": 0, "fp16_mask": 0, "inputs": []},
+            {"stage": "ps", "directory_ok": True, "wave_size": 64, "entries": 0, "fp16_mask": 0, "inputs": []},
+            {"stage": "vs", "directory_ok": True, "wave_size": 64, "entries": 0, "fp16_mask": 0, "inputs": []},
+            {"stage": "cs", "directory_ok": False, "wave_size": None, "entries": 0, "fp16_mask": 0, "inputs": []},
+        ]
+        self.assertEqual(fssm_header.tally(rows, True)["wave_sizes"], {"wave32": 1, "wave64": 2})
 
 
 class BindingTableTest(unittest.TestCase):
@@ -155,7 +227,7 @@ class CliTest(unittest.TestCase):
         fssm_dir = os.path.join(self.dir, "fssm")
         os.makedirs(fssm_dir)
         with open(os.path.join(fssm_dir, "a.fssm"), "wb") as f:
-            f.write(blob([record(1, 0xF, 0, 0, 0x10), record(2, 0x3, 1, 1, 0)]))
+            f.write(blob([record(1, 0xF, 0, 0, 0x12), record(2, 0x3, 1, 1, 0x01)]))
         with open(os.path.join(fssm_dir, "b.fssm"), "wb") as f:
             f.write(blob(first=0))
         with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
@@ -178,18 +250,49 @@ class CliTest(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "0x1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
         # A negative limit sliced from the end (paths[:-1] dropped b.fssm) instead of being refused.
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("must be 0 or more", p.stderr)
         self.assertEqual(p.stdout, "")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "nope"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("invalid int value: 'nope'", p.stderr)
+        self.assertNotIn("non_negative", p.stderr)
+
+    def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
+        os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm", "b.fssm"])
+
+        err = PermissionError(13, "Permission denied", os.path.join(self.fssm_dir, "a.fssm"))
+        with mock.patch("fssm_header.summarize", side_effect=err):
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+                orig_stderr = sys.stderr
+                try:
+                    sys.stderr = stderr_file
+                    rc = fssm_header.main([self.fssm_dir])
+                finally:
+                    sys.stderr = orig_stderr
+                stderr_file.seek(0)
+                err_out = stderr_file.read()
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot read", err_out)
 
     def test_text_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("2 files, directory_ok 2, PS with table 1, entries 2", p.stdout)
         self.assertIn("a.fssm: stage=ps directory_ok=True entries=2 fp16=0x1", p.stdout)
+        self.assertIn("read methods: interp:1, mov:1", p.stdout)
 
     def test_json_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
@@ -198,6 +301,42 @@ class CliTest(unittest.TestCase):
         doc = json.loads(p.stdout)
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
+        self.assertEqual(doc["tally"]["read_methods"], {"interp": 1, "mov": 1})
+        self.assertEqual(doc["tally"]["wave_sizes"], {"wave64": 2})
+
+    def test_wave_size_in_text_and_json_cli(self):
+        with open(os.path.join(self.fssm_dir, "b.fssm"), "wb") as f:
+            f.write(blob(first=0, wave_flags=fssm_header.FLAG_WAVE32))
+        p_txt = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)
+        self.assertEqual(p_txt.returncode, 0, p_txt.stderr)
+        self.assertIn("a.fssm: stage=ps directory_ok=True entries=2 fp16=0x1 wave=64", p_txt.stdout)
+        self.assertIn("b.fssm: stage=ps directory_ok=True entries=0 fp16=0x0 wave=32", p_txt.stdout)
+        self.assertIn("wave sizes: wave32:1, wave64:1", p_txt.stdout)
+
+        p_json = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                                capture_output=True, text=True)
+        self.assertEqual(p_json.returncode, 0, p_json.stderr)
+        doc = json.loads(p_json.stdout)
+        self.assertEqual({r["name"]: r["wave_size"] for r in doc["files"]}, {"a.fssm": 64, "b.fssm": 32})
+        self.assertEqual(doc["tally"]["wave_sizes"], {"wave32": 1, "wave64": 1})
+
+    def test_table_only_entry_counts_exclude_blobs_without_a_table(self):
+        os.remove(os.path.join(self.dir, "index.json"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        tally = json.loads(p.stdout)["tally"]
+        self.assertEqual(tally["stage_source"], "table-only")
+        self.assertEqual(tally["ps_with_table"], 1)
+        self.assertEqual(tally["entries"], 2)
+        self.assertEqual(tally["entry_counts"], {"2": 1})
+        self.assertEqual(sum(tally["entry_counts"].values()), tally["ps_with_table"])
+
+    def test_table_only_tally_with_only_non_ps_blobs_has_an_empty_histogram(self):
+        rows = [{"stage": None, "directory_ok": True, "entries": 0, "fp16_mask": 0, "inputs": []}]
+        tally = fssm_header.tally(rows, False)
+        self.assertEqual(tally["entry_counts"], {})
+        self.assertEqual(tally["entries"], 0)
 
     def test_local_stage_index_works_with_an_unrelated_parent_index(self):
         with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
@@ -207,11 +346,43 @@ class CliTest(unittest.TestCase):
         self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
 
     def test_parent_stage_index_is_used_when_local_index_is_empty_or_unrelated(self):
-        for data in ({"unrelated": []}, [], {}):
+        for data in (
+            {"unrelated": []},
+            [],
+            {},
+            [{"file": "a.bin"}],
+            [{"file": "a.dxbc", "stage": None}],
+            [{"file": "a.dxbc", "stage": ""}],
+        ):
             with self.subTest(data=data):
                 with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
                     json.dump(data, f)
                 self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
+
+    def test_stage_index_skips_malformed_rows_and_normalizes_subpaths(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([
+                {"missing_file": True, "stage": "ps"},
+                {"file": None, "stage": "ps"},
+                {"file": "a.dxbc", "stage": None},
+                {"file": "dxbc/a.dxbc", "stage": "ps"},
+            ], f)
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+
+    def test_unindexed_blob_falls_back_to_table_only_tally(self):
+        unlisted = os.path.join(self.fssm_dir, "unlisted.fssm")
+        with open(unlisted, "wb") as f:
+            f.write(blob([record(1, 0xF, 0, 0, 0x12), record(2, 0x3, 1, 1, 0x01)]))
+        p = subprocess.run([sys.executable, "-I", TOOL, unlisted, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        tally = json.loads(p.stdout)["tally"]
+        self.assertEqual(tally["stage_source"], "table-only")
+        self.assertEqual(tally["ps_with_table"], 1)
+        self.assertEqual(tally["entries"], 2)
+        self.assertEqual(tally["entry_counts"], {"2": 1})
+        self.assertEqual(tally["read_methods"], {"interp": 1, "mov": 1})
+
 
 
 class BindingCliTest(unittest.TestCase):

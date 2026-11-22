@@ -26,7 +26,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
             with patch("make_game.below_normal"):
                 with patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")):
                     with patch("make_game.check", return_value={"expected_exe": "game.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight"), patch("make_game.cross_build_missing", return_value=[]):
                             with patch("make_game.shaders"):
                                 with patch("make_game.assets"):
                                     with patch("make_game.runtime"):
@@ -176,7 +176,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                             with self.assertRaises(SystemExit) as ctx:
                                 make_game.main()
-                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertEqual(ctx.exception.code, 2)
                             self.assertIn("unknown stage 'invalid_stage'", mock_err.getvalue())
 
     def test_mixed_valid_and_unknown_stage_rejected(self):
@@ -189,8 +189,30 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                             with self.assertRaises(SystemExit) as ctx:
                                 make_game.main()
-                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertEqual(ctx.exception.code, 2)
                             self.assertIn("unknown stage 'badstage'", mock_err.getvalue())
+
+    def test_invalid_stages_rejected_before_game_access(self):
+        for stages in ("", " ", ",,", " , , ", "badstage", "shaders,badstage"):
+            with (
+                self.subTest(stages=stages),
+                patch.object(sys, "argv", ["make_game.py", "--stages", stages]),
+                patch("make_game.below_normal"),
+                patch("make_game.choose_game", return_value=self.game_dir) as choose,
+                patch("make_game.check", return_value={}) as check,
+                patch("make_game.preflight") as preflight,
+                patch("make_game.shaders") as shaders,
+                patch("make_game.log"),
+                patch("sys.stderr", new_callable=io.StringIO) as error,
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    make_game.main()
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--stages", error.getvalue())
+                choose.assert_not_called()
+                check.assert_not_called()
+                preflight.assert_not_called()
+                shaders.assert_not_called()
 
     def test_whitespace_and_empty_items_in_stages(self):
         ret, mocks = self.run_main("--stages", " shaders , , assets ")
@@ -201,11 +223,14 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         mocks["pipelines"].assert_not_called()
 
     def test_stage_sequencing_preserves_canonical_order(self):
-        """Even if user specifies stages out of order, execution follows shaders -> assets -> runtime -> pipelines."""
+        """Even if user specifies stages out of order, execution follows shaders -> assets -> runtime -> pipelines.
+        wave64_settings is patched: left to probe the installed GPU it returns keep_emulated=False on native-wave64
+        RDNA2 under the AMD Windows driver, and the test then failed there (TEST-461)."""
         manager = MagicMock()
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir,
                                         "--out", self.out_dir, "--work", self.work_dir,
-                                        "--stages", "pipelines,runtime,assets,shaders"]):
+                                        "--stages", "pipelines,runtime,assets,shaders"]), \
+                patch("make_game.wave64_settings", return_value=(False, True)):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
                     with patch("make_game.preflight"):
@@ -219,10 +244,12 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
         expected_calls = [
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY, keep_emulated=True),
+                         emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
-            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
-            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
+            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
+                         unittest.mock.ANY),
+            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
+                           runtime_build=None),
         ]
         self.assertEqual(manager.mock_calls, expected_calls)
 
@@ -290,14 +317,20 @@ class JobsHandlingTest(unittest.TestCase):
                                             "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
-                                        patch("make_game.wave64_emulate", return_value=True):
+                                        patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
+                                        patch("make_game.runtime_gpu_per_vertex", return_value=None), \
+                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
+                                    probe.assert_called_once_with("auto", mesh_compute=False)
+                                    mock_preflight.assert_called_once_with(
+                                        ["shaders"], os.path.abspath(work), False, None,
+                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True, keep_emulated=True)
+                                                                         emulate=True, keep_emulated=True, fallbacks=())
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,12 +407,12 @@ class WavValidationTest(unittest.TestCase):
     @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         def fake_which(cmd):
-            if cmd in ("spirv-as", "spirv-val"):
+            if cmd in ("llvm-mc", "spirv-as", "spirv-val"):
                 return f"/usr/bin/{cmd}"
             return None
 
         with patch("shutil.which", side_effect=fake_which):
-            with patch("make_game.tool_available", return_value=True):
+            with patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}):
                 with patch("shutil.disk_usage") as mock_disk:
                     mock_disk.return_value = MagicMock(free=50 * (2**30))
                     with patch("os.makedirs"):
@@ -413,6 +446,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
             audio_dir = os.path.join(out, "audio")
             os.makedirs(audio_dir, exist_ok=True)
             with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
@@ -441,6 +476,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             ogg_dir = os.path.join(out, "audio", "ogg")
             wav_dir = os.path.join(out, "audio", "wav")
@@ -461,6 +498,33 @@ class WavValidationTest(unittest.TestCase):
                         make_game.assets(game, work, wav=True, jobs=4)
                         mock_py.assert_called_with("audio_wav.py", ogg_dir, "--out", wav_dir, "--jobs", "4")
 
+    def test_assets_passes_jobs_to_the_ogg_opus_step(self):
+        # --jobs reached audio_wav.py only: with --jobs 1 the bank export still started half the CPU count of processes
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            game = os.path.join(tmp, "game")
+            out = os.path.join(work, "assets")
+            for rel in make_game.MODEL_ARCHIVES:
+                name = os.path.splitext(os.path.basename(rel))[0]
+                for mode in ("models", "textures"):
+                    p = os.path.join(out, name, mode)
+                    os.makedirs(p, exist_ok=True)
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
+                        f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
+            audio = os.path.join(out, "audio")
+            os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
+            os.makedirs(game, exist_ok=True)
+            for name in ("audio_manifest.json", "xma.done"):     # no ogg.done: the Ogg Opus step is still to run
+                with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
+
+            with patch("make_game.rpf9dump", return_value="fake_dump"), patch("make_game.log"), \
+                    patch("make_game.py") as mock_py:
+                make_game.assets(game, work, wav=False, jobs=3)
+            mock_py.assert_any_call("awc_opus.py", os.path.join(audio, "awc"), os.path.join(audio, "ogg"), "--jobs", "3")
+
     def test_assets_without_wav_skips_audio_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
@@ -473,6 +537,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)
@@ -551,12 +617,12 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
     def test_preflight_space_calculation_and_failure(self):
         # Shaders needs 30GB, Assets needs 300GB -> 330GB total
         def fake_which(cmd):
-            if cmd in ("dotnet", "spirv-as", "spirv-val"):
+            if cmd in ("dotnet", "llvm-mc", "spirv-as", "spirv-val"):
                 return f"/bin/{cmd}"
             return None
 
         with patch("shutil.which", side_effect=fake_which):
-            with patch("make_game.tool_available", return_value=True):
+            with patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}):
                 with patch("make_game.ensure_submodule"):
                     with patch("os.makedirs"):
                         with patch("shutil.disk_usage") as mock_disk:

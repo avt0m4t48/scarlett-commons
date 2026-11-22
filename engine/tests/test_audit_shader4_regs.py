@@ -1,4 +1,6 @@
 """Unit tests for scripts/audit_shader4_regs.py (standard library only, synthetic .s/.fssm/.dxbc)."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -33,6 +35,152 @@ def make_ms_psv0(tx=128, ty=1, tz=1, maxv=64, maxp=64, topo=2):
 
 
 class AuditShader4RegsTests(unittest.TestCase):
+    def test_inline_immediate_reads_destination_before_write(self):
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\ts_addk_i32 s3, 1",
+            "\ts_addk_i32 s3, 2",
+            "\ts_mulk_i32 s4, 2",
+            "\ts_cmovk_i32 s5, 3",
+            "\ts_movk_i32 s6, 0",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(insns), ([3, 4, 5], [], ["s_addk_i32 s3, 1"]))
+
+    def test_stores_atomics_dual_dest_valu_and_nsa_lists(self):
+        # 1. tbuffer_store / s_store / s_buffer_store have no destination operand.
+        store_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\ttbuffer_store_format_xyzw v[0:1], v2, s[4:7], 0 idxen",
+            "\ts_store_dword s8, s[10:11], 0x0",
+            "\ts_buffer_store_dword s9, s[4:7], 0x0",
+            "\tv_mov_b32 v3, v0",
+            "\ts_mov_b32 s12, s8",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(store_insns), ([4, 5, 6, 7, 8, 9, 10, 11], [0, 1, 2], []))
+
+        # 2. Non-glc atomics do not write args[0]; glc global_atomic writes vdst at args[0] without reading it.
+        atomic_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tbuffer_atomic_add v0, v1, s[4:7], 0 offen",
+            "\tglobal_atomic_add v[2:3], v4, off",
+            "\tglobal_atomic_add v5, v[6:7], v8, off glc",
+            "\tv_mov_b32 v9, v0",
+            "\tv_mov_b32 v10, v2",
+            "\tv_mov_b32 v11, v5",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(atomic_insns), ([4, 5, 6, 7], [0, 1, 2, 3, 4, 6, 7, 8], []))
+
+        # 3. v_mad_u64_u32 / v_mad_i64_i32 / v_div_scale_f32 write both args[0] (VGPR) and args[1] (SGPR mask).
+        dual_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tv_mad_u64_u32 v[0:1], s[2:3], v4, v5, v[6:7]",
+            "\ts_mov_b32 s8, s2",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(dual_insns), ([], [4, 5, 6, 7], []))
+
+        # 4. NSA vlist and slist operands report unread registers.
+        nsa_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\timage_sample v0, [v1, v3], s[4:11], s[12:15] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(nsa_insns), (list(range(4, 16)), [1, 3], []))
+
+    def test_vector_carry_in_and_out_are_distinct_in_the_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as disasm:
+            for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
+                path = os.path.join(disasm, f"cs_{op}.s")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"\t{op}_e64 v1, s3, v2, v4, s8\n"
+                            "\ts_mov_b32 s9, s3\n\ts_endpgm\n")
+
+            report = audit_mod.audit(disasm)["cs"]
+            self.assertEqual(report["count"], 3)
+            self.assertEqual(report["rbw_sgpr_counts"], {"s8": 3})
+            self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3, "v4": 3})
+            self.assertEqual(report["s3_rbw_op_patterns"], {})
+
+    def test_negative_limit_is_rejected_before_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            for name in ("a_cs", "b_cs"):
+                with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8") as f:
+                    f.write("\ts_endpgm\n")
+            with open(os.path.join(disasm, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"a_cs": {"stage": "cs"}, "b_cs": {"stage": "cs"}}, f)
+
+            out_json = os.path.join(tmp, "report.json")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    audit_mod.main([disasm, "--limit", "-1", "--json", out_json])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            self.assertIn("--limit", stderr.getvalue())
+            self.assertFalse(os.path.exists(out_json))
+
+            with self.assertRaisesRegex(ValueError, "limit"):
+                audit_mod.audit(disasm, limit=-1)
+            for limit, count in ((None, 2), (0, 0), (1, 1)):
+                self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
+
+    def test_directory_named_like_shader_is_skipped_by_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            # A directory that sorts before the real shader must not consume the --limit slot.
+            os.mkdir(os.path.join(disasm, "cs_a.s"))
+            with open(os.path.join(disasm, "cs_b.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(disasm, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"cs_b": {"stage": "cs"}}, f)
+
+            # Without scanning regular files only, the directory cs_a.s would be parsed,
+            # raising IsADirectoryError or consuming the sole limit slot.
+            self.assertEqual(audit_mod.audit(disasm, limit=1)["cs"]["count"], 1)
+
+    def test_bad_input_and_output_paths_are_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            with open(os.path.join(disasm, "cs_sample.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            plain_file = os.path.join(tmp, "not-a-folder.bin")
+            with open(plain_file, "wb") as f:
+                f.write(b"RPF9")
+            missing = os.path.join(tmp, "missing")
+            a_folder = os.path.join(tmp, "out-folder")
+            os.mkdir(a_folder)
+
+            def run(argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = audit_mod.main(argv)
+                return rc, out.getvalue(), err.getvalue()
+
+            for argv, needle in (
+                ([missing], "no such folder"),
+                ([plain_file], "not a folder"),
+                ([disasm, "--fssm", missing], "--fssm"),
+                ([disasm, "--dxbc", plain_file], "--dxbc"),
+            ):
+                rc, stdout, stderr = run(argv)
+                self.assertEqual(rc, 2, argv)
+                self.assertEqual(stdout, "", argv)
+                self.assertEqual(len(stderr.splitlines()), 1, argv)
+                self.assertIn(needle, stderr, argv)
+
+            # The report's folder is created, so a finished audit is not lost.
+            out_json = os.path.join(tmp, "nested", "deeper", "report.json")
+            rc, stdout, stderr = run([disasm, "--json", out_json])
+            self.assertEqual((rc, stderr), (0, ""))
+            self.assertIn("wrote ", stdout)
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["cs"]["count"], 1)
+
+            # A report path that cannot be written is one line, not a traceback.
+            rc, stdout, stderr = run([disasm, "--json", a_folder])
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(stderr.splitlines()), 1)
+            self.assertIn("cannot write", stderr)
+            self.assertTrue(os.path.isdir(a_folder))
+
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
@@ -88,6 +236,13 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(rep["gs"]["count"], 1)
             self.assertEqual(rep["gs"]["rbw_vgpr_counts"], {"v0": 1, "v1": 1})
             self.assertEqual(rep["gs"]["s3_rbw_op_patterns"], {"s_bfe_u32 D, s3, 0x80008": 1})
+
+
+def setUpModule():
+    # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

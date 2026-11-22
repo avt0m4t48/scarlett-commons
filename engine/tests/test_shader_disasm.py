@@ -6,6 +6,7 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import json
 import os
 import subprocess
 import sys
@@ -79,6 +80,37 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("produced no disassembly", p.stderr)
         self.assertEqual(sorted(os.listdir(out)), [])
 
+    def test_llvm_error_discards_partial_disassembly(self):
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "if '-show-encoding' in sys.argv:\n"
+                       "    print('s_nop 0')\n"
+                       "    sys.stderr.write('error: disassembly stopped\\n')\n"
+                       "    sys.exit(1)\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertIn("error: disassembly stopped", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
+    def test_no_code_is_an_error_when_no_listings_are_written(self):
+        with open(self.fssm, "wb") as f:
+            f.write(b"FSSM\x01\x01" + bytes(320))
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'no s_endpgm': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
     def test_a_real_disassembly_is_written(self):
         mc = self.fake("import sys\n"
                        "probe = sys.stdin.read().strip() == %r\n"
@@ -121,6 +153,31 @@ class DisasmInputTest(unittest.TestCase):
         with open(os.path.join(self.src, name), "wb") as f:
             f.write(data)
 
+    def test_skip_existing_only_reuses_published_nonempty_listings(self):
+        for name in ("kept", "empty", "unfinished"):
+            self.write(name + ".fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        kept = os.path.join(out, "kept.s")
+        with open(kept, "w", encoding="utf-8", newline="\n") as f:
+            f.write("completed listing\n")
+        open(os.path.join(out, "empty.s"), "w").close()
+        open(os.path.join(out, ".disasm-abandoned.tmp"), "w").close()
+
+        result = self.run_tool(self.src, "--out", out, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 1", result.stdout)
+        self.assertIn("'clean': 2", result.stdout)
+        with open(kept, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "completed listing\n")
+        for name in ("empty", "unfinished"):
+            with open(os.path.join(out, name + ".s"), encoding="utf-8") as f:
+                self.assertIn("s_endpgm", f.read())
+
+        result = self.run_tool(self.src, "--out", out, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 3", result.stdout)
+
     def test_code_range_scans_a_blob_shorter_than_the_header(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         try:
@@ -142,6 +199,84 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(out)), ["a_good.s", "c_good.s"])
         self.assertIn("'clean': 2", p.stdout)
         self.assertIn("'scan failed': 1", p.stdout)
+
+    def test_directory_with_fssm_suffix_does_not_count_toward_limit(self):
+        os.mkdir(os.path.join(self.src, "a_cache.fssm"))
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--limit", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["b_shader.s"])
+
+    def test_fallback_scan_ignores_unaligned_endpgm(self) -> None:
+        blob = bytearray(0x110)
+        blob[:4] = b"FSSM"
+        blob[0x101:0x105] = CODE[-4:]  # the same bytes in metadata, straddling two words
+        blob[0x108:0x110] = CODE
+        self.write("fallback.fssm", bytes(blob))
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--jobs", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(out, "fallback.s"), encoding="utf-8") as listing:
+            self.assertIn("..0x110 (scan)", listing.readline())
+
+    def test_unpack_index_selects_current_blobs(self):
+        self.write("current.fssm", fssm())
+        self.write("obsolete.fssm", fssm())
+        index = os.path.join(self.dir, "fssm_index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"name": "current"}], f)
+        out = os.path.join(self.dir, "out")
+        result = self.run_tool(self.src, "--out", out, "--unpack-index", index)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["current.s"])
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.fssm")))
+
+    def test_a_full_run_removes_listings_of_shaders_no_longer_there(self):
+        self.write("current.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        for name, body in (("stale.s", "; gone\n"), ("notes.txt", "keep\n")):
+            with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        result = self.run_tool(self.src, "--out", out, "--jobs", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = os.listdir(out)
+        self.assertIn("current.s", entries)
+        self.assertIn("notes.txt", entries)          # not ours to remove
+        self.assertNotIn("stale.s", entries)
+        self.assertIn("removed 1 stale .s file(s)", result.stdout)
+
+    def test_a_limited_run_leaves_the_other_listings_alone(self):
+        self.write("a_shader.fssm", fssm())
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "b_shader.s"), "w", encoding="utf-8") as f:
+            f.write("; already there\n")
+        result = self.run_tool(self.src, "--out", out, "--limit", "1", "--jobs", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stale", result.stdout)
+        self.assertIn("a_shader.s", os.listdir(out))
+        with open(os.path.join(out, "b_shader.s"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "; already there\n")
+
+    def test_a_failed_probe_does_not_delete_an_older_listing(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "old.s"), "w", encoding="utf-8") as f:
+            f.write("; usable\n")
+        env = dict(os.environ, LLVM_MC="definitely-not-an-llvm-mc")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out], capture_output=True, text=True,
+                           env=env)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("could not be started", p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(out, "old.s")))   # pruning waits for a successful decode
 
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
@@ -166,6 +301,18 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("is not a file or folder", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_an_out_that_is_a_file_is_an_error(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("keep")
+        p = self.run_tool(self.src, "--out", out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("cannot create the output folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep")
 
 
 if __name__ == "__main__":

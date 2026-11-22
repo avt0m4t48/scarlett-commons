@@ -20,6 +20,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -56,11 +57,12 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
     nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
     auto* sec = IMAGE_FIRST_SECTION(nt);
     std::memcpy(sec->Name, ".text", 6);
     sec->VirtualAddress = 0x1000;
@@ -100,7 +102,7 @@ std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const st
 std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
-    nt_of(img)->OptionalHeader.ImageBase = image_base;
+    nt_of(img)->OptionalHeader.ImageBase = leonida_test::free_image_base(image_base);
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
     ed->Base = 1;
     ed->NumberOfFunctions = 1;
@@ -182,6 +184,28 @@ void expect_rejects(const char* what, const std::vector<uint8_t>& bytes) {
 }
 
 void test_valid_image() { expect_loads("a valid image maps with its section intact", make_image()); }
+
+void test_entry_bounds() {
+    for (bool is_dll : {false, true}) {
+        for (uint32_t entry : {0u, 0x1000u, 0x1FFFu, 0x2000u, 0x2001u}) {
+            auto img = make_image();
+            if (is_dll) nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+            nt_of(img)->OptionalHeader.AddressOfEntryPoint = entry;
+            const std::string what = std::string(is_dll ? "DLL" : "EXE") + " entry RVA " + std::to_string(entry);
+            if (entry < nt_of(img)->OptionalHeader.SizeOfImage) {
+                expect_loads(what.c_str(), img);
+            } else {
+                std::string error;
+                if (load(write_image(img), error) == 0)
+                    failed(what.c_str(), "the image loaded");
+                else if (error.find("the entry point is outside the image") == std::string::npos)
+                    failed(what.c_str(), "unexpected error: " + error);
+                else
+                    pass(what.c_str());
+            }
+        }
+    }
+}
 
 void test_header_bounds() {
     {
@@ -358,6 +382,56 @@ void test_exports() {
     }
 }
 
+void test_empty_named_export() {
+    const char* what = "an empty named export stays unresolved without hiding valid exports";
+    auto img = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->NumberOfFunctions = 3;
+    ed->NumberOfNames = 3;
+    nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0x1A0;
+    auto* funcs = reinterpret_cast<uint32_t*>(img.data() + 0x300);
+    funcs[1] = 0;
+    funcs[2] = 0x11C0;  // a code export outside the export directory
+    auto* names = reinterpret_cast<uint32_t*>(img.data() + 0x320);
+    names[0] = 0x1188;
+    names[1] = 0x1180;
+    names[2] = 0x1190;
+    auto* ords = reinterpret_cast<uint16_t*>(img.data() + 0x340);
+    ords[0] = 1;
+    ords[1] = 0;
+    ords[2] = 2;
+    std::memcpy(img.data() + 0x388, "empty\0", 6);
+    std::memcpy(img.data() + 0x390, "valid\0", 6);
+    auto provider = write_image_as(img, "empty_exports.dll");
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(provider);
+        for (const char* sym : {"empty", "#2"}) {
+            bool owns = false;
+            if (m.exports.count(sym) || m.forwarders.count(sym) ||
+                loader.resolve_module_export(m.base, sym, owns) || !owns)
+                return failed(what, std::string(sym) + " did not remain absent from the mapped module");
+        }
+        for (const char* sym : {"valid", "#3", "fwd", "#1"}) {
+            bool owns = false;
+            void* expected = (std::strcmp(sym, "valid") == 0 || std::strcmp(sym, "#3") == 0)
+                ? m.base + 0x11C0 : host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (!expected || loader.resolve_module_export(m.base, sym, owns) != expected || !owns)
+                return failed(what, std::string(sym) + " no longer resolves to its valid target");
+        }
+        auto importer = write_image_as(make_import_image("empty_exports.dll", "empty"), "empty_import.exe");
+        rt::Module& importing = loader.load(importer);
+        if (importing.imports.size() != 1 || importing.imports[0].binding != rt::Binding::Unimplemented)
+            return failed(what, "an import of the empty slot did not bind as unimplemented");
+        void* bound = *reinterpret_cast<void**>(importing.base + 0x1180);
+        if (!bound || bound == m.base)
+            return failed(what, "the empty import was not given a failure thunk");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_imports() {
     {
         auto img = make_image();
@@ -393,6 +467,42 @@ void test_imports() {
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
         expect_rejects("an import thunk table that runs past the image", img);
+    }
+}
+
+void test_import_name_rvas() {
+    for (bool delay : {false, true}) {
+        auto img = make_import_image("testshim.dll", "F");
+        if (delay) {
+            std::fill(img.begin() + 0x200, img.begin() + 0x240, uint8_t{0});
+            auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+            d->Attributes.AllAttributes = 1;
+            d->DllNameRVA = 0x1060;
+            d->ImportNameTableRVA = 0x1100;
+            d->ImportAddressTableRVA = 0x1180;
+            auto* nt = nt_of(img);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {};
+            auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            dir.VirtualAddress = 0x1000;
+            dir.Size = 2 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        }
+        const char* valid = delay ? "a valid delay-import name RVA loads" : "a valid import name RVA loads";
+        std::string error;
+        if (load(write_image(img), error) != 0)
+            failed(valid, error);
+        else
+            pass(valid);
+
+        *reinterpret_cast<uint64_t*>(img.data() + 0x300) = (1ull << 32) | 0x1120;
+        const char* invalid = delay ? "a delay-import name RVA with high bits is rejected"
+                                    : "an import name RVA with high bits is rejected";
+        error.clear();
+        if (load(write_image(img), error) == 0)
+            failed(invalid, "the image loaded");
+        else if (error.find("an import name runs past the image") == std::string::npos)
+            failed(invalid, error);
+        else
+            pass(invalid);
     }
 }
 
@@ -446,8 +556,6 @@ void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint3
     img[n++] = 0xC3;
 }
 
-constexpr uint64_t kInitBase = 0x140000000;
-
 // make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
 // sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
 std::vector<uint8_t> make_init_image() {
@@ -455,7 +563,8 @@ std::vector<uint8_t> make_init_image() {
     auto* nt = nt_of(img);
     nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
-    auto va = [](uint32_t rva) { return kInitBase + rva; };
+    const uint64_t base = nt->OptionalHeader.ImageBase;  // the TLS callback addresses below are absolute
+    auto va = [base](uint32_t rva) { return base + rva; };
     constexpr size_t text = 0x200;  // file offset of RVA 0x1000
     emit_store_stub(img, text + 0x00, reinterpret_cast<uint64_t>(&g_tls_ran), 1, 0);
     emit_store_stub(img, text + 0x40, reinterpret_cast<uint64_t>(&g_main_ran), 2, 1);
@@ -532,7 +641,7 @@ void test_initialise_rejects() {
     {
         auto img = make_init_image();
         auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + 0x290);  // file offset of RVA 0x1090
-        callbacks[0] = kInitBase + 0x9000;                                  // well past SizeOfImage
+        callbacks[0] = nt_of(img)->OptionalHeader.ImageBase + 0x9000;         // well past SizeOfImage
         expect_init_rejects("a TLS callback outside the image is rejected", img);
     }
     {
@@ -541,6 +650,265 @@ void test_initialise_rejects() {
         emit_store_stub(img, 0x240, reinterpret_cast<uint64_t>(&g_main_ran), 3, 0);  // DllMain returns FALSE
         expect_init_rejects("a DllMain that returns FALSE is rejected", img);
     }
+}
+
+// The images below jump to host observers so notifications remain observable after the mappings are freed.
+// The FLS destructor itself starts in mapped code: leaving it registered would call unmapped memory at exit.
+void emit_jump_stub(std::vector<uint8_t>& img, size_t off, uint64_t target) {
+    img[off++] = 0x48;
+    img[off++] = 0xB8;  // movabs rax, target; jmp rax (preserves the notification arguments)
+    std::memcpy(img.data() + off, &target, sizeof(target));
+    off += sizeof(target);
+    img[off++] = 0xFF;
+    img[off] = 0xE0;
+}
+
+struct Notification {
+    void* base;
+    DWORD reason;
+    bool tls;
+    bool operator==(const Notification&) const = default;
+};
+std::vector<Notification> g_notifications;
+struct LiveImage {
+    void* base;
+    uint32_t tls_index;
+    void* tls_block;
+};
+std::vector<LiveImage> g_live_modules;
+bool g_detach_state_live = true;
+bool g_fail_attach = false;
+bool g_use_fls = false;
+DWORD g_fls_index = FLS_OUT_OF_INDEXES;
+int g_fls_callbacks = 0;
+
+void observe_notification(void* base, DWORD reason, void* reserved, bool tls) {
+    g_notifications.push_back({base, reason, tls});
+    if (reserved) g_detach_state_live = false;
+    if (reason != DLL_PROCESS_DETACH) return;
+    for (const auto& m : g_live_modules) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(m.base, &info, sizeof(info)) || info.State != MEM_COMMIT)
+            g_detach_state_live = false;
+        if (m.tls_index != rt::kNoTlsIndex && m.tls_block) {
+            auto** slots = reinterpret_cast<void**>(__readgsqword(0x58));
+            if (slots[m.tls_index] != m.tls_block ||
+                !VirtualQuery(m.tls_block, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+                std::memcmp(m.tls_block, "TLS!", 4) != 0)
+                g_detach_state_live = false;
+        }
+    }
+}
+
+void NTAPI observe_tls(void* base, DWORD reason, void* reserved) {
+    observe_notification(base, reason, reserved, true);
+}
+
+void NTAPI observe_fls(void* value) {
+    if (value == reinterpret_cast<void*>(1)) ++g_fls_callbacks;
+}
+
+BOOL NTAPI observe_dllmain(void* base, DWORD reason, void* reserved) {
+    observe_notification(base, reason, reserved, false);
+    if (g_use_fls) {
+        if (reason == DLL_PROCESS_ATTACH) {
+            g_fls_index = FlsAlloc(reinterpret_cast<PFLS_CALLBACK_FUNCTION>(static_cast<uint8_t*>(base) + 0x1100));
+            if (g_fls_index == FLS_OUT_OF_INDEXES || !FlsSetValue(g_fls_index, reinterpret_cast<void*>(1)))
+                return FALSE;
+        } else if (reason == DLL_PROCESS_DETACH && g_fls_index != FLS_OUT_OF_INDEXES) {
+            if (!FlsFree(g_fls_index)) g_detach_state_live = false;
+            g_fls_index = FLS_OUT_OF_INDEXES;
+        }
+    }
+    return !(reason == DLL_PROCESS_ATTACH && g_fail_attach);
+}
+
+void reset_notifications() {
+    g_notifications.clear();
+    g_live_modules.clear();
+    g_detach_state_live = true;
+    g_fail_attach = false;
+    g_use_fls = false;
+    g_fls_callbacks = 0;
+}
+
+void expect_notifications(const char* what, const std::vector<Notification>& expected) {
+    if (g_notifications == expected) pass(what);
+    else failed(what, "unexpected TLS/DllMain notification count or order");
+}
+
+std::vector<uint8_t> make_lifecycle_image() {
+    auto img = make_init_image();
+    emit_jump_stub(img, 0x200, reinterpret_cast<uint64_t>(&observe_tls));
+    emit_jump_stub(img, 0x240, reinterpret_cast<uint64_t>(&observe_dllmain));
+    emit_jump_stub(img, 0x300, reinterpret_cast<uint64_t>(&observe_fls));
+    return img;
+}
+
+void test_process_detach() {
+    // A map-only load must remain free of image-code execution, including at destruction.
+    reset_notifications();
+    {
+        rt::Loader loader(g_dir);
+        loader.load(write_image(make_lifecycle_image()));
+    }
+    expect_notifications("a never-initialised image receives no detach notifications", {});
+
+    for (bool fail_attach : {false, true}) {
+        reset_notifications();
+        g_fail_attach = fail_attach;
+        g_use_fls = true;
+        void* base = nullptr;
+        bool rejected = false;
+        {
+            rt::Loader loader(g_dir);
+            auto& m = loader.load(write_image(make_lifecycle_image()));
+            base = m.base;
+            g_live_modules = {{m.base, m.tls_index, m.tls_block}};
+            try {
+                loader.initialise();
+                loader.initialise();  // successful attach is delivered once
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+        }
+        if (rejected == fail_attach) pass("attach success/failure is preserved");
+        else failed("attach success/failure is preserved", "unexpected initialise result");
+        expect_notifications(fail_attach ? "a FALSE attach is detached once" : "TLS and DllMain detach once after attach",
+                             {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_ATTACH, false},
+                              {base, DLL_PROCESS_DETACH, true}, {base, DLL_PROCESS_DETACH, false}});
+        if (g_detach_state_live && g_fls_callbacks == 1 && g_fls_index == FLS_OUT_OF_INDEXES)
+            pass("detach frees FLS while the callback image and static TLS are live");
+        else
+            failed("detach frees FLS while the callback image and static TLS are live", "FLS cleanup missing or state freed early");
+        // Keep a failing negative-control run from crashing during process exit after reporting the regression.
+        if (g_fls_index != FLS_OUT_OF_INDEXES) {
+            FlsSetValue(g_fls_index, nullptr);
+            FlsFree(g_fls_index);
+            g_fls_index = FLS_OUT_OF_INDEXES;
+        }
+    }
+    g_live_modules.clear();
+    g_use_fls = false;
+}
+
+void test_process_detach_invalid_tls() {
+    reset_notifications();
+    g_use_fls = true;
+    void* base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        auto& m = loader.load(write_image(make_lifecycle_image()));
+        base = m.base;
+        loader.initialise();
+        // The callback table is writable in a normal PE, but this synthetic image keeps it in executable .text.
+        DWORD old_protection = 0;
+        if (!VirtualProtect(m.base + 0x1090, sizeof(uint64_t), PAGE_EXECUTE_READWRITE, &old_protection))
+            throw std::runtime_error("cannot make the synthetic TLS callback table writable");
+        *reinterpret_cast<uint64_t*>(m.base + 0x1090) = reinterpret_cast<uint64_t>(m.base) + m.size;
+        DWORD ignored = 0;
+        if (!VirtualProtect(m.base + 0x1090, sizeof(uint64_t), old_protection, &ignored))
+            throw std::runtime_error("cannot restore the synthetic TLS callback table protection");
+    }
+    expect_notifications("invalid TLS detach still calls DllMain for cleanup",
+                         {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_ATTACH, false},
+                          {base, DLL_PROCESS_DETACH, false}});
+    if (g_fls_callbacks == 1 && g_fls_index == FLS_OUT_OF_INDEXES)
+        pass("invalid TLS detach still frees the mapped FLS callback");
+    else
+        failed("invalid TLS detach still frees the mapped FLS callback", "FLS cleanup missing");
+    reset_notifications();
+}
+
+void test_process_detach_without_entry() {
+    for (bool is_dll : {false, true}) {
+        reset_notifications();
+        auto img = make_lifecycle_image();
+        if (is_dll) nt_of(img)->OptionalHeader.AddressOfEntryPoint = 0;
+        else nt_of(img)->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
+        void* base = nullptr;
+        {
+            rt::Loader loader(g_dir);
+            auto& m = loader.load(write_image(img));
+            base = m.base;
+            loader.initialise();
+        }
+        expect_notifications(is_dll ? "a DLL without an entry point still detaches TLS" : "an EXE detaches TLS without calling its entry point",
+                             {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_DETACH, true}});
+    }
+    reset_notifications();
+    auto first = make_lifecycle_image();
+    auto second = make_image();
+    nt_of(second)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
+    nt_of(second)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    emit_jump_stub(second, 0x200, reinterpret_cast<uint64_t>(&observe_dllmain));
+    void* first_base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        first_base = loader.load(write_image(first)).base;
+        loader.load(write_image(second));
+        g_fail_attach = true;
+        try {
+            loader.initialise();
+            failed("partial initialisation rejects the first DLL", "attach succeeded");
+        } catch (const std::runtime_error&) {
+            pass("partial initialisation rejects the first DLL");
+        }
+    }
+    expect_notifications("partial initialisation does not detach an untouched later DLL",
+                         {{first_base, DLL_PROCESS_ATTACH, true}, {first_base, DLL_PROCESS_ATTACH, false},
+                          {first_base, DLL_PROCESS_DETACH, true}, {first_base, DLL_PROCESS_DETACH, false}});
+    reset_notifications();
+}
+
+void test_process_detach_dependencies() {
+    reset_notifications();
+    auto dep = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto parent = make_import_image("detach_dep.dll", "fwd");
+    for (auto* img : {&dep, &parent}) {
+        nt_of(*img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(*img)->OptionalHeader.AddressOfEntryPoint = 0x11C0;
+        emit_jump_stub(*img, 0x3C0, reinterpret_cast<uint64_t>(&observe_dllmain));
+    }
+    write_image_as(dep, "detach_dep.dll");
+    void* parent_base = nullptr;
+    void* dep_base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        auto& m = loader.load(write_image_as(parent, "detach_parent.dll"));
+        parent_base = m.base;
+        for (const auto* mod : loader.modules())
+            g_live_modules.push_back({mod->base, mod->tls_index, mod->tls_block});
+        dep_base = loader.initialisation_order().front()->base;
+        loader.initialise();
+        loader.initialise();
+    }
+    expect_notifications("dependencies attach first and detach last",
+                         {{dep_base, DLL_PROCESS_ATTACH, false}, {parent_base, DLL_PROCESS_ATTACH, false},
+                          {parent_base, DLL_PROCESS_DETACH, false}, {dep_base, DLL_PROCESS_DETACH, false}});
+    if (g_detach_state_live) pass("all dependency mappings remain live until notifications finish");
+    else failed("all dependency mappings remain live until notifications finish", "a dependency was unmapped early");
+    g_live_modules.clear();
+}
+
+// A dependency whose import table is corrupt fails while the parent binds it. Neither must stay findable by name:
+// a later load or GetModuleHandle would otherwise get a mapped image whose imports were never bound.
+void test_failed_dependency_not_registered() {
+    const char* what = "a failed load leaves neither the module nor its failed dependency loaded";
+    auto dep = make_import_image("kernel32.dll", "GetCurrentProcessId");
+    reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(dep.data() + 0x200)->Name = 0x5000;  // past SizeOfImage
+    const auto dep_path = write_image_as(dep, "fail_dep.dll");
+    const auto parent_path = write_image_as(make_import_image("fail_dep.dll", "x"), "fail_parent.dll");
+    rt::Loader loader(g_dir);
+    auto throws = [&](const std::filesystem::path& p) {
+        try { loader.load(p); return false; } catch (const std::exception&) { return true; }
+    };
+    if (!throws(parent_path)) return failed(what, "the parent loaded over a corrupt dependency");
+    if (loader.find_loaded_module("fail_dep.dll") || loader.find_loaded_module("fail_parent.dll"))
+        return failed(what, "a failed module is still found by name");
+    if (!throws(dep_path)) return failed(what, "a second load of the dependency returned the half-loaded module");
+    if (!throws(parent_path)) return failed(what, "a second load of the parent returned the half-loaded module");
+    pass(what);
 }
 
 void test_forwarded_exports() {
@@ -601,6 +969,35 @@ void test_forwarded_exports() {
             pass(what);
         } catch (const std::exception& e) {
             failed(what, e.what());
+        }
+    }
+    {
+        // Forwarder strings name the module without ".dll". The package ships Xbox builds of the CRT
+        // (vcruntime140.dll, msvcp140.dll, ...) that the loader replaces with the host's for a direct import; a
+        // forwarded one must get the host copy too, not map the bundled file.
+        const char* what = "a forwarder to a CRT module without \".dll\" binds the host copy, not the bundled one";
+        write_image_as(make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x1a0000000), "vcruntime140.dll");
+        write_image_as(make_forwarder_image("vcruntime140.memset", 0x180000000), "prov_crt.dll");
+        auto importer = write_image_as(make_import_image("prov_crt.dll", "fwd"), "importer_crt.exe");
+        HMODULE host_crt = LoadLibraryExA("vcruntime140.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        void* expected = host_crt ? reinterpret_cast<void*>(GetProcAddress(host_crt, "memset")) : nullptr;
+        if (!expected) {
+            std::printf("SKIP %s: no vcruntime140.dll in System32\n", what);
+        } else {
+            try {
+                rt::Loader loader(g_dir);
+                rt::Module& m = loader.load(importer);
+                if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Host)
+                    return failed(what, "the forwarded CRT import did not bind to the host");
+                if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
+                    return failed(what, "the address table does not hold the host's memset");
+                for (auto* mod : loader.modules())
+                    if (rt::lower(mod->name) == "vcruntime140.dll")
+                        return failed(what, "the bundled vcruntime140.dll was mapped");
+                pass(what);
+            } catch (const std::exception& e) {
+                failed(what, e.what());
+            }
         }
     }
     {
@@ -672,6 +1069,19 @@ std::vector<uint8_t> make_unwind_image(const std::vector<RUNTIME_FUNCTION>& entr
     return img;
 }
 
+// PE/COFF: NumberOfRvaAndSizes counts the data directories; the slots past it are not directories whatever they hold.
+// With 9 directories the TLS slot (index 9) is not one, so bytes left in it must not make the image fail to load.
+void test_tls_directory_count() {
+    auto img = make_image();
+    auto& tls = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    tls.VirtualAddress = 0xFFFF0000;  // would run past the image if it were read as a TLS directory
+    tls.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_TLS;
+    expect_loads("a TLS slot past NumberOfRvaAndSizes is not read as a TLS directory", img);
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    expect_rejects("the same TLS slot within NumberOfRvaAndSizes is checked and refused", img);
+}
+
 void test_unwind_registration() {
     const std::vector<RUNTIME_FUNCTION> entries = {{0x1000, 0x1010, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}};
     uintptr_t pc = 0;
@@ -737,6 +1147,19 @@ void test_unwind_registration() {
     expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
 }
 
+// An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
+// refused instead of being stored as base + rva, a pointer outside the mapping.
+void test_export_bounds() {
+    auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(outside.data() + 0x300) = 0x2000;  // funcs[0] == SizeOfImage
+    expect_rejects("an export whose address is past the image", outside);
+    auto last = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(last)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(last.data() + 0x300) = 0x1FFF;  // the image's last byte: still inside
+    expect_loads("an export at the image's last byte still loads", last);
+}
+
 // The folder the images go to: leonida_loader_test\<process id> in LEONIDA_TEST_DIR when that is set, otherwise in
 // the temporary directory. A folder per run, because security software can hold the previous run's images for a
 // while after they are written (so they can be neither deleted nor overwritten); the fixed parent name is what an
@@ -780,7 +1203,10 @@ std::string written_images_blocked() {
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto each = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed) / probes;
-    if (each > slow)
+    // Under Wine there is no such software, and its file I/O alone can average over 25 ms on a CI runner (38 and
+    // 40 ms seen in the wine job): the refusals and contents above are still checked, the time isn't.
+    const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    if (each > slow && !wine)
         return "writing and reading one back took " + std::to_string(each.count()) + " ms on average (over " +
                std::to_string(slow.count()) + " ms means each is being scanned)";
     return {};
@@ -808,17 +1234,27 @@ int main() {
             return 1;
         }
         test_valid_image();
+        test_entry_bounds();
         test_header_bounds();
         test_section_bounds();
         test_truncation();
         test_relocations();
         test_exports();
+        test_empty_named_export();
         test_imports();
+        test_import_name_rvas();
         test_delay_imports();
         test_initialise();
         test_initialise_rejects();
+        test_process_detach();
+        test_process_detach_invalid_tls();
+        test_process_detach_without_entry();
+        test_process_detach_dependencies();
+        test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
         test_forwarded_exports();
+        test_export_bounds();
+        test_tls_directory_count();
         test_unwind_registration();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.

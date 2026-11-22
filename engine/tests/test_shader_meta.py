@@ -346,5 +346,247 @@ class ShaderMetaIntegrationTests(unittest.TestCase):
         })
 
 
+    def test_imm_u32_applies_vop3_abs_before_neg(self):
+        import shader_ir
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|1.0|")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|-2.0|")), 0xC0000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(0x3f800000)")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("|0xbf800000|")), 0x3F800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|0|")), 0x80000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(1)")), 0x80000001)
+
+
+class OperandClassificationTests(unittest.TestCase):
+    @staticmethod
+    def _parse(lines):
+        import shader_ir
+        return [shader_ir.parse_line(ln) for ln in lines]
+
+    def test_split_operands_scalar_rmw(self):
+        import shader_ir
+        cases = [
+            ("s_cmov_b32 s2, s4", [2, 4], [2]),
+            ("s_cmov_b64 s[2:3], s[4:5]", [2, 3, 4, 5], [2, 3]),
+            ("s_bitset0_b32 s3, 7", [3], [3]),
+            ("s_bitset1_b32 s3, s5", [3, 5], [3]),
+            ("s_bitset0_b64 s[4:5], 33", [4, 5], [4, 5]),
+            ("s_bitset1_b64 s[4:5], s6", [4, 5, 6], [4, 5]),
+        ]
+        for asm, want_reads, want_writes in cases:
+            with self.subTest(asm=asm):
+                reads, writes = M._split_operands(shader_ir.parse_line(asm))
+                self.assertEqual(reads, want_reads)
+                self.assertEqual(writes, want_writes)
+
+    def test_split_operands_v_div_scale_dual_dst(self):
+        import shader_ir
+        cases = [
+            ("v_div_scale_f32 v0, s4, v1, v2, s6", [6], [4]),
+            ("v_div_scale_f32_e64 v0, s4, v1, v2, v1", [], [4]),
+            ("v_div_scale_f32 v0, s[4:5], s7, v1, v2", [7], [4, 5]),
+            ("v_div_scale_f64 v[0:1], s[4:5], v[2:3], v[4:5], s[6:7]", [6, 7], [4, 5]),
+            ("v_div_scale_f64 v[0:1], vcc, v[2:3], v[4:5], v[2:3]", [], []),
+        ]
+        for asm, want_reads, want_writes in cases:
+            with self.subTest(asm=asm):
+                reads, writes = M._split_operands(shader_ir.parse_line(asm))
+                self.assertEqual(reads, want_reads)
+                self.assertEqual(writes, want_writes)
+
+    def test_analyse_scalar_rmw_keeps_live_user_sgprs_and_invalidates_tags(self):
+        # Each RMW op on an unwritten user SGPR (or pair) must record a user_sgpr_read.
+        # s10 is written first, so s_bitset1_b32 on s10 must NOT mark s10 as a user SGPR.
+        # s12 is initialized to a constant then conditionally overwritten by s_cmov_b32,
+        # invalidating the constant tag so s[12:15] is NOT emitted as a literal sampler.
+        insns = self._parse([
+            "s_mov_b32 s10, 0",
+            "s_bitset1_b32 s10, 1",
+            "s_cmov_b32 s0, 1",
+            "s_cmov_b64 s[2:3], s[20:21]",
+            "s_bitset0_b32 s4, 2",
+            "s_bitset1_b32 s5, 3",
+            "s_bitset0_b64 s[6:7], 4",
+            "s_bitset1_b64 s[8:9], 35",
+            "s_mov_b32 s12, 0x92",
+            "s_mov_b32 s13, 0",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "s_cmov_b32 s12, s11",
+            "image_sample v[4:7], v[0:1], s[24:31], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        sgprs = {r["sgpr"]: r["kind"] for r in got["user_sgpr_reads"]}
+        for r in (0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 20, 21):
+            self.assertIn(r, sgprs, f"expected s{r} in user_sgpr_reads")
+        self.assertNotIn(10, sgprs)
+        self.assertNotIn(12, sgprs)
+        self.assertEqual(got["literal_samplers"], [])
+
+    def test_analyse_v_div_scale_sdst_not_user_sgpr_even_when_read_after(self):
+        # s4 (f32 wave32 sdst) and s[6:7] (f64 wave64 sdst) are scratch outputs written by
+        # v_div_scale_* and then read later; neither may fabricate a user SGPR.
+        # s2 and s[8:9] are source operands and MUST be reported as user SGPRs.
+        insns = self._parse([
+            "v_div_scale_f32 v0, s4, s2, v1, s2",
+            "v_mov_b32_e32 v2, s4",
+            "v_div_scale_f64 v[4:5], s[6:7], v[2:3], v[6:7], s[8:9]",
+            "s_or_b64 s[10:11], s[6:7], s[6:7]",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        sgprs = [r["sgpr"] for r in got["user_sgpr_reads"]]
+        self.assertEqual(sgprs, [2, 8, 9])
+
+    def test_translate_synthetic_scalar_rmw_user_sgprs(self):
+        lines = [
+            "s_cmp_eq_u32 s0, 0",
+            "s_cmov_b32 s1, 42",
+            "s_bitset0_b32 s2, 1",
+            "s_bitset1_b32 s3, 2",
+            "s_bitset0_b64 s[4:5], 5",
+            "s_bitset1_b64 s[6:7], 36",
+            "v_mov_b32_e32 v0, s1",
+            "v_add_nc_u32_e32 v0, s2, v0",
+            "v_add_nc_u32_e32 v0, s3, v0",
+            "v_add_nc_u32_e32 v0, s4, v0",
+            "v_add_nc_u32_e32 v0, s5, v0",
+            "v_add_nc_u32_e32 v0, s6, v0",
+            "v_add_nc_u32_e32 v0, s7, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_rmw_user", lines)
+        sgprs = [r["sgpr"] for r in meta["user_sgpr_reads"]]
+        self.assertEqual(sgprs, [0, 1, 2, 3, 4, 5, 6, 7])
+
+    def test_global_atomic_ptr64_and_truncated_ptr32(self):
+        # global_atomic_add without glc (saddr at a[2]) and with glc (saddr at a[3]) must classify
+        # 64-bit user-SGPR pointers and 32-bit high-zeroed pointers the same way as global_load/store.
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 1",
+            "global_atomic_add v0, v1, s[0:1]",
+            "global_atomic_add v2, v0, v1, s[2:3] glc",
+            "s_mov_b32 s5, 0",
+            "global_atomic_add v3, v0, v1, s[4:5] glc",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_global_atomic_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "ptr32_lo"},
+        ])
+        self.assertEqual(meta["descriptor_access"], {
+            "table_loads": False,
+            "truncates_table_ptr_high": True,
+        })
+
+    def test_s_mulk_i32_stride_and_constant_folding(self):
+        # s_mulk_i32 scales a descriptor index (32-byte stride) and folds signed 16-bit constants.
+        lines = [
+            "s_mov_b32 s4, s2",
+            "s_mulk_i32 s4, 32",
+            "s_load_dwordx8 s[16:23], s[0:1], s4",
+            "s_mov_b32 s12, 0x49",
+            "s_mulk_i32 s12, 2",
+            "s_mov_b32 s13, 1",
+            "s_mulk_i32 s13, -1",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_mulk_meta", lines)
+        self.assertEqual(meta["descriptor_strides"], [32])
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0xFFFFFFFF, 0, 0]])
+
+    def test_scalar_store_pointer_and_vsharp(self):
+        # s_store_dword* classifies its 2-SGPR pointer pair without marking table_loads,
+        # and s_buffer_store_dword* classifies its 4-SGPR resource descriptor as vsharp.
+        insns = self._parse([
+            "s_store_dword s8, s[0:1], 0x0",
+            "s_mov_b32 s3, 0",
+            "s_store_dwordx4 s[8:11], s[2:3], 0x0",
+            "s_buffer_store_dword s8, s[4:7], 0x0",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        self.assertEqual(got["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr32_lo"},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+            {"sgpr": 8, "kind": "const32"},
+            {"sgpr": 9, "kind": "const32"},
+            {"sgpr": 10, "kind": "const32"},
+            {"sgpr": 11, "kind": "const32"},
+        ])
+        self.assertFalse(got["table_loads"])
+        self.assertTrue(got["truncates_high"])
+
+    def test_slist_operands_classify_pointers_and_descriptors(self):
+        # LLVM VCCTuple slist syntax ([s0, s1], [s4, s5, s6, s7], ...) must be classified
+        # identically to contiguous s[a:b] ranges.
+        lines = [
+            "s_load_dwordx4 s[16:19], [s0, s1], 0x0",
+            "v_mov_b32_e32 v0, 0",
+            "global_load_dword v1, v0, [s2, s3]",
+            "buffer_load_dword v2, v0, [s4, s5, s6, s7], 0 offen",
+            "v_add_nc_u32_e32 v1, v1, v2",
+            "v_add_nc_u32_e32 v1, s16, v1",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_slist_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+        ])
+        self.assertTrue(meta["descriptor_access"]["table_loads"])
+
+        # Also verify slist tsharp, ssharp, and literal sampler via analyse_instructions.
+        insns = self._parse([
+            "s_mov_b32 s20, 0x92",
+            "s_mov_b32 s21, 0",
+            "s_mov_b32 s22, 0",
+            "s_mov_b32 s23, 0",
+            "image_sample v[0:3], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s20, s21, s22, s23] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "image_sample v[4:7], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s8, s9, s10, s11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        kinds = {r["sgpr"]: r["kind"] for r in got["user_sgpr_reads"]}
+        for r in range(8):
+            self.assertEqual(kinds[r], "tsharp")
+        for r in range(8, 12):
+            self.assertEqual(kinds[r], "ssharp")
+        self.assertEqual(got["literal_samplers"], [[0x92, 0, 0, 0]])
+
+        # A VCCTuple slist mixing a user SGPR with vcc_lo must classify the SGPR without crashing.
+        insns_vcc = self._parse([
+            "global_load_dword v0, v1, [s0, vcc_lo]",
+            "s_endpgm",
+        ])
+        got_vcc = M.analyse_instructions([insns_vcc], [[]])
+        self.assertEqual(got_vcc["user_sgpr_reads"], [{"sgpr": 0, "kind": "ptr64_lo"}])
+
+
 if __name__ == "__main__":
     unittest.main()

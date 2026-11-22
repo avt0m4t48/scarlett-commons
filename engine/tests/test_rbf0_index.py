@@ -4,6 +4,7 @@
 
 Every byte here is built by the test. No game file, game asset path or game name is used.
 """
+import contextlib
 import csv
 import json
 import os
@@ -12,6 +13,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,26 @@ TOOL = os.path.join(ROOT, "tools", "rbf0_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_index  # noqa: E402
+
+
+@contextlib.contextmanager
+def tracked_mmaps():
+    """Record every mmap.mmap opened by rbf0_index and close any leak on exit."""
+    real_mmap = rbf0_index.mmap.mmap
+    created = []
+
+    def wrap(*args, **kwargs):
+        mapping = real_mmap(*args, **kwargs)
+        created.append(mapping)
+        return mapping
+
+    try:
+        with mock.patch.object(rbf0_index.mmap, "mmap", side_effect=wrap):
+            yield created
+    finally:
+        for mapping in created:
+            if not mapping.closed:
+                mapping.close()
 
 WIDE = b"RBF0" + rbf0_index.PROLOGUE
 
@@ -202,6 +224,20 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(summary["streams"], 2)
 
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        with open(os.path.join(self.root, "00000001.bin"), "wb") as f:
+            f.write(b"PSIN" + bytes(60))
+        with open(os.path.join(self.root, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 0, "stored": 16}]')
+        with open(os.path.join(self.root, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, records, summary = rbf0_index.scan_dir(self.root)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(sorted(r["offset"] for r in rows), [0, 1])
+
 
 class ArgumentTest(unittest.TestCase):
     """Out-of-range scan arguments are refused before anything is written."""
@@ -228,9 +264,37 @@ class ArgumentTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_directory_rejects_archive_ranges(self):
+        out = os.path.join(self.root, "index.json")
+        for flag in ("--start", "--limit"):
+            with self.subTest(flag=flag):
+                result = self.run_tool(self.root, out, flag, "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("apply to a single archive", result.stderr)
+                self.assertFalse(os.path.exists(out))
+
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args, "--quiet"],
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_negative_string_count_fails_before_an_index_is_written(self):
+        carve = os.path.join(self.root, "carve")
+        os.mkdir(carve)
+        blob = WIDE + _open(0, b"TestRoot")
+        blob += _value(1, 0x60, _name(b"a"), b"label")
+        blob += _value(1, 0x60, _name(b"b"))
+        blob += _value(1, 0x60, _name(b"c"))
+        blob += b"\xff\xff"
+        with open(os.path.join(carve, "00000000.bin"), "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "out.json")
+
+        p = self.run_tool(carve, out, "--strings", "-1")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--strings", p.stderr)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertFalse(os.path.exists(out))
 
     def test_missing_source_is_an_error_not_a_traceback(self):
         out = os.path.join(self.root, "missing.json")
@@ -246,6 +310,15 @@ class ArgumentTest(unittest.TestCase):
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+
+    def test_scan_rpf_closes_mmap_on_invalid_start(self):
+        with tracked_mmaps() as created:
+            with self.assertRaisesRegex(ValueError, "outside the archive"):
+                rbf0_index.scan_rpf(self.rpf, start=os.path.getsize(self.rpf) + 1)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(self.rpf)
+            self.assertFalse(os.path.exists(self.rpf))
 
 
 class OutputTest(unittest.TestCase):
@@ -291,6 +364,43 @@ class OutputTest(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["files"][0]["sample_strings"], ["alpha", "body"])
+
+
+class ScanDirCollisionAndTrailingTest(unittest.TestCase):
+    def _make_rbf0(self, root_name):
+        raw = root_name.encode("utf-8")
+        return b"RBF0\x00\x00" + struct.pack("<H", len(raw)) + raw + struct.pack("<HHH", 0, 0, 0) + b"\xff\xff"
+
+    def test_scan_dir_keeps_each_file_on_offset_collisions(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Non-hex name used to get offset=len(entries)=1, colliding with 00000001.bin, and
+            # duplicate hex prefixes (00001000.bin + 00001000_alt.bin) used to overwrite in by_offset.
+            with open(os.path.join(d, "00000001.bin"), "wb") as f:
+                f.write(self._make_rbf0("Alpha"))
+            with open(os.path.join(d, "extra.bin"), "wb") as f:
+                f.write(b"NOT_RBF0_PAYLOAD" * 8)
+            with open(os.path.join(d, "00001000.bin"), "wb") as f:
+                f.write(self._make_rbf0("First"))
+            with open(os.path.join(d, "00001000_alt.bin"), "wb") as f:
+                f.write(self._make_rbf0("Second"))
+            _, records, _ = rbf0_index.scan_dir(d)
+        self.assertEqual([r["root"] for r in records], ["Alpha", "First", "Second"])
+
+    def test_join_resource_stops_on_trailing_status(self):
+        hdr = b"RBF0\x00\x00" + struct.pack("<H", 4) + b"Root" + struct.pack("<HHH", 0, 0, 0)
+        full = hdr + b"\xfd\xff" + struct.pack("<I", 70000) + (b"A" * 70000) + b"\xff\xff"
+        c1, c2 = full[:65536], full[65536:].ljust(65536, b"\x00")
+        c3 = b"UNRELATED_NON_RBF0_CHUNK" + b"\x00" * 100
+        rows = [
+            {"offset": 0, "stored": len(c1), "size": len(c1), "head": c1[:8]},
+            {"offset": len(c1), "stored": len(c2), "size": len(c2), "head": c2[:8]},
+            {"offset": len(c1) + len(c2), "stored": len(c3), "size": len(c3), "head": c3[:8]},
+        ]
+        blobs = {0: c1, len(c1): c2, len(c1) + len(c2): c3}
+        blob, chunks, parsed = rbf0_index.join_resource(rows, 0, lambda r: blobs[r["offset"]], check_gap=False)
+        self.assertEqual(chunks, 2)
+        self.assertEqual(len(blob), 131072)
+        self.assertEqual(parsed["status"], "trailing")
 
 
 if __name__ == "__main__":

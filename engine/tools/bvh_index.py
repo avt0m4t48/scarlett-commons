@@ -23,6 +23,7 @@ Usage:
 
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 --max-inflate applies to every .rpf in the directory.
+Archive rows include a fill histogram only when the complete node range was kept.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -35,8 +36,19 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
+import unicodedata
 import zlib
+from contextlib import suppress
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 TAG = 0x81020006
@@ -57,7 +69,14 @@ FILL_BYTES = (0x00, 0x81, 0x94, 0x29)
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # GetCurrentProcess returns a pointer-sized pseudo-handle.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
@@ -114,7 +133,7 @@ def classify(head, size, tail=None):
     decompressor. `size` is the inflated size.
     """
     row = {"kind": "raw", "signature": "", "version": ""}
-    body = head[3:40] if head[:3] == b"\xef\xbb\xbf" else head[:40]
+    body = head[3:] if head[:3] == b"\xef\xbb\xbf" else head
     if body.startswith(b"<?xml"):
         row.update(kind="xml", signature="xml", fragment=False)
         rest = body
@@ -195,7 +214,7 @@ def inflate_stream(m, s, size, max_inflate):
 
     try:
         while not d.eof and p < size:
-            chunk = m[p:p + (1 << 20)]
+            chunk = m[p:min(p + (1 << 20), size)]   # size is the scan window's end
             if not chunk:
                 break
             take(d.decompress(chunk))
@@ -218,7 +237,7 @@ def _count_stream(m, s, size):
     d = zlib.decompressobj()
     total, p = 0, s
     while not d.eof and p < size:
-        chunk = m[p:p + (1 << 20)]
+        chunk = m[p:min(p + (1 << 20), size)]
         if not chunk:
             break
         total += len(d.decompress(chunk))
@@ -254,29 +273,27 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                 if not mt:
                     break
                 s = mt.start()
-                got = inflate_stream(m, s, size, max_inflate)
+                # Bounded by the scan window (the archive without --limit): a stream that runs past it is left out,
+                # so readable + zero + unread add up to the span, as in story_index (#712).
+                got = inflate_stream(m, s, end, max_inflate)
                 if got is None:
                     pos = s + 1
                     continue
                 head, kept, total, used = got
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
-                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= total:
+                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
                     body = kept[HEAD:HEAD + row["node_count"] * 64]
                     row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES if body.count(bytes([b]))}
                     row["fill"]["total"] = len(body)
                 rows.append(row)
                 last = pos = s + used
-            tailgap = m[last:end]
-            if tailgap.count(0) == len(tailgap):
-                zero += len(tailgap)
-            else:
-                unread += len(tailgap)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
         finally:
             m.close()
     return rows, [summarize(rows, path, span, zero, unread, time.time() - t0)]
@@ -300,7 +317,10 @@ def summarize(rows, source, span, zero, unread, elapsed):
 
 
 def scan_dir(path, max_inflate=1 << 28):
-    rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
+    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
+    # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
+    root = glob.escape(os.fspath(path))
+    rpfs = sorted(glob.glob(os.path.join(root, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
@@ -310,9 +330,9 @@ def scan_dir(path, max_inflate=1 << 28):
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
             rows += r
-            summaries.append(s)
+            summaries.extend(s)
         return rows, summaries
-    for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
+    for p in sorted(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
         with open(p, "rb") as f:
             head = f.read(HEAD)
@@ -323,7 +343,8 @@ def scan_dir(path, max_inflate=1 << 28):
                 tail = head
         row = classify(head, size, tail)
         row.update(source=p, offset=0, stored=size, size=size)
-        if row["kind"] in ("bvh4", "bvh4-chunk"):
+        # A chunk exposes the header but has only a prefix of the declared node buffer.
+        if row["kind"] == "bvh4":
             with open(p, "rb") as f:
                 body = f.read(HEAD + row["node_count"] * 64)[HEAD:]
             row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES}
@@ -335,11 +356,39 @@ def scan_dir(path, max_inflate=1 << 28):
     return rows, [summary]
 
 
+def _make_parent(path):
+    """Create the folder a report lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _publish(dest, write, newline):
+    """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
+    serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,
+                                         prefix=".bvh_index-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            write(f)
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
-        with open(out, "w", encoding="utf-8") as f:
-            json.dump({"summary": payload, "streams": rows}, f, indent=0)
+        _publish(out, lambda f: json.dump({"summary": payload, "streams": rows}, f, indent=0), "\n")
     if csv_path:
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
@@ -348,8 +397,9 @@ def write_outputs(rows, summaries, out, csv_path):
                 "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+
+        def write_csv(f):
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)
@@ -357,6 +407,8 @@ def write_outputs(rows, summaries, out, csv_path):
                     if k in r:
                         r[k] = " ".join(str(v) for v in r[k])
                 w.writerow(r)
+
+        _publish(csv_path, write_csv, "")
 
 
 def byte_count(text):
@@ -381,6 +433,42 @@ def offset(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
+def same_output_path(first, second):
+    if _path_key(first) == _path_key(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -391,6 +479,29 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if a.out and a.csv and same_output_path(a.out, a.csv):
+        ap.error("--out and --csv must use different paths")
+    if a.out and same_output_path(a.target, a.out):
+        ap.error("--out must not overwrite the source")
+    if a.csv and same_output_path(a.target, a.csv):
+        ap.error("--csv must not overwrite the source")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        if path and os.path.isdir(path):
+            ap.error(f"{flag} is a folder, not a report file: {path}")
+    if os.path.isdir(a.target):
+        manifest = os.path.join(a.target, "index.json")
+        for flag, path in (("--out", a.out), ("--csv", a.csv)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_output_path(path, manifest):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for root, _dirs, names in os.walk(a.target):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
@@ -411,4 +522,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

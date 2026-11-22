@@ -6,7 +6,7 @@ The code ends with s_endpgm (0xBF810000). If the header guess doesn't hold for a
 scanning back from the first s_endpgm to the start that decodes with no invalid instructions.
 
 Usage:
-    python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N]
+    python -I shader_disasm.py <fssm dir or file> [--unpack-index FILE] [--out DIR] [--mcpu gfx1013] [--limit N] [--skip-existing]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
@@ -16,10 +16,12 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -74,6 +76,8 @@ def disasm(code: bytes, mcpu: str):
     except OSError as e:
         return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
+    if p.returncode != 0:
+        return "", bad, p.stderr.strip() or f"llvm-mc exited with code {p.returncode}"
     return p.stdout, bad, p.stderr
 
 
@@ -92,11 +96,15 @@ def code_range(b: bytes):
         if last >= 0:
             return start, last + 4, "header"
     end = b.find(ENDPGM)
+    # Fallback instructions are dword-aligned in the blob. A matching byte sequence can straddle metadata words.
+    while end >= 0 and end % 4:
+        end = b.find(ENDPGM, end + 1)
     return None, end + 4 if end >= 0 else None, "scan"
 
 
 def one(path, out, mcpu):
-    b = open(path, "rb").read()
+    with open(path, "rb") as f:
+        b = f.read()
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
@@ -116,43 +124,108 @@ def one(path, out, mcpu):
         FAILED.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
-    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8") as f:
-        f.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
-        f.write(asm)
-        if err.strip():
-            f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+    # Only a published listing can be reused after an interruption.
+    listing = tempfile.NamedTemporaryFile(mode="w", dir=out, prefix=".disasm-", suffix=".tmp",
+                                          encoding="utf-8", newline="\n", delete=False)
+    try:
+        with listing:
+            listing.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
+            listing.write(asm)
+            if err.strip():
+                listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+        os.replace(listing.name, os.path.join(out, name + ".s"))
+    finally:
+        if os.path.exists(listing.name):
+            os.unlink(listing.name)
     return "clean" if bad == 0 else "invalid words"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
+    ap.add_argument("--unpack-index", help="disassemble only the FSSMs listed in this unpack index")
     ap.add_argument("--out")
+    ap.add_argument("--skip-existing", action="store_true", help="reuse complete listings from a matching run")
     ap.add_argument("--mcpu", default="gfx1013")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
-    if not os.path.isfile(a.src) and not os.path.isdir(a.src):
+    if os.path.isfile(a.src):
+        if a.unpack_index:
+            ap.error("--unpack-index requires an FSSM directory")
+        files = [a.src]
+    elif os.path.isdir(a.src):
+        try:
+            if a.unpack_index:
+                names = shader_stems(a.unpack_index, "name")
+                files = sorted(os.path.join(a.src, name + ".fssm") for name in names)
+                for path in files:
+                    if not os.path.isfile(path):
+                        raise ValueError(f"{a.unpack_index}: declared FSSM file is missing: {path}")
+            else:
+                with os.scandir(a.src) as entries:
+                    files = sorted(entry.path for entry in entries
+                                   if entry.name.endswith(".fssm") and entry.is_file())
+        except (OSError, ValueError) as e:
+            fail(f"cannot list shaders in {a.src}: {e}")
+    else:
         fail(f"{a.src} is not a file or folder")
-    files = [a.src] if os.path.isfile(a.src) else sorted(
-        os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
     if not files:
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
-    os.makedirs(out, exist_ok=True)
-    probe(a.mcpu)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot create the output folder {out}: {e.strerror or e}")
     from collections import Counter
-    with ThreadPoolExecutor(a.jobs) as ex:
-        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
-    print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
+    res = Counter()
+    total = len(files)
+    every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
+    if a.skip_existing:
+        pending = []
+        for path in files:
+            listing = os.path.join(out, os.path.splitext(os.path.basename(path))[0] + ".s")
+            if not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0:
+                res["reused"] += 1
+            else:
+                pending.append(path)
+        files = pending
+    if files:
+        probe(a.mcpu)
+        with ThreadPoolExecutor(a.jobs) as ex:
+            res.update(ex.map(lambda p: one(p, out, a.mcpu), files))
+    print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]
-        print(f"ERROR: {len(FAILED)} shader(s) produced no disassembly, first {os.path.basename(path)}: {reason}",
-              file=sys.stderr)
-        return 1
+        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
+    if not (res["clean"] or res["invalid words"] or res["reused"]):
+        fail(f"no disassembly produced for {a.src}")
+    if os.path.isdir(a.src) and not a.limit:
+        # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
+        # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
+        # is a partial run on purpose and leaves the rest of the folder alone.
+        # Every input's stem, not just this run's `files`: --skip-existing leaves the reused listings out of `files`,
+        # and pruning against that list deleted every listing a resumed run had just reused.
+        stems = every_stem
+        stale = []
+        try:
+            with os.scandir(out) as entries:
+                stale = sorted(e.path for e in entries
+                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+            for path in stale:
+                os.remove(path)
+        except OSError as e:
+            fail(f"cannot prune stale .s files in {out}: {e.strerror or e}")
+        if stale:
+            print(f"removed {len(stale)} stale .s file(s) that no .fssm in {a.src} names")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

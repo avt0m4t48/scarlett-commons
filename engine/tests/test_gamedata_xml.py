@@ -139,6 +139,23 @@ class GamedataXmlTest(unittest.TestCase):
         for value in ("fixture.bk2", "synthetic note", "synthetic_set", "0 1", "fixture.xml"):
             self.assertNotIn(value, blob)
 
+    def test_counts_tail_references_across_parser_buffer_boundary(self):
+        start = b"<root><child>"
+        close = b"</child>"
+        tail = b"$(common)/x</root>"
+        short = self.write("short.xml", start + b"x" + close + tail)
+        padding = b"x" * (16384 - len(start) - len(close))
+        long = self.write("long.xml", start + padding + close + tail)
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(short, long, "--check", "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        rows = {row["source"]: row for row in data["rows"]}
+        self.assertEqual(rows["short.xml"]["refs"], {"$(common)": 1})
+        self.assertEqual(rows["long.xml"]["refs"], {"$(common)": 1})
+
     def test_check_reports_tail_only_fragment_and_malformed(self):
         tail = self.write("tail.xml", TAIL)
         p = self.run_tool(tail, "--check")
@@ -158,6 +175,77 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
+
+        # An end-truncated file that starts at <COther> and cuts off right after a closed child </x>
+        # must keep root "COther" and report malformed (not tail_only under bogus root "x").
+        cut = self.write("cut.xml", b"<COther><x>1</x>")
+        out = os.path.join(self.root, "cut.json")
+        p = self.run_tool(cut, "--check", "--json", out)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual(row["root"], "COther")
+        self.assertFalse(row["tail_only"])
+        self.assertFalse(row["truncated"])
+        self.assertTrue(row["malformed"])
+
+    def test_check_crossed_tags(self):
+        cases = (
+            (b"<R><x></R></x>", "R"),
+            (b'<?xml version="1.0"?><R><x></R></x>', "R"),
+            (b'<n:R xmlns:n="urn:test"><!-- </n:R> --><x><![CDATA[</x>]]></n:R></x>', "n:R"),
+        )
+        for payload, root in cases:
+            with self.subTest(payload=payload):
+                doc = self.write("crossed.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("malformed " + root + " @", p.stdout)
+                self.assertIn("0 truncated at the start", p.stdout)
+
+    def test_check_crossed_text_in_missing_comment_or_cdata_prefix(self):
+        for opener, suffix in ((b"<!-- ", b" -->"), (b"<![CDATA[", b"]]>")):
+            payload = b"<A><B></A></B>" + suffix + b"</R>"
+            with self.subTest(opener=opener):
+                # Establish that these are tails of a well-formed document.
+                import xml.etree.ElementTree as ET
+                ET.fromstring(b"<R>" + opener + payload)
+                doc = self.write("lexical_tail.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("1 truncated at the start", p.stdout)
+                self.assertIn("truncated R @", p.stdout)
+                # A stray terminator must not hide malformed text after it.
+                broken = self.write("lexical_broken.xml", payload[:-4] + b"<C><D></C></D></R>")
+                p = self.run_tool(broken, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
+    def test_check_reports_unknown_encoding_as_malformed(self):
+        unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
+        valid = self.write("valid.xml", b"<root/>")
+        p = self.run_tool(unknown, valid, "--check")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("1 well-formed", p.stdout)
+        self.assertIn("1 malformed", p.stdout)
+        self.assertIn("not-a-charset", p.stdout)
+
+    def test_comments_in_a_document_that_does_not_parse_are_counted(self):
+        # A truncated or tail-only document stops the parser at the error; its comments still count, and
+        # comment-like text in CDATA (closed or cut off) still doesn't.
+        cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
+                 "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+        for name, (body, want) in cases.items():
+            with self.subTest(name=name):
+                doc = self.write(name, body)
+                out = os.path.join(self.root, name + ".json")
+                p = self.run_tool(doc, "--json", out)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    row = json.load(f)["rows"][0]
+                self.assertFalse(row["well_formed"])
+                self.assertEqual(row["comments"], want)
 
     def test_comments_inside_cdata_are_not_counted(self):
         doc = self.write("comments.xml", b"<!-- real --><Root><![CDATA[<!-- text -->]]></Root><!-- real -->")
@@ -216,6 +304,45 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertTrue(tail["tail_only"])
         self.assertTrue(tail["truncated"])
         self.assertFalse(tail["malformed"])
+
+    def test_carve_catalog_marks_parsed_headerless_documents_complete(self) -> None:
+        carve = os.path.join(self.root, "headerless")
+        os.makedirs(carve)
+        rows = []
+        for off, data in ((0x1000, b"<Plain><Child/></Plain>"), (0x2000, b"<Empty/>")):
+            with open(os.path.join(carve, f"{off:012x}.bin"), "wb") as f:
+                f.write(data)
+            rows.append({"off": off, "stored": len(data), "size": len(data),
+                         "head": data[:16].hex(), "pre": ""})
+        with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": rows}, f)
+
+        out = os.path.join(self.root, "headerless.json")
+        result = self.run_tool(carve, "--json", out, "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual([row["root"] for row in report["rows"]], ["Plain", "Empty"])
+        for row in report["rows"]:
+            with self.subTest(root=row["root"]):
+                self.assertTrue(row["well_formed"])
+                self.assertTrue(row["complete"])
+                self.assertFalse(row["header"])
+                self.assertFalse(row["tail_only"])
+                self.assertFalse(row["fragment"])
+        self.assertEqual(report["summary"]["tail_only"], 0)
+        self.assertEqual(report["summary"]["fragments"], 0)
+
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        doc = self.write("alpha.xml", ALPHA)
+        blocker = self.write("blocker", b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(doc, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

@@ -5,8 +5,9 @@ zlib stream that inflates cleanly to its end, then classify the inflated bytes. 
 game data, and does not decode animation.
 
 Signatures are only the byte patterns measured in docs/animation.md. Anything else is reported as `raw:<hex>`
-instead of being guessed. A `0DRP` page is reported with its version and page count; `MoVE` with its version and
-size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
+instead of being guessed. A `0DRP` page is reported with its version and page count; the tagged auxiliary table that starts a
+`0DRP` second system page (historical label `clip-stream`) with its entry count, tags and payload end, and only
+when its directory and payloads fit in the stream; `MoVE` with its version and size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
 
 Usage:
     python -I anim_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
@@ -26,7 +27,13 @@ import os
 import re
 import struct
 import sys
+import unicodedata
 import zlib
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -64,8 +71,34 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
+
+
+AUX_FIRST_TAG = 0x101
+AUX_COUNTS = (2, 3)
+
+
+def aux_table(data):
+    """The tagged auxiliary table at the start of a `0DRP` resource's second system page (docs/animation.md):
+    a u32 count (2 or 3), then `count` pairs {u32 tag, u32 payloadBytes}, then the payloads in order; the first
+    tag is 0x101. Bytes after the payloads are legitimate (schema tables follow them). Returns
+    ([(tag, size), ...], payload_end) when the directory and every payload fit in `data`, else None, so a
+    matching prefix on truncated or unrelated bytes keeps its generic classification. Needs the whole
+    inflated stream, not a head slice."""
+    count = _u32(data, 0)
+    if count not in AUX_COUNTS:
+        return None
+    directory_end = 4 + 8 * count
+    if len(data) < directory_end:
+        return None
+    entries = [struct.unpack_from("<II", data, 4 + 8 * i) for i in range(count)]
+    if entries[0][0] != AUX_FIRST_TAG:
+        return None
+    payload_end = directory_end + sum(size for _, size in entries)
+    if payload_end > len(data):
+        return None
+    return entries, payload_end
 
 
 def classify(data, offset, stored):
@@ -98,8 +131,13 @@ def classify(data, offset, stored):
           and 0 < (_u32(data, 8) or 0) <= 4096):
         record.update(signature="typehash", version=8, count=_u32(data, 8),
                       detail=f"type=0x{_u32(data, 0):08x}")
-    elif len(data) >= 8 and _u32(data, 0) in (2, 3) and data[4:8] == b"\x01\x01\x00\x00":
-        record.update(signature="clip-stream", version=_u32(data, 0), detail="24-byte header")
+    elif (table := aux_table(data)) is not None:
+        # Historical label kept so existing consumers group these pages as before; the count is the measured
+        # entry count, not a version.
+        entries, payload_end = table
+        record.update(signature="clip-stream", count=len(entries),
+                      detail=f"aux-table tags={','.join(f'0x{tag:x}' for tag, _ in entries)} "
+                             f"payload_end={payload_end}")
     elif data[:3] == b"KB2" and len(data) >= 0x20:
         record.update(signature="bink2", version=chr(data[3]), count=_u32(data, 8))
         record["detail"] = f"{_u32(data, 0x14)}x{_u32(data, 0x18)}"
@@ -204,10 +242,18 @@ def parse_rbf0(data, offset=0):
                                    "source_offset": source_at, "rig_offset": rig_at})
     for row in rows:
         row["distinct_rigs"] = len({e["rig"] for e in row["entries"]})
-    stored = set(struct.unpack_from("<I", data, i)[0] for i in range(0, len(data) - 3))
     rig_names = {e["rig"] for row in rows for e in row["entries"]}
     names = {row["key"] for row in rows} | rig_names
-    stored_hashes = sum(1 for n in names if struct.pack("<I", joaat32(n)) in stored)
+    # Little-endian u32 at every byte offset (all four alignments), checked against the wanted hashes only.
+    wanted = {joaat32(n) for n in names}
+    found = set()
+    view = memoryview(data)
+    for a in range(4):
+        if found == wanted:
+            break
+        whole = a + (len(data) - a) // 4 * 4
+        found.update(h for (h,) in struct.iter_unpack("<I", view[a:whole]) if h in wanted)
+    stored_hashes = sum(1 for n in names if joaat32(n) in found)
     entries = [e for row in rows for e in row["entries"]]
     by_source = {}
     for source in RBF0_SOURCES:
@@ -241,20 +287,26 @@ def _inflate_row(archive, row):
         return zlib.decompress(f.read(row["stored"]))
 
 
+MAX_CHUNK = 65536   # a resource is split into 64 KiB streams; only a full one is followed by a continuation
+
+
 def collect_rbf0(archive, rows):
-    """Join the RBF0 stream with its 64 KiB continuation blocks. Stops at a known signature or a gap."""
+    """Join the RBF0 stream with its 64 KiB continuation blocks. Stops at a known signature, a gap, or after
+    a stream shorter than 64 KiB: that one ends the resource, so the next stream belongs to something else."""
     start = next((i for i, r in enumerate(rows) if r["signature"] == "rbf0"), None)
     if start is None:
         return None
     blob = bytearray(_inflate_row(archive, rows[start]))
     previous_end = rows[start]["offset"] + rows[start]["stored"]
+    previous_size = rows[start]["size"]
     for row in rows[start + 1:]:
-        if len(blob) >= 8 * 1024 * 1024 or row["offset"] > previous_end + 16:
+        if len(blob) >= 8 * 1024 * 1024 or row["offset"] > previous_end + 16 or previous_size != MAX_CHUNK:
             break
-        if row["signature"] in STOP_SIGNATURES or row["size"] > 65536:
+        if row["signature"] in STOP_SIGNATURES or row["size"] > MAX_CHUNK:
             break
         blob += _inflate_row(archive, row)
         previous_end = row["offset"] + row["stored"]
+        previous_size = row["size"]
     return bytes(blob)
 
 
@@ -277,7 +329,7 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -293,9 +345,9 @@ def collect_skeletons_dir(path):
 def collect_rbf0_dir(path):
     """The same continuation rule for a carved directory sorted by offset."""
     entries = []
-    for name in os.listdir(path):
+    for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
@@ -307,17 +359,18 @@ def collect_rbf0_dir(path):
         return None
     blob = bytearray(entries[first][2])
     previous_end = entries[first][0] + len(entries[first][2])
+    previous_size = len(entries[first][2])
     for offset, _, data in entries[first + 1:]:
+        if previous_size != MAX_CHUNK:
+            break
         sign = classify(data, offset, len(data))["signature"]
-        if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > 65536:
+        if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > MAX_CHUNK:
             break
         blob += data
         previous_end = offset + len(data)
+        previous_size = len(data)
     return bytes(blob)
 
-
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
 
 
 def scan_rpf(path, start=None, limit=None, progress=None):
@@ -325,8 +378,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     rows = []
     if os.path.getsize(path) == 0:
         raise ValueError("empty file")
-    with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         size = len(m)
         first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
         pos = start if start is not None else first
@@ -343,10 +395,10 @@ def scan_rpf(path, start=None, limit=None, progress=None):
             if m[s:s + 3] == b"KB2":
                 blen = (_u32(m, s + 4) or 0) + 8
                 w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 head = m[s:s + min(blen, 0x20)]
@@ -358,8 +410,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = m[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = m[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
@@ -372,17 +424,16 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
-        m.close()
     summary = summarise(rows, end - span_start, zero, unread)
     summary["mode"] = "rpf9"
     summary["archive"] = path
@@ -394,7 +445,8 @@ def scan_dir(path, progress=None):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -436,11 +488,11 @@ def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension. CSV writes one summary line to stderr."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(COLUMNS)
         for r in rows:
             w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
@@ -469,6 +521,42 @@ def byte_count(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
+def same_report_path(first, second):
+    if _path_key(first) == _path_key(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -478,8 +566,45 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_report_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.rigs:
+        if same_report_path(a.source, a.rigs):
+            ap.error("--rigs must not overwrite the source")
+        if same_report_path(a.out, a.rigs):
+            ap.error("index and --rigs must use different paths")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    if a.rigs and os.path.isdir(a.rigs):
+        ap.error(f"{a.rigs} is a folder, not a JSON file")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_report_path(manifest, path):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for name in os.listdir(a.source):
+                    inp = os.path.join(a.source, name)
+                    if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                        if same_report_path(inp, path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
+    if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
+        ap.error("output must end in .json or .csv")
+    if a.rigs and os.path.splitext(a.rigs)[1].lower() != ".json":
+        ap.error("--rigs must end in .json")
+    for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+        if not path:
+            continue
+        folder = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(folder):
+            sys.exit(f"{path}: cannot write: folder does not exist: {folder}")
     try:
         if os.path.isdir(a.source):
+            if a.start is not None or a.limit is not None:
+                print("--start and --limit are only supported for archive files", file=sys.stderr)
+                return 2
             rows, summary = scan_dir(a.source)
         else:
             def progress(n, pos, end):
@@ -510,8 +635,11 @@ def main():
             # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
             print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
             return 2
-        with open(a.rigs, "w", encoding="utf-8") as f:
-            json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        try:
+            with open(a.rigs, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        except OSError as e:
+            sys.exit(f"{a.rigs}: cannot write: {e.strerror or e}")
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
@@ -523,4 +651,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

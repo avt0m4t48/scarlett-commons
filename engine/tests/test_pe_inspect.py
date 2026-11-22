@@ -149,6 +149,33 @@ def build_image(is64: bool = True, with_directories: bool = True) -> bytes:
     return bytes(buf)
 
 
+EXPORT_FUNCS = 0x1F00  # AddressOfFunctions for the rebuilt export tables below: last in the section, so a cut can reach it
+FORWARDER = 0x1790     # inside the export directory once its size is widened: a forwarder string lives here
+
+
+def with_exports(slots: list[int], names: dict[int, str], base: int = 10, is64: bool = True) -> bytes:
+    """build_image() with its export directory replaced: `slots` is AddressOfFunctions, `names` maps an index into
+    it to the export name that points at it."""
+    buf = bytearray(build_image(is64=is64))
+    img = pe_inspect.PeImage(bytes(buf))
+    dir_entry = (0x58 + (112 if is64 else 96)) + pe_inspect.DIR_EXPORT * 8
+    struct.pack_into("<II", buf, dir_entry, 0x1700, 0x100)
+    ordered = sorted(names.items(), key=lambda kv: kv[1])
+    place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, base, len(slots), len(ordered),
+                                   EXPORT_FUNCS, 0x1C00, 0x1C80))
+    place(buf, 0x1780, b"sample.dll\0")
+    place(buf, FORWARDER, b"other.Target\0")
+    place(buf, EXPORT_FUNCS, struct.pack(f"<{len(slots)}I", *slots))
+    text = 0x1D00
+    for n, (index, name) in enumerate(ordered):
+        place(buf, 0x1C00 + 4 * n, struct.pack("<I", text))
+        place(buf, 0x1C80 + 2 * n, struct.pack("<H", index))
+        place(buf, text, name.encode() + b"\0")
+        text += len(name) + 1
+    assert img.offset(EXPORT_FUNCS) is not None
+    return bytes(buf)
+
+
 class PeInspectTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -208,6 +235,49 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["export_count"], 3)
             self.assertEqual(set(report["exports"]), {"ExportedA", "ExportedB", "#6"})
 
+    def exports_of(self, data: bytes) -> list[str]:
+        return pe_inspect._exports(pe_inspect.PeImage(data))
+
+    def test_unused_ordinal_slot_is_not_an_export(self):
+        for is64 in (True, False):
+            data = with_exports([0x1000, 0, 0x1010], {0: "Alpha"}, is64=is64)
+            self.assertEqual(self.exports_of(data), ["Alpha", "#12"])
+            path = os.path.join(self.dir, "gap.dll")
+            with open(path, "wb") as f:
+                f.write(data)
+            report = pe_inspect.inspect(path, None)
+            self.assertEqual(report["exports"], ["Alpha", "#12"])
+            self.assertEqual(report["export_count"], 2)
+
+    def test_named_exports_require_a_populated_address_table_slot(self) -> None:
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                data = bytearray(with_exports([0x1000, 0, FORWARDER, 0x1010],
+                                              {0: "Alpha", 1: "Empty", 2: "Forwarded", 4: "Outside"},
+                                              is64=is64))
+                # The bytes after AddressOfFunctions are not part of its declared four slots.
+                place(data, EXPORT_FUNCS + 16, struct.pack("<I", 0x1020))
+                self.assertEqual(self.exports_of(bytes(data)), ["Alpha", "Forwarded", "#13"])
+
+    def test_unused_slots_in_a_table_without_names(self):
+        data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
+        self.assertEqual(self.exports_of(data), ["#11", "#13"])
+
+    def test_unnamed_forwarder_is_still_an_export(self):
+        data = with_exports([0x1000, FORWARDER, 0], {0: "Alpha"})
+        self.assertEqual(self.exports_of(data), ["Alpha", "#11"])
+
+    def test_function_table_cut_by_end_of_file_lists_the_readable_slots(self):
+        data = with_exports([0x1000, 0, 0x1010, 0x1020], {})
+        at = pe_inspect.PeImage(data).offset(EXPORT_FUNCS)
+        for keep, expected in ((8, ["#10"]), (10, ["#10"]), (12, ["#10", "#12"]), (0, [])):
+            with self.subTest(bytes_kept=keep):
+                self.assertEqual(self.exports_of(data[:at + keep]), expected)
+
+    def test_table_without_gaps_is_listed_as_before(self):
+        data = with_exports([0x1000, 0x1008, 0x1010, 0x1018], {1: "Beta", 3: "Delta"}, base=1)
+        self.assertEqual(self.exports_of(data), ["Beta", "Delta", "#1", "#3"])
+
     def test_pdata_and_tls_counts(self):
         for report in (self.report, self.report32):
             self.assertEqual(report["pdata_functions"], 3)
@@ -245,6 +315,33 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("## Needs checking or a shim", md)
         self.assertIn("`XMemAlloc`", md)
 
+    def test_runtime_load_candidates(self):
+        """DLL names held as strings but not imported: what a run-time LoadLibrary* reaches
+        (docs/runtime_imports.md)."""
+        base = {d["name"] for d in self.report["runtime_load_candidates"]}
+        self.assertEqual(base, {"d3d12_xs.dll"}, "the 64-bit fixture names d3d12_xs.dll without importing it")
+        buf = bytearray(build_image())
+        place(buf, 0x1E00, "XGameRuntime.dll".encode("utf-16-le") + b"\0\0")
+        place(buf, 0x1E40, b"gameplatformservices.dll\0xmem.dll\0")
+        path = os.path.join(self.dir, "loads.dll")
+        with open(path, "wb") as f:
+            f.write(buf)
+        r = pe_inspect.inspect(path, self.dir)
+        found = {d["name"]: d for d in r["runtime_load_candidates"]}
+        self.assertEqual(set(found) - base, {"gameplatformservices.dll", "xgameruntime.dll"}, "xmem.dll is imported")
+        self.assertEqual(found["xgameruntime.dll"]["encoding"], "utf-16")
+        self.assertEqual(found["gameplatformservices.dll"]["encoding"], "ascii")
+        self.assertIn(found["xgameruntime.dll"]["where"], ("system", "shim"))
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("## Run-time load candidates", md)
+        self.assertIn("| xgameruntime.dll | utf-16 |", md)
+
+    def test_dll_strings_encodings_own_name_and_near_misses(self):
+        data = (b"a.dll\0" + "b.dll".encode("utf-16-le") + b"\0\0" + "a.dll".encode("utf-16-le") +
+                b" self.DLL x.dllz .dll y.dll")
+        got = pe_inspect.dll_strings(data, {"y.dll"}, "Self.dll")
+        self.assertEqual(got, [{"name": "a.dll", "encoding": "both"}, {"name": "b.dll", "encoding": "utf-16"}])
+
     def test_non_pe_input_is_rejected(self):
         bad = os.path.join(self.dir, "not_pe.bin")
         with open(bad, "wb") as f:
@@ -262,6 +359,17 @@ class PeInspectTest(unittest.TestCase):
         self.assertEqual(r["tls_callbacks"], 0)
         self.assertEqual(r["pdata_functions"], 0)
         self.assertFalse(r["has_relocs"])
+
+    def test_cli_reports_an_unusable_output_directory(self):
+        out = os.path.join(self.dir, "report-file")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("keep me")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(pe_inspect.main([self.image, "--out", out]), 1)
+        self.assertIn(f"cannot create output directory {out}", stderr.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
 
     def test_cli_writes_json_and_markdown(self):
         out = os.path.join(self.dir, "reports")
@@ -370,6 +478,166 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(pe_inspect.main([bad, "--out", os.path.join(self.dir, "reports2")]), 1)
         self.assertIn("not a PE image", err.getvalue())
 
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.dir, "test.exe")
+        self.assertTrue(pe_inspect.same_output_path(a, a))
+        b = os.path.join(self.dir, "other.exe")
+        self.assertFalse(pe_inspect.same_output_path(a, b))
+
+    def test_cli_refuses_to_overwrite_input_file_with_report(self):
+        out = os.path.join(self.dir, "reports_collision")
+        os.makedirs(out, exist_ok=True)
+        colliding_file = os.path.join(out, "sample.dll.json")
+        with open(colliding_file, "w", encoding="utf-8") as f:
+            f.write("original preserved text")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([self.image, colliding_file, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", err.getvalue())
+        with open(colliding_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "original preserved text")
+
+    def test_cli_refuses_existing_file_as_out_dir(self):
+        file_out = os.path.join(self.dir, "some_file.txt")
+        with open(file_out, "w", encoding="utf-8") as f:
+            f.write("file not dir")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.image, "--out", file_out]), 1)
+        self.assertIn("path is a file, not a directory", err.getvalue())
+
+
+OPT = 0x58   # where build_image puts the optional header
+
+
+class DirectoryCountTest(unittest.TestCase):
+    """NumberOfRvaAndSizes counts the data directories; a slot past it is not one, whatever it holds."""
+
+    def report(self, count, is64=True):
+        image = bytearray(build_image(is64=is64))
+        struct.pack_into("<I", image, OPT + (108 if is64 else 92), count)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "counted.dll")
+            with open(path, "wb") as f:
+                f.write(image)
+            return pe_inspect.inspect(path, tmp)
+
+    def test_slots_past_the_count_are_not_directories(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                # export (0) and import (1) stay; exception (3), relocations (5), TLS (9) and delay import (13)
+                # are stale bytes now
+                r = self.report(2, is64)
+                self.assertEqual(r["export_count"], 3)
+                self.assertEqual([e["kind"] for e in r["imports"]], ["normal", "normal"])
+                self.assertEqual((r["pdata_functions"], r["tls_callbacks"], r["has_relocs"]), (0, 0, False))
+
+    def test_the_count_cuts_between_two_used_slots(self):
+        r = self.report(pe_inspect.DIR_BASERELOC)          # slots 0-4: the relocation directory is the first one out
+        self.assertEqual((r["pdata_functions"], r["has_relocs"]), (3, False))
+        r = self.report(pe_inspect.DIR_BASERELOC + 1)
+        self.assertEqual((r["pdata_functions"], r["has_relocs"], r["tls_callbacks"]), (3, True, 0))
+
+    def test_a_count_above_16_reads_the_16_there_are(self):
+        full, more = self.report(16), self.report(0x1000)
+        self.assertEqual(full, more)
+        self.assertEqual((full["pdata_functions"], full["tls_callbacks"], full["has_relocs"]), (3, 2, True))
+
+    def test_no_directories(self):
+        r = self.report(0)
+        self.assertEqual((r["imports"], r["exports"], r["has_relocs"]), ([], [], False))
+
+
+class ImportDescriptorBoundsTest(unittest.TestCase):
+    DIRECTORIES = (
+        ("normal", pe_inspect.DIR_IMPORT, 20, ["kernel32.dll", "xmem.dll"]),
+        ("delay", pe_inspect.DIR_DELAY_IMPORT, 32, ["xmem.dll", "d3d12_xs.dll"]),
+    )
+
+    def test_import_descriptors_fit_the_declared_directory(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for size, count in ((step - 1, 0), (2 * step - 1, 1), (2 * step, 2)):
+                with self.subTest(kind=kind, size=size):
+                    data = bytearray(build_image(is64=False))
+                    struct.pack_into("<I", data, OPT + 96 + index * 8 + 4, size)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:count])
+
+    def test_import_descriptors_fit_the_file_backed_section(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for extra in (0, 1):
+                with self.subTest(kind=kind, extra=extra):
+                    data = bytearray(build_image(is64=False)) + b"\0"
+                    directory = OPT + 96 + index * 8
+                    source_rva = struct.unpack_from("<I", data, directory)[0]
+                    source = TEXT_RAW + source_rva - TEXT_RVA
+                    rva = TEXT_RVA + TEXT_SIZE - step + extra
+                    place(data, rva, data[source:source + step])
+                    struct.pack_into("<II", data, directory, rva, step)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:1 - extra])
+
+
+class SectionSpanTest(unittest.TestCase):
+    """An RVA belongs to the section whose virtual span holds it, not to an earlier section's raw tail."""
+
+    @staticmethod
+    def two_sections(a_vsize, a_raw):
+        """`.a` at RVA 0x1000 (raw 0x200) and `.b` at RVA 0x2000 (raw 0x200 + a_raw), each with a marker."""
+        b_raw = 0x200 + a_raw
+        image = bytearray(build_image(with_directories=False)[:0x200]) + bytearray(a_raw + 0x200)
+        struct.pack_into("<H", image, 0x46, 2)                                   # NumberOfSections
+        table = OPT + 240
+        struct.pack_into("<IIII", image, table + 8, a_vsize, 0x1000, a_raw, 0x200)
+        image[table + 40:table + 48] = b".b\0\0\0\0\0\0"
+        struct.pack_into("<IIII", image, table + 48, 0x200, 0x2000, 0x200, b_raw)
+        struct.pack_into("<I", image, table + 76, 0x40000040)
+        struct.pack_into("<I", image, OPT + 56, 0x3000)                          # SizeOfImage
+        image[0x200:0x20A] = b"NAME_IN_A\0"
+        image[b_raw:b_raw + 10] = b"NAME_IN_B\0"
+        return pe_inspect.PeImage(bytes(image)), b_raw
+
+    def test_raw_data_longer_than_the_virtual_span_does_not_shadow_the_next_section(self):
+        img, b_raw = self.two_sections(a_vsize=0x1000, a_raw=0x2000)
+        self.assertEqual(img.offset(0x1000), 0x200)
+        self.assertEqual(img.offset(0x1FFF), 0x11FF)
+        self.assertEqual(img.offset(0x2000), b_raw)
+        self.assertEqual((img.string_at(0x1000), img.string_at(0x2000)), ("NAME_IN_A", "NAME_IN_B"))
+
+    def test_virtual_bytes_past_the_raw_data_have_no_file_offset(self):
+        img, _ = self.two_sections(a_vsize=0x1000, a_raw=0x400)
+        self.assertEqual(img.offset(0x13FF), 0x5FF)
+        self.assertIsNone(img.offset(0x1400))
+
+    def test_virtual_size_zero_uses_the_raw_size(self):
+        img, b_raw = self.two_sections(a_vsize=0, a_raw=0x400)
+        self.assertEqual(img.offset(0x13FF), 0x5FF)
+        self.assertIsNone(img.offset(0x1400))
+        self.assertEqual(img.offset(0x2000), b_raw)
+
+
+class LongNameTest(unittest.TestCase):
+    def test_a_long_decorated_import_name_is_read_whole(self):
+        # the section is 0x1000 bytes, so the longest name that fits after the fixtures is used: 1,200 characters
+        name = "?Long@" + "V" * 1190 + "@@QE"
+        self.assertEqual(len(name), 1200)
+        image = bytearray(build_image())
+        place(image, 0x1B00, struct.pack("<H", 0) + name.encode() + b"\0")
+        place(image, 0x1200, struct.pack("<QQ", 0x1B00, 0))                       # the first import's lookup entry
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "long.dll")
+            with open(path, "wb") as f:
+                f.write(image)
+            r = pe_inspect.inspect(path, tmp)
+        self.assertEqual(r["imports"][0]["functions"], [name])
+
+    def test_an_unterminated_name_is_still_bounded(self):
+        data = b"A" * (3 * pe_inspect.NAME_LIMIT)
+        self.assertIsNone(pe_inspect._cstring(data, 0))
+        self.assertEqual(pe_inspect._cstring(b"A" * 4096 + b"\0", 0), "A" * 4096)
+
 
 class TruncatedImageTest(unittest.TestCase):
     """A file cut off inside a header or table is a bad image, not a struct.error that stops the run."""
@@ -433,6 +701,102 @@ class TruncatedImageTest(unittest.TestCase):
         path = self.write("huge_exports.dll", bytes(full))
         exports = pe_inspect.inspect(path, None)["exports"]
         self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
+
+
+class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
+    """Reject optional headers smaller than the fields the parser reads."""
+
+    def test_declared_optional_header_too_small(self):
+        for is64 in (False, True):
+            for declared_size in (0, 2, 71):
+                with self.subTest(is64=is64, declared_size=declared_size):
+                    data = bytearray(build_image(is64=is64))
+                    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                    struct.pack_into("<H", data, pe_offset + 20, declared_size)
+
+                    with self.assertRaisesRegex(
+                        pe_inspect.PeFormatError, "truncated optional header"
+                    ):
+                        pe_inspect.PeImage(bytes(data))
+
+    def test_declared_optional_header_extends_beyond_file(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                data = bytearray(build_image(is64=is64))
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                struct.pack_into("<H", data, pe_offset + 20, 0xFFFF)
+
+                with self.assertRaisesRegex(
+                    pe_inspect.PeFormatError, "truncated optional header"
+                ):
+                    pe_inspect.PeImage(bytes(data))
+
+
+class ShortHeaderTest(unittest.TestCase):
+    """A file too short for a header names the header it stops short of, not a signature that is present."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def dos_header(self, size: int, nt: int | None = None) -> bytes:
+        """`size` bytes starting with MZ, optionally with e_lfanew at 0x3c pointing at `nt`."""
+        data = bytearray(size)
+        data[0:2] = b"MZ"
+        if nt is not None:
+            struct.pack_into("<I", data, 0x3C, nt)
+        return bytes(data)
+
+    def check_rejected(self, name: str, data: bytes, expected: str, not_expected: str = "") -> None:
+        """PeImage raises the message, and the CLI prints it to stderr and exits 1; no traceback on either path."""
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, expected):
+            pe_inspect.PeImage(data)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.write(name, data), "--out", os.path.join(self.dir, "reports")]), 1)
+        self.assertIn(expected, err.getvalue())
+        if not_expected:
+            self.assertNotIn(not_expected, err.getvalue())
+
+    def test_mz_shorter_than_the_msdos_header_reports_the_length(self):
+        # a 4-byte truncated copy: the signature is there, the 64-byte MS-DOS header (e_lfanew lives at 0x3c) is not
+        self.check_rejected("short4.bin", self.dos_header(4),
+                            "file is 4 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_mz_one_byte_short_of_the_msdos_header_reports_the_length(self):
+        self.check_rejected("short63.bin", self.dos_header(63),
+                            "file is 63 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_file_without_the_mz_signature_still_reports_no_mz_header(self):
+        for name, data in (("aaaa.bin", b"AAAA"), ("empty.bin", b""), ("one_byte.bin", b"A"), ("m.bin", b"M")):
+            with self.subTest(name=name):
+                self.check_rejected(name, data, "no MZ header")
+
+    def test_e_lfanew_past_the_end_reports_a_short_file_not_a_missing_signature(self):
+        # 64 bytes: the MS-DOS header fits, the PE header it points at at 0x40 does not
+        self.check_rejected("nt_past.bin", self.dos_header(64, 0x40),
+                            "file is 64 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_pe_header_cut_after_the_signature_reports_a_short_file(self):
+        # PE\0\0 at 0x40 is there, the 20 bytes of file header after it are cut off
+        data = bytearray(self.dos_header(68, 0x40))
+        data[0x40:0x44] = b"PE\0\0"
+        self.check_rejected("coff_cut.bin", bytes(data),
+                            "file is 68 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_a_long_enough_file_with_a_wrong_signature_still_reports_no_pe_signature(self):
+        data = bytearray(self.dos_header(88, 0x40))
+        data[0x40:0x44] = b"XX\0\0"
+        self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
 
 
 if __name__ == "__main__":

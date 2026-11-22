@@ -21,11 +21,12 @@ from collections import Counter
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shader_ir  # noqa: E402
+from shader_meta import SGPR_RMW  # noqa: E402
 
 NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_cbranch",
                "s_waitcnt", "s_barrier", "s_nop", "s_endpgm", "s_sendmsg", "s_sleep",
-               "exp", "buffer_store", "global_store", "flat_store", "scratch_store",
-               "image_store", "ds_write")
+               "exp", "buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store",
+               "s_store", "s_buffer_store", "image_store", "ds_write")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
 
 
@@ -141,7 +142,9 @@ def _fmt_s3_arg(a, is_dst=False):
         if a["r"] == 3 and a.get("n", 1) == 1:
             return "s3"
         return "sN"
-    if k == "vgpr":
+    if k == "slist":
+        return "s3" if 3 in a["r"] else "sN"
+    if k in ("vgpr", "vlist"):
         return "vN"
     if k == "imm":
         v = a["v"]
@@ -156,6 +159,8 @@ def rbw_registers(insns):
     s3_patterns = []
 
     def expand_reg(a):
+        if a["k"] in ("vlist", "slist"):
+            return [r for r in a["r"] if isinstance(r, int)]
         return range(a["r"], a["r"] + a.get("n", 1))
 
     for ins in insns:
@@ -163,14 +168,26 @@ def rbw_registers(insns):
         args = ins["args"]
         if not args:
             continue
-        is_no_dest = op.startswith(NO_DEST_OPS)
-        # Instructions that read their destination too (accumulators / atomics / writelane / swap).
-        dst_also_read = (
-            "fmac" in op or "mac_" in op or op == "v_writelane_b32"
-            or op == "v_swap_b32" or "_atomic_" in op
+        mods = ins.get("mods", ())
+        is_gf_atomic = op.startswith(("global_atomic_", "flat_atomic_"))
+        is_bi_atomic = op.startswith(("buffer_atomic_", "image_atomic_"))
+        is_no_dest = (
+            op.startswith(NO_DEST_OPS)
+            or (is_gf_atomic and "glc" not in mods)
+            or (is_bi_atomic and "glc" not in mods)
         )
-        # v_add_co_u32 / v_sub_co_u32 write both a[0] (VGPR) and a[1] (carry SGPR/vcc).
-        if not is_no_dest and op.startswith("v_") and "_co_" in op and "_ci_" not in op and len(args) >= 2:
+        reads_imm_dst = op in SGPR_RMW
+        # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];
+        # global/flat atomics with glc write vdst at args[0] and read vaddr/vdata/saddr from args[1:]).
+        dst_also_read = (
+            reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
+            or op == "v_swap_b32" or (not is_gf_atomic and "_atomic_" in op)
+        )
+        is_dual_dst = op.startswith("v_") and (
+            "_co_" in op or op.startswith(("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
+        )
+        # Carry-out / scale-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
+        if not is_no_dest and is_dual_dst and len(args) >= 2:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
@@ -182,25 +199,25 @@ def rbw_registers(insns):
 
         reads_s3_rbw = False
         for a in srcs:
-            if a["k"] == "sgpr":
+            if a["k"] in ("sgpr", "slist"):
                 for r in expand_reg(a):
                     if r not in written_s:
                         rbw_s.add(r)
                         if r == 3:
                             reads_s3_rbw = True
-            elif a["k"] == "vgpr":
+            elif a["k"] in ("vgpr", "vlist"):
                 for r in expand_reg(a):
                     if r not in written_v:
                         rbw_v.add(r)
         if reads_s3_rbw:
-            dst_ids = {id(x) for x in dsts}
+            dst_ids = set() if reads_imm_dst else {id(x) for x in dsts}
             fmt_args = ", ".join(_fmt_s3_arg(x, is_dst=(id(x) in dst_ids)) for x in args)
             s3_patterns.append(f"{op} {fmt_args}".strip())
 
         for a in dsts:
-            if a["k"] == "sgpr":
+            if a["k"] in ("sgpr", "slist"):
                 written_s.update(expand_reg(a))
-            elif a["k"] == "vgpr":
+            elif a["k"] in ("vgpr", "vlist"):
                 written_v.update(expand_reg(a))
 
     return sorted(rbw_s), sorted(rbw_v), s3_patterns
@@ -215,12 +232,15 @@ def detect_wave64(insns):
 
 
 def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None):
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
     parent = os.path.dirname(os.path.realpath(disasm_dir))
     fssm_dir = fssm_dir or os.path.join(parent, "fssm")
     dxbc_dir = dxbc_dir or parent
     stage_map = load_stage_map(disasm_dir)
 
-    files = sorted(f for f in os.listdir(disasm_dir) if f.endswith(".s"))
+    with os.scandir(disasm_dir) as it:
+        files = sorted(e.name for e in it if e.name.endswith(".s") and e.is_file())
     if limit is not None:
         files = files[:limit]
 
@@ -347,16 +367,39 @@ def main(argv=None):
     ap.add_argument("--json", dest="json_out", default=None, help="optional path to write full JSON report")
     ap.add_argument("--limit", type=int, default=None, help="stop after N .s files")
     a = ap.parse_args(argv)
+    if a.limit is not None and a.limit < 0:
+        ap.exit(2, f"{ap.prog}: error: --limit must be non-negative\n")
+    # A bad path is one ERROR line, not a traceback out of os.listdir: the audit of a whole corpus can
+    # run for minutes, and an explicit --fssm/--dxbc that does not exist would otherwise be counted as
+    # "(missing fssm)" and print a report that looks right.
+    for label, path in (("", a.disasm_dir), ("--fssm: ", a.fssm), ("--dxbc: ", a.dxbc)):
+        if path is None:
+            continue
+        if not os.path.exists(path):
+            print(f"ERROR: {label}{path}: no such folder", file=sys.stderr)
+            return 2
+        if not os.path.isdir(path):
+            print(f"ERROR: {label}{path}: not a folder", file=sys.stderr)
+            return 2
 
     rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit)
     print_report(rep)
     if a.json_out:
-        with open(a.json_out, "w", encoding="utf-8") as f:
-            json.dump(rep, f, indent=2)
-            f.write("\n")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json_out)), exist_ok=True)
+            with open(a.json_out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(rep, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: {a.json_out}: cannot write: {e.strerror or e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.json_out}")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

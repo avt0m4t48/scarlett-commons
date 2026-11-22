@@ -134,5 +134,57 @@ class ShaderMetaTests(unittest.TestCase):
         self.assertIn("geometryShader", mg["features"])
 
 
+class MalformedIndexTest(unittest.TestCase):
+    def run_tool(self, contents):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                f.write(contents)
+            tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+            return subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+
+    def test_bad_index_json_is_one_error_not_a_traceback(self):
+        p = self.run_tool("not json")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("cannot read", p.stderr)
+        self.assertIn("index.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_help_prints_usage_and_exits_zero(self):
+        tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                p = subprocess.run([sys.executable, "-I", tool, flag], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0)
+                self.assertIn("spirv_stubs.py <spirv dir>", p.stdout)
+                self.assertEqual(p.stderr, "")
+                self.assertEqual(spirv_stubs.main([flag]), 0)
+
+    def test_valid_json_of_the_wrong_shape_is_one_error(self):
+        for contents in ("5", "[]"):
+            with self.subTest(contents=contents):
+                p = self.run_tool(contents)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("cannot read", p.stderr)
+                self.assertIn("expected a JSON object", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_invalid_graphics_locations_are_one_error_not_a_traceback(self):
+        cases = (
+            ("ps_bad", {"stage": "ps", "inputs": ["not-a-location"]}),
+            ("vs_bad", {"stage": "vs", "outputs": [None]}),
+            ("ms_bad", {"stage": "ms", "params": [-1]}),
+            ("gs_bad", {"stage": "gs", "gs_input_locations": [0x100000000]}),
+        )
+        for name, metadata in cases:
+            with self.subTest(shader=name):
+                p = self.run_tool(json.dumps({name: metadata}))
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("cannot generate stubs", p.stderr)
+                self.assertIn("index.json", p.stderr)
+                if name in ("ms_bad", "gs_bad"):
+                    self.assertIn("invalid Location", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,13 +9,18 @@ Validates tools/shader_carve.py without touching game files or proprietary asset
 - Candidate size filtering, raw deflate decompression error handling, and container integrity checks
 - End-to-end archive carving, duplicate variant naming, filename character sanitization, and index.json output
 """
+import contextlib
+import hashlib
+import io
 import json
+import mmap
 import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -437,6 +442,40 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIsNone(index[5]["sm"])
         self.assertIn("PRIV", index[5]["parts"])
 
+    def test_carve_rejects_unfinished_deflate_stream(self):
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x66, 5))])
+        compressor = zlib.compressobj(wbits=-15)
+        compressed = compressor.compress(dxbc) + compressor.flush(zlib.Z_SYNC_FLUSH)
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("synthetic", 1, dxbc, compressed_override=compressed))
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no shaders carved", res.stderr)
+        self.assertIn("rejected candidates: 1", res.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_empty_carve_preserves_an_existing_index(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        initial = self.run_carve(self.archive, self.out)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        index_path = os.path.join(self.out, "index.json")
+        with open(index_path, "rb") as f:
+            previous = f.read()
+        with open(self.archive, "wb") as f:
+            f.write(b"no shader entries")
+
+        res = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no shaders carved", res.stderr)
+        self.assertIn("rejected candidates: 0", res.stderr)
+        with open(index_path, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(sorted(os.listdir(self.out)), ["index.json", "valid.dxbc"])
+
     def test_carve_rejects_incomplete_parts_and_continues(self):
         valid = make_dxbc([(b"PRIV", bytes(range(32)))])
         short_directory = bytearray(valid)
@@ -478,11 +517,128 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
             self.assertNotIn("Traceback", res.stderr)
             self.assertFalse(os.path.exists(self.out))
 
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"x")
+        res = self.run_carve(self.archive, out_file)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("is a file, not a folder", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_carve_preserves_existing_index_temp_sibling(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        os.mkdir(self.out)
+        sibling = os.path.join(self.out, "index.json.tmp")
+        with open(sibling, "w", encoding="utf-8") as f:
+            f.write("keep me")
+
+        result = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(sibling, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["valid"])
+        self.assertFalse(any(os.path.isdir(os.path.join(self.out, name)) for name in os.listdir(self.out)))
+
+    def test_main_closes_mmap_on_exit(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        real_mmap = mmap.mmap
+        opened = []
+
+        def record(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            opened.append(m)
+            return m
+
+        with mock.patch("shader_carve.mmap.mmap", side_effect=record):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 0)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+        os.remove(self.archive)
+        self.assertFalse(os.path.exists(self.archive))
+
     def test_no_arguments_is_a_usage_error(self):
         res = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True)
         self.assertEqual(res.returncode, 2, res.stderr)
         self.assertIn("required", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+    def test_carve_skips_deflate_payload_ending_in_printable_ascii(self):
+        # Find a deterministic compressed DXBC whose raw deflate stream ends with a printable ASCII byte (0x21..0x7E).
+        # Back-to-back with entry2, a scan that does not skip the payload attaches those bytes to entry2's name.
+        comp1 = dxbc1 = None
+        for seed in range(64):
+            payload = b"".join(hashlib.sha256(f"{seed}-{i}".encode()).digest() for i in range(12))
+            cand = make_dxbc([(b"PRIV", payload)])
+            c = compress_raw_deflate(cand)
+            if 0x21 <= c[-1] <= 0x7E:
+                dxbc1, comp1 = cand, c
+                break
+        self.assertIsNotNone(comp1, "expected a raw deflate stream ending in printable ASCII")
+        dxbc2 = make_dxbc([(b"PRIV", b"SECOND_SHADER_PAYLOAD_BYTES_123456")])
+        entry1 = make_rpf_entry("first_shader", 1, dxbc1, entry_id=1, compressed_override=comp1)
+        entry2 = make_rpf_entry("second_shader", 1, dxbc2, entry_id=2)
+        entry3 = make_rpf_entry("second_shader", 1, dxbc2, entry_id=3)
+        with open(self.archive, "wb") as f:
+            f.write(entry1 + entry2 + entry3)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("3 shaders carved, 0 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["file"], r["offset"]) for r in index], [
+            ("first_shader", "first_shader.dxbc", 0),
+            ("second_shader", "second_shader.dxbc", len(entry1)),
+            ("second_shader", "second_shader~1.dxbc", len(entry1) + len(entry2)),
+        ])
+
+    def test_carve_ignores_entry_pattern_inside_deflate_payload(self):
+        # RFC 1951 raw deflate stored block (BFINAL=1, BTYPE=00) embeds raw bytes verbatim, including an
+        # ENTRY-matching decoy whose 17-byte header crosses the boundary into the real next entry's name.
+        dxbc2 = make_dxbc([(b"PRIV", b"FOLLOWING_SHADER_PAYLOAD_0123456789")])
+        decoy_trailer = b"decoy\x00\x01" + struct.pack("<IIII", 20, 7, 20, 40)
+        dxbc1 = make_dxbc([(b"PRIV", b"P" * 32 + decoy_trailer + b"TAIL")])
+        stored_block = b"\x01" + struct.pack("<HH", len(dxbc1), (~len(dxbc1)) & 0xFFFF) + dxbc1
+        entry1 = make_rpf_entry("outer_shader", 1, dxbc1, entry_id=1, compressed_override=stored_block)
+        entry2 = make_rpf_entry("next_shader", 1, dxbc2, entry_id=2)
+        with open(self.archive, "wb") as f:
+            f.write(entry1 + entry2)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("2 shaders carved, 0 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["file"], r["offset"]) for r in index], [
+            ("outer_shader", "outer_shader.dxbc", 0),
+            ("next_shader", "next_shader.dxbc", len(entry1)),
+        ])
+
+    def test_rejected_candidate_trailer_does_not_swallow_following_entry(self):
+        # A bogus match whose 17-byte trailer overlaps the start of a real entry's name must not skip that entry.
+        dxbc = make_dxbc([(b"PRIV", b"REAL_SHADER_AFTER_BOGUS_MATCH_123456")])
+        real_entry = make_rpf_entry("real_shader", 1, dxbc, entry_id=1)
+        # Craft "bogus\x00" + kind + stored + id + stored, so the match's 4-byte size field is "real", the start of
+        # the real entry's name. The size bound rejects it; the real entry must still be carved under its own name.
+        bogus = b"bogus\x00\x00" + struct.pack("<III", 32, 0, 32)
+        with open(self.archive, "wb") as f:
+            f.write(bogus + real_entry)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["offset"]) for r in index], [("real_shader", len(bogus))])
 
 
 if __name__ == "__main__":

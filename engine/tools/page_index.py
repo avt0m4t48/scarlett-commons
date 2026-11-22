@@ -14,9 +14,13 @@ The header has no key: what earlier reports called a 64-bit key at +0x60 is the 
 29,297 of 29,298 measured pages. This tool reports `payload_at_0x60` instead.
 
 The +0x28 table (32-byte records) is reported raw as `q28_records`: the hash in its first u32 matches a +0x38
-hash on most pages, its +0x10 pointer resolves in the resource, and its +0x1c word behaves as flags. The
-+0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`. The +0x30 and +0x40
+hash on most pages, its +0x10 pointer resolves in the resource, and its +0x1c word behaves as flags.The +0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`. The +0x30 and +0x40
 tables are reported by offset only; their internal layout is not decoded here.
+
+Each page also carries a `resource`: the directory stream plus the continuations that reach the q38 table and its
+last record, their byte total, and the +0x20 count next to the 64 KiB units the group occupies. The count does not
+predict the boundary (its best byte reading matches 56.7% of `story000` pages), so the table extent is used and the
+mismatch stays visible as `declared_matches_units`.
 
 Usage:
     python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
@@ -38,6 +42,7 @@ import zlib
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BASE = 0x50000000
 HEADER_SIZE = 0x60
+PAGE_UNIT = 0x10000   # 64 KiB: the unit a resource's declared +0x20 count is compared against
 MAX_CONTINUATIONS = 16
 COLUMNS = [
     "page_offset", "stored", "inflated", "version", "page_count",
@@ -95,8 +100,8 @@ def scan_rpf(path, start=None, limit=None):
                 d = zlib.decompressobj()
                 chunks, p = [], s
                 try:
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:
+                        block = m[p:min(p + (1 << 20), end)]
                         if not block:
                             break
                         chunks.append(d.decompress(block))
@@ -238,18 +243,43 @@ def parse_page(base, continuations):
     return page, True
 
 
+def resource_of(page):
+    """The streams that make up one logical resource, and how its declared count compares.
+
+    The boundary is the q38 table and its last record: the resource is the directory stream plus the
+    continuation streams needed to reach them. The +0x20 count is reported next to the 64 KiB units
+    the group actually occupies, so a caller can see a disagreement instead of trusting the field.
+    """
+    streams = [{"offset": page["offset"], "inflated": page["inflated"]}]
+    streams += [{"offset": c["offset"], "inflated": c["inflated"]} for c in page["continuations"]]
+    total = page["inflated"] + sum(c["inflated"] for c in page["continuations"])
+    units = max(1, -(-total // PAGE_UNIT))
+    declared = page["page_count"]
+    return {
+        "streams": streams,
+        "bytes": total,
+        "page_units": units,
+        "declared_pages": declared,
+        "declared_matches_units": None if declared is None else declared == units,
+    }
+
+
 def index_streams(streams, progress=None):
     """Consume a stream sequence and return page records. At most one page waits for a continuation."""
     pages = []
     waiting = None
     streams_seen = 0
 
+    def add(page):
+        page["resource"] = resource_of(page)
+        pages.append(page)
+
     def start(offset, stored, data):
         page, complete = parse_page(data, [])
         page["offset"] = offset
         page["stored"] = stored
         if complete:
-            pages.append(page)
+            add(page)
             return None
         return (page, data, [])
 
@@ -264,21 +294,23 @@ def index_streams(streams, progress=None):
             page["offset"] = waiting[0]["offset"]
             page["stored"] = waiting[0]["stored"]
             if complete:
-                pages.append(page)
+                add(page)
                 waiting = None
                 continue
             if is_page(data):
                 # The previous resource ended before its declared table/entries did. Report it, then
                 # treat this stream as the new directory page instead of swallowing it as a continuation.
-                waiting[0]["complete"] = False
-                waiting[0]["error"] = waiting[0]["error"] or "resource ended before q38 was complete"
-                pages.append(waiting[0])
+                # Report the page re-parsed with this stream: waiting[0] is the parse before the last
+                # continuation was appended and would lose it from the reported continuations/records.
+                page["complete"] = False
+                page["error"] = page["error"] or "resource ended before q38 was complete"
+                add(page)
                 waiting = start(offset, stored, data)
                 continue
             if len(cont) >= MAX_CONTINUATIONS:
                 page["complete"] = False
                 page["error"] = page["error"] or "too many continuation streams"
-                pages.append(page)
+                add(page)
                 waiting = None
             else:
                 waiting = (page, base, cont)
@@ -289,7 +321,7 @@ def index_streams(streams, progress=None):
         page = waiting[0]
         page["complete"] = False
         page["error"] = page["error"] or "archive ended before q38 was complete"
-        pages.append(page)
+        add(page)
     return pages, streams_seen
 
 
@@ -306,6 +338,12 @@ def summarise(pages, mode, source):
         "pages_with_continuations": sum(1 for p in pages if p["continuations"]),
         "span_bytes": sum(p["span"] for p in pages),
         "payload_at_0x60": sum(1 for p in pages if p["payload_at_0x60"]),
+        "resource_streams": {str(n): sum(1 for p in pages if len(p["resource"]["streams"]) == n)
+                             for n in sorted({len(p["resource"]["streams"]) for p in pages})},
+        "page_units": sum(p["resource"]["page_units"] for p in pages),
+        "declared_matches_units": sum(1 for p in pages if p["resource"]["declared_matches_units"]),
+        "declared_differs_from_units": sum(1 for p in pages
+                                           if p["resource"]["declared_matches_units"] is False),
         "versions": {str(v): sum(1 for p in pages if p["version"] == v)
                      for v in sorted({p["version"] for p in pages})},
         "page_counts": {str(v): sum(1 for p in pages if p["page_count"] == v)
@@ -314,13 +352,13 @@ def summarise(pages, mode, source):
 
 
 def write_json(path, pages, summary):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "pages": pages}, f, indent=1)
 
 
 def write_csv(path, pages):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w = csv.DictWriter(f, fieldnames=COLUMNS, lineterminator="\n")
         w.writeheader()
         for page in pages:
             records = page["q38_records"]
@@ -366,19 +404,46 @@ def offset(text):
     return value
 
 
-def main():
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Index RPF9 0DRP page directories (read-only, no TOC decryption)")
     ap.add_argument("source", help="archive.rpf or a directory of carved <offset>.bin files")
     ap.add_argument("out", help="output .json or .csv")
     ap.add_argument("--start", type=offset, help="first archive offset (default: header u32@4)")
     ap.add_argument("--limit", type=byte_count, help="stop after this many bytes")
     ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .json or .csv file")
     ext = os.path.splitext(a.out)[1].lower()
     if ext not in (".json", ".csv"):   # checked before the scan, which can take minutes on a large archive
         ap.error("output must end in .json or .csv")
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+            ap.error(f"output would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for name in os.listdir(a.source):
+                inp = os.path.join(a.source, name)
+                if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                    if same_output_path(inp, a.out):
+                        ap.error(f"output would overwrite an input file: {a.out}")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
 
     def progress(n, pages):
         print("streams=%d pages=%d" % (n, pages), file=sys.stderr, flush=True)
@@ -399,14 +464,22 @@ def main():
         return 2
     summary = summarise(pages, mode, a.source)
     summary["streams"] = streams_seen
-    if ext == ".json":
-        write_json(a.out, pages, summary)
-    else:
-        write_csv(a.out, pages)
+    try:
+        if ext == ".json":
+            write_json(a.out, pages, summary)
+        else:
+            write_csv(a.out, pages)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1))
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

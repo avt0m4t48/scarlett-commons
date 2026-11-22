@@ -278,8 +278,6 @@ class RealIsaTests(unittest.TestCase):
     # Names the translator matches that AMD's RDNA2 XML does not list. Each one was looked at (docs/isa_coverage.md);
     # a name that is not here and not in the XML is a typo or a wrong-generation name and fails the test.
     KNOWN_NOT_IN_XML = {
-        "s_and_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
-        "s_or_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
         "s_delay_alu": "RDNA3 instruction, kept in NOOPS so RDNA3 text does not trip the translator",
         "s_get_waveid_in_workgroup": "gfx1013 per llvm-mc, missing from the XML",
         "v_mac_f32": "gfx1013 per llvm-mc, missing from the XML",
@@ -294,10 +292,6 @@ class RealIsaTests(unittest.TestCase):
         "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
         "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
         "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
-        "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_and_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_or_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_xor_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
     }
 
     @classmethod

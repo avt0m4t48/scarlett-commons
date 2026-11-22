@@ -493,28 +493,39 @@ void install_on_existing_threads(Module& m) {
     if (!query_thread_fn()) return;
 
     // Outside the TLS lock: none of this may wait for a thread that is inside its attach event.
+    // The handles are closed on every way out, also when a vector below cannot grow.
     struct Candidate {
-        DWORD id;
-        HANDLE handle;
+        DWORD id = 0;
+        HANDLE handle = nullptr;
     };
-    std::vector<Candidate> candidates;
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return;
+    struct Candidates {
+        std::vector<Candidate> list;
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+        ~Candidates() {
+            if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+            for (const Candidate& c : list)
+                if (c.handle) CloseHandle(c.handle);
+        }
+    } found;
+    std::vector<Candidate>& candidates = found.list;
+    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's.
+    found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (found.snapshot == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 entry{};
     entry.dwSize = sizeof entry;
     const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
-    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+    for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
         if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
-        if (HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID))
-            candidates.push_back({entry.th32ThreadID, h});
+        candidates.push_back({entry.th32ThreadID, nullptr});  // the slot first, so the handle always has an owner
+        candidates.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
     }
-    CloseHandle(snapshot);
 
     {
         ExclusiveTlsLock tls_lock;
         ExistingThreadsLock lock;
         ExistingThreads& state = existing_threads();
         for (const Candidate& c : candidates) {
+            if (!c.handle) continue;
             if (std::find(state.ended.begin(), state.ended.end(), c.id) != state.ended.end()) continue;
             void*** vector = running_thread_tls_vector(c.handle);
             void** slots = nullptr;
@@ -564,7 +575,6 @@ void install_on_existing_threads(Module& m) {
             state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_index, vector, saved, block});
         }
     }
-    for (const Candidate& c : candidates) CloseHandle(c.handle);
 }
 
 // ~Loader, with g_tls_lock held exclusively: the blocks load() put into other threads come out. A thread that has

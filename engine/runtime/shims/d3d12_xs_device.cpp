@@ -18,6 +18,7 @@
 // frame. xs_proxy_mock_test's mock hit this in an optimized build, and its thunks now pass their words by pointer.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
 
@@ -1070,25 +1071,37 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     };
     const auto* xbox_desc = static_cast<const XboxNativeComputePipelineStateDesc*>(desc);
 
-    if (xbox_desc->kind0 || xbox_desc->kind0_size || xbox_desc->kind1 || xbox_desc->kind1_size ||
-        xbox_desc->kind7 || xbox_desc->kind7_size) {
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed)) {
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: slot 67 FSPX metadata: kind0 0x%llx (%llu B), kind1 0x%llx (%llu B), kind7 0x%llx (%llu B)\n",
-                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind0)),
-                         static_cast<unsigned long long>(xbox_desc->kind0_size),
-                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind1)),
-                         static_cast<unsigned long long>(xbox_desc->kind1_size),
-                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind7)),
-                         static_cast<unsigned long long>(xbox_desc->kind7_size));
-        }
-    }
-
     D3D12_COMPUTE_PIPELINE_STATE_DESC pc_desc{};
     pc_desc.pRootSignature = xbox_desc->root_signature;
     pc_desc.CS.pShaderBytecode = xbox_desc->kind6;
     pc_desc.CS.BytecodeLength = static_cast<SIZE_T>(xbox_desc->kind6_size);
+    // With kind 0 (the DLL always passes it: its reader refuses a payload without one), the four pairs go on as one
+    // FSPX payload, so the device matches the program by its kind-6 and kind-0 keys (docs/fspx.md, "Build and run-time
+    // lookup"): two programs with the same code and different dispatch state stay apart. Every pair is checked before
+    // it is read (leonida::fspx_payload_from_parts); an inconsistent one refuses the call. Without kind 0 the kind-6
+    // bytes go on alone, as before.
+    std::vector<std::uint8_t> payload;
+    if (xbox_desc->kind0 || xbox_desc->kind0_size) {
+        const leonida::FspxPart parts[] = {{0, xbox_desc->kind0, xbox_desc->kind0_size},
+                                           {1, xbox_desc->kind1, xbox_desc->kind1_size},
+                                           {6, xbox_desc->kind6, xbox_desc->kind6_size},
+                                           {7, xbox_desc->kind7, xbox_desc->kind7_size}};
+        payload = leonida::fspx_payload_from_parts(parts);
+        if (payload.empty()) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 67 refused: a pointer/size pair is inconsistent or too large "
+                             "(kind0 %llu B, kind1 %llu B, kind6 %llu B, kind7 %llu B)\n",
+                             static_cast<unsigned long long>(xbox_desc->kind0_size),
+                             static_cast<unsigned long long>(xbox_desc->kind1_size),
+                             static_cast<unsigned long long>(xbox_desc->kind6_size),
+                             static_cast<unsigned long long>(xbox_desc->kind7_size));
+            return E_INVALIDARG;
+        }
+        pc_desc.CS.pShaderBytecode = payload.data();
+        pc_desc.CS.BytecodeLength = payload.size();
+    }
     pc_desc.NodeMask = 0;
     pc_desc.CachedPSO = {nullptr, 0};
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;

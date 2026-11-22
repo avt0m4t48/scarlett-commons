@@ -36,7 +36,20 @@ namespace {
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10: handle in RAX
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+// Device slot 67 as the FidelityFX DLL calls it: (desc, riid, out), the description as docs/fspx.md lays it out.
+struct XboxNativeDesc {
+    ID3D12RootSignature* root_signature;
+    const void* kind0;
+    std::uint64_t kind0_size;
+    const void* kind1;
+    std::uint64_t kind1_size;
+    const void* kind6;
+    std::uint64_t kind6_size;
+    const void* kind7;
+    std::uint64_t kind7_size;
+};
+using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const XboxNativeDesc*, const IID*, void**);
+using SerializeFn =HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -191,7 +204,8 @@ int main() {
                    "\"uses_code_base\": true, \"wave64\": false}";
         };
         sub << "{\"cs_user_data\": " << entry(code_a, 0x11) << ",\n \"cs_user_data_b\": " << entry(code_b, 0x11)
-            << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32) << "}";
+            << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32)
+            << ",\n \"cs_c_state3\": " << entry(code_c, 0x33) << "}";  // no cs_c_state3.spv: see the slot-67 block
     }
 
     constexpr UINT elements = 64, bytes = elements * 4;
@@ -274,6 +288,72 @@ int main() {
             pso_desc.CS = {code_c.data(), code_c.size()};
             EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&none_bare.p)) == E_INVALIDARG &&
                    !none_bare.p);
+        }
+
+        // Slot 67 with all four pairs (RT-99): the proxy passes kind 0 on, so program C resolves by its state there
+        // too. State 0x31 finds cs_c_state1 (S_OK); state 0x33 finds cs_c_state3, whose module is missing on purpose
+        // (E_FAIL, not the E_INVALIDARG of an unknown program), so a lookup that ignored kind 0 would show. The
+        // pipeline's console slot 11 answers with a blob holding 0, and every object is released again.
+        {
+            const std::vector<std::uint8_t> state31(28, 0x31), state33(28, 0x33), kind1(20, 0x22), kind7(8, 0x77);
+            XboxNativeDesc native{};
+            native.root_signature = root.p;
+            native.kind0 = state31.data();
+            native.kind0_size = state31.size();
+            native.kind1 = kind1.data();
+            native.kind1_size = kind1.size();
+            native.kind6 = code_c.data();
+            native.kind6_size = code_c.size();
+            native.kind7 = kind7.data();
+            native.kind7_size = kind7.size();
+            const auto slot67 = reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67));
+            Ref<ID3D12PipelineState> pso67, missing67;
+            EXPECT(SUCCEEDED(slot67(device.p, &native, &pso_iid, reinterpret_cast<void**>(&pso67.p))) && pso67.p);
+            native.kind0 = state33.data();
+            EXPECT(slot67(device.p, &native, &pso_iid, reinterpret_cast<void**>(&missing67.p)) == E_FAIL &&
+                   !missing67.p);
+            native.kind0 = state31.data();
+
+            // Inconsistent pairs are refused before anything is read (the wild pointer is never dereferenced).
+            const void* wild = reinterpret_cast<const void*>(std::uintptr_t(0x10));
+            const auto refused67 = [&](XboxNativeDesc bad) {
+                Ref<ID3D12PipelineState> none;
+                return slot67(device.p, &bad, &pso_iid, reinterpret_cast<void**>(&none.p)) == E_INVALIDARG && !none.p;
+            };
+            XboxNativeDesc bad = native;
+            bad.kind1_size = 0;  // a pointer without a size
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind7 = nullptr;  // a size without a pointer
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind0 = nullptr;  // kind 0's size without its pointer
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind6 = wild;
+            bad.kind6_size = std::uint64_t(1) << 40;  // far over the limit
+            EXPECT(refused67(bad));
+
+            // Slot 11 as the DLL calls it: (0, 0, &obj); obj's slot 3 gives a pointer to the dword it multiplies by
+            // 1024, slot 2 releases it. The pipeline's own count is unchanged by the call.
+            using Slot11Fn = HRESULT(WINAPI*)(void*, std::uint64_t, std::uint64_t, void**);
+            using BufferPointerFn = void*(WINAPI*)(void*);
+            using SizeFn = SIZE_T(WINAPI*)(void*);
+            using ReleaseFn = ULONG(WINAPI*)(void*);
+            for (ID3D12PipelineState* pipeline : {pso67.p, pso_a.p}) {
+                const ULONG before = pipeline->AddRef() - 1;
+                pipeline->Release();
+                void* obj = nullptr;
+                EXPECT(reinterpret_cast<Slot11Fn>(slot(pipeline, 11))(pipeline, 0, 0, &obj) == S_OK && obj);
+                const auto* value = static_cast<const std::uint32_t*>(reinterpret_cast<BufferPointerFn>(slot(obj, 3))(obj));
+                EXPECT(value && *value == 0);
+                EXPECT(reinterpret_cast<SizeFn>(slot(obj, 4))(obj) == 4);
+                EXPECT(reinterpret_cast<ReleaseFn>(slot(obj, 2))(obj) == 0);
+                EXPECT(reinterpret_cast<Slot11Fn>(slot(pipeline, 11))(pipeline, 0, 0, nullptr) == E_POINTER);
+                const ULONG after = pipeline->AddRef() - 1;
+                pipeline->Release();
+                EXPECT(after == before);
+            }
         }
 
         // Refused with E_INVALIDARG, and no object: an untranslated program, bare and in a container; directories

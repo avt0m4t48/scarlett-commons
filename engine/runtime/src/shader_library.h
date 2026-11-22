@@ -553,6 +553,59 @@ inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> 
     return fspx_parts(payload).code;
 }
 
+// One pointer and size pair of the description device slot 67 receives (docs/fspx.md, "How the DLL reads it").
+struct FspxPart {
+    std::uint32_t kind;
+    const void* data;
+    std::uint64_t size;
+};
+
+// The largest entry fspx_payload_from_parts takes: far above the 1.0.2.1 DLL's largest (a 41,536-byte program), and
+// small enough that the payload's u32 offsets cannot overflow.
+inline constexpr std::uint64_t kFspxPartLimit = 16u << 20;
+
+// An FSPX payload built from the pairs of a slot-67 description, in the layout fspx_parts() reads: the header, one
+// directory entry per present pair and the entries' bytes after it, each at a 16-byte boundary. A pair is present
+// when its pointer is non-null and its size non-zero; a pointer without a size or a size without a pointer, a size
+// over kFspxPartLimit, a kind other than 0, 1, 6 and 7, the same kind twice, or a missing kind 0 or kind 6 gives an
+// empty result, and nothing is read. Every pointer is read only for its own size.
+inline std::vector<std::uint8_t> fspx_payload_from_parts(std::span<const FspxPart> parts) {
+    bool seen[8] = {};
+    std::vector<const FspxPart*> present;
+    for (const FspxPart& part : parts) {
+        if (part.kind > 7 || (part.kind != 0 && part.kind != 1 && part.kind != 6 && part.kind != 7)) return {};
+        if (seen[part.kind]) return {};
+        seen[part.kind] = true;
+        if (!part.data && !part.size) continue;
+        if (!part.data || !part.size || part.size > kFspxPartLimit) return {};
+        present.push_back(&part);
+    }
+    const auto has = [&](std::uint32_t kind) {
+        return std::any_of(present.begin(), present.end(), [&](const FspxPart* p) { return p->kind == kind; });
+    };
+    if (!has(0) || !has(6)) return {};
+    const auto align = [](std::uint64_t v) { return (v + 15) & ~std::uint64_t(15); };
+    std::uint64_t at = align(16 + 16 * std::uint64_t(present.size()));
+    std::vector<std::uint64_t> offsets;
+    for (const FspxPart* p : present) {
+        offsets.push_back(at);
+        at = align(at + p->size);
+    }
+    std::vector<std::uint8_t> out(std::size_t(at), 0);
+    const auto put = [&](std::size_t where, std::uint32_t v) { std::memcpy(out.data() + where, &v, 4); };
+    std::memcpy(out.data(), "FSPX", 4);
+    put(4, 1);
+    put(8, std::uint32_t(present.size()));
+    put(12, std::uint32_t(at));
+    for (std::size_t i = 0; i < present.size(); ++i) {
+        put(16 + 16 * i, present[i]->kind);
+        put(16 + 16 * i + 4, std::uint32_t(offsets[i]));
+        put(16 + 16 * i + 8, std::uint32_t(present[i]->size));
+        std::memcpy(out.data() + offsets[i], present[i]->data, std::size_t(present[i]->size));
+    }
+    return out;
+}
+
 // Whether `code` looks like a bare kind-6 program: the 36-byte prologue of three VOP3 words with opcode 0x180
 // (bits 31..16 = 0xD580) at words 0, 3 and 6, which all 29 programs of the 1.0.2.1 DLL have (docs/fspx.md).
 inline bool fspx_bare_program(std::span<const std::uint8_t> code) {

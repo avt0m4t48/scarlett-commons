@@ -1,6 +1,6 @@
 // Driver-level check of the translated corpus: vk_pipeline_check <spirv dir> [pipeline_cache.bin]
-// Reads <spirv dir>/index.json (written by tools/rdna2spirv.py), creates a VkShaderModule for every entry and a real
-// pipeline with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
+// Reads <spirv dir>/index.json (written by tools/rdna2spirv.py) and checks module and pipeline creation for compatible
+// entries with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
 // table 2; storage images 4, 7 and 8..19; push constants 144 bytes):
 //   - cs: compute pipeline via vkCreateComputePipelines
 //   - ps/vs/ms/gs: graphics pipeline via vkCreateGraphicsPipelines (Vulkan 1.3 dynamic rendering, no render pass)
@@ -916,7 +916,16 @@ int main(int argc, char** argv) {
     LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
     const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
-    // Map enabled device features for per-shader compatibility checks.
+    // These capability requirements apply as soon as the module is passed to Vulkan.
+    auto check_missing_module_feature = [&](const ShaderMeta& meta) -> std::string {
+        for (const auto& feat : meta.features) {
+            if (feat == "shaderSampledImageArrayDynamicIndexing" && !f2.features.shaderSampledImageArrayDynamicIndexing)
+                return "no " + feat;
+        }
+        return {};
+    };
+
+    // Keep the remaining pipeline compatibility checks after module creation.
     auto check_missing_feature = [&](const ShaderMeta& meta) -> std::string {
         if (is_graphics_stage(meta.stage) && !f13.dynamicRendering) return "no dynamicRendering";
         if (meta.stage == "ms" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
@@ -952,8 +961,6 @@ int main(int argc, char** argv) {
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
-            if (feat == "shaderSampledImageArrayDynamicIndexing" && !f2.features.shaderSampledImageArrayDynamicIndexing)
-                return "no shaderSampledImageArrayDynamicIndexing";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
             if (feat == "shaderResourceMinLod" && !f2.features.shaderResourceMinLod) return "no shaderResourceMinLod";
             if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)
@@ -1176,6 +1183,12 @@ int main(int argc, char** argv) {
                 modules_bad[stage]++;
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds maxComputeSharedMemorySize %u)\n",
                             name.c_str(), meta.lds_bytes, props.limits.maxComputeSharedMemorySize);
+                ++done;
+                continue;
+            }
+            if (const std::string miss = check_missing_module_feature(meta); !miss.empty()) {
+                // No module was attempted, so only the pipeline skip is counted.
+                record_skip(name, stage, miss);
                 ++done;
                 continue;
             }

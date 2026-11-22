@@ -1145,9 +1145,22 @@ public:
         bindless_commit_ = std::move(commit);
     }
 
+    // The set 0 the commands of this ExecuteCommandLists bind, read after `prepare` succeeded and under the same
+    // locks (a flush may have made a new set). Without it the pipelines' own set is bound.
+    void set_bindless_current(std::function<VkDescriptorSet()> current) {
+        std::unique_lock lock(resource_mutex_);
+        bindless_current_ = std::move(current);
+    }
+
     void set_bindless_release(DeferredDeletionQueue::BindlessReleaseFn fn, void* user) {
         deletion_queue_.set_bindless_release(fn, user);
     }
+
+    // The ticket of the latest submission: everything submitted so far is at or below it, and a resource that any
+    // of that work may use can be freed once completed_retire_ticket() has reached it. Tickets run over all queues,
+    // each recorded with its queue's timeline value, so this waits for every queue's timeline to pass what was
+    // submitted to it, and never makes a queue wait.
+    std::uint64_t submitted_retire_ticket() const { return submitted_ticket_.load(std::memory_order_acquire); }
 
     template<typename VkHandle>
     void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
@@ -1278,6 +1291,7 @@ private:
     std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::function<VkDescriptorSet()> bindless_current_;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -1655,6 +1669,7 @@ public:
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
         }
+        replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         auto next_tracker = context_.tracker_;
         // Images with a UAV view are moved to GENERAL (zeroed) by the first submission that can use a shader on them:
         // not a copy queue (its family may not clear images), and one whose lists dispatch or draw.

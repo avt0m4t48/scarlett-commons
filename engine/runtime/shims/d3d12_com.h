@@ -204,6 +204,15 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
+// What the bindless set did without waiting (D3D-314): table generations made because a flush grew the table or
+// changed live entries, the retired ones not freed yet, and vkDeviceWaitIdle calls made for it (always 0 unless
+// LEONIDA_BINDLESS_IDLE_WAIT=1 restores the old wait, to compare frame times). All 0 without a bindless set.
+struct BindlessStats {
+    std::uint64_t generations_made = 0;
+    std::uint64_t retired_pending = 0;
+    std::uint64_t device_idle_waits = 0;
+};
+BindlessStats bindless_stats(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.

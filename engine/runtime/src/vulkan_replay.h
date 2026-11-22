@@ -768,6 +768,9 @@ struct ShaderUserData {
 static_assert(sizeof(ShaderUserData) == 144);
 
 struct ReplayFunctions {
+    // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
+    // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
@@ -3312,9 +3315,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         data.heap_base = vk.heap_base;
                         data.code_base = p.pipeline.code_base;
                         vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-                        if (p.pipeline.bindless_set)
+                        if (p.pipeline.bindless_set) {
+                            const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
                             vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
-                                                    1, &p.pipeline.bindless_set, 0, nullptr);
+                                                    1, &set0, 0, nullptr);
+                        }
                         vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                           &data);
                     }
@@ -3391,9 +3396,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-            if (p.pipeline.bindless_set)
+            if (p.pipeline.bindless_set) {
+                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
-                                        &p.pipeline.bindless_set, 0, nullptr);
+                                        &set0, 0, nullptr);
+            }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
@@ -3440,9 +3447,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
-            if (p.graphics.bindless_set)
+            if (p.graphics.bindless_set) {
+                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.graphics.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.layout, 0, 1,
-                                        &p.graphics.bindless_set, 0, nullptr);
+                                        &set0, 0, nullptr);
+            }
             vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.

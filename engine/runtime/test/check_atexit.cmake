@@ -1,6 +1,9 @@
-# atexit handlers, static destructors and every way out: tiny_atexit run natively and through `gta6rt --run` must
-# print the same lines and end with the same exit code. The native run is also held to the sequence written below,
-# so the two cannot agree on a wrong answer. Under Wine both runs go through RUNNER.
+# atexit handlers, static destructors and every way out: tiny_atexit run through `gta6rt --run` must print the
+# sequence written below and end with its exit code. That is what the program does natively on Windows, and the
+# native run is held to the same sequence, so the two cannot agree on a wrong answer. Under Wine both runs go through
+# RUNNER, and Wine's own CRT differs in places (it drops a handler registered while handlers run, and its _exit does
+# not wait for the exit lock), so there a native difference is reported without failing; --run is still held to the
+# Windows sequence.
 get_filename_component(guest_dir "${GUEST}" DIRECTORY)
 get_filename_component(guest_name "${GUEST}" NAME)
 
@@ -49,15 +52,20 @@ foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_ex
   guest_lines("${native_out}" native_lines)
   guest_lines("${run_out}" run_lines)
   if(NOT native_code STREQUAL code_${mode} OR NOT native_lines STREQUAL expect_${mode})
-    string(APPEND failures "\n[${mode}] native run differs from the expected sequence (the fixture or the host changed)"
+    string(CONCAT native_diff "[${mode}] native run differs from the expected sequence"
       "\n  expected (${code_${mode}}): ${expect_${mode}}\n  native   (${native_code}): ${native_lines}")
+    if(RUNNER)
+      message(STATUS "${native_diff}\n  (the host CRT differs from Windows; not a gta6rt failure)")
+    else()
+      string(APPEND failures "\n${native_diff}\n  (the fixture or the host changed)")
+    endif()
   endif()
-  if(NOT run_code STREQUAL native_code OR NOT run_lines STREQUAL native_lines)
-    string(APPEND failures "\n[${mode}] gta6rt --run differs from the native run"
-      "\n  native (${native_code}): ${native_lines}\n  --run  (${run_code}): ${run_lines}\n${run_err}")
+  if(NOT run_code STREQUAL code_${mode} OR NOT run_lines STREQUAL expect_${mode})
+    string(APPEND failures "\n[${mode}] gta6rt --run differs from the expected sequence"
+      "\n  expected (${code_${mode}}): ${expect_${mode}}\n  --run    (${run_code}): ${run_lines}\n${run_err}")
   endif()
 endforeach()
 if(failures)
   message(FATAL_ERROR "atexit/termination differences:${failures}")
 endif()
-message(STATUS "tiny_atexit: 8 termination paths match the native run")
+message(STATUS "tiny_atexit: 8 termination paths match the Windows sequence")

@@ -9,7 +9,8 @@
 Per the SPIR-V specification and tests/semantic/README.md, OpFDiv by zero (+-0.0) is undefined and raises
 spirv_mini_interp.UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)"). Accordingly, finite non-zero,
 subnormal, +-inf, and NaN operands are value-checked against independent Fraction-based binary32/binary16
-oracles, while +-0.0 divisors/inputs are verified to raise UnsupportedConstruct.
+oracles, while +-0.0 divisors/inputs of the f32 ops are verified to raise UnsupportedConstruct (v_rcp_f16 selects the
+ISA's +-inf for +-0 itself).
 
 NaN payloads are not pinned because values passing through Python floats lose exact NaN payload bits; NaN
 results are asserted as binary32/binary16 NaNs. Standard library only; hand-written RDNA2 listings only.
@@ -816,16 +817,17 @@ class RcpF16ExecutionTests(unittest.TestCase):
                     self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
                     self.assertTrue(is_f16_nan(got & 0xFFFF), f"expected NaN in low half, got {got:#010x}")
 
-    def test_zero_inputs_raise_unsupported_construct(self):
-        for line, v1 in (
-            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_POS_ZERO),
-            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_ZERO),
-            ("v_rcp_f16_e64 v0, v1 op_sel:[1,0]", (H_POS_ZERO << 16) | H_1P0),
-            ("v_rcp_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_ZERO << 16) | H_1P0),
+    def test_zero_inputs_give_signed_infinity(self):
+        # The ISA's rcp(+-0) = +-inf. The translator selects it itself rather than dividing by zero (undefined in
+        # SPIR-V, so the interpreter raises); the f32 forms above still leave it to the driver.
+        for line, v1, want, dst_hi in (
+            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_POS_ZERO, 0x7C00, 0),
+            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_ZERO, 0xFC00, 0),
+            ("v_rcp_f16_e64 v0, v1 op_sel:[1,0]", (H_POS_ZERO << 16) | H_1P0, 0x7C00, 0),
+            ("v_rcp_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_ZERO << 16) | H_1P0, 0xFC00, 1),
         ):
             with self.subTest(line=line, v1=hex(v1)):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_op(line, v1)
+                self.assertEqual(run_op(line, v1), merge_half(OLD, want, dst_hi))
 
     def test_op_sel_all_combinations(self):
         # v1 = (hi: -4.0, lo: 0.5) -> rcp(hi) = -0.25, rcp(lo) = 2.0.

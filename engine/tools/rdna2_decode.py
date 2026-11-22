@@ -1195,7 +1195,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
         vdata = (w1 >> 8) & 0xFF
         srsrc = ((w1 >> 16) & 0x1F) * 4
         ssamp = ((w1 >> 21) & 0x1F) * 4
-        slc = (w1 >> 25) & 1
+        slc = (w0 >> 25) & 1
         a16 = (w1 >> 30) & 1
         d16 = (w1 >> 31) & 1
         entry = T.MIMG.get(opc)

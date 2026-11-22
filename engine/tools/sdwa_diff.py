@@ -35,7 +35,7 @@ transcendentals, f32 arithmetic.
 
 Skips (counted with their reasons): an f16 NaN operand of an op whose NaN result or IEEE-mode NaN rule is not
 modelled (the compares and v_cmp_class_f16 take NaNs), v_fract_f16 of an infinity, and anything the translator or
-the interpreter does not take: on main that is v_cmp_class_f16 (no f16 class compare in any encoding).
+the interpreter does not take.
 
 Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always

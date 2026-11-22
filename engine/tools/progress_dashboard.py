@@ -122,11 +122,10 @@ def scrub(text, limit=240):
     if os.name == "nt":
         root = r"[\\/]".join(re.escape(part) for part in re.split(r"[\\/]", ROOT))
         checkout = rf"(?i:(?<![\w/\\]){root})"
-        separator = r"[\\/]"
     else:
         checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
-        separator = "/"
-    checkout_path = rf"{checkout}(?:{separator}[^\s'\"]*|(?=$|['\"]))"
+    # Consume a same-prefix sibling too, so shown() can redact its entire path.
+    checkout_path = rf"{checkout}(?:[^\s'\"]+|(?=$|['\"]))"
     drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
     posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
     line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)

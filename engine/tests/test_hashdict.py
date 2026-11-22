@@ -332,6 +332,20 @@ class CarveAndExtraCLITest(unittest.TestCase):
             text=True,
         )
 
+    def test_missing_extra_input_leaves_existing_dictionary_untouched(self):
+        missing = os.path.join(self.dir, "missing.txt")
+        previous = {"00000001": "previous_name"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(previous, output)
+
+        result = self.run_tool(self.carve_dir, "--extra", self.extra_file, missing, "--out", self.out_json)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--extra", result.stderr)
+        self.assertIn(missing, result.stderr)
+        with open(self.out_json, encoding="utf-8") as output:
+            self.assertEqual(json.load(output), previous)
+
     def test_build_dictionary_and_roundtrip_lookup(self):
         p = self.run_tool(
             self.carve_dir,

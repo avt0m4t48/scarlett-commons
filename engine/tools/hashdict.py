@@ -93,6 +93,10 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    for extra in a.extra:
+        if not os.path.exists(extra):
+            print(f"ERROR: --extra input does not exist: {extra}", file=sys.stderr)
+            return 2
     # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
     # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
     if os.path.isfile(os.path.join(a.carve, "index.json")):

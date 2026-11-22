@@ -250,6 +250,25 @@ def centre_agreement(data, group, positions):
     return out
 
 
+def centre_distance(data, group, positions):
+    """Sum over a group's meshlets of the distance (per axis, in metres) between the stored centre and the centre of
+    the meshlet's vertex box, with these positions. The `42 40` block a group was built against gives the smallest
+    sum; a vertex reference past the block gives None."""
+    at, k = group["offset"], group["meshlets"]
+    rec_at = at + 12
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, rec_at + 16 * k + 4 * group["triangles"])
+    total = 0.0
+    for m in range(k):
+        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
+        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
+        if len(pts) != vc:
+            return None
+        stored = meshlet_centre(w2, w3)
+        total += sum(abs((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) for i in range(3))
+    return total
+
+
 def block4240_checks(data, block):
     """Count-only plausibility checks for one `42 40` block's decoded positions."""
     pos = positions_4240(data, block)
@@ -393,8 +412,10 @@ def block_checks(data, block):
 
 def summarise_page(data, name, faces=False, centres=False):
     """Counts for one page. faces=True also runs face_agreement, and centres=True centre_agreement, on every group
-    whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
-    it)."""
+    whose vertex span matches a `42 40` block in the page. With one such block, that block. With several, nothing
+    in the page orders them (a group of `Q0 Q1 G0 G1` belongs to Q0 in some pages and to Q1 in others), so the
+    block whose vertex boxes are closest to the group's stored centres (`centre_distance`); ties, and groups no
+    block fits, keep the nearest block before the group, else the first after it."""
     try:
         chunks = parse_page(data)
     except PageError as exc:
@@ -418,6 +439,19 @@ def summarise_page(data, name, faces=False, centres=False):
                     continue
                 before = [b for b in same if b["offset"] < g["offset"]]
                 b = before[-1] if before else same[0]
+                if len(same) > 1:
+                    checks["groups_4240_several_blocks"] = checks.get("groups_4240_several_blocks", 0) + 1
+                    scored = []
+                    for c in same:
+                        if c["offset"] not in decoded:
+                            decoded[c["offset"]] = positions_4240(data, c)
+                        cost = centre_distance(data, g, decoded[c["offset"]])
+                        if cost is not None:
+                            scored.append((cost, c is not b, c["offset"], c))
+                    best = min(scored, key=lambda x: x[:3])[3] if scored else b
+                    if best is not b:
+                        b = best
+                        checks["groups_4240_block_by_centres"] = checks.get("groups_4240_block_by_centres", 0) + 1
                 if b["offset"] not in decoded:
                     decoded[b["offset"]] = positions_4240(data, b)
                 if faces:

@@ -405,6 +405,8 @@ struct DeviceState {
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
+    // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
+    mutable std::once_flag spill_logged;
 
     // What D3D12_OPTIONS1 answers with: the physical device's own subgroup facts, read on first use.
     struct SubgroupFacts {
@@ -1059,12 +1061,15 @@ struct DeviceState {
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
-                if ((preferred & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                    !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                    const std::string msg = "resource allocation spilled from DEVICE_LOCAL to host memory (heap " +
-                                            std::to_string(memory.memoryTypes[i].heapIndex) + "); size in KiB:";
-                    log_once(msg.c_str(), static_cast<int>(requirements.size / 1024));
-                }
+                if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
+                    std::call_once(spill_logged, [&] {
+                        const std::uint32_t heap = memory.memoryTypes[i].heapIndex;
+                        std::fprintf(stderr,
+                                     "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and went "
+                                     "to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
+                                     static_cast<unsigned long long>(requirements.size), i, heap,
+                                     static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
+                    });
                 return out;
             }
         }

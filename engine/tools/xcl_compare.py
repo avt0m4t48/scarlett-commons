@@ -76,7 +76,6 @@ class Run:
         self.order = []
         self.checks = {}
         self.exit_code = None
-        self.log = []
 
     def set(self, name, **fields):
         if name not in self.checks:
@@ -132,8 +131,11 @@ def kill_tree(pid):
     subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
 
 
-def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip):
-    """Run one title process; returns the name of a check that hung, or None."""
+def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=None):
+    """Run one title process; returns the name of a check that hung, or None.
+
+    The title's output goes to the events as it arrives and, when `transcript` (a path) is given, is appended to
+    that file; it is not kept in memory."""
     env = dict(env)
     if skip:
         env["XCL_TESTTITLE_SKIP"] = ";".join(skip)
@@ -147,6 +149,17 @@ def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip):
         lines.put(None)
 
     threading.Thread(target=pump, daemon=True).start()
+    out = open(transcript, "a", encoding="utf-8", newline="\n") if transcript else None
+    if out:
+        out.write("--- %s\n" % " ".join(str(c) for c in cmd))
+    try:
+        return _follow(proc, lines, run, known, timeout, cdb, events, out, cmd)
+    finally:
+        if out:
+            out.close()
+
+
+def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
     current, started, last = None, time.monotonic(), time.monotonic()
     done_names = []
     events.put(("start", run.label, " ".join(str(c) for c in cmd)))
@@ -168,7 +181,8 @@ def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip):
         if line is None:
             break
         last = time.monotonic()
-        run.log.append(line)
+        if out:
+            out.write(line + "\n")
         events.put(("line", run.label, line))
         if line.startswith("[RUN] "):
             current, started = line[6:], time.monotonic()
@@ -216,6 +230,9 @@ def run_all(args, events):
 
     xcl, leo = Run("XCL"), Run("Leonida")
     events.put(("runs", xcl, leo))
+    transcripts = {"xcl": work / "xcl_output.txt", "leonida": work / "leonida_output.txt"}
+    for path in transcripts.values():
+        open(path, "w", encoding="utf-8", newline="\n").close()
 
     # 1. XCL: the reference run, which also gives the check order.
     if (work / "xcl").exists():
@@ -223,7 +240,7 @@ def run_all(args, events):
     prepare_game(xcl_dir, bins, work / "xcl" / "game")
     env = dict(os.environ, XCL_DATA_ROOT=str(work / "xcl" / "data"))
     run_title([str(bins[0]), "run", str(work / "xcl" / "game"), "--", "--hello"], env, str(work / "xcl"), xcl,
-              [], args.timeout, cdb, events, list(args.skip))
+              [], args.timeout, cdb, events, list(args.skip), transcripts["xcl"])
     known = list(xcl.order)
 
     # 2. gta6rt, restarted with a hung check skipped, up to --max-restarts times.
@@ -236,7 +253,8 @@ def run_all(args, events):
         trace = work / "leonida" / ("trace_%d.jsonl" % attempt)
         cmd = [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
                "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
-        hung = run_title(cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events, skip)
+        hung = run_title(cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events, skip,
+                         transcripts["leonida"])
         if not hung:
             break
         if hung in skip:
@@ -251,6 +269,7 @@ def run_all(args, events):
         if name not in leo.checks:
             leo.set(name)
     report = make_report(xcl, leo, known, gta6rt, xcl_dir)
+    report["transcripts"] = {k: str(v) for k, v in transcripts.items()}
     out = Path(args.out) if args.out else work / "report.json"
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)

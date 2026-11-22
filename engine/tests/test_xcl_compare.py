@@ -6,6 +6,7 @@ Pure functions only: nothing here starts XCL, gta6rt or a title, and no game fil
 """
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
@@ -65,6 +66,29 @@ class Report(unittest.TestCase):
         b = r["checks"][1]
         self.assertEqual((b["leonida"], b["unimplemented"]), ("FAIL", ["kernelx.dll!XMemAlloc"]))
         self.assertEqual(r["checks"][2]["stack"], ["main: XTaskQueueTerminate"])
+
+
+class Transcript(unittest.TestCase):
+    """run_title streams the title's output to the transcript file and keeps none of it on the Run."""
+
+    def test_output_goes_to_the_file(self):
+        class Sink:
+            def put(self, event):
+                pass
+
+        script = "print('[RUN] a'); print('x' * 256); print('[PASS] a')"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.txt")
+            run = xc.Run("synthetic")
+            hung = xc.run_title([sys.executable, "-I", "-c", script], dict(os.environ), tmp, run, ["a"], 15, None,
+                                Sink(), [], path)
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().split("\n")
+        self.assertIsNone(hung)
+        self.assertEqual(run.checks["a"]["status"], "PASS")
+        self.assertTrue(lines[0].startswith("--- "))
+        self.assertEqual(lines[1:4], ["[RUN] a", "x" * 256, "[PASS] a"])
+        self.assertFalse(hasattr(run, "log"))
 
 
 if __name__ == "__main__":

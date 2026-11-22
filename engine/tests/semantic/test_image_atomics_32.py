@@ -79,9 +79,10 @@ class ImageAtomics32Tests(unittest.TestCase):
             ("image_atomic_fmax", "v2", "0x1",
              ("OpAtomicLoad %uint", "OpExtInst %float %glsl NMax", "OpAtomicCompareExchange %uint", "OpLoopMerge"), ()),
             ("image_atomic_fcmpswap", "v[2:3]", "0x3",
-             ("OpAtomicLoad %uint", "OpFOrdEqual %bool", "OpAtomicCompareExchange %uint", "OpLoopMerge"), ()),
+             ("OpAtomicLoad %uint", "OpUGreaterThan %bool", "OpAtomicCompareExchange %uint", "OpLoopMerge"),
+             ("OpFOrdEqual",)),
         ]
-        for op, vdata, dmask, must_have, _ in cases:
+        for op, vdata, dmask, must_have, must_not_have in cases:
             for dim, addr_op, vec_ty, img_var in (
                 ("SQ_RSRC_IMG_2D", "v[4:5]", "%v2int", "%simages"),
                 ("SQ_RSRC_IMG_3D", "v[4:6]", "%v3int", "%simages3d"),
@@ -109,6 +110,8 @@ class ImageAtomics32Tests(unittest.TestCase):
                         self.assertNotIn(f"OpLoad %uint {tp_m.group(1)}", spv)
                         for tok in must_have:
                             self.assertIn(tok, spv)
+                        for tok in must_not_have:
+                            self.assertNotIn(tok, spv)
                         # Verify glc writes back to v2 while non-glc does not overwrite v2 after the atomic.
                         after_tp = spv[tp_m.start():]
                         vgpr2_stores = re.findall(r"OpAccessChain %_ptr_Function_uint %vgpr %c2\b", after_tp)
@@ -136,7 +139,8 @@ class ImageAtomics32Tests(unittest.TestCase):
         ])
         check_cfg(spv_3d)
         self.assertIn("OpCompositeConstruct %v3int", spv_3d)
-        self.assertIn("OpFOrdEqual %bool", spv_3d)
+        self.assertIn("OpUGreaterThan %bool", spv_3d)
+        self.assertNotIn("OpFOrdEqual", spv_3d)
 
     def test_rejected_forms(self):
         for line in (

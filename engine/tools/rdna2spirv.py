@@ -10753,17 +10753,28 @@ class Gen:
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
         elif op == "image_atomic_fcmpswap":
-            cmp_f, init = self.tmp(), self.tmp()
-            self.emit(f"{cmp_f} = OpBitcast %float {cmpv}")
+            # IEEE-754 binary32 ordered equality on raw 32-bit words (denormal-safe on drivers with
+            # shaderDenormPreserveFloat32 = false): equal iff neither is NaN and (cur == cmpv or both are +-0.0).
+            abs_cmp, nan_cmp, init = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{abs_cmp} = OpBitwiseAnd %uint {cmpv} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{nan_cmp} = OpUGreaterThan %bool {abs_cmp} {self.cu(0x7F800000)}")
             self.emit(f"{init} = OpAtomicLoad %uint {tp} {sc} {sem}")
             lbl_hdr, lbl_try, lbl_after, lbl_cont, lbl_exit = (
                 self.tmp() + s for s in ("_hdr", "_try", "_after", "_cont", "_exit"))
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_hdr} = OpLabel")
-            cur, got, cur_f, eq_f = (self.tmp() for _ in range(4))
+            cur, got, abs_cur, nan_cur, any_nan, not_nan, same_bits, or_abs, both_zero, eq_val, eq_f = (
+                self.tmp() for _ in range(11))
             self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
-            self.emit(f"{cur_f} = OpBitcast %float {cur}")
-            self.emit(f"{eq_f} = OpFOrdEqual %bool {cur_f} {cmp_f}")
+            self.emit(f"{abs_cur} = OpBitwiseAnd %uint {cur} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{nan_cur} = OpUGreaterThan %bool {abs_cur} {self.cu(0x7F800000)}")
+            self.emit(f"{any_nan} = OpLogicalOr %bool {nan_cur} {nan_cmp}")
+            self.emit(f"{not_nan} = OpLogicalNot %bool {any_nan}")
+            self.emit(f"{same_bits} = OpIEqual %bool {cur} {cmpv}")
+            self.emit(f"{or_abs} = OpBitwiseOr %uint {abs_cur} {abs_cmp}")
+            self.emit(f"{both_zero} = OpIEqual %bool {or_abs} {self.cu(0)}")
+            self.emit(f"{eq_val} = OpLogicalOr %bool {same_bits} {both_zero}")
+            self.emit(f"{eq_f} = OpLogicalAnd %bool {not_nan} {eq_val}")
             self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
             self.emit(f"OpBranchConditional {eq_f} {lbl_try} {lbl_exit}")
             self.emit(f"{lbl_try} = OpLabel")

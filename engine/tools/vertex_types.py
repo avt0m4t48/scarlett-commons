@@ -262,10 +262,6 @@ def mad_log(ratios):
     return dev[len(dev) // 2]
 
 
-def add(d, k, v=1):
-    d[k] = d.get(k, 0) + v
-
-
 def tangent_0x27(w):
     """(unit vector, sign) from one tag-0x27 u32, read as the mesh shaders read it: a 2_10_10_10 UNORM element
     (tbuffer_load_format_xyzw BUF_FMT_2_10_10_10_UNORM) with each component mapped by v * 2 - 1, so
@@ -329,6 +325,10 @@ def tangent27_checks(data, at, slots, n, mpos, tris, face_normals):
                         minus_v = bt[0] * gv[0] + bt[1] * gv[1] + bt[2] * gv[2] < 0
                         add(out, f"{si}:uv{ui}_w_plus_minus_v", int(minus_v == (sign > 0)))
     return out
+
+
+def add(d, k, v=1):
+    d[k] = d.get(k, 0) + v
 
 
 def measure_block(data, at, T, rng, found=None):

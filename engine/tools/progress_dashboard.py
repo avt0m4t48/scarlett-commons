@@ -125,7 +125,7 @@ def scrub(text, limit=240):
     else:
         checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
     # Consume a same-prefix sibling too, so shown() can redact its entire path.
-    checkout_path = rf"{checkout}(?:[^\s'\"]+|(?=$|['\"]))"
+    checkout_path = rf"{checkout}[^\s'\"]*"
     drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
     posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
     line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)

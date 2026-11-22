@@ -2305,5 +2305,40 @@ class Uncompressed2DTest(unittest.TestCase):
             self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
 
 
+class VolumePatternTest(unittest.TestCase):
+    """3D SW_4KB_S: the intra-tile bit order must be AMD's, and the tile extents must follow from it."""
+
+    # Mesa src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h, GFX10_SW_4K_S3_PATINFO (1 pipe, 1/2/4/8/16 bpe):
+    # nibble01 + nibble2 entries; GFX10_SW_4K_S3_RBPLUS_PATINFO gives the same rows.
+    MESA_SW_4K_S3 = {
+        0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
+        1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+        2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
+        3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
+        4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
+    }
+
+    def test_patterns_are_amds_sw_4k_s3(self):
+        self.assertEqual(ttpf.VOLUME_PATTERNS_4K, self.MESA_SW_4K_S3)
+
+    def test_each_row_uses_every_x_y_z_bit_once_from_bit_0(self):
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                self.assertEqual(pat[:log], (0,) * log)        # the element's own byte-address bits
+                for axis, keep in (("x", lambda s: 0 < s < 100), ("y", lambda s: s < 0), ("z", lambda s: s >= 101)):
+                    bits = sorted(abs(s) - (100 if s >= 101 else 0) for s in pat if keep(s))
+                    self.assertEqual(bits, list(range(1, len(bits) + 1)), axis)
+
+    def test_tile_extents_follow_from_the_bit_order(self):
+        tex = sys.modules["tex_headers"]   # imported by ttpf_mips.py
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                want = (1 << sum(0 < s < 100 for s in pat), 1 << sum(s < 0 for s in pat), 1 << sum(s >= 101 for s in pat))
+                self.assertEqual(tex._VOLUME_4K_TILE[log], want)
+                lay = tex.volume_surface_layout(64, 64, 32, 1, 1 << log)
+                self.assertEqual((lay["block_w"], lay["block_h"], lay["block_d"]), want)
+                self.assertEqual(lay["z_tile_stride"] % 4096, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

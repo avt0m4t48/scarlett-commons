@@ -1905,15 +1905,18 @@ if(TARGET Vulkan::Headers)
     option(LEONIDA_TEST_GUEST_DRAW
            "Build tiny_guest_draw.exe and run the M1.5 draw through gta6rt --run (needs a Vulkan GPU)" OFF)
     if(LEONIDA_TEST_GUEST_DRAW)
-      add_library(d3d12_xs_stub SHARED test/fixtures/d3d12_xs_stub.cpp test/fixtures/d3d12_xs_stub.def)
-      target_compile_definitions(d3d12_xs_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-      target_compile_options(d3d12_xs_stub PRIVATE /W4 /permissive- /utf-8)
-      set_target_properties(d3d12_xs_stub PROPERTIES
-        OUTPUT_NAME d3d12_xs
-        PREFIX ""
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
-        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
-      )
+      # Share the import stub with the tiny_frame clear/readback guest from PR #3488.
+      if(NOT TARGET d3d12_xs_stub)
+        add_library(d3d12_xs_stub SHARED test/fixtures/d3d12_xs_stub.cpp test/fixtures/d3d12_xs_stub.def)
+        target_compile_definitions(d3d12_xs_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(d3d12_xs_stub PRIVATE /W4 /permissive- /utf-8)
+        set_target_properties(d3d12_xs_stub PROPERTIES
+          OUTPUT_NAME d3d12_xs
+          PREFIX ""
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+          ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+        )
+      endif()
       add_executable(tiny_guest_draw test/d3d12_translated_draw_test.cpp)
       target_link_libraries(tiny_guest_draw PRIVATE d3d12_xs_stub Vulkan::Headers)
       target_compile_definitions(tiny_guest_draw PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_M15_GUEST)

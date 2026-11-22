@@ -5,10 +5,10 @@
 `tests/test_docs_links.py` checks Markdown links; this checks the other way the docs point at the tree, a backticked
 `tools/...`, `runtime/...`, `tests/...`, `scripts/...`, `docs/...`, `viewer/...` or `game/...` path (TEST-871: until
 the last three were added, `docs/audio_config.md` named a `docs/music.md` that was never in the repository).
-`third_party/` is left out: its files are a submodule's, which `git ls-files` doesn't list. A rename, or a page written against an unmerged pull
-request, leaves such a path pointing at nothing (docs/saves.md described #279's `xgameruntime_services.cpp` as the
-runtime's save store while #279 was still open). Reads tracked files only (`git ls-files`, with a directory walk when
-git is not available); no game files.
+`third_party/` is left out: its files are a submodule's, which `git ls-files` doesn't list.
+A rename, or a page written against an unmerged pull request, leaves such a path pointing at nothing
+(docs/saves.md described #279's `xgameruntime_services.cpp` as the runtime's save store while #279 was still
+open). Reads tracked files only (`git ls-files`, with a directory walk when git is not available); no game files.
 """
 import os
 import re

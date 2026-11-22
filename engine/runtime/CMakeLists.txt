@@ -569,6 +569,34 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
+    # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
+    # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.
+    find_library(GAMEINPUT_LIBRARY NAMES gameinput HINTS ${_sdk_lib_hints})
+    if(GAMEINPUT_LIBRARY)
+      add_library(gameinput_host SHARED test/fixtures/gameinput_host.cpp)
+      target_compile_options(gameinput_host PRIVATE /W4 /permissive- /utf-8 /GS-)
+      target_link_options(gameinput_host PRIVATE /NODEFAULTLIB /ENTRY:gameinput_host_main)
+      target_link_libraries(gameinput_host PRIVATE kernel32 ${GAMEINPUT_LIBRARY})
+      set_target_properties(gameinput_host PROPERTIES
+        OUTPUT_NAME gameinput_host
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      )
+      add_executable(gameinput_host_test
+        test/gameinput_host_test.cpp
+        src/pe_loader.cpp
+        shims/registry.cpp
+      )
+      target_include_directories(gameinput_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      target_compile_definitions(gameinput_host_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(gameinput_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+      add_dependencies(gameinput_host_test gameinput_host)
+      add_test(NAME gameinput_host COMMAND gameinput_host_test "$<TARGET_FILE:gameinput_host>")
+      set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # Windows cannot load GameInput.dll
+    endif()
+
     # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in
     # process (log, fail) and in child processes (default/env parsing, stop). No game files, no GPU.
     add_executable(unimplemented_policy_test

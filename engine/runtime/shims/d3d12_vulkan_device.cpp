@@ -1440,8 +1440,6 @@ public:
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
                 return E_OUTOFMEMORY;
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
-        } else {
-            log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -1474,6 +1472,10 @@ public:
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
         device_.context->add_resource(id(), binding);
+        // Committed resources start zeroed unless the heap says otherwise; the host cannot reach device-local memory,
+        // so the next submission fills it (D3D-71).
+        if (!host && !(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
+            device_.context->zero_on_next_submit(id(), buffer_);
         return S_OK;
     }
 

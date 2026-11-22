@@ -10681,12 +10681,9 @@ def assemble(gen):
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
-    tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
-            else None)
-    if tree is not None:
-        nesting = cfg_structure.depth(tree)
-        if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
-            tree = None                              # too deep to validate cheaply: use the flat form
+    tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
+                     else (None, None))
+    if nesting is not None:
         gen.nesting = nesting
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
@@ -11998,6 +11995,20 @@ def translate(path):
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
 
 
+def capped_tree(succ):
+    """(tree, nesting): the structured tree for `succ` and its depth, or (None, None) under --dispatch-loop or when
+    cfg_structure can't structure it; tree is None (nesting still the measured depth) when it nests deeper than
+    MAX_STRUCTURED_DEPTH. assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one
+    (SHADER-427 review): a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
+    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    if tree is None:
+        return None, None
+    nesting = cfg_structure.depth(tree)
+    if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
+        return None, nesting                         # too deep to validate cheaply: use the flat form
+    return tree, nesting
+
+
 def needs_barrier_rounds(g, blocks, succ):
     """SHADER-91: whether a native wave32 compute shader has to run in barrier rounds (bar_scheduler). On RDNA every
     s_barrier counts against the same workgroup barrier, so waves on different paths meet at different s_barrier
@@ -12018,7 +12029,7 @@ def needs_barrier_rounds(g, blocks, succ):
                 break
     if not with_barrier:
         return False
-    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 

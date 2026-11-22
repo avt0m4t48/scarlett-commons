@@ -794,6 +794,30 @@ def test_top_level_barrier_keeps_the_plain_translation(make_shader):
     assert asm.count("OpControlBarrier") == 1 and "%x_bar" not in asm and "%x_buf" not in asm
 
 
+def test_top_level_barrier_over_the_depth_bound_runs_in_barrier_rounds(make_shader, monkeypatch):
+    """SHADER-427 review: the barrier-rounds decision uses the same capped tree as assemble(). A top-level barrier
+    is uniform only while the tree is structured; once the tree nests deeper than MAX_STRUCTURED_DEPTH it is
+    emitted in the dispatch loop, where the barrier sits in a switch case, so the shader has to run in rounds."""
+    n = 4
+    chain = "".join(f"s_cmp_eq_u32 s0, {i}\ns_cbranch_scc0 {3 + 2 * (n - i - 1)}\n" for i in range(n))
+    shader = make_shader("v_lshlrev_b32_e32 v2, 2, v0\nds_write_b32 v2, v0\ns_waitcnt lgkmcnt(0)\ns_barrier\n"
+                         + chain + "v_lshlrev_b32_e32 v3, 2, v0\nds_write_b32 v3, v0\ns_endpgm\n",
+                         "cs_barrier_top_deep")
+    structured = shader.translate()
+    shader.validate(structured)
+    gen = rdna2spirv.translate.last_gen
+    assert gen.control_flow == "structured" and not gen.bar_rounds and gen.nesting > 1
+    assert structured.count("OpControlBarrier") == 1 and "%x_bar" not in structured
+
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", gen.nesting - 1)
+    rounds = shader.translate()
+    shader.validate(rounds)
+    gen = rdna2spirv.translate.last_gen
+    assert gen.bar_rounds and gen.control_flow == "barrier rounds"
+    blocks = rounds[rounds.index("OpSwitch %pcv"):rounds.index("%sw_default = OpLabel")]
+    assert "OpControlBarrier" not in blocks and "OpStore %x_bar %true" in blocks
+
+
 def test_barrier_rounds_are_wave32_compute_only(make_shader, monkeypatch):
     """Native wave64 (AMD's 64-wide subgroups) keeps the barrier where s_barrier is; under --wave64-emulate the
     emulated round loop already holds the only barrier."""

@@ -315,6 +315,13 @@ class TexturedOracleTests(unittest.TestCase):
         pixels[1 * 4 + 1] = list(probe)
         return struct.pack("<64f", *(v for pixel in pixels for v in pixel))
 
+    @staticmethod
+    def _make_raw(width: int, height: int, overrides: dict[tuple[int, int], tuple[float, float, float, float]]) -> bytes:
+        pixels = [[CLEAR] * 4 for _ in range(width * height)]
+        for (x, y), rgba in overrides.items():
+            pixels[y * width + x] = list(rgba)
+        return struct.pack(f"<{width * height * 4}f", *(v for pixel in pixels for v in pixel))
+
     def test_accepts_expected_textured_image(self):
         check_image(self.image(), self.manifest)
 
@@ -406,6 +413,107 @@ class TexturedOracleTests(unittest.TestCase):
                 blob = f.read()
             self.assertEqual(blob[:8], struct.pack("<II", 2, 2))
             self.assertEqual(blob[8:], pixels)
+
+    def test_off_centre_default_uv_triangle_gets_probes_and_rejects_magenta(self):
+        # Off-centre triangle in the top-left quadrant with default (0, 0) UVs: centre_uv is None
+        # and uv_probes() is empty (|u - v| == 0). rgba_probes_for_mesh() must still pick covered
+        # pixels so a magenta fallback draw is rejected when red is expected.
+        verts = [
+            (-0.9, -0.9, 0.5, 0.0, 0.0),
+            (-0.2, -0.9, 0.5, 0.0, 0.0),
+            (-0.9, -0.2, 0.5, 0.0, 0.0),
+        ]
+        indices = [0, 1, 2]
+        self.assertIsNone(fl.uv_at(verts, indices, 16, 16, 32, 32))
+        self.assertEqual(fl.uv_probes(verts, indices, 32, 32), [])
+        red_tex = bytes([255, 0, 0, 255])
+        probes = fl.rgba_probes_for_mesh(verts, indices, 32, 32, 1, 1, red_tex, uv_probe_list=[])
+        self.assertTrue(len(probes) >= 1)
+        manifest = {
+            "width": 32,
+            "height": 32,
+            "min_coverage": 0.01,
+            "max_coverage": 0.99,
+            "clear_pixel": [31, 31],
+            "clear": -1.0,
+            "texture": {"width": 1, "height": 1},
+            "rgba_tolerance": 0.02,
+            "rgba_probes": probes,
+        }
+        # Build synthetic image: covered pixels in the triangle set to red vs magenta fallback.
+        covered_pixels = {
+            (px, py)
+            for py in range(32)
+            for px in range(32)
+            if fl.uv_at(verts, indices, px, py, 32, 32) is not None
+        }
+        self.assertTrue(len(covered_pixels) > 0)
+        red_img = self._make_raw(
+            32, 32,
+            {pos: (1.0, 0.0, 0.0, 1.0) for pos in covered_pixels},
+        )
+        res = fl.check_image(red_img, manifest)
+        self.assertEqual(res["covered"], len(covered_pixels))
+        magenta_img = self._make_raw(
+            32, 32,
+            {pos: (1.0, 0.0, 1.0, 1.0) for pos in covered_pixels},
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, manifest)
+        # Empty-probe textured manifest and fallback-indistinguishable expected colour are both rejected.
+        empty_manifest = dict(manifest, rgba_probes=[])
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, empty_manifest)
+        magenta_manifest = dict(
+            manifest,
+            rgba_probes=[{"pixel": probes[0]["pixel"], "uv": [0.0, 0.0], "rgba": [1.0, 0.0, 1.0, 1.0]}],
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, magenta_manifest)
+
+    def test_nan_channels_rejected(self):
+        nan = float("nan")
+        # NaN in centre_rgba must fail (abs(NaN) > tol is False without an explicit finiteness check).
+        with self.assertRaises(AssertionError):
+            fl.check_image(self.image(centre=(nan, 0.4, 0.6, 1.0)), self.manifest)
+        # NaN in rgba_probes must fail.
+        with self.assertRaises(AssertionError):
+            fl.check_image(self.image(probe=(0.8, nan, 0.1, 1.0)), self.manifest)
+        # NaN in clear_pixel must fail.
+        raw_clear_nan = self._make_raw(
+            4, 4,
+            {
+                (0, 0): (nan, -1.0, -1.0, -1.0),
+                (1, 1): (0.8, 0.2, 0.1, 1.0),
+                (2, 1): (0.2, 0.4, 0.6, 1.0),
+                (1, 2): (0.2, 0.4, 0.6, 1.0),
+                (2, 2): (0.2, 0.4, 0.6, 1.0),
+            },
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(raw_clear_nan, self.manifest)
+
+    def test_transparent_unorm_fragments_counted_as_covered(self):
+        # Valid transparent-red UNORM fragments (alpha == 0.0) must be counted as covered by
+        # distinguishing them from the -1.0 clear sentinel rather than requiring alpha > 0.5.
+        manifest = {
+            "width": 4,
+            "height": 4,
+            "min_coverage": 0.2,
+            "max_coverage": 0.9,
+            "centre_pixel": [2, 2],
+            "centre_rgba": [1.0, 0.0, 0.0, 0.0],
+            "clear_pixel": [0, 0],
+            "clear": -1.0,
+            "texture": {"width": 1, "height": 1},
+            "rgba_tolerance": 0.02,
+            "rgba_probes": [{"pixel": [1, 1], "uv": [0.0, 0.0], "rgba": [1.0, 0.0, 0.0, 0.0]}],
+        }
+        overrides = {(x, y): (1.0, 0.0, 0.0, 0.0) for x in (1, 2) for y in (1, 2)}
+        raw = self._make_raw(4, 4, overrides)
+        res = fl.check_image(raw, manifest)
+        self.assertEqual(res["covered"], 4)
+        self.assertAlmostEqual(res["ratio"], 0.25)
 
 
 if __name__ == "__main__":

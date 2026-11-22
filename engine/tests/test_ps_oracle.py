@@ -179,6 +179,26 @@ class OnHardware(unittest.TestCase):
         want_u = [0x3E000000, 0x3EC00000, 0x3F200000, 0x3F600000]    # 0.125, 0.375, 0.625, 0.875
         self.assertEqual(px, [[u, 0, 0x40000000, 0x12345678] for u in want_u])
 
+    def test_other_target_formats(self):
+        # The driver picks the export format for the target: a compressed export reaches an RGBA16_UNORM target
+        # bit for bit (the halves are unorm16 values, not f16), and an RG32F target (32_GR) takes R from the last
+        # enabled of x/z and G from the last enabled of y/w (measured on gfx1036).
+        cases = [("rgba16unorm", ["v_mov_b32_e32 v2, 0x80017fff", "v_mov_b32_e32 v3, 0xc0003c01",
+                                  "exp mrt0, v2, v2, v3, v3 done compr vm"], [0x80017FFF, 0xC0003C01]),
+                 ("rg32f", ["v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 2", "v_mov_b32_e32 v4, 3", "v_mov_b32_e32 v5, 4",
+                            "exp mrt0, v2, v3, v4, v5 done vm"], [3, 4]),
+                 ("rg32f", ["v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v5, 4", "exp mrt0, v2, off, off, v5 done vm"], [1, 4])]
+        for fmt, body, want in cases:
+            with self.subTest(fmt=fmt, body=body[-1]):
+                try:
+                    o = P.Oracle(os.environ["LEONIDA_PS_ORACLE_BUILD"], template="const", size=(1, 1), fmt=fmt)
+                except P.Unavailable as e:
+                    self.skipTest(str(e))
+                try:
+                    self.assertEqual(o.run(body + ["s_endpgm"]), [want])
+                finally:
+                    o.close()
+
 
 if __name__ == "__main__":
     unittest.main()

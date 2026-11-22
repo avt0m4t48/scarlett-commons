@@ -285,10 +285,22 @@ bool rgb96_refused(const D3D12_RESOURCE_DESC& desc) {
 }
 
 // B8G8R8X8: the BGRA8 Vulkan formats with the alpha byte unused. Its typeless family is a family of its own, so
-// views never cross between it and B8G8R8A8, although both land on the same VkFormat.
+// only a castable-format list lets a view cross between it and B8G8R8A8, although both land on the same VkFormat.
 bool alpha_unused(DXGI_FORMAT format) {
     return format == DXGI_FORMAT_B8G8R8X8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
            format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
+// The 8-bit four-channel UNORM and SRGB formats in either channel order, B8G8R8X8 included. A texture in one of them
+// takes an RTV in another when its castable-format list names it: WARP and AMD's D3D12 driver store the clear or the
+// draw in the view's channel order and encoding.
+bool rgba8_any_order(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return true;
+    default: return false;
+    }
 }
 
 // The full mip chain's length for a texture this size.
@@ -5051,6 +5063,11 @@ public:
                                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
+            // An RGBA8 or BGRA8 texture whose castable list names the RTV's format in the other channel order, or
+            // across B8G8R8X8 and B8G8R8A8, gets an RTV in that format.
+            const DXGI_FORMAT asked = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+            const bool cast_listed = r && asked != rd.Format && rgba8_any_order(rd.Format) && rgba8_any_order(asked) &&
+                                     r->lists_castable_format(asked);
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
@@ -5058,8 +5075,8 @@ public:
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                     (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
                     view = {};
-            } else if (typeless_color || typed_rgba8) {
-                const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+            } else if (typeless_color || typed_rgba8 || cast_listed) {
+                const DXGI_FORMAT requested = asked;
                 // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
                 // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
                 // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
@@ -5067,8 +5084,8 @@ public:
                 const bool listed = requested == rd.Format ||
                                     (r && r->has_view_format_list() &&
                                      r->allows_view_format(vulkan_format(requested, false).format));
-                if (typeless_color || (requested != rd.Format && listed &&
-                                       rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                if (typeless_color || cast_listed ||
+                    (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
                     const bool msaa = rd.SampleDesc.Count > 1;
                     const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
                     const bool array_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
@@ -5089,11 +5106,14 @@ public:
                         view = {};
                     } else {
                         // The view's own format, of the resource's family (B8G8R8X8 and B8G8R8A8 are two families
-                        // that share Vulkan formats); the clear and the attachment view reinterpret the image in it.
+                        // that share Vulkan formats) or named by its castable list; the clear and the attachment
+                        // view reinterpret the image in it.
                         const Format named = vulkan_format(requested, false);
                         const int family = leonida::detail::typeless_view_family(named.format);
-                        if (named.typeless || named.rgb96 || !family || alpha_unused(requested) != alpha_unused(rd.Format) ||
-                            family != leonida::detail::typeless_view_family(vulkan_format(rd.Format, false).format))
+                        const bool same_family =
+                            alpha_unused(requested) == alpha_unused(rd.Format) &&
+                            family == leonida::detail::typeless_view_family(vulkan_format(rd.Format, false).format);
+                        if (named.typeless || named.rgb96 || !family || !(same_family || cast_listed))
                             view = {};
                         else
                             view.format = static_cast<leonida::ColorViewFormat>(named.format);

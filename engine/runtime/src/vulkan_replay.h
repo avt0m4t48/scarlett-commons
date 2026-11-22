@@ -1081,10 +1081,18 @@ inline int typeless_view_family(VkFormat format) {
     }
 }
 
+// The RGBA8 and BGRA8 UNORM and SRGB formats: a castable-format list may cross between the two channel orders.
+inline bool rgba8_any_order(VkFormat format) {
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ||
+           format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
 // The format a color view clears or renders in. A view of the resource's own format keeps it (a typeless resource
 // has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
 // is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
-// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A volume keeps its own format.
+// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A castable RGBA8 or BGRA8 image may
+// also be viewed in the other channel order, which the device let through only when the list names it. A volume
+// keeps its own format.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -1093,7 +1101,9 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (family != typeless_view_family(resource.format) || resource.volume || resource.depth != 1)
+    const bool other_order = resource.castable_view_formats && rgba8_any_order(format) &&
+                             rgba8_any_order(resource.format);
+    if ((family != typeless_view_family(resource.format) && !other_order) || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }

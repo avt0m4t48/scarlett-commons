@@ -9,7 +9,9 @@
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
-//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver.
+//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
+//   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
+//     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
@@ -872,6 +874,96 @@ int main() {
                 auto& dst_buf = pass == 0 ? step2_pixels : step1_pixels;
                 std::memcpy(dst_buf.data(), mapped, dst_buf.size());
             }
+        }
+
+        // An opaque draw through an RTV in a format the texture's castable list names, in the other channel order or
+        // across B8G8R8X8 and B8G8R8A8, is stored in the view's channel order and encoding, as WARP and AMD's D3D12
+        // driver store it. The X byte after a draw through an X8 view differs between them (WARP 0, AMD the alpha),
+        // so it isn't compared.
+        {
+            const float cast_tint[3] = {0.8f, 0.6f, 0.4f};  // with the full-screen VS's yellow: (0.8, 0.6, 0, 1)
+            void* cast_up = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &cast_up)));
+            std::memcpy(static_cast<std::uint8_t*>(cast_up) + 2048, cast_tint, sizeof(cast_tint));
+            upload->Unmap(0, nullptr);
+            Ref<ID3D12Device10> inner10;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+            // The bytes of (0.8, 0.6, 0, 1) in the view's order; sRGB encodes 0.8 as 231 and 0.6 as 203.
+            struct Cast { DXGI_FORMAT resource, view; const char* name; std::uint8_t bytes[4]; };
+            const Cast casts[] = {
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "R8G8B8A8{B8G8R8A8}", {0, 153, 204, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, "B8G8R8A8{R8G8B8A8}", {204, 153, 0, 255}},
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "R8G8B8A8{B8G8R8A8_SRGB}",
+                 {0, 203, 231, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, "B8G8R8A8{R8G8B8A8_SRGB}",
+                 {231, 203, 0, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "B8G8R8A8{B8G8R8A8_SRGB}",
+                 {0, 203, 231, 255}},
+                {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "B8G8R8X8{B8G8R8A8}", {0, 153, 204, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "B8G8R8A8{B8G8R8X8}", {0, 153, 204, 0}},
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "R8G8B8A8{B8G8R8X8}", {0, 153, 204, 0}},
+            };
+            const D3D12_DESCRIPTOR_HEAP_DESC cast_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                            D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> cast_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&cast_heap_desc, IID_PPV_ARGS(&cast_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE cast_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(cast_heap.p, 9))(cast_heap.p))};
+            const D3D12_VIEWPORT cast_viewport{0, 0, 4, 4, 0, 1};
+            const D3D12_RECT cast_scissor{0, 0, 4, 4};
+            UINT64 cast_fence = 70;  // after the step-rate block's 61 and 62
+            for (const Cast& c : casts) {
+                D3D12_RESOURCE_DESC1 cast_desc{};
+                cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                cast_desc.Width = cast_desc.Height = 4;
+                cast_desc.DepthOrArraySize = 1;
+                cast_desc.MipLevels = 1;
+                cast_desc.Format = c.resource;
+                cast_desc.SampleDesc.Count = 1;
+                cast_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                Ref<ID3D12Resource> cast_target;
+                EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &cast_desc,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &c.view, IID_PPV_ARGS(&cast_target.p))));
+                D3D12_RENDER_TARGET_VIEW_DESC cast_view{};
+                cast_view.Format = c.view;
+                cast_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                device->CreateRenderTargetView(cast_target.p, &cast_view, cast_rtv);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC cast_pso_desc = fullscreen_desc;
+                cast_pso_desc.RTVFormats[0] = c.view;
+                Ref<ID3D12PipelineState> cast_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&cast_pso_desc, IID_PPV_ARGS(&cast_pso.p))));
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, cast_pso.p)));
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->RSSetViewports(1, &cast_viewport);
+                list->RSSetScissorRects(1, &cast_scissor);
+                list->OMSetRenderTargets(1, &cast_rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                list->DrawInstanced(3, 1, 0, 0);
+                const auto cast_to_copy = transition(cast_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &cast_to_copy);
+                D3D12_TEXTURE_COPY_LOCATION cast_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                cast_dst.PlacedFootprint = {0, {c.resource, 4, 4, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION cast_src{cast_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                list->CopyTextureRegion(&cast_dst, 0, 0, 0, &cast_src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++cast_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, cast_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(cast_fence, nullptr)));
+                const auto* got = static_cast<const std::uint8_t*>(mapped);
+                const unsigned compared = c.view == DXGI_FORMAT_B8G8R8X8_UNORM ? 3 : 4;
+                for (unsigned b = 0; b < compared; ++b) {
+                    if (std::abs(int(got[b]) - int(c.bytes[b])) <= 1) continue;
+                    std::fprintf(stderr, "draw through %s: got bytes %u,%u,%u,%u, byte %u wants %u\n", c.name, got[0],
+                                 got[1], got[2], got[3], b, unsigned(c.bytes[b]));
+                    return 1;
+                }
+            }
+            std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
+                        unsigned(std::size(casts)));
         }
 
         // A draw without a topology is invalid; Close reports it.

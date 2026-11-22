@@ -146,6 +146,35 @@ def _parse_int(tok: str, lineno: int) -> int:
         raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
 
 
+def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
+    """The bits of integer literal `tok` for a `width`-bit integer type, refused where spirv-as refuses it.
+
+    As SPIRV-Tools reads it: an unsigned type takes 0..2^width-1 and no minus sign (not even -0); a signed type
+    takes -2^(width-1)..2^(width-1)-1, or a hex literal 0..2^width-1 read as the bit pattern (0xFFFF for a 16-bit
+    signed type is -1). A type narrower than 32 bits fills its word as the spec says: zero-extended when unsigned,
+    sign-extended when signed (0x8000 for a 16-bit signed type is 0xFFFF8000). Returns the value as an unsigned
+    number of max(width, 32) bits.
+    """
+    val = _parse_int(tok, lineno)
+    kind = "signed" if signed else "unsigned"
+    if not signed:
+        if tok.startswith("-"):
+            raise SpirvAsmError(f"line {lineno}: cannot put a negative number in an unsigned literal: {tok}")
+        if val >> width:
+            raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    elif re.match(r"\+?0[xX]", tok) and val >> width == 0:
+        if val >> (width - 1):
+            val -= 1 << width
+    elif not -(1 << (width - 1)) <= val < 1 << (width - 1):
+        raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    return val & ((1 << max(width, 32)) - 1)
+
+
+def _u32_literal(tok: str, lineno: int) -> int:
+    """A LiteralInteger operand, or a numeric enum/mask value: one unsigned 32-bit word."""
+    return _int_literal(tok, 32, False, lineno)
+
+
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
 _FLOAT_SPEC = {
     16: (5, 10, 15, "<e", "<H"),
@@ -211,13 +240,10 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
         raise SpirvAsmError(f"line {lineno}: OpConstant references unknown scalar type")
     kind, width = type_info[0], type_info[1]
     if kind == "int":
-        val = _parse_int(tok, lineno)
-        if width <= 32:
-            return [val & 0xFFFFFFFF]
-        if width == 64:
-            u64 = val & 0xFFFFFFFFFFFFFFFF
-            return [u64 & 0xFFFFFFFF, (u64 >> 32) & 0xFFFFFFFF]
-        raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        if width > 32 and width != 64:
+            raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        val = _int_literal(tok, width, bool(type_info[2]), lineno)
+        return [val] if width <= 32 else [val & 0xFFFFFFFF, val >> 32]
     if kind == "float":
         bits = _parse_float_bits(tok, width, lineno)
         if width <= 32:
@@ -255,12 +281,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     def encode_operand(kind: str, toks: list[str], idx: int, lineno: int,
                        res_type_id: int | None, cur_ext_table: dict[str, int] | None,
-                       switch_width: int, out: list[int]) -> int:
+                       switch_type: tuple | None, out: list[int]) -> int:
         if kind in _ID_KINDS:
             out.append(get_id(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralInteger":
-            out.append(_parse_int(toks[idx], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralFloat":
             out.append(_parse_float_bits(toks[idx], 32, lineno))
@@ -276,16 +302,21 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if cur_ext_table is not None and tok in cur_ext_table:
                 out.append(cur_ext_table[tok])
             else:
-                out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                out.append(_u32_literal(tok, lineno))
             return idx + 1
         if kind == "PairLiteralIntegerIdRef":
-            val = _parse_int(toks[idx], lineno)
-            if switch_width == 64:
-                u64 = val & 0xFFFFFFFFFFFFFFFF
-                out.append(u64 & 0xFFFFFFFF)
-                out.append((u64 >> 32) & 0xFFFFFFFF)
+            tok = toks[idx]
+            if switch_type is not None:
+                width, signed = switch_type
             else:
+                # Selector of unknown type: one word, read as signed only when the literal is negative.
+                width, signed = 32, tok.startswith("-")
+            val = _int_literal(tok, width, signed, lineno)
+            if width == 64:
                 out.append(val & 0xFFFFFFFF)
+                out.append(val >> 32)
+            else:
+                out.append(val)
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing label in {kind}")
             out.append(get_id(toks[idx + 1], lineno))
@@ -300,7 +331,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing literal in {kind}")
             out.append(get_id(toks[idx], lineno))
-            out.append(_parse_int(toks[idx + 1], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx + 1], lineno))
             return idx + 2
         if kind == "LiteralSpecConstantOpInteger":
             opname = toks[idx]
@@ -313,14 +344,14 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             for sk, sq in sub[3]:
                 if sq == "*":
                     while idx < len(toks):
-                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
                 elif sq == "?":
                     if idx < len(toks):
-                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                        idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
                 else:
                     if idx >= len(toks):
                         raise SpirvAsmError(f"line {lineno}: missing operand {sk} for {opname}")
-                    idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    idx = encode_operand(sk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         venum = VALUE_ENUMS.get(kind)
@@ -330,7 +361,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if entry is None:
                 # Allow raw numeric value fallback (e.g. hex enum value)
                 if tok[:1].isdigit() or tok.startswith(("0x", "0X")):
-                    out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                    out.append(_u32_literal(tok, lineno))
                     return idx + 1
                 raise SpirvAsmError(f"line {lineno}: unknown {kind} value {tok!r}")
             val, params = entry
@@ -339,7 +370,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             for pk in params:
                 if idx >= len(toks):
                     raise SpirvAsmError(f"line {lineno}: missing parameter {pk} for {kind}.{tok}")
-                idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         benum = BIT_ENUMS.get(kind)
@@ -351,7 +382,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 entry = benum.get(part)
                 if entry is None:
                     if part[:1].isdigit() or part.startswith(("0x", "0X")):
-                        mask |= _parse_int(part, lineno) & 0xFFFFFFFF
+                        mask |= _u32_literal(part, lineno)
                         continue
                     raise SpirvAsmError(f"line {lineno}: unknown {kind} flag {part!r} in {tok!r}")
                 bval, params = entry
@@ -366,7 +397,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 for pk in params:
                     if idx >= len(toks):
                         raise SpirvAsmError(f"line {lineno}: missing parameter {pk} for {kind} {tok!r}")
-                    idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    idx = encode_operand(pk, toks, idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             return idx
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
@@ -452,26 +483,26 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 ext_imports[res_id] = _EXT_SETS[ext_name]
 
         cur_ext_table = None
-        switch_width = 32
+        switch_type = None                 # (width, signed) of the OpSwitch selector's integer type
         if opname == "OpExtInst" and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
             sel_ti = type_info.get(id_to_type.get(sel_id))
-            if sel_ti and sel_ti[0] == "int":
-                switch_width = sel_ti[1]
+            if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
+                switch_type = (sel_ti[1], bool(sel_ti[2]))
 
         for kind, quant in op_specs:
             if quant == "*":
                 while arg_idx < len(toks):
-                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             elif quant == "?":
                 if arg_idx < len(toks):
-                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                    arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
             else:
                 if arg_idx >= len(toks):
                     raise SpirvAsmError(f"line {lineno}: {opname} missing operand ({kind})")
-                arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_width, out)
+                arg_idx = encode_operand(kind, toks, arg_idx, lineno, res_type_id, cur_ext_table, switch_type, out)
 
         if arg_idx != len(toks):
             raise SpirvAsmError(f"line {lineno}: {opname} unexpected trailing tokens {toks[arg_idx:]!r}")

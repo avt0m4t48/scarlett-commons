@@ -126,7 +126,28 @@ class TallyTest(unittest.TestCase):
         self.assertEqual(s["flags18"]["8"], {"nodes": 1, "polygons": 1, "area_m2": 1024})
         self.assertEqual(s["flags18"]["12"], {"nodes": 1, "polygons": 2, "area_m2": 1088})
         self.assertEqual(s["flags28"], {"17": {"nodes": 1, "polygons": 1, "area_m2": 1024}})
+        self.assertEqual(s["flags18_bits_8_and_13"], {
+            "both": {"nodes": 1, "polygons": 1, "area_m2": 1024},
+            "only_8": {"nodes": 0, "polygons": 0, "area_m2": 0},
+            "only_13": {"nodes": 0, "polygons": 0, "area_m2": 0},
+            "neither": {"nodes": 1, "polygons": 2, "area_m2": 1088},
+        })
         self.assertAlmostEqual(s["height_difference_m"]["p10"], 0.5, delta=0.01)
+
+    def test_the_two_road_bits_are_counted_in_combination(self):
+        self.assertEqual([nn.pair_key(w) for w in (0x2100, 0x100, 0x2000, 0x1000, 0, 0xFFFFFFFF)],
+                         ["both", "only_8", "only_13", "neither", "neither", "both"])
+        squares = [(0.0, 0.0, 8.0, 8.0, 0.0, 0x100, 0), (8.0, 0.0, 16.0, 8.0, 0.0, 0x2000, 0),
+                   (16.0, 0.0, 24.0, 8.0, 0.0, 0x2100, 0), (24.0, 0.0, 32.0, 8.0, 0.0, 0, 0)]
+        nodes = [(4.0, 4.0, 0.0), (12.0, 4.0, 0.0), (13.0, 4.0, 0.0), (20.0, 4.0, 0.0), (28.0, 4.0, 0.0)]
+        tally = nn.new_tally()
+        nn.tally_tile(tally, build_tile(squares), {(256, 256): list(range(len(nodes)))}, nodes)
+        pair = nn.summarize(tally, len(nodes), 1, 3.0)["flags18_bits_8_and_13"]
+        self.assertEqual({k: v["nodes"] for k, v in pair.items()},
+                         {"both": 1, "only_8": 1, "only_13": 2, "neither": 1})
+        self.assertEqual({k: v["polygons"] for k, v in pair.items()},
+                         {"both": 1, "only_8": 1, "only_13": 1, "neither": 1})
+        self.assertEqual(sum(v["area_m2"] for v in pair.values()), 4 * 64)
 
     def test_max_dz_bounds_which_nodes_count(self):
         self.assertEqual(self.summary(max_dz=0.0)["nodes_within_max_dz"], 0)

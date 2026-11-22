@@ -5,8 +5,9 @@ The lane graph (tools/world_lights_paths.py, levels.rpf) gives every road node a
 tool puts the two together: for each node it finds the polygon of the node's 128 m tile that contains the node in
 plan view and is closest in height, and counts the bits of that polygon's `+0x18` and `+0x28` words. Next to it,
 it sums the plan area of the polygons that carry each bit, over the tiles that hold at least one node. A bit that
-most nodes sit on while it covers a small share of the area marks road surface; see docs/navmesh.md, "Polygon
-flags under the lane graph".
+most nodes sit on while it covers a small share of the area is tied to the roads. Two bits of `+0x18` do that,
+8 and 13, so the summary also says how they combine (both, only one, neither) for the nodes and for the area; see
+docs/navmesh.md, "Polygon flags under the lane graph".
 
 A tile's vertices are three u16 each: position = tile minimum + u16 / 65535 * tile extent (the minimum is the
 quadtree root's, the extent the header's `+0x60`). The node heights test that: a wrong scale would leave the
@@ -38,6 +39,17 @@ TILE = 128.0
 CELL = 8.0               # bucket size of the per-tile lookup grid, metres
 POLYGON = struct.Struct("<II16xI12xI")   # tile id, (first index << 4) | count, +0x18 flags, +0x28 flags
 assert POLYGON.size == 44
+PAIR = (8, 13)           # the two +0x18 bits most nodes stand on; counted in combination as well
+
+
+def pair_key(flags18):
+    """Which of the PAIR bits a `+0x18` word carries: "both", "only_8", "only_13" or "neither"."""
+    low, high = (flags18 >> PAIR[0]) & 1, (flags18 >> PAIR[1]) & 1
+    if low and high:
+        return "both"
+    if low:
+        return "only_%d" % PAIR[0]
+    return "only_%d" % PAIR[1] if high else "neither"
 
 
 def sector_of(x, y):
@@ -119,6 +131,7 @@ def new_tally():
         "tiles_with_nodes": 0, "tiles_unreadable": 0, "polygons": 0, "area": 0.0,
         "area18": collections.Counter(), "area28": collections.Counter(),
         "polygons18": collections.Counter(), "polygons28": collections.Counter(),
+        "pair_area": collections.Counter(), "pair_polygons": collections.Counter(),
         "best": {},          # node index -> (height difference, flags18, flags28)
     }
 
@@ -144,6 +157,8 @@ def tally_tile(tally, b, by_sector, nodes):
         area = plan_area(points)
         tally["polygons"] += 1
         tally["area"] += area
+        tally["pair_area"][pair_key(flags18)] += area
+        tally["pair_polygons"][pair_key(flags18)] += 1
         for word, area_by, count_by in ((flags18, tally["area18"], tally["polygons18"]),
                                         (flags28, tally["area28"], tally["polygons28"])):
             bit = 0
@@ -215,6 +230,8 @@ def summarize(tally, n_nodes, n_sectors, max_dz):
     near = [v for v in tally["best"].values() if v[0] <= max_dz]
     heights = sorted(v[0] for v in tally["best"].values())
     under18, under28 = collections.Counter(), collections.Counter()
+    pair_nodes = collections.Counter(pair_key(flags18) for _dz, flags18, _flags28 in near)
+    pair_names = ("both", "only_%d" % PAIR[0], "only_%d" % PAIR[1], "neither")
     for _dz, flags18, flags28 in near:
         for word, into in ((flags18, under18), (flags28, under28)):
             bit = 0
@@ -246,6 +263,10 @@ def summarize(tally, n_nodes, n_sectors, max_dz):
         "area_m2": round(tally["area"]),
         "flags18": table(under18, tally["area18"], tally["polygons18"]),
         "flags28": table(under28, tally["area28"], tally["polygons28"]),
+        "flags18_bits_%d_and_%d" % PAIR: {
+            name: {"nodes": pair_nodes.get(name, 0), "polygons": tally["pair_polygons"].get(name, 0),
+                   "area_m2": round(tally["pair_area"].get(name, 0.0))}
+            for name in pair_names},
     }
 
 

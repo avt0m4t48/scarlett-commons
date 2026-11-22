@@ -240,6 +240,9 @@ def verify_manifest(
 
     want = load_manifest(manifest_path)
     have = dict(walk(target_dir, exclude=manifest_path))
+    if not want and have:
+        # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.
+        raise ManifestError(f"{manifest_path} lists no files, but {target_dir} holds {len(have)}")
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
     problems: dict[str, str] = {}

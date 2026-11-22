@@ -23,6 +23,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 
 #include <cctype>
 #include <cmath>
@@ -36,18 +37,6 @@
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
-static unsigned g_validation_errors = 0;
-
-static VKAPI_ATTR VkBool32 VKAPI_CALL on_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                 VkDebugUtilsMessageTypeFlagsEXT types,
-                                                 const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    // Only validation-type errors count: a broken third-party layer must not fail the test.
-    const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++g_validation_errors;
-    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
-                 data && data->pMessage ? data->pMessage : "(no message)");
-    return VK_FALSE;
-}
 #define CHECK(x)                                                                         \
     do {                                                                                 \
         VkResult r_ = (x);                                                               \
@@ -130,40 +119,14 @@ static int run(int argc, char** argv) {
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);
-    LOADI(vkEnumerateInstanceLayerProperties);
-    const char* validation_env = std::getenv("LEONIDA_VK_VALIDATION");
-    const bool validation = validation_env && std::strcmp(validation_env, "0") != 0;
-    const char* layer = "VK_LAYER_KHRONOS_validation";
-    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    VkDebugUtilsMessengerCreateInfoEXT messenger_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-    messenger_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
-    messenger_info.pfnUserCallback = on_message;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    if (validation) {
-        uint32_t count = 0;
-        vkEnumerateInstanceLayerProperties(&count, nullptr);
-        std::vector<VkLayerProperties> layers(count);
-        vkEnumerateInstanceLayerProperties(&count, layers.data());
-        bool found = false;
-        for (const auto& properties : layers) found = found || !std::strcmp(properties.layerName, layer);
-        if (!found) {
-            std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but %s is not installed\n", layer);
-            return 1;
-        }
-        ici.pNext = &messenger_info;   // also reports instance creation and destruction
-        ici.enabledLayerCount = 1; ici.ppEnabledLayerNames = &layer;
-        ici.enabledExtensionCount = 1; ici.ppEnabledExtensionNames = &debug_utils;
-    }
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
-    if (validation) {
-        LOADI(vkCreateDebugUtilsMessengerEXT);
-        VkDebugUtilsMessengerEXT messenger;
-        CHECK(vkCreateDebugUtilsMessengerEXT(inst, &messenger_info, nullptr, &messenger));
-    }
+    CHECK(validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
@@ -188,7 +151,7 @@ static int run(int argc, char** argv) {
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)%s\n", props.deviceName, sgProps.minSubgroupSize,
-                 sgProps.maxSubgroupSize, validation ? " (validation on)" : "");
+                 sgProps.maxSubgroupSize, validation.enabled() ? " (validation on)" : "");
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -488,11 +451,6 @@ static int run(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    const int rc = run(argc, argv);
     // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
-    if (g_validation_errors) {
-        std::fprintf(stderr, "%u validation errors\n", g_validation_errors);
-        return rc != 0 && rc != 77 ? rc : 1;
-    }
-    return rc;
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

@@ -13354,6 +13354,34 @@ def same_encoding(raw, printed, op, operand_count):
     return diff == 0
 
 
+def mix_literal(raw, printed, op):
+    """The 32-bit literal of a v_fma_mix* when LLVM printed it cut to its low half, else None.
+
+    A v_fma_mix source read as f16 (op_sel_hi set) takes the half op_sel names, so one literal can feed one source its
+    low half and another its high half (seen in the FidelityFX DLL's FSPX code: src0 low, src2 high, op_sel:[0,0,1]
+    op_sel_hi:[1,0,1]). llvm-mc prints that literal as its low 16 bits and re-encodes it with a zero high half, which
+    would read the high half as +0.0. Only that half may differ: the 8 instruction bytes must match (same_encoding)
+    and the printed literal must be the stored one's low half. That the hardware hands op_sel's high half of the
+    literal to that source is not measured; Mesa's ACO relies on it (optimize_constants() in aco_optimizer.cpp packs
+    two constants as the two f16 halves of one literal for v_fma_mix), and the console compiler emitted it here."""
+    if not op.startswith("v_fma_mix") or len(raw) != 12 or len(printed) != 12 or raw[3] != 0xCC:
+        return None
+    if not same_encoding(raw[:8], printed[:8], op, 4):           # vdst, src0, src1, src2
+        return None
+    stored, shown = int.from_bytes(raw[8:], "little"), int.from_bytes(printed[8:], "little")
+    if stored == shown or shown != stored & 0xFFFF:
+        return None
+    return stored
+
+
+def restore_mix_literal(ins, raw, literal):
+    """Give every source of ``ins`` that the stored bytes encode as the literal (SRC field 0xff) its 32-bit value."""
+    w1 = int.from_bytes(raw[4:8], "little")
+    for i in range(3):
+        if (w1 >> (9 * i)) & 0x1FF == 0xFF and ins["args"][1 + i].get("k") == "imm":
+            ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
@@ -13534,6 +13562,10 @@ def check_printed_encodings(path, info):
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
+            literal = mix_literal(raw, enc, base_op(ins["op"]))
+            if literal is not None:
+                restore_mix_literal(ins, raw, literal)
+                continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
 
@@ -13571,6 +13603,10 @@ def translate(path):
             op, operand_count = ins["op"], len(ins["args"])
             skipped, at = 0, pos
             while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
+                literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
+                if literal is not None:
+                    restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    break
                 at += 4
                 skipped += 4
                 if skipped > 4096 or at >= len(blob):

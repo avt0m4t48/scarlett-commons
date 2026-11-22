@@ -1,0 +1,96 @@
+"""A v_fma_mix* literal that llvm-mc prints cut to its low half is read from the blob.
+
+A v_fma_mix source read as f16 (op_sel_hi set) takes the half op_sel names, so one 32-bit literal can give src0 its
+low half and src2 its high half. llvm-mc prints that literal as its low 16 bits and re-encodes it with a zero high
+half, so the printed-encoding check (#2026) refused such an instruction, and LLVM's text alone reads the high half as
++0.0. The translator now takes the literal from the blob when only its high half differs. Hand-built encodings
+(registers and values made up for the test), no game data.
+
+    python -I tests/semantic/test_fma_mix_literal.py -v
+"""
+import os
+import struct
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from support import mrt0_words, rdna2spirv, translate_listing  # noqa: E402
+
+NAME = "ps_fma_mix_literal"
+CODE_START = 0x100
+# v_mov_b32 v2, 2.0 (VOP1); v_fma_mix_f32 v1, lit, v2, lit with op_sel:[0,0,1] op_sel_hi:[1,0,1]: src0 = the
+# literal's low half as f16, src1 = v2 as f32, src2 = the literal's high half as f16. The stored literal is
+# 0x40003c00 (low 1.0, high 2.0); llvm-mc prints 0x3c00 and encodes 0x00003c00.
+MOV = ("v_mov_b32_e32 v2, 2.0", "f4 02 04 7e")
+MIX_TEXT = "v_fma_mix_f32 v1, 0x3c00, v2, 0x3c00 op_sel:[0,0,1] op_sel_hi:[1,0,1]"
+MIX_WORDS = "01 60 20 cc ff 04 fc 0b"
+EXP = ("exp mrt0 v1, v1, v1, v1 done vm", "0f 18 00 f8 01 01 01 01")
+END = ("s_endpgm", "00 00 81 bf")
+
+
+def lit(value):
+    return struct.pack("<I", value).hex(" ")
+
+
+def program(literal, words=MIX_WORDS):
+    return [MOV, (MIX_TEXT, f"{words} {lit(literal)}"), EXP, END]
+
+
+def listing(prog, invalid=False):
+    size = sum(len(bytes.fromhex(enc)) for _, enc in prog)
+    lines = [f"; {NAME}  code 0x{CODE_START:x}..0x{CODE_START + size:x} (scan), gfx1030, "
+             f"{1 if invalid else 0} invalid words"]
+    for text, enc in prog:
+        printed = ",".join(f"0x{b:02x}" for b in bytes.fromhex(enc))
+        lines.append(f"\t{text:<40}; encoding: [{printed}]")
+    if invalid:
+        # translate() takes the re-anchoring path when the listing reports an undecodable word.
+        lines += ["", "; --- llvm-mc messages ---", "; <stdin>:1:1: warning: invalid instruction encoding"]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def blob(prog):
+    return bytes(CODE_START) + b"".join(bytes.fromhex(enc) for _, enc in prog)
+
+
+def f2u(x):
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+PRINTED = program(0x00003C00)
+STORED = program(0x40003C00)
+
+
+class FmaMixLiteralTest(unittest.TestCase):
+    def run_ps(self, data, fssm):
+        return mrt0_words(translate_listing(NAME, data, fssm=fssm))
+
+    def test_high_half_comes_from_the_blob(self):
+        # fma(1.0, 2.0, 2.0) = 4.0
+        self.assertEqual(self.run_ps(listing(PRINTED), blob(STORED)), [f2u(4.0)] * 4)
+
+    def test_reanchored_listing_takes_it_too(self):
+        self.assertEqual(self.run_ps(listing(PRINTED, invalid=True), blob(STORED)), [f2u(4.0)] * 4)
+
+    def test_without_the_blob_the_printed_literal_is_all_there_is(self):
+        # LLVM's text alone: the high half reads +0.0, fma(1.0, 2.0, 0.0) = 2.0 (what the listing says).
+        self.assertEqual(self.run_ps(listing(PRINTED), None), [f2u(2.0)] * 4)
+
+    def test_printed_low_half_must_match(self):
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            self.run_ps(listing(PRINTED), blob(program(0x40003C01)))
+        self.assertIn("v_fma_mix_f32 at 0x104", str(cm.exception))
+
+    def test_any_other_difference_is_still_refused(self):
+        # The stored instruction reads v3 as src1 (SRC1 field 0x103), not the printed v2.
+        other = program(0x40003C00, words="01 60 20 cc ff 06 fc 0b")
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            self.run_ps(listing(PRINTED), blob(other))
+        self.assertIn("dropped", str(cm.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

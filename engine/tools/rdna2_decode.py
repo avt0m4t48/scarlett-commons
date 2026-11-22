@@ -878,32 +878,31 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
                 return None, 4
             lit = struct.unpack_from("<I", code, pc + 8)[0]
             nbytes = 12
+        is_mix = name.startswith("v_fma_mix")
         args = []
         for fn, nr, _ in spec:
             w = _width(nr, wave32)
             if fn == "VDST":
                 args.append(_vreg(vdst, w))
-            elif fn == "SRC0":
-                args.append(_src(src0, w, lit))
-            elif fn == "SRC1":
-                args.append(_src(src1, w, lit))
-            elif fn == "SRC2":
-                args.append(_src(src2, w, lit))
+            elif fn in ("SRC0", "SRC1", "SRC2"):
+                idx = int(fn[-1])
+                args.append(_src(srcs_codes[idx], w, lit,
+                                 neg=is_mix and bool(neg_lo & (1 << idx)),
+                                 absm=is_mix and bool(neg_hi & (1 << idx))))
         mods = []
         sel_bits = [(op_sel >> i) & 1 for i in range(nsrc)]
         selhi_bits = [(op_sel_hi >> i) & 1 for i in range(nsrc)]
         neglo_bits = [(neg_lo >> i) & 1 for i in range(nsrc)]
         neghi_bits = [(neg_hi >> i) & 1 for i in range(nsrc)]
         # v_fma_mix* uses op_sel/op_sel_hi with default [0,...]; standard packed ops default op_sel_hi to [1,...].
-        is_mix = name.startswith("v_fma_mix")
         if any(sel_bits):
             mods.append(f"op_sel:[{','.join(str(b) for b in sel_bits)}]")
         default_hi = [0] * nsrc if is_mix else [1] * nsrc
         if selhi_bits != default_hi:
             mods.append(f"op_sel_hi:[{','.join(str(b) for b in selhi_bits)}]")
-        if any(neglo_bits):
+        if not is_mix and any(neglo_bits):
             mods.append(f"neg_lo:[{','.join(str(b) for b in neglo_bits)}]")
-        if any(neghi_bits):
+        if not is_mix and any(neghi_bits):
             mods.append(f"neg_hi:[{','.join(str(b) for b in neghi_bits)}]")
         if clamp:
             mods.append("clamp")

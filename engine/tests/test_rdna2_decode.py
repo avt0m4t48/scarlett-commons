@@ -47,6 +47,16 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_mix_source_modifiers(self):
+        # LLVM gfx1013: v17, -v19, |v21|, -|v23| across all three mix variants.
+        for opcode, name in enumerate(("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16")):
+            with self.subTest(name=name):
+                code = words(0xCC200611 + (opcode << 16), 0xA45E2B13)
+                ins, = rdna2_decode.decode_bytes(code)["insns"]
+                expected = shader_ir.parse_line(f"{name} v17, -v19, |v21|, -|v23|")
+                self.assertEqual((ins["op"], ins["args"], ins["mods"]),
+                                 (name, expected["args"], expected["mods"]))
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000

@@ -1194,10 +1194,14 @@ def main():
     try:
         if "translator" in backends:
             a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-            parent = Path(a.work).resolve() if a.work else None
-            if parent is not None:
-                parent.mkdir(parents=True, exist_ok=True)
-            work = Path(tempfile.mkdtemp(prefix="lds_fuzz_", dir=parent))
+            try:
+                parent = Path(a.work).resolve() if a.work else None
+                if parent is not None:
+                    parent.mkdir(parents=True, exist_ok=True)
+                work = Path(tempfile.mkdtemp(prefix="lds_fuzz_", dir=parent))
+            except OSError as e:
+                print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+                return 2
             print(f"work dir {work}")
             rcs.append(run_translator(progs, a, work, tally))
         if oracle:

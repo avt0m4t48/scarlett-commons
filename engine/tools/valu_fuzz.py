@@ -974,10 +974,14 @@ def negative_control(oracle, a, waves):
 def run_translator(progs, a):
     """The translator path: assemble for gfx1013, translate, run with vk_compute_test. Returns an exit code."""
     a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-    parent = Path(a.work).resolve() if a.work else None
-    if parent is not None:
-        parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_", dir=parent))
+    try:
+        parent = Path(a.work).resolve() if a.work else None
+        if parent is not None:
+            parent.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_", dir=parent))
+    except OSError as e:
+        print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+        return 2
     print(f"work dir {work}")
     pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:

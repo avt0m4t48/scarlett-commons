@@ -775,6 +775,22 @@ def box16_rounding(data):
     return errs
 
 
+def count_pairs(data):
+    """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
+    count = 0
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind == TRI1:
+            count += 1
+        elif kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return count
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -815,6 +831,11 @@ def check_build(directory, rays=300, seed=1):
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
         if desc["kind"] == "blas" and not errs:
             errs += box16_rounding(data)
+        pairs = count_pairs(data) if desc["kind"] == "blas" and not errs else 0
+        if desc.get("pairs") is True and not pairs:
+            errs.append("built with pairing, but no TRI1 node is reachable")
+        if desc.get("pairs") is False and pairs:
+            errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]
@@ -846,13 +867,19 @@ def check_build(directory, rays=300, seed=1):
             if ids is not None:
                 same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
+                # D3D12's barycentrics: a paired (TRI1) or rotated TRI0 triangle must still return them through its
+                # remap byte, not its slot order
+                same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
+                                    for g, w in zip(got["bary"], want["bary"]))
             else:
                 # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
                 want_id = inst_ids[want["instance"]][want["primitive"]]
                 same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
             bad += not same
-        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
+        paired = f", {pairs} TRI1" if pairs else ""
+        print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "
+              f"({hits} hits)")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:

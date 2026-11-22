@@ -60,9 +60,9 @@ const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_so
 const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
 const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
 const uint INVALID = 0xffffffffu;
-const uint TRI0 = 0u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
+const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
 const uint REMAP_IDENTITY = 0x09u;
-const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u;  // pc.flags; xdxr_build.h XdxrBuilder flag_tlas, flag_box16
+const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
            INST_FLAGS_MASK = 0xc0000000u;
 
@@ -87,7 +87,8 @@ layout(push_constant) uniform Push {
     uint nodes_off;
     uint parents_off;
     uint total_size;
-    uint flags;           // FLAG_TLAS: elements are 128-byte instances; FLAG_BOX16: inner nodes are 64-byte BOX16
+    uint flags;           // FLAG_TLAS: elements are 128-byte instances; FLAG_BOX16: inner nodes are 64-byte BOX16;
+                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves
 } pc;
 
 // ---- 64-bit addresses as uvec2 ----
@@ -429,11 +430,80 @@ void radix_scatter(uint w, uint t) {
 }
 
 // ---- MODE_LEVEL ----
+// TRI1 pairing (FLAG_PAIR, bottom level, the level above the leaves): among one node's children, a triangle and a
+// later sibling that shares an edge with it, traversed in the opposite direction (the same two vertices, bit for bit),
+// from the same geometry and both active, go into the first one's leaf: TRI0 reads slots (0, 1, 2) and TRI1 (1, 3, 2)
+// (docs/bvh.md 7a), so the first triangle is rotated to put the shared edge in slots 1 -> 2, the sibling's third
+// vertex goes in slot 3, its primitive index in PrimitiveIndex2 and its remap byte in byte 1. The node keeps one child
+// per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf
+// and the sibling's own leaf is left unreferenced. Both pointers have this node as parent. Pairs never cross nodes,
+// so no other thread touches these leaves. The barycentric remap byte of a node type returns D3D12's (b1, b2): bits
+// [1:0] and [3:2] are the slots holding the triangle's vertices 1 and 2.
+uint leaf_off(uint e) { return pc.elements_off + 64u * e; }
+uvec3 leaf_vertex(uint e, uint k) {
+    uint o = leaf_off(e) + 12u * k;
+    return uvec3(load(pc.dst, o), load(pc.dst, o + 4u), load(pc.dst, o + 8u));
+}
+void store_vertex(uint e, uint slot, uvec3 v) {
+    uint o = leaf_off(e) + 12u * slot;
+    store(pc.dst, o, v.x); store(pc.dst, o + 4u, v.y); store(pc.dst, o + 8u, v.z);
+}
+void pair_children(uint n, out uint kids[4]) {
+    uint e[4];
+    uvec3 v[4][3];
+    uint geo[4];
+    bool live[4], used[4];
+    uint count = min(4u, pc.arg0 - 4u * n);
+    for (uint c = 0u; c < 4u; ++c) { kids[c] = INVALID; live[c] = false; used[c] = false; e[c] = 0u; geo[c] = 0u; }
+    for (uint c = 0u; c < count; ++c) {
+        e[c] = load(pc.scratch, vals_off() + 4u * (4u * n + c));
+        kids[c] = element_ptr(e[c]);
+        geo[c] = load(pc.dst, leaf_off(e[c]) + 48u);
+        for (uint k = 0u; k < 3u; ++k) v[c][k] = leaf_vertex(e[c], k);
+        vec3 lo, hi;
+        load_box(e[c], lo, hi);
+        live[c] = !box_empty(lo, hi);                    // a triangle with a NaN vertex is inactive: never paired
+    }
+    for (uint c = 0u; c < count; ++c) {
+        if (used[c] || !live[c]) continue;
+        used[c] = true;
+        for (uint d = c + 1u; d < count; ++d) {
+            if (used[d] || !live[d] || geo[d] != geo[c]) continue;
+            uint k = 3u, kd = 3u;
+            for (uint a = 0u; a < 3u && k == 3u; ++a) {
+                uvec3 p = v[c][a], q = v[c][(a + 1u) % 3u];      // edge p -> q of the first triangle
+                if (all(equal(p, q))) continue;
+                for (uint b = 0u; b < 3u; ++b) {
+                    if (all(equal(v[d][b], q)) && all(equal(v[d][(b + 1u) % 3u], p))) { k = a; kd = b; break; }
+                }
+            }
+            if (k == 3u) continue;
+            used[d] = true;
+            // the first triangle as (p0, p1, p2) with the shared edge p1 -> p2; slot 3 is the sibling's third vertex
+            store_vertex(e[c], 0u, v[c][(k + 2u) % 3u]);
+            store_vertex(e[c], 1u, v[c][k]);
+            store_vertex(e[c], 2u, v[c][(k + 1u) % 3u]);
+            store_vertex(e[c], 3u, v[d][(kd + 2u) % 3u]);
+            store(pc.dst, leaf_off(e[c]) + 56u, load(pc.dst, leaf_off(e[d]) + 52u));
+            // TRI0 reads (p0, p1, p2): vertex m of the first triangle is in slot (m + 4 - k) % 3. TRI1 reads
+            // (p1, p3, p2): vertex m of the sibling is in slot (m + 5 - kd) % 3.
+            uint remap0 = (5u - k) % 3u | ((6u - k) % 3u) << 2;
+            uint remap1 = (6u - kd) % 3u | ((7u - kd) % 3u) << 2;
+            store(pc.dst, leaf_off(e[c]) + 60u, remap0 | remap1 << 8);
+            kids[d] = (kids[c] & ~7u) | TRI1;
+            break;
+        }
+    }
+}
+
 void build_node(uint n) {
     uint node = pc.first + n;
     uint me = node_ptr(node);
     uint o = pc.nodes_off + node_size() * node;
     vec3 ulo = vec3(uintBitsToFloat(0x7f800000u)), uhi = -ulo;
+    uint kids[4];
+    bool pairing = pc.arg2 != 1u && pc.arg1 == INVALID && !is_tlas() && (pc.flags & FLAG_PAIR) != 0u;
+    if (pairing) pair_children(n, kids);
     for (uint c = 0u; c < 4u; ++c) {
         uint entry = 4u * n + c;
         uint child = INVALID;
@@ -456,7 +526,7 @@ void build_node(uint n) {
         } else if (entry < pc.arg0) {
             if (pc.arg1 == INVALID) {
                 uint e = load(pc.scratch, vals_off() + 4u * entry);
-                child = element_ptr(e);
+                child = pairing ? kids[c] : element_ptr(e);
                 load_box(e, lo, hi);
                 if (is_tlas()) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
             } else {

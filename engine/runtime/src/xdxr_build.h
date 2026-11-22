@@ -120,10 +120,16 @@ public:
     // destination itself, or another one, which is copied first) was built from the same topology, and is refitted
     // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
     // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
+    //
+    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_LEVEL).
+    // The layout and the tree are the same either way. A refit rewrites every leaf as one triangle, so a structure
+    // that will be updated must be built without pairing (the layer pairs only builds without ALLOW_UPDATE), and an
+    // update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
-                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0) {
+                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
         if (!loaded_ || layout.tlas) return false;
         Push p = base(layout, dst, scratch);
+        if (pair && !update_from) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
@@ -212,7 +218,7 @@ private:
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
                       sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
     };
-    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2 };  // xdxr_build.comp FLAG_TLAS, FLAG_BOX16
+    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4 };  // xdxr_build.comp FLAG_*
     static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }

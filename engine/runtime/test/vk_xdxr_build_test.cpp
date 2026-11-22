@@ -9,7 +9,9 @@
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
 // compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
 // BOX16 builds (blas_box16_*: half boxes, which check-build compares bit for bit with tools/xdxr_bvh.py encode_box16),
-// including coordinates past the half range and below its smallest normal, and a refit.
+// including coordinates past the half range and below its smallest normal, and a refit; TRI1 pairing (blas_paired_*:
+// sibling triangles that share an edge in one leaf), on grids, BOX16, a transform, inactive triangles, triangles that
+// share an edge in the same direction or across geometries (never paired), and the radix-sort path.
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -123,10 +125,12 @@ struct Built {
 
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
 // `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
-// `box16`: BOX16 inner nodes.
+// `box16`: BOX16 inner nodes. `pair`: TRI1 pairing; the case's JSON then asks check-build for at least one TRI1
+// node, or with `expect_no_pairs` for none.
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
-               const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false) {
+               const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false,
+               bool pair = false, bool expect_no_pairs = false) {
     std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -174,7 +178,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires
     bool recorded = false;
     EXPECT(gpu.run([&](VkCommandBuffer cb) {
-        recorded = builder.record_blas(cb, layout, descs, base, scratch.address);
+        recorded = builder.record_blas(cb, layout, descs, base, scratch.address, 0, pair);
         barrier_to_host(gpu, cb);
         return recorded;
     }));
@@ -183,6 +187,8 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         const auto* bytes = static_cast<const char*>(buffer.map) + (at - buffer.address);
         const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
                                  (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
+                                 (pair && !moved ? (expect_no_pairs ? ", \"pairs\": false" : ", \"pairs\": true")
+                                                 : "") +
                                  ", \"triangles\": " + tris_json(tris) + "}\n";
         return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());
@@ -385,6 +391,61 @@ int main(int argc, char** argv) {
         const Geometry big = soup(3000);
         const std::vector<Geometry> after = {move(big, 1.5f)};
         if (build_blas(gpu, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
+    }
+
+    // TRI1 pairing: the same tree, with sibling triangles that share an edge in one leaf.
+    {
+        Built p0, p1, p2, p3, p4;
+        Geometry pg = grid(12, 4, false);
+        pg.u16 = true;
+        if (build_blas(gpu, builder, dir, "blas_paired_grid", {pg}, p0, 0, nullptr, false, false, true)) return 1;
+        if (build_blas(gpu, builder, dir, "blas_paired_grid_box16", {grid(9, 2, true)}, p1, 0, nullptr, false, true,
+                       true))
+            return 1;
+        Geometry ptf = grid(6, 3, false);
+        ptf.transform = true;
+        std::memcpy(ptf.m, m, sizeof m);
+        if (build_blas(gpu, builder, dir, "blas_paired_transform", {ptf}, p2, 0, nullptr, false, false, true)) return 1;
+        // A grid with a NaN vertex (its triangles are inactive); quads split across two geometries (each edge shared
+        // the right way, but a leaf holds one geometry, so a pair would report the wrong one); and triangle pairs that
+        // share an edge in the same direction (mirrored winding: not a valid pair).
+        Geometry holed = grid(8, 3, false);
+        holed.vertex_data[3 * 40] = std::nanf("");
+        // Each pair is small and the pairs are spread through the volume, so a pair's two triangles have nearly the
+        // same Morton key and end up siblings: the rules, not the sort, must keep them apart.
+        Geometry cross_a, cross_b, same_dir;
+        for (int i = 0; i < 32; ++i) {
+            const float cx = spread(rng), cy = spread(rng), cz = spread(rng);
+            const float a[3] = {cx - 0.2f, cy, cz}, b[3] = {cx + 0.2f, cy, cz};
+            const float up[3] = {cx, cy + 0.3f, cz + 0.05f}, down[3] = {cx, cy - 0.3f, cz - 0.05f};
+            const float ta[9] = {a[0], a[1], a[2], b[0], b[1], b[2], up[0], up[1], up[2]};        // A -> B
+            const float tb[9] = {b[0], b[1], b[2], a[0], a[1], a[2], down[0], down[1], down[2]};  // B -> A
+            const float td[9] = {a[0], a[1], a[2], b[0], b[1], b[2], down[0], down[1], down[2]};  // A -> B again
+            if (i < 16) {                                    // across two geometries, the reverse edge
+                cross_a.vertex_data.insert(cross_a.vertex_data.end(), ta, ta + 9);
+                cross_b.vertex_data.insert(cross_b.vertex_data.end(), tb, tb + 9);
+            } else {                                         // one geometry, the same direction
+                same_dir.vertex_data.insert(same_dir.vertex_data.end(), ta, ta + 9);
+                same_dir.vertex_data.insert(same_dir.vertex_data.end(), td, td + 9);
+            }
+        }
+        cross_a.triangle_count = cross_b.triangle_count = 16;
+        same_dir.triangle_count = 32;
+        if (build_blas(gpu, builder, dir, "blas_paired_mixed", {holed, cross_a, cross_b, same_dir}, p3, 0, nullptr,
+                       false, false, true))
+            return 1;
+        // on their own, so that the triangles that must not pair are siblings: no TRI1 at all
+        Built q0, q1;
+        if (build_blas(gpu, builder, dir, "blas_unpaired_geometries", {cross_a, cross_b}, q0, 0, nullptr, false, false,
+                       true, true))
+            return 1;
+        if (build_blas(gpu, builder, dir, "blas_unpaired_same_direction", {same_dir}, q1, 0, nullptr, false, false,
+                       true, true))
+            return 1;
+        // 7,200 triangles: the radix-sort path
+        if (build_blas(gpu, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,
+                       false, true))
+            return 1;
     }
 
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address

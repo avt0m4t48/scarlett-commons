@@ -897,7 +897,8 @@ public:
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
-                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from);
+                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from,
+                                           xdxr_pair(b));
                     }
                 };
                 replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
@@ -1115,6 +1116,12 @@ public:
     // would make boxes metres too large a few kilometres from the origin.
     static bool xdxr_box16(const BuildAccelerationStructure& b) {
         return !b.is_tlas && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR) != 0;
+    }
+    // Whether a bottom-level build pairs sibling triangles into TRI0/TRI1 leaves: not when the structure may be
+    // updated (ALLOW_UPDATE), since a refit rewrites the leaves one triangle each. Pairing changes neither the layout
+    // nor the tree, so prebuild info does not depend on it.
+    static bool xdxr_pair(const BuildAccelerationStructure& b) {
+        return !b.is_tlas && !b.update && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) == 0;
     }
     // Triangles (BLAS) or instances (TLAS) a build has: what XdxrLayout is computed from, for the build and for
     // GetRaytracingAccelerationStructurePrebuildInfo.

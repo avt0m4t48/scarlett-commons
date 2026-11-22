@@ -47,6 +47,15 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_image_slc_is_independent_of_sampler(self):
+        for sampler in (0, 64):
+            for slc in (0, 1):
+                with self.subTest(sampler=sampler, slc=slc):
+                    code = words(0xF0800108 | (slc << 25), 0x0004090A | ((sampler // 4) << 21))
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    self.assertEqual(ins["args"][-1]["r"], sampler)
+                    self.assertEqual("slc" in ins["mods"], bool(slc))
+
     def test_mix_source_modifiers(self):
         # LLVM gfx1013: v17, -v19, |v21|, -|v23| across all three mix variants.
         for opcode, name in enumerate(("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16")):

@@ -3782,6 +3782,17 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def dst_f64(self, d, value, mods, op):
+        if d["k"] != "vgpr" or d.get("n") != 2:
+            raise Unsupported(op + " destination")
+        result = self.clamp_mods_f64(value, mods)
+        pair = self.tmp()
+        self.emit(f"{pair} = OpBitcast %v2uint_d {result}")
+        for i in range(2):
+            word = self.tmp()
+            self.emit(f"{word} = OpCompositeExtract %uint {pair} {i}")
+            self.dst({"k": "vgpr", "r": d["r"] + i, "n": 1}, word)
+
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
         for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
@@ -4925,6 +4936,15 @@ class Gen:
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
+        elif op in ("v_cvt_f64_i32", "v_cvt_f64_u32"):
+            self.uses_f64 = True
+            src = self.src_u(a[1])
+            result = self.tmp()
+            if op == "v_cvt_f64_i32":
+                self.emit(f"{result} = OpConvertSToF %double {self.as_int(src)}")
+            else:
+                self.emit(f"{result} = OpConvertUToF %double {src}")
+            self.dst_f64(a[0], result, mods, op)
         elif op in ("v_add_f64", "v_cvt_f32_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
@@ -4951,7 +4971,7 @@ class Gen:
             self.uses_f64 = True
             if op == "v_add_f64":
                 x, y = f64(a[1]), f64(a[2])
-                r, v2, lo, hi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                r = self.tmp()
                 self.emit(f"{r} = OpFAdd %double {x} {y}")
                 if self.round_mode:
                     # MODE rounds the sum itself; clamp/omod then apply to the rounded value, as on the hardware.
@@ -4964,15 +4984,7 @@ class Gen:
                     self.emit(f"{rd} = OpBitcast %double {n2}")
                     r = rd
                 # VOP3_Profile<VOP_F64_F64_F64>: HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
-                r = self.clamp_mods_f64(r, mods)
-                self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
-                self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
-                self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
-                d = a[0]
-                if d["k"] != "vgpr":
-                    raise Unsupported(op + " destination")
-                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
-                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
+                self.dst_f64(a[0], r, mods, op)
             else:
                 x = f64(a[1])
                 r = self.tmp()

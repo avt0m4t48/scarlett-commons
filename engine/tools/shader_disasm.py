@@ -70,7 +70,7 @@ def probe(mcpu: str) -> None:
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
     if backend == "python":
-        asm, bad = rdna2_decode.disasm_bytes(code, wave32=wave32)
+        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
@@ -100,6 +100,9 @@ def code_range(b: bytes):
         if last >= 0:
             return start, last + 4, "header"
     end = b.find(ENDPGM)
+    # Fallback instructions are dword-aligned in the blob. A matching byte sequence can straddle metadata words.
+    while end >= 0 and end % 4:
+        end = b.find(ENDPGM, end + 1)
     return None, end + 4 if end >= 0 else None, "scan"
 
 
@@ -184,6 +187,7 @@ def main():
     from collections import Counter
     res = Counter()
     total = len(files)
+    every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
     if a.skip_existing:
         pending = []
         for path in files:
@@ -204,6 +208,25 @@ def main():
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
     if not (res["clean"] or res["invalid words"] or res["reused"]):
         fail(f"no disassembly produced for {a.src}")
+    if os.path.isdir(a.src) and not a.limit:
+        # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
+        # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
+        # is a partial run on purpose and leaves the rest of the folder alone.
+        # Every input's stem, not just this run's `files`: --skip-existing leaves the reused listings out of `files`,
+        # and pruning against that list deleted every listing a resumed run had just reused.
+        stems = every_stem
+        stale = []
+        try:
+            with os.scandir(out) as entries:
+                stale = sorted(e.path for e in entries
+                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+            for path in stale:
+                os.remove(path)
+        except OSError as e:
+            fail(f"cannot prune stale .s files in {out}: {e.strerror or e}")
+        if stale:
+            print(f"removed {len(stale)} stale .s file(s) that no .fssm in {a.src} names")
     return 0
 
 

@@ -57,7 +57,7 @@ def group_for(tris, n):
     return struct.pack("<3I", 0x80000000 | len(chunks), tbase, vbase) + bytes(recs + words + refs)
 
 
-def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
+def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True, extra=()):
     """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28),
     followed by its meshlet group unless with_group is false."""
     n = grid * grid
@@ -67,6 +67,7 @@ def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
         (2, 0x21, bytes((0, 0, 127, 0)) * n),
         (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % grid + uv_offset), 1000 * (v // grid + uv_offset))
                            for v in range(n))),
+        *[(slot, tag, data * n) for slot, tag, data in extra],
     ]
     head = bytearray(vt.HEADER)
     off = vt.HEADER
@@ -152,6 +153,52 @@ class BlockTests(unittest.TestCase):
         _, out = measure(block())
         self.assertLess(out["pos_edge_vs_random_median"], 0.5)
         self.assertEqual(out["pos_header_finite"], 1)
+
+
+def word27(x, y, z, w):
+    """Inverse of tangent_0x27 for components in [-1, 1] and w in 0..3."""
+    return struct.pack("<I", sum(round((c + 1) / 2 * 1023) << s for c, s in ((x, 0), (y, 10), (z, 20))) | w << 30)
+
+
+class Tag27Tests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_decode_is_2_10_10_10_unorm_times_2_minus_1(self):
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(1, 0, 0, 3))[0])
+        self.assertGreater(t[0], 0.999)
+        self.assertEqual(sign, 1.0)
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(0, 0, -1, 0))[0])
+        self.assertLess(t[2], -0.999)
+        self.assertEqual(sign, -1.0)
+        self.assertAlmostEqual(vt.tangent_0x27(2 << 30)[1], 1 / 3)
+
+    def test_tangent_along_u_with_w_as_bitangent_sign(self):
+        # flat grid: face normal +z, dP/du = +x, dP/dv = +y; cross(+z, +x) = +y, so it points along +v and
+        # w = 0 (sign -1) is the "w > 0 exactly when -v" side; w = 3 is the other
+        for w, agree in ((0, True), (3, False)):
+            _, out = measure(block(extra=[(11, 0x27, word27(1, 0, 0, w))]))
+            t = out["tag27"]
+            self.assertEqual(t["11:vertices"], self.N)
+            self.assertEqual(t["11:unit"], self.N)
+            self.assertEqual(t[f"11:w{w}"], self.N)
+            self.assertEqual(t["11:perp_face"], t["11:perp_face_n"])
+            self.assertEqual(t["11:uv3_along_u"], t["11:uv3_n"])
+            self.assertEqual(t["11:uv3_w_plus_minus_v"], t["11:uv3_along_u"] if agree else 0)
+
+    def test_vector_along_the_normal_fails_the_checks(self):
+        _, out = measure(block(extra=[(11, 0x27, word27(0, 0, 1, 3))]))
+        t = out["tag27"]
+        self.assertEqual(t["11:unit"], self.N)
+        self.assertEqual(t["11:perp_face"], 0)
+        self.assertNotIn("11:uv3_along_u", t)
+
+    def test_non_unit_vectors_are_counted(self):
+        _, out = measure(block(extra=[(11, 0x27, word27(0.5, 0, 0, 3))]))
+        self.assertEqual(out["tag27"]["11:unit"], 0)
+
+    def test_no_0x27_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["tag27"], {})
 
 
 class BlockRunTests(unittest.TestCase):

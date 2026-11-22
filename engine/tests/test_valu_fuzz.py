@@ -372,6 +372,22 @@ def test_oracle_hw_exits_77_without_the_tools(monkeypatch, capsys, tmp_path):
     assert "hardware oracle unavailable" in capsys.readouterr().out
 
 
+def test_oracle_hw_exits_77_on_an_rdna4_gpu(monkeypatch, capsys):
+    from hw_oracle import runner
+
+    class Rdna4:
+        arch, device = "gfx1201", "fake"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "open_oracle", lambda **kw: Rdna4())
+    for family in sorted(vf.FAMILIES):
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--oracle", "hw", "--programs", "2"])
+        assert vf.main() == 77
+    assert "hardware oracle unavailable: gfx1201" in capsys.readouterr().out
+
+
 def test_oracle_option_is_validated(monkeypatch):
     for argv in (["--oracle", "gpu"], ["--negative-control"], ["--oracle", "translator", "--negative-control"]):
         monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--model-only", *argv])

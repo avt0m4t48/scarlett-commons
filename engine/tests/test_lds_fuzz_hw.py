@@ -373,6 +373,14 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("hardware oracle unavailable: no AMD clang", out)
 
+    def test_exit_77_on_an_rdna4_gpu(self):
+        oracle = FakeOracle([])
+        oracle.arch = "gfx1201"
+        with patch.object(runner, "open_oracle", return_value=oracle):
+            rc, out = self.main("--oracle", "hw", "--programs", "2")
+        self.assertEqual(rc, 77)
+        self.assertIn("hardware oracle unavailable: gfx1201", out)
+
     def test_exit_77_with_a_missing_compiler(self):
         with patch.dict(os.environ, {"LEONIDA_AMD_CLANG": str(TOOLS / "no-such-clang.exe")}):
             rc, out = self.main("--oracle", "translator,hw", "--programs", "1")
@@ -422,6 +430,10 @@ class OnHardware(unittest.TestCase):
             cls.oracle = runner.open_oracle()
         except runner.Unavailable as e:
             raise unittest.SkipTest(f"no hardware oracle: {e}")
+        why = asm.rdna23_skip_reason(cls.oracle.arch)
+        if why:
+            cls.oracle.close()
+            raise unittest.SkipTest(why)
         if asm.family(cls.oracle.arch) == "gfx10":
             raise unittest.SkipTest("the cmpstore operand order is measured on GFX11")
 

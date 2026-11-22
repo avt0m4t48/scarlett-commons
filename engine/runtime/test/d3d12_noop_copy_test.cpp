@@ -13,7 +13,7 @@ template<class T> struct Ref {
 };
 
 int check(ID3D12Device* device, const char* name) {
-    Ref<ID3D12Resource> buffer, texture;
+    Ref<ID3D12Resource> buffer, default_buffer, texture;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC desc{};
@@ -34,6 +34,9 @@ int check(ID3D12Device* device, const char* name) {
     buffer->Unmap(0, &written);
 
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                              D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                              IID_PPV_ARGS(&default_buffer.p)))) return 1;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = 8;
     desc.Height = 8;
@@ -46,13 +49,14 @@ int check(ID3D12Device* device, const char* name) {
     D3D12_COMMAND_QUEUE_DESC qdesc{};
     qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue.p)))) return 1;
-    for (int test = 0; test < 4; ++test) {
+    for (int test = 0; test < 5; ++test) {
         Ref<ID3D12CommandAllocator> allocator;
         Ref<ID3D12GraphicsCommandList> list;
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
             FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                              IID_PPV_ARGS(&list.p)))) return 1;
         if (test == 0) list->CopyResource(texture.p, texture.p);
+        else if (test == 1) list->CopyResource(default_buffer.p, default_buffer.p);
         else {
             D3D12_TEXTURE_COPY_LOCATION location{};
             location.pResource = texture.p;
@@ -62,8 +66,8 @@ int check(ID3D12Device* device, const char* name) {
             upload.pResource = buffer.p;
             upload.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             upload.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 256};
-            const D3D12_BOX box = test == 1 ? D3D12_BOX{2, 0, 0, 2, 3, 1} :
-                                  test == 2 ? D3D12_BOX{2, 4, 0, 3, 4, 1} :
+            const D3D12_BOX box = test == 2 ? D3D12_BOX{2, 0, 0, 2, 3, 1} :
+                                  test == 3 ? D3D12_BOX{2, 4, 0, 3, 4, 1} :
                                               D3D12_BOX{5, 0, 0, 3, 1, 1};
             list->CopyTextureRegion(&location, 0, 0, 0, &upload, &box);
         }
@@ -86,11 +90,26 @@ int check(ID3D12Device* device, const char* name) {
         CloseHandle(event);
         if (!ok) return 1;
     }
+    // Upload memory is not a copy destination. This is invalid even for a self-copy: accepting every
+    // same-resource pair as a no-op would silently loosen validation compared to native D3D12.
+    {
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                             IID_PPV_ARGS(&list.p)))) return 1;
+        list->CopyResource(buffer.p, buffer.p);
+        if (SUCCEEDED(list->Close())) {
+            std::fprintf(stderr, "%s incorrectly accepted upload-heap self-copy\n", name);
+            return 1;
+        }
+    }
     if (FAILED(buffer->Map(0, &no_read, reinterpret_cast<void**>(&bytes))) || !bytes) return 1;
     unsigned mismatches = 0;
     for (unsigned i = 0; i < 65536; ++i) mismatches += bytes[i] != static_cast<unsigned char>((i * 31 + 7) & 255);
     buffer->Unmap(0, &no_read);
-    std::printf("%s: 4 legal no-op copy submissions; upload pattern mismatches=%u\n", name, mismatches);
+    std::printf("%s: 5 legal no-op copy submissions, invalid upload copy rejected; pattern mismatches=%u\n",
+                name, mismatches);
     return mismatches ? 1 : 0;
 }
 } // namespace

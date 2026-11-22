@@ -650,17 +650,27 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     double minimum = 0, maximum = 0;  // the component range of an integer format; maximum 0: not an integer format
     bool is_signed = false;
     std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
+    std::array<double, 4> channel_maximum{};  // the largest value of each channel of a packed integer format
     double snorm = 0;               // the largest value of a signed normalised format
     switch (format) {
     case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8G8_UINT:
     case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
-    case VK_FORMAT_R16_UINT: maximum = 65535; break;
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: maximum = 65535; break;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: maximum = 1023; channel_maximum = {1023, 1023, 1023, 3}; break;
     case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT:
     case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
     case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R8G8B8A8_SINT: is_signed = true; minimum = -128; maximum = 127; break;
-    case VK_FORMAT_R16_SINT: is_signed = true; minimum = -32768; maximum = 32767; break;
+    case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: is_signed = true; minimum = -32768; maximum = 32767; break;
     case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32_SINT:
     case VK_FORMAT_R32G32B32A32_SINT:
         is_signed = true;
         minimum = std::numeric_limits<std::int32_t>::min();
@@ -691,8 +701,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
             else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
         } else if (!is_signed) {
+            const double top = channel_maximum[i] != 0.0 ? channel_maximum[i] : maximum;
             if (!(x > 0.0)) value.uint32[i] = 0;  // NaN, negative values and either zero; no out-of-range float-to-int cast.
-            else if (x >= maximum) value.uint32[i] = static_cast<std::uint32_t>(maximum);  // includes +infinity
+            else if (x >= top) value.uint32[i] = static_cast<std::uint32_t>(top);  // includes +infinity
             else value.uint32[i] = static_cast<std::uint32_t>(input[i]);
         } else {
             if (x != x) value.int32[i] = 0;

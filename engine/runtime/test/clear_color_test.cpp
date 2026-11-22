@@ -131,6 +131,12 @@ int main() {
         {VK_FORMAT_R32G32B32A32_SINT, {-inf, 0.5f, -0.5f, 100000.0f}, {-2147483647 - 1, 0, 0, 100000}},
         {VK_FORMAT_R8_UINT, {256, 1.5f, -1, nan}, {255, 1, 0, 0}},
         {VK_FORMAT_R16_UINT, {65536, 65535.5f, -0.0f, 2.5f}, {65535, 65535, 0, 2}},
+        {VK_FORMAT_R8G8_UINT, {256, 1.5f, -1, nan}, {255, 1, 0, 0}},
+        {VK_FORMAT_R16G16_SINT, {-32769, 32768, -1.5f, nan}, {-32768, 32767, -1, 0}},
+        {VK_FORMAT_R16G16B16A16_UINT, {65536, 65535.5f, -0.0f, 2.5f}, {65535, 65535, 0, 2}},
+        // R10G10B10A2_UINT: each channel clamps to its own width, 10, 10, 10 and 2 bits.
+        {VK_FORMAT_A2B10G10R10_UINT_PACK32, {1023.5f, 2000, 1024, 4}, {1023, 1023, 1023, 3}},
+        {VK_FORMAT_A2B10G10R10_UINT_PACK32, {5.5f, 1.5f, 1022.5f, 2.5f}, {5, 1, 1022, 2}},
     };
     for (const auto& c : integers) {
         for (const bool rect : {false, true}) {

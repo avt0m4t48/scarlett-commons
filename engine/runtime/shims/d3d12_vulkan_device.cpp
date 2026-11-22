@@ -86,6 +86,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_UINT: return {VK_FORMAT_R8G8_UINT, color};
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
+    case DXGI_FORMAT_R8_TYPELESS: return {VK_FORMAT_R8_UNORM, color, true};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
     case DXGI_FORMAT_R16G16_UNORM: return {VK_FORMAT_R16G16_UNORM, color};
     case DXGI_FORMAT_R16_UNORM: return {VK_FORMAT_R16_UNORM, color};

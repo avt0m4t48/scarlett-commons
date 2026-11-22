@@ -104,10 +104,10 @@ def reconcile(shader_reads, dwords):
 
 
 def cluster(shaders):
-    """Group shaders by read-set shape. Returns [(shape, count, names)]."""
+    """Group by read-set shape, using the first shader name to break size ties."""
     groups = {}
-    for name, entry in shaders.items():
-        reads = entry.get("user_sgpr_reads", [])
+    for name in sorted(shaders):
+        reads = shaders[name].get("user_sgpr_reads", [])
         shape = tuple(sorted(
             ((r["sgpr"], r["kind"]) if type(r["sgpr"]) is int
              else (f"invalid:{r['sgpr']!r}", r["kind"]) for r in reads),

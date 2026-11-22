@@ -419,12 +419,13 @@ TEXTURE_CONSTANTS = {
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
 }
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
+NAN_PAYLOAD_TEST = "ps_nan_payload"
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_texoff_forms",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
-                      "ps_mandelbrot"))
+                      "ps_mandelbrot", NAN_PAYLOAD_TEST))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
@@ -1400,6 +1401,19 @@ def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: fl
     return ""
 
 
+def nan_payload_problem(px, out):
+    """Check the exact words, except for the measured KosmicKrisp RGBA32F canonicalization (#3125)."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    want = (0x7fc12345, 0xffc54321, 0x3f800000, 0x3f000000)
+    canonicalizes = "driver: KosmicKrisp" in out.splitlines()
+    for i, p in enumerate(px):
+        if any(actual != expected and not (canonicalizes and c < 2 and actual == 0x7fc00000)
+               for c, (actual, expected) in enumerate(zip(p, want))):
+            return f"pixel ({i % 64},{i // 64}) has unexpected words: {[hex(x) for x in p]}"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1432,6 +1446,8 @@ def pixel_test(tools, spirv, name):
     if not px:
         return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
+    if name == NAN_PAYLOAD_TEST:
+        return nan_payload_problem(px, out)
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
         return "" if not wrong else f"{wrong} of {n} pixels differ, e.g. {[hex(x) for x in next(p for p in px if p != PIXEL_BITS[name])]}"

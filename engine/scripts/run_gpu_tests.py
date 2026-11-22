@@ -43,6 +43,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
+from check import NAN_PAYLOAD_TEST, nan_payload_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
@@ -1255,6 +1256,9 @@ def run_suite(a, work: str) -> int:
                     ok, detail = None, str(skip)
                 else:
                     ok, detail = check_pixel_const(raw, const_wants[name])
+            elif name == NAN_PAYLOAD_TEST:
+                problem = nan_payload_problem(read_raw_u32(raw), msg)
+                ok, detail = not problem, problem or "4096/4096 pixels match the driver-aware NaN payload check"
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
             elif name == "ps_bitmask_perm":

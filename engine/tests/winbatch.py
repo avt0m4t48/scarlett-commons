@@ -17,9 +17,28 @@ def batch_path(path):
     return buf.value if 0 < n < len(buf) else path
 
 
+def _encodes(char):
+    try:
+        char.encode("oem")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def write_python_cmd(cmd_path, python, script):
-    """Write cmd_path as a batch file that runs `python script` with the batch file's arguments."""
-    # "oem" for a path that keeps non-ASCII letters (no short name): the code page cmd.exe reads it with.
-    with open(cmd_path, "w", encoding="oem") as f:
-        f.write(f'@"{batch_path(python)}" "{batch_path(script)}" %*\n')
+    """Write cmd_path as a batch file that runs `python script` with the batch file's arguments.
+
+    Raises unittest.SkipTest when a path has no 8.3 name and letters outside the OEM code page (Cyrillic on a
+    cp850 machine with 8.3 names off, say): cmd.exe couldn't run such a file in any encoding."""
+    line = f'@"{batch_path(python)}" "{batch_path(script)}" %*\n'
+    try:
+        data = line.encode("oem")   # the code page cmd.exe reads a batch file with
+    except UnicodeEncodeError:
+        import unittest
+        # Windows' "oem" codec doesn't report a useful position, so name the letters it can't encode here.
+        letters = "".join(sorted({c for c in line if not _encodes(c)}))
+        raise unittest.SkipTest(f"{letters!r} in a path has no 8.3 name and is outside the OEM code page,"
+                                " so cmd.exe can't run a batch file that names it; use an ASCII TEMP") from None
+    with open(cmd_path, "wb") as f:
+        f.write(data)
     return cmd_path

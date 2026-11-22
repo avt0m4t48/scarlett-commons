@@ -40,6 +40,50 @@ def _validate(spv: bytes, target_env: str = "vulkan1.2") -> None:
 
 
 class SpirvAsmUnitTests(unittest.TestCase):
+    def test_reject_repeated_type_result_ids(self):
+        declarations = (
+            ("OpTypeInt 32 0", "OpTypeFloat 32"),
+            ("OpTypeBool", "OpTypeBool"),
+            ("OpTypeInt 32 0", "OpTypeBool"),
+            ("OpTypeBool", "OpTypeInt 32 0"),
+        )
+        for first, second in declarations:
+            with self.subTest(first=first, second=second):
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: type ID %t is already defined"):
+                    spirv_asm.assemble(f"%t = {first}\n%t = {second}\n")
+
+    def test_forward_pointer_can_be_completed_once(self):
+        declaration = "%node_ptr = OpTypePointer PhysicalStorageBuffer %node\n"
+        asm = (
+            "OpCapability Shader\n"
+            "OpCapability PhysicalStorageBufferAddresses\n"
+            'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+            "OpMemoryModel PhysicalStorageBuffer64 GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "OpTypeForwardPointer %node_ptr PhysicalStorageBuffer\n"
+            "%node = OpTypeStruct %node_ptr\n"
+            f"{declaration}"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        _validate(spirv_asm.assemble(asm))
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 10: type ID %node_ptr is already defined"):
+            spirv_asm.assemble(asm.replace(declaration, declaration * 2))
+
+    def test_assembler_leaves_non_type_redefinitions_to_validator(self):
+        for body in (
+            "%t = OpTypeBool\n%t = OpUndef %uint\n",
+            "%t = OpUndef %uint\n%t = OpTypeBool\n",
+            "%t = OpConstant %uint 1\n%t = OpConstant %uint 2\n",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(spirv_asm.assemble("%uint = OpTypeInt 32 0\n" + body))
+
     def test_header_and_target_env_versions(self):
         asm = (
             "OpCapability Shader\n"

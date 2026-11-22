@@ -50,6 +50,12 @@ _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
 }
 
+# OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.
+_TYPE_DEFINITIONS = frozenset(
+    name for name, (_, _, has_result, _) in INSTRUCTIONS.items()
+    if has_result and name.startswith("OpType")
+)
+
 # Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)
 # so the hot loop encodes ~80% of shader lines without per-operand dispatch overhead.
 _PURE_ID_INSNS: dict[str, tuple[int, bool, bool, int, bool]] = {}
@@ -236,6 +242,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     sym_to_id: dict[str, int] = {}
     next_id = 1
+    defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
@@ -383,6 +390,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         else:
             opname = toks[0]
             arg_idx = 1
+
+        if res_tok is not None and opname in _TYPE_DEFINITIONS:
+            if res_tok in defined_types:
+                raise SpirvAsmError(f"line {lineno}: type ID {res_tok} is already defined")
+            defined_types.add(res_tok)
 
         fast = _PURE_ID_INSNS.get(opname)
         if fast is not None:

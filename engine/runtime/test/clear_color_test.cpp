@@ -3,6 +3,7 @@
 // No Vulkan loader, GPU, shaders or game data. Expected conversions also match the WARP differential GPU tests.
 #include "../src/vulkan_replay.h"
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -191,6 +192,30 @@ int main() {
                         int(c.format), int(rect), i, captured.int32[i], c.expected[i]);
                     return 1;
                 }
+            }
+            ++checks;
+        }
+    }
+    // Ties go to even whatever the thread's floating-point rounding mode (std::nearbyint would follow it: 127.5 is
+    // 127 when rounding down). Converted under each mode, checked after the default mode is back.
+    {
+        const int mode = std::fegetround();
+        VkClearColorValue unorm[3]{}, snorm[3]{};
+        const int modes[3] = {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+        for (int m = 0; m < 3; ++m) {
+            std::fesetround(modes[m]);
+            unorm[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_UNORM, {0.5f, 0.5f, 0.5f, 0.5f});
+            snorm[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_SNORM, {-0.5f, 0.5f, -0.5f, 0.5f});
+        }
+        std::fesetround(mode);
+        for (int m = 0; m < 3; ++m) {
+            const long u = std::lround(double(unorm[m].float32[0]) * 255.0);
+            const long s0 = std::lround(double(snorm[m].float32[0]) * 127.0);
+            const long s1 = std::lround(double(snorm[m].float32[1]) * 127.0);
+            if (u != 128 || s0 != -64 || s1 != 64) {
+                std::fprintf(stderr, "tie rounding under FP mode %d: UNORM %ld (128), SNORM %ld %ld (-64 64)\n",
+                             modes[m], u, s0, s1);
+                return 1;
             }
             ++checks;
         }

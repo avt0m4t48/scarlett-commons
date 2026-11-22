@@ -762,10 +762,19 @@ struct Prepared {
 // even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
 // step below WARP and AMD. The value is rounded here and handed over as the exact fraction, which no GPU rounds
 // differently. NaN is 0 and values outside 0..1 clamp, as in D3D.
+//
+// Ties go to even whatever the thread's floating-point rounding mode: std::nearbyint follows it, so a game that
+// changes the mode would round differently. floor() does not depend on it, and x + 0.5 is exact here (x is at most
+// a float times 65535, well inside a double's 53 bits).
+inline double round_half_even(double x) {
+    const double r = std::floor(x + 0.5);
+    return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
 inline float quantize_unorm(float value, double maximum) {
     if (!(value > 0.0f)) return 0.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(std::nearbyint(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
 }
 
 // The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
@@ -773,7 +782,7 @@ inline float quantize_unorm(float value, double maximum) {
 inline float quantize_snorm(float value, double maximum) {
     if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(std::nearbyint(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
 }
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the

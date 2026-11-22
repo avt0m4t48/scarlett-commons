@@ -648,7 +648,7 @@ int check_allocators() {
     return 0;
 }
 
-// ---- 7. The refused tail and the guard region ----
+// ---- 7. The console tail and the guard region ----
 
 int check_tail(bool want_guarded) {
     Mock* mock = nullptr;
@@ -662,8 +662,10 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
+    // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
-        EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
+        EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
@@ -743,8 +745,9 @@ int run_fault_mode(const char* mode) {
         g_armed = false;
         if (failed) return 1;
         EXPECT(g_injected.load() > 0);  // the proxy's own call was the one refused
-        std::printf("%s: %s refused %d time(s): the tables %s guarded, the proxies forward and refuse their tail as "
-                    "before\n", m.flag, m.function, g_injected.load(), m.guarded ? "stay" : "are not");
+        std::printf("%s: %s refused %d time(s): the tables %s guarded, the proxies forward and answer their "
+                    "console tail as before\n", m.flag, m.function, g_injected.load(),
+                    m.guarded ? "stay" : "are not");
         return 0;
     }
     return 2;

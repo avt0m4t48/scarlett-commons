@@ -155,6 +155,7 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
 async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
     const helpMessages = [];
+    const actions = [];
     const canvas = {
         addEventListener: (type, handler) => canvasEvents.set(type, handler),
         requestPointerLock,
@@ -171,17 +172,25 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         renderer: { domElement: canvas }, document,
         addEventListener: (type, handler) => windowEvents.set(type, handler),
         loadWorld: async () => ({}),
+        wire: false,
+        applyWire: () => actions.push('wireframe'),
+        camera: { position: { toArray: () => [1, 2, 3] } },
+        formatCamHash: () => '#cam=1,2,3,0,0',
+        history: { replaceState: (_state, _title, hash) => actions.push(hash) },
+        location: { href: 'http://localhost/#cam=1,2,3,0,0' },
+        navigator: { clipboard: { writeText: async url => actions.push(url) } },
     });
     return {
         ...state,
         helpMessages,
+        actions,
         fallback: () => start.onclick(),
         lockError: () => documentEvents.get('pointerlockerror')?.(),
         lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
         down: button => canvasEvents.get('mousedown')({ button }),
         up: button => windowEvents.get('mouseup')({ button }),
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
-        key: code => windowEvents.get('keydown')({ code }),
+        key: (code, modifiers) => windowEvents.get('keydown')({ code, ...modifiers }),
         blur: () => windowEvents.get('blur')(),
     };
 }
@@ -253,6 +262,24 @@ test('pointer lock turns the camera without a pressed mouse button', async () =>
     cam.lock();
     cam.move(0);
     assert.ok(cam.yaw() < 0);
+});
+
+test('browser shortcuts leave viewer actions alone and Ctrl movement remains available', async () => {
+    const cam = await freecamFixture();
+    for (const modifier of ['ctrlKey', 'metaKey', 'altKey']) {
+        cam.key('KeyF', { [modifier]: true });
+        cam.key('KeyP', { [modifier]: true });
+    }
+    assert.deepEqual(cam.actions, []);
+
+    cam.key('ControlLeft', { ctrlKey: true });
+    cam.key('KeyW', { ctrlKey: true });
+    assert.equal(cam.keys.has('ControlLeft'), true);
+    assert.equal(cam.keys.has('KeyW'), true);
+
+    cam.key('KeyF');
+    cam.key('KeyP');
+    assert.deepEqual(cam.actions, ['wireframe', '#cam=1,2,3,0,0', 'http://localhost/#cam=1,2,3,0,0']);
 });
 
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {

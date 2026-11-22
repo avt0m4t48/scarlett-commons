@@ -92,6 +92,13 @@ int main() {
     const auto uoff_program = read_file(root_dir / "fssm" / "ps_m2_uoff.fssm");
     EXPECT(uoff_program.size() >= 4 && library.find("ps", leonida::sha256_hex(uoff_program)));
     const auto uoff_container = shader_container(uoff_program);
+    // ps_m2_literal builds its S# from immediates: the index lists it under literal_samplers.
+    const auto literal_program = read_file(root_dir / "fssm" / "ps_m2_literal.fssm");
+    const auto* literal_entry = library.find("ps", leonida::sha256_hex(literal_program));
+    EXPECT(literal_program.size() >= 4 && literal_entry);
+    const leonida::gfx10::SamplerWords literal_words{0x92u, 0xc00000u, 0x14500000u, 0u};
+    EXPECT(literal_entry->literal_samplers.size() == 1 && literal_entry->literal_samplers[0] == literal_words);
+    const auto literal_container = shader_container(literal_program);
 
     std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size), control_pixels = pixels;
     unsigned image_hits = 0, sampler_hits = 0;
@@ -167,6 +174,20 @@ int main() {
         pso_desc.pRootSignature = indexed_root.p;
         pso_desc.PS = {uoff_container.data(), uoff_container.size()};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&uoff_pso.p))));
+        {
+            // A pipeline with a literal-S# shader registers that S#: before it the hash table has no key for the
+            // words (a lookup gives the fallback, 0), after it a sampler index. Nothing else names this S#.
+            std::uint32_t key[8];
+            std::memcpy(key, literal_words.data(), 16);
+            std::fill(key + 4, key + 8, 0xffffffffu);
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) == 0);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC literal_desc = pso_desc;
+            literal_desc.pRootSignature = root.p;
+            literal_desc.PS = {literal_container.data(), literal_container.size()};
+            Ref<ID3D12PipelineState> literal_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&literal_desc, IID_PPV_ARGS(&literal_pso.p))));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) != 0);
+        }
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};

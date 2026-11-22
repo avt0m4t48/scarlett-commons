@@ -269,6 +269,59 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 checked += 1
         self.assertGreater(checked, 5000)
 
+    def test_sdwa_inline_constants_and_sgpr(self):
+        # Exact encodings from runtime/test/shaders/ps_sdwa_f16_const.asm:
+        # 1) v_add_f16_sdwa v2, 1.0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0
+        # 2) v_mul_f16_sdwa v3, 2.0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1 src1_sel:WORD_1
+        # 3) v_add_f16_sdwa v4, s8, v1  dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0
+        # 4) v_cvt_f16_u16_sdwa v5, 1.0 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 (VOP1 opc 0x50)
+        # 5) v_cmp_eq_u32_sdwa vcc_lo, 5, -1 src0_sel:WORD_0 src1_sel:WORD_0 (VOPC opc 0xc2, s0=133, s1=193)
+        raw = bytes([
+            0xF9, 0x02, 0x04, 0x64, 0xF2, 0x14, 0x85, 0x04,
+            0xF9, 0x02, 0x06, 0x6A, 0xF4, 0x14, 0x81, 0x05,
+            0xF9, 0x02, 0x08, 0x64, 0x08, 0x14, 0x85, 0x04,
+            0xF9, 0xA0, 0x0A, 0x7E, 0xF2, 0x14, 0x85, 0x00,
+            0xF9, 0x82, 0x85, 0x7D, 0x85, 0x00, 0x84, 0x84,
+        ])
+        dec = rdna2_decode.decode_bytes(raw, wave32=True)
+        self.assertEqual(dec["invalid"], 0)
+        insns = dec["insns"]
+        self.assertEqual(len(insns), 5)
+
+        self.assertEqual(insns[0]["op"], "v_add_f16_sdwa")
+        self.assertEqual(insns[0]["args"][1]["k"], "fimm")
+        self.assertEqual(insns[0]["args"][1]["v"], 1.0)
+        self.assertEqual(insns[0]["args"][2]["k"], "vgpr")
+        self.assertEqual(insns[0]["args"][2]["r"], 1)
+
+        self.assertEqual(insns[1]["op"], "v_mul_f16_sdwa")
+        self.assertEqual(insns[1]["args"][1]["k"], "fimm")
+        self.assertEqual(insns[1]["args"][1]["v"], 2.0)
+
+        self.assertEqual(insns[2]["op"], "v_add_f16_sdwa")
+        self.assertEqual(insns[2]["args"][1]["k"], "sgpr")
+        self.assertEqual(insns[2]["args"][1]["r"], 8)
+
+        self.assertEqual(insns[3]["op"], "v_cvt_f16_u16_sdwa")
+        self.assertEqual(insns[3]["args"][1]["k"], "fimm")
+        self.assertEqual(insns[3]["args"][1]["v"], 1.0)
+
+        self.assertEqual(insns[4]["op"], "v_cmp_eq_u32_sdwa")
+        self.assertEqual(insns[4]["args"][1]["k"], "imm")
+        self.assertEqual(insns[4]["args"][1]["v"], 5)
+        self.assertEqual(insns[4]["args"][2]["k"], "imm")
+        self.assertEqual(insns[4]["args"][2]["v"], -1)
+
+        # Verify formatted text round-trips cleanly through shader_ir.parse_line.
+        text, bad = rdna2_decode.disasm_bytes(raw, wave32=True)
+        self.assertEqual(bad, 0)
+        parsed = [shader_ir.parse_line(ln) for ln in text.splitlines() if ln.strip()]
+        self.assertEqual(len(parsed), 5)
+        self.assertEqual(parsed[0]["args"][1]["k"], "fimm")
+        self.assertEqual(parsed[0]["args"][1]["v"], 1.0)
+        self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
+        self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

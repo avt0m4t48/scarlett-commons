@@ -34,6 +34,8 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <deque>
+#include <mutex>
 #include <vector>
 
 namespace leonida {
@@ -131,6 +133,7 @@ public:
     }
 
     ~VulkanPresenter() {
+        context_.holds().cancel_after(this);  // presents still queued behind held work are dropped
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
@@ -237,8 +240,53 @@ public:
     }
 
     // Shared by present() and present_blank(). `binding` null: clear instead of blit.
+    //
+    // A Present is ordered behind the work the queues hold (a batch that waits for a Signal not yet submitted,
+    // queue_holds.h): it would otherwise blit whatever the source texture held before that batch ran. It is not
+    // blocked: it is queued, returns VK_SUCCESS as ExecuteCommandLists does for a held batch, and is submitted,
+    // in order with the presents before it, by the thread that releases the last operation held when it was called
+    // (its failure is printed there). Held work that is never released holds back the presents after it, as it
+    // holds back the queue's own work; with nothing held this is the plain path. A blank present reads nothing and
+    // is only ordered behind earlier presents. Waiting instead was rejected: the Signal that releases the work may
+    // be one the application's own thread makes after Present returns.
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false) {
+        std::lock_guard lock(present_mutex_);
+        if (deferred_.empty() && !(binding && context_.holds().any_held()))
+            return submit_now(binding, source, vsync, source_rect, srgb, tear);
+        PendingPresent pending{binding != nullptr, source, vsync, source_rect != nullptr, {}, srgb, tear};
+        if (source_rect) pending.rect = *source_rect;
+        deferred_.push_back(pending);
+        context_.holds().after_held(this, [this] { run_deferred(); });
+        return VK_SUCCESS;
+    }
+
+private:
+    struct PendingPresent {
+        bool has_source;
+        ResourceId source;
+        bool vsync;
+        bool has_rect;
+        PresentRect rect;
+        bool srgb;
+        bool tear;
+    };
+
+    void run_deferred() {
+        std::lock_guard lock(present_mutex_);
+        if (deferred_.empty()) return;
+        const PendingPresent p = deferred_.front();
+        deferred_.pop_front();
+        ResourceBinding binding{};
+        const VkResult result = submit_now(p.has_source ? &binding : nullptr, p.source, p.vsync,
+                                           p.has_rect ? &p.rect : nullptr, p.srgb, p.tear);
+        if (result != VK_SUCCESS)
+            std::fprintf(stderr, "[rt] d3d12: a Present held behind queued work failed when it was released (%d)\n",
+                         int(result));
+    }
+
+    VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
+                        bool srgb, bool tear = false) {
         last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_) {
@@ -818,6 +866,8 @@ private:
     VkInstance instance_;
     VkPhysicalDevice physical_;
     VkQueue queue_;
+    std::recursive_mutex present_mutex_;  // submit() and a deferred present on the releasing thread
+    std::deque<PendingPresent> deferred_;  // presents queued behind held work, in call order
     VkSurfaceKHR surface_;
     bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled
     VkPresentModeKHR tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;  // set with the swapchain, see tear_mode()

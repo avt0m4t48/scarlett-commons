@@ -972,6 +972,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_handover COMMAND d3d12_queue_handover_test)
     set_tests_properties(d3d12_queue_handover PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 400
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # The same on a caller-owned device: two VkQueues handed to the layer (the D3D12 queues share them), and one
+    # (every D3D12 queue shares it, where a Wait ahead of its Signal would never progress on the GPU).
+    add_test(NAME d3d12_queue_handover_two_queues COMMAND d3d12_queue_handover_test --two-queues)
+    add_test(NAME d3d12_queue_handover_shared_queue COMMAND d3d12_queue_handover_test --shared-queue)
+    set_tests_properties(d3d12_queue_handover_two_queues d3d12_queue_handover_shared_queue PROPERTIES
+                         SKIP_RETURN_CODE 77 TIMEOUT 400 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.

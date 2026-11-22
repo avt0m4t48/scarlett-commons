@@ -313,6 +313,41 @@ int main() {
         EXPECT(std::abs(r - 51) <= 2 && std::abs(g - 153) <= 2 && std::abs(b - 230) <= 2);
         std::printf("presenter sync: capture-buffer WAW barriers (4/4) and read_back (%d,%d,%d) ok\n", r, g, b);
 
+        // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
+        //     no submitted Signal, so the queue holds it; the Present is queued behind it instead of blitting the back
+        //     buffer as it was. Two presents queue up and keep their order; the blank one in the middle reads nothing.
+        {
+            VulkanFence gate(context, 0);
+            EXPECT(gate.semaphore() != VK_NULL_HANDLE);
+            CommandList red;
+            EXPECT(red.transition({1, 0, d3d12_state::common, d3d12_state::render_target}));
+            EXPECT(red.clear_render_target({1, 0, 0, 1}, {0.9f, 0.1f, 0.2f, 1.0f}));
+            EXPECT(red.transition({1, 0, d3d12_state::render_target, d3d12_state::common}));
+            EXPECT(red.close());
+            const CommandList* ptr = &red;
+            queue.wait(gate.semaphore(), 1);
+            EXPECT(queue.execute({&ptr, 1}) == ReplayResult::success);   // held
+            const auto center = [&](int& cr, int& cg, int& cb) {
+                std::vector<std::uint8_t> shot;
+                VkExtent2D e{};
+                VkFormat f{};
+                if (!presenter.read_back(shot, &e, &f)) return false;
+                const std::size_t at = (std::size_t(e.height / 2) * e.width + e.width / 2) * 4;
+                const bool bgr = (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB);
+                cr = bgr ? shot[at + 2] : shot[at + 0];
+                cg = shot[at + 1];
+                cb = bgr ? shot[at + 0] : shot[at + 2];
+                return true;
+            };
+            int cr = 0, cg = 0, cb = 0;
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);            // queued: returns at once
+            EXPECT(center(cr, cg, cb) && std::abs(cr - 51) <= 2 && std::abs(cg - 153) <= 2 && std::abs(cb - 230) <= 2);
+            EXPECT(gate.signal(1));   // releases the render, then the presents, on this thread
+            EXPECT(queue.idle());
+            EXPECT(center(cr, cg, cb) && std::abs(cr - 230) <= 2 && std::abs(cg - 26) <= 2 && std::abs(cb - 51) <= 2);
+            std::printf("presenter sync: Present queued behind held work shows the rendered content (%d,%d,%d)\n", cr, cg, cb);
+        }
+
         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
         std::atomic<bool> stop{false};
         std::atomic<bool> worker_failed{false};

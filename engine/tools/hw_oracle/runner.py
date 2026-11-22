@@ -6,7 +6,8 @@ picks the one for the platform.
 
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
-                        the amdgcn target, %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
+                        the amdgcn target (a launcher without ld.lld beside it is followed to the clang it is
+                        installed as), %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
     LEONIDA_HIP_DLL     the HIP runtime (amdhip64_7.dll); default: the one in System32 (it ships with the driver)
     LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc, or cl.exe from a Developer shell); default: gcc on
                         PATH, C:\\msys64\\ucrt64\\bin, then on Windows a cl on PATH or Visual Studio's (vswhere)
@@ -47,6 +48,24 @@ def _has_amdgcn(clang):
     return "amdgcn" in out
 
 
+def _installed_clang(clang):
+    """The clang a launcher stands for. The rocm-sdk wheels put `amdclang` in the Python environment's Scripts (bin)
+    folder: it has the amdgcn target, but ld.lld and amdgpu-arch sit beside the real clang, in the folder `--version`
+    names as InstalledDir. A clang with its ld.lld beside it, or one that names no such folder, is returned as it is."""
+    if os.path.isfile(os.path.join(os.path.dirname(clang), _exe("ld.lld"))):
+        return clang
+    try:
+        out = subprocess.run([clang, "--version"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return clang
+    for line in out.splitlines():
+        if line.startswith("InstalledDir:"):
+            real = os.path.join(line.split(":", 1)[1].strip(), _exe("clang"))
+            if os.path.isfile(real):
+                return real
+    return clang
+
+
 def find_clang():
     env = os.environ.get("LEONIDA_AMD_CLANG")
     if env:
@@ -62,7 +81,7 @@ def find_clang():
     cands.append(os.path.join(REPO, ".venv", tail))   # only the repo root's venv, never a glob under the cwd
     for c in cands:
         if c and os.path.isfile(c) and _has_amdgcn(c):
-            return c
+            return _installed_clang(c)
     raise Unavailable("no AMD clang (set LEONIDA_AMD_CLANG; `pip install rocm-sdk-core` from "
                       "https://stable.repo.amd.com/rocm/whl-next/ provides one)")
 

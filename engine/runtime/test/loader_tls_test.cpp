@@ -465,6 +465,44 @@ void CALLBACK pool_probe(PTP_CALLBACK_INSTANCE, void* context) {
     SetEvent(probe->done);
 }
 
+struct ParkedThread {
+    HANDLE up = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE never = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+};
+
+DWORD WINAPI park(void* context) {
+    auto* parked = static_cast<ParkedThread*>(context);
+    SetEvent(parked->up);
+    WaitForSingleObject(parked->never, INFINITE);
+    return 0;
+}
+
+// TerminateThread ends a thread with no DLL_THREAD_DETACH and frees its TEB. A thread that load() gave a block and
+// that is then terminated must not be touched by ~Loader, and a thread that is already dead must be passed by.
+void test_terminated_thread(const fs::path& dll) {
+    ParkedThread parked;
+    const HANDLE victim = CreateThread(nullptr, 0, &park, &parked, 0, nullptr);
+    check(victim != nullptr && WaitForSingleObject(parked.up, 10000) == WAIT_OBJECT_0, "a parked thread is running");
+    if (!victim) return;
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "load() with a parked thread running");
+        TerminateThread(victim, 0);
+        WaitForSingleObject(victim, INFINITE);
+    }
+    check(true, "~Loader passes by a thread that was terminated while it held a block");
+    {
+        // The dead thread is still a kernel object (its handle is open) while this load() looks at the threads.
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "load() passes by a thread that has ended");
+    }
+    CloseHandle(victim);
+    CloseHandle(parked.up);
+    CloseHandle(parked.never);
+}
+
 void test_existing_threads(const fs::path& dll) {
     // A pool worker exists from here on: the callback has run on one, and the pool keeps its workers for a while.
     PoolProbe warm;
@@ -599,6 +637,7 @@ int main(int argc, char** argv) {
 
         TempDir temp;
         test_existing_threads(tls_dll);
+        test_terminated_thread(tls_dll);
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);

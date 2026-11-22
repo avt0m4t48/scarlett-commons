@@ -206,9 +206,17 @@ def main(argv=None):
     a = ap.parse_args(argv)
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")
+    # Everything the run reads is checked before anything is created: a mistyped shaders folder or names file
+    # used to leave an empty output tree behind and end in a traceback.
     import json
-    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
+    index_path = os.path.join(old, "index.json")
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
+    if a.names and not os.path.isfile(a.names):
+        ap.error(f"--names {a.names} is not a file")
     names = supported_pixel_shaders(index)
     print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
     picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
@@ -216,11 +224,17 @@ def main(argv=None):
         print("ERROR: no shader candidates for the control-flow comparison", file=sys.stderr)
         return 1
     new = os.path.join(a.out, "new")
-    os.makedirs(new, exist_ok=True)
+    try:
+        os.makedirs(new, exist_ok=True)
+    except OSError as e:
+        ap.error(f"cannot create {new}: {e.strerror or e}")
     # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
     exe = "vk_texture_test.exe" if os.name == "nt" else "vk_texture_test"
     harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
-    vs = test_vertex_shader(a.out)
+    try:
+        vs = test_vertex_shader(a.out)
+    except (OSError, subprocess.CalledProcessError) as e:
+        ap.error(f"cannot build the test vertex shader (needs spirv-as and spirv-val on PATH): {e}")
 
     branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, name + ".s"), encoding="utf-8",
                                                  errors="replace").read())) for name in picked)

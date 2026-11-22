@@ -396,6 +396,54 @@ class CountArgumentTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+class CliBadInputTest(unittest.TestCase):
+    """Bad paths end in one stderr line and exit 2, and a mistyped input leaves no output tree behind."""
+
+    def run_cli(self, *args, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "ab_control_flow.py"), *args],
+                              capture_output=True, text=True, env=env)
+
+    def check_one_line(self, res, needle):
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(needle, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_bad_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("x")
+            out = os.path.join(tmp, "out")
+            # No shaders folder at all.
+            self.check_one_line(self.run_cli(tmp, os.path.join(tmp, "nope"), out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            # An index that is not JSON.
+            with open(os.path.join(shaders, "spirv", "index.json"), "wb") as f:
+                f.write(b"\xff\xfe not json")
+            self.check_one_line(self.run_cli(tmp, shaders, out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            # A names file that does not exist.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", os.path.join(tmp, "nope.txt")), "--names")
+            self.assertFalse(os.path.exists(out))
+            # Past the selection (an explicit names file selects without reading the disassembly):
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("one\n")
+            # an output path under a regular file,
+            self.check_one_line(self.run_cli(tmp, shaders, os.path.join(blocker, "out"), "--names", names),
+                                "cannot create")
+            # and no SPIR-V tools on PATH.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
+                                             path=os.path.join(tmp, "empty-path")), "spirv-as")
+
+
 class ResultClassificationTest(unittest.TestCase):
     def test_translation_failure(self):
         self.assertEqual(AB.classify_result(False, [b"same"], [b"same"]), "a translation is invalid")

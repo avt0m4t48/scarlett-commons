@@ -163,6 +163,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_smem_bounds", [0, 0x5eed0010, 0x5eed000c, 0, 0x5eed000c, 0x5eed0010, 0, 0]),
           ("cs_smem_stride_align", [0x5eed0010, 0, 0, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0004]),
+          # SHADER-328: a constant SGPR offset gives what the run-time one gives (no 32-bit wrap)
+          ("cs_smem_sconst_off", [0, 0x5eed0018, 0x5eed0018, 0x5eed0014]),
           ("cs_smem_sload_neg", [0x5eed0004, 0x5eed0000, 0x5eed0004, 0x5eed0004, 0x5eed0008, 0x5eed000c,
                                  0xeeeeeeee, 0xeeeeeeee]),
           ("cs_buf_tail", [0, 0x5eed000c, 0x5eed0008, 0x5eed000c, 0, 0, 0x5eed0010, 0]),

@@ -268,6 +268,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               # v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, f_i32, t_u32, {eq,gt,le}_i64, {ge,lt,ne}_u64 (.asm header)
               "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
+              # v_cmp_{eq,ne,lt,le,gt,ge,f,t}_{u32,i32}, e32 and e64, constants and literals (.asm header)
+              "ps_vcmp_int32": (0x963e52e8, 0x984dcee8, 0xb9458ee8, 0xb73612e8),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
               "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
@@ -315,6 +317,10 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                             "0x1028=0x1,0x102c=0,0x1030=0x7,0x1034=0x80000000,0x1038=0x7,0x103c=0,"
                                             "0x1040=0x1,0x1044=0x5,0x1048=0x80000000,0x104c=0x5,0x1050=0x7,0x1054=0x5,"
                                             "0x1058=0x7,0x105c=0x5"},
+             # 32-bit integer compares: operands from memory (derivations in the .asm header)
+             "ps_vcmp_int32": {"VKH_SGPRS": "0x1000,0,32,0",
+                               "VKH_HEAP": "0x1000=0x1,0x1004=0,0x1008=0x80000000,0x100c=0x12345678,0x1010=0x3,"
+                                           "0x1014=0x5,0x1018=0,0x101c=0"},
              # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
              "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"

@@ -622,6 +622,9 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
+  add_executable(spirv_stores_test test/spirv_stores_test.cpp)
+  add_test(NAME spirv_stores COMMAND spirv_stores_test)
   add_executable(shader_fixture_path_test test/shader_fixture_path_test.cpp)
   add_test(NAME shader_fixture_path COMMAND shader_fixture_path_test)
   add_executable(resource_tiling_test test/resource_tiling_test.cpp)
@@ -1832,6 +1835,26 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bundle_forbidden_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle_forbidden COMMAND d3d12_bundle_forbidden_test)
       set_tests_properties(d3d12_bundle_forbidden PROPERTIES SKIP_RETURN_CODE 77)
+      # A pixel shader with a writable storage image (an image atomic) needs fragmentStoresAndAtomics: refused on a
+      # device without it, created on the runtime's own device, under the validation layer where it is installed.
+      set(LEONIDA_TEST_PS_ATOMIC ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_image_atomic.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_PS_ATOMIC}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_PS_ATOMIC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_image_atomic.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_image_atomic.frag
+        COMMENT "Compiling the stores-and-atomics test shader ps_image_atomic.frag"
+        VERBATIM)
+      add_executable(d3d12_stores_atomics_test test/d3d12_stores_atomics_test.cpp ${LEONIDA_TEST_VS_FULLSCREEN}
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_ATOMIC})
+      target_link_libraries(d3d12_stores_atomics_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_stores_atomics_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_PS_ATOMIC_SPV="${LEONIDA_TEST_PS_ATOMIC}")
+      target_compile_options(d3d12_stores_atomics_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
+      set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()

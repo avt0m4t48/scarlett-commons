@@ -24,6 +24,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2665,6 +2666,22 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
+        }
+        // A stage that declares a storage image or buffer it may write needs a device feature outside compute
+        // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
+        // VUID-RuntimeSpirv-NonWritable-06340 / -06341, so the PSO is refused here with the stage named.
+        for (const Stage& stage : stages) {
+            if (!stage.entry) continue;
+            const bool pixel = stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT;
+            const VkBool32 allowed = pixel ? device_.info.features.fragmentStoresAndAtomics
+                                           : device_.info.features.vertexPipelineStoresAndAtomics;
+            if (allowed || !leonida::spirv_declares_writable_storage(stage.words)) continue;
+            std::fprintf(stderr,
+                         "[rt] d3d12: %s (%s) writes a storage image or buffer, which needs the Vulkan feature %s; "
+                         "the device does not have it enabled, so the pipeline is refused\n",
+                         stage.entry->name.c_str(), stage.name,
+                         pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
+            return E_NOTIMPL;
         }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
@@ -8037,6 +8054,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderStorageImageReadWithoutFormat = chosen_features.shaderStorageImageReadWithoutFormat;
     enable.shaderImageGatherExtended = chosen_features.shaderImageGatherExtended;
     enable.shaderResourceMinLod = chosen_features.shaderResourceMinLod;
+    // A translated pixel shader that stores to an image or does an image atomic declares that storage image without
+    // NonWritable (1,018 of the corpus's 1,038 image-atomic shaders are pixel shaders), and Vulkan allows that outside
+    // a compute shader only with these two features: fragmentStoresAndAtomics for the pixel stage,
+    // vertexPipelineStoresAndAtomics for vertex and geometry shaders. Enabled where the GPU has them; a graphics PSO
+    // whose shader needs a missing one is refused (PipelineState::create_graphics).
+    enable.fragmentStoresAndAtomics = chosen_features.fragmentStoresAndAtomics;
+    enable.vertexPipelineStoresAndAtomics = chosen_features.vertexPipelineStoresAndAtomics;
     info.features = enable;
 
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).

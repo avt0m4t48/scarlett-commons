@@ -45,6 +45,13 @@
 
 namespace leonida {
 
+// A CPU-written Vulkan-address instance pointer array, kept until the submission that builds with it completes.
+struct KhrInstanceStage {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+};
+
 // VK_EXT_debug_utils labels: an instance extension, so a device has them only when its instance enabled it.
 struct DebugLabelFunctions {
     PFN_vkCmdInsertDebugUtilsLabelEXT cmd_insert = nullptr;
@@ -874,6 +881,18 @@ public:
             size = std::min<std::uint64_t>(size, b->size - (va - b->va));
             return true;
         };
+        // Host reads of small CPU-written inputs. Unlike buffer_at, the whole range must be in one host-visible
+        // mapping: a partial read would see bytes the application has not written through the D3D12 API.
+        replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
+            BufferVaIndex<ResourceId>::Hit hit{};
+            if (!buffer_vas_.find(va, hit)) return false;
+            const ResourceBinding* b = resolve(hit.id);
+            if (!b || !b->host) return false;
+            const std::uint64_t offset = va - b->va;
+            if (offset > b->size || bytes > b->size - offset) return false;
+            host = b->host + offset;
+            return true;
+        };
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
             if (xdxr_->loaded()) {
@@ -1491,7 +1510,10 @@ public:
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
-        for (auto& slot : buffers_) free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
+        for (auto& slot : buffers_) {
+            destroy_khr_stages(slot.khr_instances);
+            free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
+        }
         for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
     }
 
@@ -1640,6 +1662,97 @@ public:
     }
 
 private:
+    void destroy_khr_stages(std::vector<KhrInstanceStage>& stages) {
+        for (const auto& stage : stages) {
+            if (stage.memory) context_.vk.vkFreeMemory(context_.device(), stage.memory, nullptr);
+            if (stage.buffer) context_.vk.vkDestroyBuffer(context_.device(), stage.buffer, nullptr);
+        }
+        stages.clear();
+    }
+
+    // A KHR TLAS built with D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS holds console VAs in its pointer list; Vulkan
+    // reads those 8-byte entries as device addresses. Stage a translated copy in our own host-visible buffer instead
+    // of editing the guest's input. The caller keeps the buffer until the submission that builds with it completes.
+    bool stage_khr_instances(const ReplayFunctions& vk, const BuildAccelerationStructure& build,
+                             std::vector<KhrInstanceStage>& stages, VkDeviceAddress& address) {
+        const auto& funcs = context_.vk;
+        if (!funcs.vkCreateBuffer || !funcs.vkDestroyBuffer || !funcs.vkGetBufferMemoryRequirements ||
+            !funcs.vkAllocateMemory || !funcs.vkFreeMemory || !funcs.vkBindBufferMemory || !funcs.vkMapMemory ||
+            !funcs.vkUnmapMemory || !funcs.vkGetBufferDeviceAddress || !vk.host_at || !vk.buffer_at ||
+            !build.instance_count)
+            return false;
+        const std::uint64_t bytes = 8ull * build.instance_count;
+        const std::uint8_t* guest = nullptr;
+        if (!vk.host_at(build.instances_va, bytes, guest)) return false;
+        std::vector<std::uint64_t> translated;
+        translated.reserve(build.instance_count);
+        for (std::uint32_t i = 0; i < build.instance_count; ++i) {
+            std::uint64_t va = 0;
+            std::memcpy(&va, guest + 8ull * i, sizeof(va));
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
+            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64 || va > UINT64_MAX - vk.heap_base)
+                return false;
+            translated.push_back(vk.heap_base + va);
+        }
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = bytes;
+        info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        KhrInstanceStage stage{};
+        const auto discard = [&] {
+            if (stage.memory) funcs.vkFreeMemory(context_.device(), stage.memory, nullptr);
+            if (stage.buffer) funcs.vkDestroyBuffer(context_.device(), stage.buffer, nullptr);
+        };
+        if (funcs.vkCreateBuffer(context_.device(), &info, nullptr, &stage.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        funcs.vkGetBufferMemoryRequirements(context_.device(), stage.buffer, &requirements);
+        const auto& memory = context_.occlusion_resolve_memory_;
+        constexpr VkMemoryPropertyFlags host_flags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        std::uint32_t type = memory.memoryTypeCount;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i))) continue;
+            if ((memory.memoryTypes[i].propertyFlags & host_flags) == host_flags) {
+                type = i;
+                break;
+            }
+        }
+        if (type == memory.memoryTypeCount) {
+            discard();
+            return false;
+        }
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = type;
+        if (funcs.vkAllocateMemory(context_.device(), &allocation, nullptr, &stage.memory) != VK_SUCCESS ||
+            funcs.vkBindBufferMemory(context_.device(), stage.buffer, stage.memory, 0) != VK_SUCCESS) {
+            discard();
+            return false;
+        }
+        void* mapped = nullptr;
+        if (funcs.vkMapMemory(context_.device(), stage.memory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
+            discard();
+            return false;
+        }
+        for (std::size_t i = 0; i < translated.size(); ++i)
+            std::memcpy(static_cast<std::uint8_t*>(mapped) + 8 * i, &translated[i], sizeof(std::uint64_t));
+        funcs.vkUnmapMemory(context_.device(), stage.memory);
+        VkBufferDeviceAddressInfo device_address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        device_address.buffer = stage.buffer;
+        stage.address = funcs.vkGetBufferDeviceAddress(context_.device(), &device_address);
+        if (!stage.address) {
+            discard();
+            return false;
+        }
+        stages.push_back(stage);
+        address = stage.address;
+        return true;
+    }
+
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
@@ -1649,6 +1762,11 @@ private:
                         std::holds_alternative<ClearDepthStencil>(command))
                         return ReplayResult::unsupported;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+        struct KhrGuard {
+            VulkanQueue* queue;
+            std::vector<KhrInstanceStage> stages;
+            ~KhrGuard() { queue->destroy_khr_stages(stages); }
+        } khr_guard{this};
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
@@ -1684,6 +1802,10 @@ private:
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
+        replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
+                                                                   VkDeviceAddress& address) {
+            return stage_khr_instances(replay, build, khr_guard.stages, address);
+        };
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -1816,6 +1938,8 @@ private:
 
         CommandSlot* slot = acquire();
         if (!slot) return ReplayResult::unsupported;
+        slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
+        khr_guard.stages.clear();
         command_buffer = slot->buffer;
         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
         // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
@@ -2111,6 +2235,7 @@ private:
         std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
+        std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
     };
 
     struct PendingBindings {
@@ -2218,6 +2343,7 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            destroy_khr_stages(slot.khr_instances);
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);

@@ -604,6 +604,9 @@ struct BuildAccelerationStructure {
     std::uint64_t scratch_va = 0;
     std::uint64_t instances_va = 0;
     std::uint32_t instance_count = 0;
+    // D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS: instances_va is an array of instance_count GPU virtual addresses, one
+    // per 64-byte D3D12_RAYTRACING_INSTANCE_DESC; otherwise the descs themselves, consecutively.
+    bool instance_pointers = false;
     std::vector<RtTriangleGeometry> triangles;
 };
 

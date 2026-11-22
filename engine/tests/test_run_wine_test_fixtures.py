@@ -12,7 +12,8 @@ WINDOWS_ROOT = "synthetic-checkout"
 
 
 class WineFixtureSetupTests(unittest.TestCase):
-    def run_fixture(self, setup_status: int, *, fixture: bool = True, disabled: bool = False
+    def run_fixture(self, setup_status: int, *, fixture: bool = True, disabled: bool = False,
+                    dependent: bool = False,
                     ) -> tuple[int, str, list[str]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +38,8 @@ class WineFixtureSetupTests(unittest.TestCase):
             setup = entry("setup", setup_status, setup_props)
             consumer = entry("consumer", 0, consumer_props)
             tests = [consumer, setup] if fixture else [setup, consumer]
+            if dependent:
+                tests.append(entry("dependent", 0, {"DEPENDS": ["consumer"]}))
             listing = root / "ctest.json"
             listing.write_text(json.dumps({"tests": tests}), encoding="utf-8", newline="\n")
             result = subprocess.run(
@@ -50,6 +53,11 @@ class WineFixtureSetupTests(unittest.TestCase):
         status, output, calls = self.run_fixture(0)
         self.assertEqual(status, 0, output)
         self.assertEqual(calls, ["setup", "consumer"])
+
+    def test_explicit_dependency_still_runs_after_the_fixture_consumer(self) -> None:
+        status, output, calls = self.run_fixture(0, dependent=True)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(calls, ["setup", "consumer", "dependent"])
 
     def test_failed_setup_blocks_a_required_consumer(self) -> None:
         status, output, calls = self.run_fixture(3)

@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import struct
@@ -400,6 +401,70 @@ def find_harness(explicit: str | None) -> str:
 
 
 CLEAR = -1.0
+FALLBACK_RGBA = (1.0, 0.0, 1.0, 1.0)
+
+
+def _close(got: float, want: float, tol: float) -> bool:
+    return math.isfinite(got) and abs(got - want) <= tol
+
+
+def _distinguishable_from_fallback(rgba: list[float] | tuple[float, ...], tol: float) -> bool:
+    return any(abs(c - m) > tol for c, m in zip(rgba, FALLBACK_RGBA))
+
+
+def rgba_probes_for_mesh(
+    vertices,
+    indices,
+    width: int,
+    height: int,
+    tw: int,
+    th: int,
+    rgba: bytes,
+    uv_probe_list: list[dict] | None = None,
+    tol: float = 0.02,
+    limit: int = 4,
+) -> list[dict]:
+    """Select covered RGBA probes for textured verification.
+
+    Starts from ``uv_probe_list`` when available; if that is empty (e.g. an off-centre mesh with
+    default (0, 0) UVs), scans covered pixels so textured draws always have at least one covered
+    RGBA probe. Prefers samples whose expected colour differs from the harness's magenta fallback.
+    """
+    candidates = list(uv_probe_list) if uv_probe_list else []
+    if not candidates and vertices:
+        step = max(1, min(width, height) // 16)
+        for py in range(step // 2, height, step):
+            for px in range(step // 2, width, step):
+                uv = uv_at(vertices, indices, px, py, width, height)
+                if uv is not None:
+                    candidates.append(
+                        {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                    )
+        if not candidates:
+            for py in range(height):
+                for px in range(width):
+                    uv = uv_at(vertices, indices, px, py, width, height)
+                    if uv is not None:
+                        candidates.append(
+                            {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                        )
+                        if len(candidates) >= limit * 4:
+                            break
+                if len(candidates) >= limit * 4:
+                    break
+    sampled = [
+        {
+            "pixel": p["pixel"],
+            "uv": p["uv"],
+            "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
+        }
+        for p in candidates
+    ]
+    distinct = [p for p in sampled if _distinguishable_from_fallback(p["rgba"], tol)]
+    pool = distinct if distinct else sampled
+    if len(pool) > limit:
+        pool = [pool[int(i * len(pool) / limit)] for i in range(limit)]
+    return pool
 
 
 def check_image(data: bytes, manifest: dict) -> dict:
@@ -413,7 +478,22 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    clear_val = manifest.get("clear", CLEAR)
+    textured = (
+        manifest.get("texture") is not None
+        or manifest.get("centre_rgba") is not None
+        or manifest.get("rgba_probes") is not None
+    )
+    if textured:
+        # UNORM texels can have any alpha in [0, 1] (including 0.0), so distinguish covered fragments
+        # from the harness clear sentinel (-1.0) instead of testing alpha > 0.5.
+        covered = sum(
+            1
+            for i in range(0, len(pixels), 4)
+            if not all(_close(pixels[i + c], clear_val, 1e-5) for c in range(4))
+        )
+    else:
+        covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
@@ -426,17 +506,31 @@ def check_image(data: bytes, manifest: dict) -> dict:
         )
     if (clear := manifest.get("clear_pixel")) is not None:
         i = (clear[1] * width + clear[0]) * 4
-        want = manifest.get("clear", CLEAR)
-        if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
+        if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):
             raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
+                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {clear_val}"
+            )
+    if textured:
+        tol = manifest.get("rgba_tolerance", 0.02)
+        expected_rgbas = []
+        if (rgba := manifest.get("centre_rgba")) is not None:
+            expected_rgbas.append(rgba)
+        for probe in manifest.get("rgba_probes") or []:
+            expected_rgbas.append(probe["rgba"])
+        if not expected_rgbas:
+            raise AssertionError(
+                "textured manifest has no covered RGBA samples (centre_rgba or rgba_probes)"
+            )
+        if not any(_distinguishable_from_fallback(r, tol) for r in expected_rgbas):
+            raise AssertionError(
+                f"textured manifest has no expected colour distinguishable from fallback {FALLBACK_RGBA} (tol {tol})"
             )
     if (rgba := manifest.get("centre_rgba")) is not None:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         tol = manifest.get("rgba_tolerance", 0.02)
         for c, want in enumerate(rgba):
-            if abs(pixels[i + c] - want) > tol:
+            if not _close(pixels[i + c], want, tol):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
                 )
@@ -444,7 +538,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
-            if abs(pixels[i + c] - want) > 2e-3:
+            if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
@@ -455,7 +549,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             i = (py * width + px) * 4
             want_rgba = probe["rgba"]
             for c, want in enumerate(want_rgba):
-                if abs(pixels[i + c] - want) > tol:
+                if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
@@ -465,7 +559,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             i = (py * width + px) * 4
             u, v = probe["uv"]
             for c, want in enumerate((u, v, 0.0, 1.0)):
-                if abs(pixels[i + c] - want) > 2e-3:
+                if not _close(pixels[i + c], want, 2e-3):
                     raise AssertionError(
                         f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
                     )
@@ -741,15 +835,19 @@ def main(argv=None) -> int:
             manifest["centre_rgba"] = sample_rgba_bilinear(
                 tw, th, rgba, centre_uv[0], centre_uv[1]
             )
-        if probes:
-            manifest["rgba_probes"] = [
-                {
-                    "pixel": p["pixel"],
-                    "uv": p["uv"],
-                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
-                }
-                for p in probes
-            ]
+        tex_probes = rgba_probes_for_mesh(
+            vertices,
+            indices,
+            a.width,
+            a.height,
+            tw,
+            th,
+            rgba,
+            uv_probe_list=probes,
+            tol=manifest["rgba_tolerance"],
+        )
+        if tex_probes:
+            manifest["rgba_probes"] = tex_probes
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")

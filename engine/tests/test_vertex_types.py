@@ -57,7 +57,7 @@ def group_for(tris, n):
     return struct.pack("<3I", 0x80000000 | len(chunks), tbase, vbase) + bytes(recs + words + refs)
 
 
-def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
+def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True, extra=()):
     """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28),
     followed by its meshlet group unless with_group is false."""
     n = grid * grid
@@ -67,6 +67,7 @@ def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
         (2, 0x21, bytes((0, 0, 127, 0)) * n),
         (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % grid + uv_offset), 1000 * (v // grid + uv_offset))
                            for v in range(n))),
+        *[(slot, tag, data(n) if callable(data) else data * n) for slot, tag, data in extra],
     ]
     head = bytearray(vt.HEADER)
     off = vt.HEADER
@@ -152,6 +153,52 @@ class BlockTests(unittest.TestCase):
         _, out = measure(block())
         self.assertLess(out["pos_edge_vs_random_median"], 0.5)
         self.assertEqual(out["pos_header_finite"], 1)
+
+
+def skin_block(weights, joints, pairs=1):
+    """block() with weight slots 6(/7) (tag 0x26) and joint slots 8(/9) (tag 0x25); weights and joints are
+    8-byte lists (two slots' worth), the first four bytes used when pairs == 1."""
+    extra = [(6, 0x26, bytes(weights[:4])), (8, 0x25, bytes(joints[:4]))]
+    if pairs == 2:
+        extra = [(6, 0x26, bytes(weights[:4])), (7, 0x26, bytes(weights[4:])),
+                 (8, 0x25, bytes(joints[:4])), (9, 0x25, bytes(joints[4:]))]
+    return block(extra=extra)
+
+
+class SkinTests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_two_pairs_of_sorted_weights_summing_to_255(self):
+        _, out = measure(skin_block([100, 80, 40, 20, 10, 5, 0, 0], [3, 7, 1, 2, 9, 4, 0, 0], pairs=2))
+        sk = out["skin"]
+        self.assertEqual(sk["blocks"], 1)
+        self.assertEqual(sk["pairs_2"], 1)
+        for k in ("weight_sum_255", "weight_sum_247_255", "weights_descending", "nonzero_indices_distinct",
+                  "zero_weight_zero_index"):
+            self.assertEqual(sk[k], self.N, k)
+        self.assertEqual(sk["index_max_0-15"], 1)
+        self.assertEqual(sk["colour_vertices"], self.N)
+        self.assertEqual(sk["colour_sum_255"], 0)
+
+    def test_failures_are_counted(self):
+        # sum 250, not descending, joint 40 repeated, a zero weight with a non-zero index
+        _, out = measure(skin_block([50, 100, 100, 0], [40, 40, 2, 5]))
+        sk = out["skin"]
+        self.assertEqual(sk["pairs_1"], 1)
+        self.assertEqual(sk["weight_sum_255"], 0)
+        self.assertEqual(sk["weight_sum_247_255"], self.N)
+        self.assertEqual(sk["weights_descending"], 0)
+        self.assertEqual(sk["nonzero_indices_distinct"], 0)
+        self.assertEqual(sk["zero_weight_zero_index"], 0)
+        self.assertEqual(sk["index_max_32-47"], 1)
+
+    def test_no_joint_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["skin"], {})
+
+    def test_joint_slot_without_weights_is_unpaired(self):
+        _, out = measure(block(extra=[(8, 0x25, bytes((1, 2, 3, 4)))]))
+        self.assertEqual(out["skin"], {"unpaired": 1})
 
 
 class BlockRunTests(unittest.TestCase):

@@ -26,8 +26,9 @@ Checks per tag (each one a count over vertices or triangle edges; no value leave
                   the log ratio within a block) is lower for the reading that maps the surface evenly.
     4-byte tags   per byte: share of blocks where the byte is constant, share of vertices with byte 3 = 0 or 255,
                   edge smoothness (mean |difference| over triangle edges / mean |difference| over random vertex
-                  pairs; < 1 means the value follows the surface), and unit length read as snorm8 xyz and as
-                  10:10:10:2 snorm.
+                  pairs; < 1 means the value follows the surface), unit length read as snorm8 xyz and as
+                  10:10:10:2 snorm, and each NORMAL_CANDIDATES decoding against the face normals. Tag 0x21 is
+                  the octahedral normal of normal_0x21 (the mesh shaders' decode, chosen by bit 31).
 
 Usage:
     python -I tools/vertex_types.py <archive.rpf|dir> [...] [--limit N] [--json out.json]
@@ -195,6 +196,89 @@ def _oct(x, y):
     return _norm(x, y, z)
 
 
+def normal_0x21(w):
+    """Unit normal from one tag-0x21 u32, decoded as the mesh shaders decode it (docs/restofworld.md).
+
+    Bit 31 set: octahedral x = bits 0-9, y = bits 10-19, each unorm10 remapped by v * 2 / 1023 - 1.
+    Bit 31 clear: octahedral x = byte 0, y = byte 1, each unorm8 remapped by v / 127.5 - 1.
+    The other bits are not part of the normal."""
+    if w >> 31:
+        return _oct((w & 1023) * 2 / 1023 - 1, ((w >> 10) & 1023) * 2 / 1023 - 1)
+    return _oct((w & 255) / 127.5 - 1, ((w >> 8) & 255) / 127.5 - 1)
+
+
+def tangent_0x21(w):
+    """(unit tangent, bitangent sign) from one tag-0x21 u32, decoded as the mesh shaders decode it.
+
+    Bit 31 set: bits 20-29 are an angle, v * 2pi / 1023 - pi, that turns a basis built from the normal alone
+    (b1 = (s*x*x*a - 1, s*x*y*a, s*x), b2 = (x*y*a, y*y*a - s, y), s = sign(z) with z = 0 as +1, a = 1 / (s + z));
+    tangent = b1 * cos(angle) - b2 * sin(angle).
+    Bit 31 clear: octahedral tangent, x = bits 16-22, y = bits 23-29, each unorm7 remapped by v / 63.5 - 1.
+    Bit 30 is the bitangent sign: 1 when cross(normal, tangent) runs along +v of the texture coordinates
+    (docs/restofworld.md), returned as +1 or -1. The shaders themselves turn a set bit 30 into the factor -1.0
+    (`v_cndmask_b32 ..., 1.0, -1.0`); the sign here is the measured side, not that factor.
+    Returns (None, sign) when a vector cannot be built."""
+    sign = 1 if (w >> 30) & 1 else -1
+    if not w >> 31:
+        return _oct(((w >> 16) & 127) / 63.5 - 1, ((w >> 23) & 127) / 63.5 - 1), sign
+    n = normal_0x21(w)
+    if n is None:
+        return None, sign
+    x, y, z = n
+    s = 1.0 if z >= 0 else -1.0
+    a = 1.0 / (s + z)
+    ang = ((w >> 20) & 1023) * (2 * math.pi / 1023) - math.pi
+    c, sn = math.cos(ang), math.sin(ang)
+    b1 = (s * x * x * a - 1, s * x * y * a, s * x)
+    b2 = (x * y * a, y * y * a - s, y)
+    return _norm(*(b1[i] * c - b2[i] * sn for i in range(3))), sign
+
+
+def tangent_checks(words, uvs, mpos, tris):
+    """Counts for the tag-0x21 tangent against the texture-coordinate gradients of each triangle.
+
+    words: the 0x21 u32 per vertex; uvs: (u, v) per vertex; mpos: model-space positions; tris: triangles.
+    For each vertex of a triangle with a usable UV mapping, dP/du is projected into the vertex's tangent plane.
+    Keys per form (10 = bit 31 set, 8 = clear): checked, along_u (cos(tangent, dP/du) > 0.8), rotated_along_u
+    (the same tangent turned by a seeded random angle about the normal, the chance level), and of the along_u
+    vertices, sign_agree (bit 30 matches the side of dP/dv that cross(normal, tangent) is on)."""
+    out = {}
+    rng = random.Random(0)
+    for a, b, c in tris:
+        e1 = [mpos[b][i] - mpos[a][i] for i in range(3)]
+        e2 = [mpos[c][i] - mpos[a][i] for i in range(3)]
+        du1, dv1 = uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]
+        du2, dv2 = uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]
+        det = du1 * dv2 - du2 * dv1
+        if abs(det) < 1e-12:
+            continue
+        dpdu = _norm(*((e1[i] * dv2 - e2[i] * dv1) / det for i in range(3)))
+        dpdv = _norm(*((e2[i] * du1 - e1[i] * du2) / det for i in range(3)))
+        if dpdu is None or dpdv is None:
+            continue
+        for v in (a, b, c):
+            w = words[v]
+            n = normal_0x21(w)
+            t, sign = tangent_0x21(w)
+            if n is None or t is None:
+                continue
+            d = sum(dpdu[i] * n[i] for i in range(3))
+            pu = _norm(*(dpdu[i] - d * n[i] for i in range(3)))
+            if pu is None:
+                continue
+            form = "10" if w >> 31 else "8"
+            add(out, f"tangent{form}_checked")
+            cu = sum(t[i] * pu[i] for i in range(3))
+            bt = (n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0])
+            th = rng.uniform(0, 2 * math.pi)
+            rt = [t[i] * math.cos(th) + bt[i] * math.sin(th) for i in range(3)]
+            add(out, f"tangent{form}_rotated_along_u", int(sum(rt[i] * pu[i] for i in range(3)) > 0.8))
+            if cu > 0.8:
+                add(out, f"tangent{form}_along_u")
+                add(out, f"tangent{form}_sign_agree", int((sum(bt[i] * dpdv[i] for i in range(3)) > 0) == (sign > 0)))
+    return out
+
+
 def _s8(b):
     return max((b - 256 if b > 127 else b) / 127.0, -1.0)
 
@@ -216,14 +300,19 @@ def _qt(x, y, z, w, col):
     return (1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
 
 
+def _snorm10_components(word: int) -> tuple[float, float, float]:
+    channels = [(word >> shift) & 0x3FF for shift in (0, 10, 20)]
+    x, y, z = (max(-1.0, (v - 1024 if v >= 512 else v) / 511.0) for v in channels)
+    return x, y, z
+
+
 NORMAL_CANDIDATES = {
     **{f"qtan_snorm8_col{c}": (lambda c: lambda r, v: _qt(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2]), _s8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_unorm8_col{c}": (lambda c: lambda r, v: _qt(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2]), _u8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_10102_col{c}": (lambda c: lambda r, v: (lambda w: _qt(*[((w >> s) & 1023) / 511.5 - 1 for s in (0, 10, 20)], ((w >> 30) & 3) / 1.5 - 1, c))(struct.unpack_from("<I", r, 4 * v)[0]))(c) for c in (0, 1, 2)},
     "snorm8_xyz": lambda r, v: _norm(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2])),
     "unorm8_xyz": lambda r, v: _norm(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2])),
-    "snorm10_xyz": lambda r, v: _norm(*[((w - 1024 if w > 511 else w) / 511.0) for w in
-                                        (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
+    "snorm10_xyz": lambda r, v: _norm(*_snorm10_components(struct.unpack_from("<I", r, 4 * v)[0])),
     "unorm10_xyz": lambda r, v: _norm(*[(w / 511.5 - 1) for w in
                                         (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
     "oct_snorm8_b01": lambda r, v: _oct(_s8(r[4 * v]), _s8(r[4 * v + 1])),
@@ -232,6 +321,7 @@ NORMAL_CANDIDATES = {
     "oct_unorm8_b23": lambda r, v: _oct(_u8(r[4 * v + 2]), _u8(r[4 * v + 3])),
     "oct_snorm16": lambda r, v: _oct(*[max(x / 32767.0, -1.0) for x in struct.unpack_from("<2h", r, 4 * v)]),
     "oct_unorm16": lambda r, v: _oct(*[x / 32767.5 - 1 for x in struct.unpack_from("<2H", r, 4 * v)]),
+    "oct_bit31_10_or_8": lambda r, v: normal_0x21(struct.unpack_from("<I", r, 4 * v)[0]),
 }
 
 
@@ -361,8 +451,7 @@ def measure_block(data, at, T, rng, found=None):
                 x, y, z = (b - 256 if b > 127 else b for b in raw[4 * v:4 * v + 3])
                 unit8 += abs(math.sqrt(x * x + y * y + z * z) / 127.0 - 1) < 0.03
                 w = struct.unpack_from("<I", raw, 4 * v)[0]
-                c = [((w >> s) & 1023) for s in (0, 10, 20)]
-                c = [(x - 1024 if x > 511 else x) / 511.0 for x in c]
+                c = _snorm10_components(w)
                 unit10 += abs(math.sqrt(sum(x * x for x in c)) - 1) < 0.03
             add(tt, "unit_snorm8", unit8)
             add(tt, "unit_snorm10", unit10)
@@ -379,6 +468,16 @@ def measure_block(data, at, T, rng, found=None):
                         good += abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8
                 if tot:
                     tt.setdefault(f"facenormal_{name}", []).append(good / tot)
+    # tag 0x21 tangent: against the first 0x28 (texture coordinate) stream of the block, if it has one
+    s21 = [(i, off) for i, (tag, off) in sorted(slots.items()) if tag == 0x21 and i]
+    s28 = [off for i, (tag, off) in sorted(slots.items()) if tag == 0x28 and i]
+    if s21 and s28:
+        words = struct.unpack_from(f"<{n}I", data, at + s21[0][1])
+        raw = struct.unpack_from(f"<{2 * n}h", data, at + s28[0])
+        uvs = [(raw[2 * v], raw[2 * v + 1]) for v in range(n)]
+        tt = T["tags"][f"slot{s21[0][0]}:21"]
+        for key, val in tangent_checks(words, uvs, mpos, stris).items():
+            add(tt, key, val)
     return n
 
 

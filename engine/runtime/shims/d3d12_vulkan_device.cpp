@@ -22,6 +22,7 @@
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
+#include "../src/resource_detile.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/vulkan_present.h"

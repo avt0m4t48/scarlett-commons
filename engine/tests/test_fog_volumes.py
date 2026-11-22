@@ -178,6 +178,41 @@ class FogVolumesTests(unittest.TestCase):
             self.assertEqual(doc["scanned_0x7a_complete"], 1)
             self.assertEqual(doc["scanned_0x7a_incomplete"], 0)
 
+    def test_corrupt_and_truncated_compressed_stream(self):
+        # Build a valid 0x7a FogVolume payload large enough that its compressed body has
+        # room for a corrupt byte past the 24-byte header probe, plus a truncated copy.
+        raw_valid = build_synthetic_fog_0x7a([
+            {"IsBox": 1, "PositionOffset": (float(i), 2.0, -0.5), "ProfileIndex": 12}
+            for i in range(16)
+        ])
+        comp_valid = zlib.compress(raw_valid)
+        self.assertGreater(len(comp_valid), 64)
+
+        corrupt = bytearray(comp_valid)
+        corrupt[-10] ^= 0xFF
+        truncated = comp_valid[:-12]
+
+        with tempfile.TemporaryDirectory() as td:
+            # 1. Corrupt stream followed by a valid stream: must not raise zlib.error and must still find the valid one.
+            rpf_corrupt = os.path.join(td, "corrupt_then_valid.rpf")
+            with open(rpf_corrupt, "wb") as f:
+                f.write(b"9FPR" + b"\x00" * 12 + bytes(corrupt) + b"\x00" * 32 + comp_valid + b"\x00" * 32)
+            doc = fv.summarize(rpf_corrupt, jobs=1)
+            self.assertEqual(doc["resources"], 1)
+            self.assertEqual(doc["volumes"], 16)
+            self.assertGreaterEqual(doc["scanned_0x7a_incomplete"], 1)
+            self.assertEqual(doc["scanned_0x7a_complete"], 1)
+
+            # 2. Truncated stream at EOF (missing last 12 bytes): must return 0 resources without crashing.
+            rpf_trunc = os.path.join(td, "truncated.rpf")
+            with open(rpf_trunc, "wb") as f:
+                f.write(b"9FPR" + b"\x00" * 12 + truncated)
+            doc_t = fv.summarize(rpf_trunc, jobs=1)
+            self.assertEqual(doc_t["resources"], 0)
+            self.assertEqual(doc_t["volumes"], 0)
+            self.assertEqual(doc_t["scanned_0x7a_incomplete"], 1)
+            self.assertEqual(doc_t["scanned_0x7a_complete"], 0)
+
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as td:
             fp = os.path.join(td, "in.bin")

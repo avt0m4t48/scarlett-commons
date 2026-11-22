@@ -178,8 +178,14 @@ def _scan_rpf_chunk(args: tuple[str, int, int]) -> tuple[list[int], int, int]:
             if len(head) < 21 or head[0x10:0x14] != b"0DRP" or head[0x14] != 0x7A:
                 pos = off + 2
                 continue
-            res = WC.assemble(m, off, size)
+            try:
+                res = WC.assemble(m, off, size)
+            except zlib.error:
+                incomplete_0x7a += 1
+                pos = off + 2
+                continue
             if not res:
+                incomplete_0x7a += 1
                 pos = off + 2
                 continue
             pos = max(off + 2, res.get("end", off + 2))
@@ -255,7 +261,10 @@ def iter_fog_resources(path: str, jobs: int = 1, stats: dict | None = None):
         stats["scanned_0x7a_incomplete"] = incomplete_0x7a
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         for off in offs:
-            res = WC.assemble(m, off, size)
+            try:
+                res = WC.assemble(m, off, size)
+            except zlib.error:
+                continue
             if res and res.get("complete"):
                 yield off, res["data"]
 

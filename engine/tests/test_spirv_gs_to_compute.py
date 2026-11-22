@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -136,6 +137,20 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
     r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.skipif(not HAVE_SPIRV or not shutil.which("spirv-dis"), reason="needs SPIRV-Tools on PATH")
+@pytest.mark.parametrize("target", ["vulkan1.0", "vulkan1.1", "vulkan1.2"])
+def test_cli_preserves_valid_capture_across_spirv_versions(tmp_path: Path, target: str) -> None:
+    source, output = tmp_path / "gs.spv", tmp_path / "cs.spv"
+    subprocess.run(["spirv-as", "--target-env", target, "-", "-o", source], input=PHI_GS, text=True, check=True)
+    subprocess.run(["spirv-val", "--target-env", target, source], check=True)
+    tool = os.path.join(ROOT, "tools", "spirv_gs_to_compute.py")
+    result = subprocess.run([sys.executable, "-I", tool, source, output], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run(["spirv-val", "--target-env", target, output], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes()[4:8] == source.read_bytes()[4:8]
 
 
 @pytest.fixture

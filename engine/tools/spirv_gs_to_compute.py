@@ -112,7 +112,7 @@ def layout_of(text):
             "input_vars": inputs, "output_vars": outputs, "builtins": builtins}
 
 
-def rewrite(text):
+def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
     """Return (compute module text, layout dict for --layout)."""
     lay = layout_of(text)
     defs, _ = parse(text)
@@ -130,13 +130,15 @@ def rewrite(text):
     def k(v):
         return f"%gsc_k{v}"
 
+    # Before SPIR-V 1.3, storage buffers use Uniform with BufferBlock in core SPIR-V.
+    buffer_storage, buffer_block = ("StorageBuffer", "Block") if version >= (1, 3) else ("Uniform", "BufferBlock")
     decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId",
              "OpDecorate %gsc_rt_v4 ArrayStride 16", "OpDecorate %gsc_rt_u ArrayStride 4",
              "OpDecorate %gsc_pad ArrayStride 4",
-             "OpDecorate %gsc_in_t Block", "OpMemberDecorate %gsc_in_t 0 Offset 0",
+             f"OpDecorate %gsc_in_t {buffer_block}", "OpMemberDecorate %gsc_in_t 0 Offset 0",
              "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
-             "OpDecorate %gsc_rec_t Block", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
-             "OpDecorate %gsc_meta_t Block", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
+             f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
+             f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
              "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
              "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
              "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
@@ -149,24 +151,27 @@ def rewrite(text):
               f"%gsc_pad = OpTypeArray {uint} {k(3)}",
               f"%gsc_in_t = OpTypeStruct {uint} %gsc_pad %gsc_rt_v4",
               "%gsc_rec_t = OpTypeStruct %gsc_rt_v4", "%gsc_meta_t = OpTypeStruct %gsc_rt_u",
-              "%gsc_ptr_in_t = OpTypePointer StorageBuffer %gsc_in_t",
-              "%gsc_ptr_rec_t = OpTypePointer StorageBuffer %gsc_rec_t",
-              "%gsc_ptr_meta_t = OpTypePointer StorageBuffer %gsc_meta_t",
-              f"%gsc_ptr_sb_v4 = OpTypePointer StorageBuffer {v4}",
-              f"%gsc_ptr_sb_u = OpTypePointer StorageBuffer {uint}",
-              f"%gsc_ptr_sb_f = OpTypePointer StorageBuffer {f32}",
+              f"%gsc_ptr_in_t = OpTypePointer {buffer_storage} %gsc_in_t",
+              f"%gsc_ptr_rec_t = OpTypePointer {buffer_storage} %gsc_rec_t",
+              f"%gsc_ptr_meta_t = OpTypePointer {buffer_storage} %gsc_meta_t",
+              f"%gsc_ptr_sb_v4 = OpTypePointer {buffer_storage} {v4}",
+              f"%gsc_ptr_sb_u = OpTypePointer {buffer_storage} {uint}",
+              f"%gsc_ptr_sb_f = OpTypePointer {buffer_storage} {f32}",
               f"%gsc_ptr_pv_v4 = OpTypePointer Private {v4}", f"%gsc_ptr_pv_f = OpTypePointer Private {f32}",
               f"%gsc_ptr_pv_u = OpTypePointer Private {uint}",
               "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input",
-              "%gsc_in = OpVariable %gsc_ptr_in_t StorageBuffer",
-              "%gsc_rec = OpVariable %gsc_ptr_rec_t StorageBuffer",
-              "%gsc_meta = OpVariable %gsc_ptr_meta_t StorageBuffer",
+              f"%gsc_in = OpVariable %gsc_ptr_in_t {buffer_storage}",
+              f"%gsc_rec = OpVariable %gsc_ptr_rec_t {buffer_storage}",
+              f"%gsc_meta = OpVariable %gsc_ptr_meta_t {buffer_storage}",
               f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
     in_slot = {v: i for i, v in enumerate(ins)}
     gone = set(ins) | set(outs) | {v for v, b in builtins.items() if b in ("PrimitiveId", "InvocationId")}
-    new_globals = ["%gsc_gid", "%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
+    capture_interface = ["%gsc_gid"]
+    # Before SPIR-V 1.4, the interface only lists Input and Output variables.
+    if version >= (1, 4):
+        capture_interface += ["%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
 
     count = 0
 
@@ -184,7 +189,7 @@ def rewrite(text):
             continue
         m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
         if m:
-            iface = [v for v in m.group(3).split() if v not in gone] + new_globals
+            iface = [v for v in m.group(3).split() if v not in gone] + capture_interface
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
@@ -330,13 +335,14 @@ def main(argv):
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
     text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    ver = re.search(r"; Version: (\d+)\.(\d+)", text)
+    version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
-        new, lay = rewrite(text)
+        new, lay = rewrite(text, version=version)
     except Unsupported as e:
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
-    ver = re.search(r"; Version: (\d+)\.(\d+)", text)
-    target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
+    target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
         with open(lay_path, "w", newline="\n") as f:

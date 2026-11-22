@@ -24,6 +24,9 @@ so rounding plays no part.
 Sides:
     translator  tools/rdna2spirv.py on a listing whose printed encodings are llvm-mc's (the literal cut to 16 bits)
                 with the real bytes next to it, run in tests/semantic/spirv_mini_interp.py on the CPU. Always runs.
+                The text and encodings are what llvm-mc 23.1.5 prints for these bytes, except D's text: it prints
+                that f32 literal as lit(0x40400000), which the translator does not parse, so D's listing says
+                0x40400000.
     hw          the instruction's exact bytes (`.long`, since LLVM's assembler can't encode the literal either) on an
                 AMD GPU through tools/hw_oracle (HIP on Windows, libdrm on Linux), one wave32 lane. The measurement.
 
@@ -94,9 +97,9 @@ class Case:
         return f2u(self.operand(0, reading) * V2_VALUE + self.operand(2, reading))
 
     def printed_literal(self):
-        """What llvm-mc prints and re-encodes: the low 16 bits when the literal is read as f16, else all 32."""
-        f16 = any(self.srcs[i] == "lit" and self.op_sel_hi[i] for i in (0, 2))
-        return self.literal & 0xFFFF if f16 else self.literal
+        """What llvm-mc re-encodes: the literal's low 16 bits. llvm-mc 23.1.5 does that for every v_fma_mix literal,
+        one that a source reads as f32 (D) too."""
+        return self.literal & 0xFFFF
 
     def words(self, vdst, vsrc1, literal):
         """The instruction's three dwords: VOP3P word 0, word 1, literal."""
@@ -108,19 +111,20 @@ class Case:
         return w0, w1, literal
 
     def text(self, vdst, vsrc1):
-        lit = f"0x{self.printed_literal():x}"
+        f16 = any(self.srcs[i] == "lit" and self.op_sel_hi[i] for i in (0, 2))
+        lit = f"0x{self.printed_literal() if f16 else self.literal:x}"      # D: hand-written, see the docstring
         reg = f"v{vsrc1}"
         ops = [lit if self.srcs[0] == "lit" else reg, reg, lit if self.srcs[2] == "lit" else reg]
-        sel = ",".join(map(str, self.op_sel))
-        hi = ",".join(map(str, self.op_sel_hi))
-        return f"v_fma_mix_f32 v{vdst}, {ops[0]}, {ops[1]}, {ops[2]} op_sel:[{sel}] op_sel_hi:[{hi}]"
+        mods = [f"{name}:[{','.join(map(str, bits))}]" for name, bits in (("op_sel", self.op_sel),
+                                                                          ("op_sel_hi", self.op_sel_hi)) if any(bits)]
+        return " ".join([f"v_fma_mix_f32 v{vdst}, {ops[0]}, {ops[1]}, {ops[2]}"] + mods)  # llvm-mc omits [0,0,0]
 
 
 CASES = (
-    Case("A", ("lit", "v", "lit"), (0, 0, 1), (1, 0, 1), 0x40003C00, "src0 = lo, src2 = hi (the FSPX shape)"),
-    Case("B", ("lit", "v", "lit"), (1, 0, 1), (1, 0, 1), 0x42003C00, "src0 = hi, src2 = hi"),
-    Case("E", ("v", "v", "lit"), (0, 0, 1), (0, 0, 1), 0xBC003800, "src0 = v (f32), src2 = hi"),
-    Case("C", ("lit", "v", "lit"), (0, 0, 0), (1, 0, 1), 0x40003C00, "control: src0 = src2 = lo"),
+    Case("A", ("lit", "v", "lit"), (0, 0, 1), (1, 0, 1), 0x40004200, "src0 = lo, src2 = hi (the FSPX shape)"),
+    Case("B", ("lit", "v", "lit"), (1, 0, 1), (1, 0, 1), 0x42004500, "src0 = hi, src2 = hi"),
+    Case("E", ("v", "v", "lit"), (0, 0, 1), (0, 0, 1), 0xBC004200, "src0 = v (f32), src2 = hi"),
+    Case("C", ("lit", "v", "lit"), (0, 0, 0), (1, 0, 1), 0x40004200, "control: src0 = src2 = lo"),
     Case("D", ("lit", "v", "v"), (0, 0, 0), (0, 0, 0), 0x40400000, "control: src0 = the f32 literal"),
 )
 

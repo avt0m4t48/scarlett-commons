@@ -361,6 +361,12 @@ int main(int argc, char** argv) {
                 // (TEST-907: an RTX 5060 Ti on Windows 10 drew nothing for scene 4 with conservative raster on) is
                 // reported, with both of its masks, and that scenario is not compared with the host.
                 bool host_ok = compare_host && coverage(triangle, scissor, conservative_b);
+                if (compare_host && !host_ok && compare_warp_msaa4) {
+                    // --warp-msaa4 exists to reproduce WARP's known 4x discrepancy, so there it stays a failure.
+                    std::fprintf(stderr, "scene %zu samples %u variant %d scissor-left %ld: host fails the oracle\n",
+                                 std::size_t(&triangle - scenes), samples, int(variant), scissor.left);
+                    return 1;
+                }
                 if (compare_host && !host_ok) {
                     unsigned normal_only = 0;
                     for (unsigned i = 0; i < normal_b.size(); ++i) normal_only += normal_b[i] && !conservative_b[i];

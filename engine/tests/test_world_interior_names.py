@@ -62,7 +62,7 @@ def build(structs, blocks):
 
 
 ROOM_SIZE, MLO_SIZE, INST_SIZE = 0x40, 0x60, 0x40
-ROOM_MEMBERS = [(T.NAME, 0x00, 0x4A), (T.BBMIN, 0x10, 0x33), (T.BBMAX, 0x20, 0x33)]
+ROOM_MEMBERS = [(T.NAME, 0x00, 0x4A), (T.BBMIN, 0x10, 0x33), (T.BBMAX, 0x20, 0x33), (T.ROOM_KEY, 0x34, 0x4A)]
 KEY_MEMBER = J("someKey")
 MLO_MEMBERS = [(T.NAME, 0x00, 0x4A), (KEY_MEMBER, 0x08, T.U64), (J("otherKey"), 0x10, T.U64),
                (T.BBMIN, 0x18, 0x32), (T.BBMAX, 0x24, 0x32), (J("rooms"), 0x30, T.ARRAY), (J("portals"), 0x40, T.ARRAY)]
@@ -72,9 +72,10 @@ ROOM_BOX = ((-2.0, -1.0, 0.0), (2.0, 1.0, 3.0))
 BOX = ((-4.0, -1.0, 0.0), (4.0, 1.0, 3.0))  # long in X so the rotation convention changes the world box
 
 
-def room(name, lo, hi):
+def room(name, lo, hi, key=0):
     b = bytearray(ROOM_SIZE)
     struct.pack_into("<I", b, 0, name)
+    struct.pack_into("<I", b, 0x34, key)
     struct.pack_into("<3f", b, 0x10, *lo)
     struct.pack_into("<3f", b, 0x20, *hi)
     return bytes(b)
@@ -89,19 +90,19 @@ def interior(name, key64, first_room, rooms):
     return bytes(b)
 
 
-def placement(name, pos, rot=(0.0, 0.0, 0.0, 1.0)):
+def placement(name, pos, rot=(0.0, 0.0, 0.0, 1.0), scale=(1.0, 1.0)):
     b = bytearray(INST_SIZE)
-    struct.pack_into("<I3f4f2f", b, 0, name, *pos, *rot, 1.0, 1.0)
+    struct.pack_into("<I3f4f2f", b, 0, name, *pos, *rot, *scale)
     return bytes(b)
 
 
 KEY_A, KEY_B, KEY_C = "TEST_INT01_ROOM_1", "TEST_INT02_HALL_1", "NOT_AN_INTERIOR_1"
-HA, HB = T.joaat(KEY_A), T.joaat(KEY_B)
+HA, HB, HC = T.joaat(KEY_A), T.joaat(KEY_B), T.joaat(KEY_C)
 
 
 def interiors():
     """Two interiors in one resource, two rooms each: limbo first, as in the game data."""
-    rooms = (room(T.LIMBO, (0, 0, 0), (0, 0, 0)) + room(J("a"), *ROOM_BOX)
+    rooms = (room(T.LIMBO, (0, 0, 0), (0, 0, 0)) + room(J("a"), *ROOM_BOX, key=HA)
              + room(T.LIMBO, (0, 0, 0), (0, 0, 0)) + room(J("b"), *ROOM_BOX))
     payload = interior(HA, T.hash64(KEY_A.lower()), 0, 2) + interior(HB, 0xDEAD, 2, 2)
     return build([(T.ROOM, ROOM_SIZE, ROOM_MEMBERS), (T.MLO, MLO_SIZE, MLO_MEMBERS)],
@@ -145,6 +146,11 @@ class ParseTest(unittest.TestCase):
         _, placed = T.parse(placements())
         self.assertEqual([p["archetype"] for p in placed], [HA, HB, HB])
         self.assertEqual(placed[0]["position"], [100.0, 0.0, 0.0])
+        self.assertEqual((placed[0]["scale_xy"], placed[0]["scale_z"]), (1.0, 1.0))
+
+    def test_room_key_member_is_read(self):
+        found, _ = T.parse(interiors())
+        self.assertEqual([r[3] for r in found[0]["rooms"]], [0, HA])
 
     def test_array_reference_out_of_range_is_ignored(self):
         b = bytearray(interiors())
@@ -186,6 +192,63 @@ class ResolveTest(unittest.TestCase):
         # centre of room "b", its second 10 m away from either copy.
         self.assertEqual(s["positions_in_a_room_box"], {"stored": 1, "conjugate": 1})
 
+    def test_room_counts(self):
+        s, _ = self.resolve()
+        self.assertEqual((s["interiors_with_rooms"], s["interiors_first_room_limbo"]), (2, 2))
+        self.assertEqual(s["keys_in_a_room_key_member"], 1)  # room "a" holds KEY_A's hash
+
+    def test_placement_scale_is_applied(self):
+        # The reviewer's case: archetype and room both [-1, 1], placed at the origin with scaleXY 2, scaleZ 1, and
+        # a position at x = 1.5: inside the scaled box (X spans [-2, 2]) and inside the scaled room.
+        unit = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+        d = {"name": HA, "keys": {}, "bb_min": unit[0], "bb_max": unit[1],
+             "rooms": [[T.LIMBO, [0, 0, 0], [0, 0, 0], 0], [J("a"), unit[0], unit[1], 0]]}
+        p = {"archetype": HA, "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0],
+             "scale_xy": 2.0, "scale_z": 1.0}
+        s, rows = T.resolve({KEY_A: [[1.5, 0.0, 0.0], [0.0, 0.0, 1.5]]}, {0: ([d], [p])})
+        # The second position is 1.5 m up: scaleZ 1 keeps the box at z <= 1, so it is 0.5 m outside (in metres).
+        self.assertEqual(rows[KEY_A]["outside_box_m_stored"], [0.0, 0.5])
+        self.assertEqual(rows[KEY_A]["outside_box_m_conjugate"], [0.0, 0.5])
+        self.assertEqual(s["positions_in_a_room_box"], {"stored": 1, "conjugate": 1})
+
+    def test_scaled_box_negative_and_missing_scale(self):
+        lo, hi = [-1.0, -2.0, 0.0], [3.0, 2.0, 4.0]
+        self.assertEqual(T._scaled(lo, hi, {"scale_xy": -2.0, "scale_z": 0.5}), ([-6.0, -4.0, 0.0], [2.0, 4.0, 2.0]))
+        self.assertEqual(T._scaled(lo, hi, {"scale_xy": None, "scale_z": 0.0}), (lo, hi))
+
+    def test_unknown_placements_are_not_counted_as_placed_interiors(self):
+        found = {0: T.parse(interiors()), 1: T.parse(placements()),
+                 2: T.parse(build([(T.INSTANCE, INST_SIZE, INST_MEMBERS)],
+                                  [(T.INSTANCE, placement(HC, (0.0, 0.0, 0.0)))]))}
+        s, _ = T.resolve({}, found)
+        self.assertEqual((s["placements"], s["placed_interior_names"]), (4, 2))
+        self.assertEqual((s["placed_unknown_names"], s["placements_of_unknown_interior"]), (1, 1))
+
+    def test_duplicate_interior_definition_keeps_the_first(self):
+        found = {0: T.parse(interiors()), 1: T.parse(interiors()), 2: T.parse(placements())}
+        s, _ = T.resolve({}, found)
+        self.assertEqual((s["interior_definitions"], s["interior_names"]), (4, 2))
+        self.assertEqual(s["duplicate_interior_definitions"], 2)
+
+
+class HelperTest(unittest.TestCase):
+    def test_median_of_sorted_list(self):
+        self.assertIsNone(T._median([]))
+        self.assertEqual(T._median([1.0, 2.0, 7.0]), 2.0)
+        self.assertEqual(T._median([1.0, 2.0, 4.0, 7.0]), 3.0)
+        b = T._buckets([3.0, 0.0, 1.0, 2.0])
+        self.assertEqual((b["n"], b["median_m"], b["within_m"]["1"]), (4, 1.5, 2))
+
+    def test_duplicate_keys_keep_every_item_and_are_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"InteriorNames": {"K": [{"Pos": [1, 2, 3]}], "J": {"Pos": [0, 0, 0]},'
+                        ' "K": {"Pos": [4, 5, 6]}}}')
+            names, dup = T.load_names(path)
+        self.assertEqual(dup, 1)
+        self.assertEqual(names, {"K": [[1, 2, 3], [4, 5, 6]], "J": [[0, 0, 0]]})
+
 
 class CliTest(unittest.TestCase):
     def setUp(self):
@@ -220,6 +283,32 @@ class CliTest(unittest.TestCase):
                 f.write(data)
         s = self.run_cli(folder)
         self.assertEqual((s["interior_names"], s["placed_interior_names"]), (2, 2))
+
+    def test_out_never_overwrites_an_input(self):
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        archive = rpf([interiors(), placements()])
+        with open(path, "wb") as f:
+            f.write(archive)
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "a.bin")
+        with open(carved, "wb") as f:
+            f.write(interiors())
+        with open(self.names, "rb") as f:
+            names = f.read()
+        for src, out in ((path, path), (path, self.names), (folder, carved), (folder, os.path.join(folder, "r.json"))):
+            err = io.StringIO()
+            sys.stderr, saved = err, sys.stderr
+            try:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(T.main([src, "--names", self.names, "--out", out]), 2, out)
+            finally:
+                sys.stderr = saved
+            self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        for p, data in ((path, archive), (self.names, names), (carved, interiors())):
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), data, p)
+        self.assertFalse(os.path.exists(os.path.join(folder, "r.json")))
 
     def test_bad_arguments(self):
         for argv in (["nope", "--names", self.names], [self.names, "--names", self.names, "--jobs", "0"]):

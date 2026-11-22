@@ -12,7 +12,10 @@ with one or more inner items, each a display-name key and a world position. This
   only when the lower-cased key's MurmurHash3 x64 low 64 equals one of that interior's 64-bit keys;
 - each position is compared with the placements of its own key's interior: how many placements there are, and
   how far the position lies from the placed interior box (0 = inside), with the stored and the conjugated
-  quaternion.
+  quaternion. The interior and room boxes are scaled by each placement's ``scaleXY`` (X, Y) and ``scaleZ`` (Z)
+  first, so distances stay in metres;
+- the rooms are also counted for two checks: how many interiors have ``limbo`` as their first room, and how many
+  keys equal the hash member ``a261e0a9`` of some room.
 
 Every field is found by the case-sensitive joaat of its name in the resource's member table.
 
@@ -31,7 +34,6 @@ import bisect
 import json
 import math
 import os
-import statistics
 import struct
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -42,6 +44,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
 J = WA.joaat_cs
@@ -51,6 +54,7 @@ INSTANCE = J("CMloInstanceDef")
 NAME, BBMIN, BBMAX = J("name"), J("bbMin"), J("bbMax")
 U64, ARRAY = 0x4F, 0x52
 LIMBO = joaat("limbo")
+ROOM_KEY = 0xA261E0A9  # a room's hash member that holds an interior key's joaat
 OVERLAP = 64 << 20  # a worker reads this far past its window so a resource that straddles the edge is whole
 THRESHOLDS = (0, 1, 2, 5, 10, 25, 100)
 
@@ -91,7 +95,7 @@ def _array(b, blocks, base, member):
 
 
 def _rooms(b, structs, blocks, base, members):
-    """[[name hash, bbMin, bbMax]] of the CMloRoomDef array an interior points at."""
+    """[[name hash, bbMin, bbMax, a261e0a9 hash]] of the CMloRoomDef array an interior points at."""
     if ROOM not in structs:
         return []
     rsize, rm = structs[ROOM]
@@ -101,7 +105,8 @@ def _rooms(b, structs, blocks, base, members):
         found = _array(b, blocks, base, mm)
         if found and found[0] == ROOM and rsize:
             h, first, count = found
-            return [[WI._value(b, o, rm.get(NAME)), _vec3(b, o, rm.get(BBMIN)), _vec3(b, o, rm.get(BBMAX))]
+            return [[WI._value(b, o, rm.get(NAME)), _vec3(b, o, rm.get(BBMIN)), _vec3(b, o, rm.get(BBMAX)),
+                     WI._value(b, o, rm.get(ROOM_KEY))]
                     for o in range(first, first + rsize * count, rsize) if o + rsize <= len(b)]
     return []
 
@@ -165,15 +170,29 @@ def scan(path, start=None, limit=None, jobs=1):
     return found
 
 
+def _pairs(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:  # a repeated key keeps all its items and is counted, not silently replaced
+            out.setdefault("\0duplicates", []).append(k)
+            prev = out[k] if isinstance(out[k], list) else [out[k]]
+            out[k] = prev + (v if isinstance(v, list) else [v])
+        else:
+            out[k] = v
+    return out
+
+
 def load_names(path):
+    """({key: [position]}, number of repeated keys in the InteriorNames section)."""
     with open(path, encoding="utf-8") as f:
-        doc = json.load(f)
+        doc = json.load(f, object_pairs_hook=_pairs)
     section = doc.get("InteriorNames", doc)
+    duplicates = len(section.pop("\0duplicates", []))
     out = {}
     for key, items in section.items():
         items = items if isinstance(items, list) else [items]
         out[key] = [it.get("Pos") for it in items if isinstance(it, dict) and it.get("Pos")]
-    return out
+    return out, duplicates
 
 
 def _local(q, p, r):
@@ -185,26 +204,54 @@ def _outside(v, lo, hi):
     return math.sqrt(sum(max(lo[i] - v[i], 0.0, v[i] - hi[i]) ** 2 for i in range(3)))
 
 
+def _scaled(lo, hi, p):
+    """Box [lo, hi] scaled by placement p (scaleXY on X and Y, scaleZ on Z; a missing or zero scale is 1)."""
+    sxy, sz = p.get("scale_xy") or 1.0, p.get("scale_z") or 1.0
+    s = (sxy, sxy, sz)
+    a, b = [lo[i] * s[i] for i in range(3)], [hi[i] * s[i] for i in range(3)]
+    return [min(a[i], b[i]) for i in range(3)], [max(a[i], b[i]) for i in range(3)]
+
+
+def _median(values):
+    """Median of an already sorted list."""
+    n = len(values)
+    if not n:
+        return None
+    m = n // 2
+    return values[m] if n % 2 else (values[m - 1] + values[m]) / 2
+
+
 def _buckets(values):
     values = sorted(values)
-    return {"n": len(values), "median_m": round(statistics.median(values), 3) if values else None,
+    median = _median(values)
+    return {"n": len(values), "median_m": round(median, 3) if median is not None else None,
             "within_m": {str(t): bisect.bisect_right(values, t) for t in THRESHOLDS}}
 
 
-def resolve(names, found):
+def resolve(names, found, duplicate_keys=0):
     interiors, placements = {}, {}
-    n_interiors = n_placements = 0
+    n_interiors = n_placements = duplicate_interiors = 0
     for parsed_interiors, parsed_placements in found.values():
         for d in parsed_interiors:
             n_interiors += 1
+            if d["name"] in interiors:  # the first definition is used; the others are counted
+                duplicate_interiors += 1
             interiors.setdefault(d["name"], d)
         for p in parsed_placements:
             n_placements += 1
             placements.setdefault(p["archetype"], []).append(p)
+    room_keys = {r[3] for d in interiors.values() for r in d["rooms"] if r[3]}
     summary = {"interior_definitions": n_interiors, "interior_names": len(interiors),
-               "placements": n_placements, "placed_interior_names": len(placements),
+               "duplicate_interior_definitions": duplicate_interiors,
+               "interiors_with_rooms": sum(1 for d in interiors.values() if d["rooms"]),
+               "interiors_first_room_limbo": sum(1 for d in interiors.values()
+                                                 if d["rooms"] and d["rooms"][0][0] == LIMBO),
+               "placements": n_placements,
+               "placed_interior_names": sum(1 for k in placements if k in interiors),
+               "placed_unknown_names": sum(1 for k in placements if k not in interiors),
                "placements_of_unknown_interior": sum(len(v) for k, v in placements.items() if k not in interiors),
-               "keys": len(names), "positions": sum(map(len, names.values())),
+               "keys": len(names), "duplicate_keys": duplicate_keys, "positions": sum(map(len, names.values())),
+               "keys_in_a_room_key_member": sum(1 for k in names if joaat(k) in room_keys),
                "keys_naming_an_interior": 0, "confirmed_by_64bit_key": {}, "keys_not_confirmed": 0,
                "keys_with_placements": 0, "positions_vs_placements": {"equal": 0, "more_positions": 0,
                                                                       "fewer_positions": 0},
@@ -237,18 +284,29 @@ def resolve(names, found):
         if lo is None or hi is None:
             continue
         for tag, conj in (("stored", False), ("conjugate", True)):
-            rots = [(p["position"], WA._rotation(p["rotation"], conj)) for p in pl if p["position"]]
+            placed = [(p, WA._rotation(p["rotation"], conj)) for p in pl if p["position"]]
             out = []
             for q in positions:
-                locs = [_local(q, p, r) for p, r in rots]
-                out.append(min(_outside(v, lo, hi) for v in locs))
-                if any(rn != LIMBO and rlo and rhi and _outside(v, rlo, rhi) == 0.0
-                       for v in locs for rn, rlo, rhi in d["rooms"]):
+                locs = [(_local(q, p["position"], r), p) for p, r in placed]
+                out.append(min(_outside(v, *_scaled(lo, hi, p)) for v, p in locs))
+                if any(rn != LIMBO and rlo and rhi and _outside(v, *_scaled(rlo, rhi, p)) == 0.0
+                       for v, p in locs for rn, rlo, rhi, _ in d["rooms"]):
                     summary["positions_in_a_room_box"][tag] += 1
             row["outside_box_m_" + tag] = [round(x, 3) for x in out]
             dist[tag].extend(out)
     summary["distance_outside_own_interior_box"] = {k: _buckets(v) for k, v in dist.items()}
     return summary, rows
+
+
+def _inside(folder, path):
+    """True when ``folder`` is a folder and ``path`` lies in it (a report there would be read as a carved file)."""
+    if not os.path.isdir(folder):
+        return False
+    root = os.path.normcase(os.path.realpath(folder))
+    try:
+        return os.path.commonpath([root, os.path.normcase(os.path.realpath(path))]) == root
+    except ValueError:  # different drives on Windows
+        return False
 
 
 def main(argv=None):
@@ -265,8 +323,16 @@ def main(argv=None):
             ap.error("no such file or folder: %s" % p)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
-    summary, rows = resolve(load_names(a.names), scan(a.path, a.start, a.limit, a.jobs))
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    out_abs = os.path.abspath(a.out)
+    if same_report_path(a.out, a.path) or same_report_path(a.out, a.names) or _inside(a.path, out_abs):
+        print("world_interior_names.py: --out would overwrite an input: %s" % a.out, file=sys.stderr)
+        return 2
+    if os.path.isdir(a.out):
+        print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
+        return 2
+    names, duplicate_keys = load_names(a.names)
+    summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys)
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
     print(json.dumps(summary, indent=1, sort_keys=True))

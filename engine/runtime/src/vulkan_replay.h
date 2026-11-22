@@ -924,6 +924,8 @@ struct Prepared {
     VkImageSubresourceRange source_range{};   // copies: the source subresources (range: the destination's)
     std::vector<VkBufferCopy> buffer_copies;
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
+    VkBuffer tile_scratch = VK_NULL_HANDLE;            // CopyTiles with a byte-unaligned linear buffer offset
+    std::vector<VkBufferCopy> tile_rows;
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
@@ -1550,7 +1552,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     // Vulkan wants a buffer offset that is a multiple of the texel size (VUID-vkCmdCopyBufferToImage-dstImage-07975),
     // which D3D12's 512-byte placement does not give a 12-byte texel: one more reason an rgb96 copy is repacked.
     const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) || image.rgb96 ? 4 : format.bytes;
-    if (offset % alignment) return ReplayResult::unsupported;
+    if (offset % alignment && !copy.tile_footprint) return ReplayResult::unsupported;
     const std::uint64_t rows = (std::uint64_t(h) + format.block - 1) / format.block;
     const std::uint64_t row_bytes = (std::uint64_t(w) + format.block - 1) / format.block * format.bytes;
     if (!rows || !row_bytes || !within(std::uint64_t(placed_x / format.block) * format.bytes, row_bytes, placed.row_pitch) ||
@@ -1559,7 +1561,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         return ReplayResult::invalid_copy;
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
-    if (backing_offset % alignment) return ReplayResult::unsupported;
+    if (backing_offset % alignment && !copy.tile_footprint) return ReplayResult::unsupported;
     VkBufferImageCopy region{};
     region.bufferOffset = backing_offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
@@ -1577,6 +1579,30 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     p.buffer_image_copies.push_back(region);
     (upload ? p.range : p.source_range) = range;
     return ReplayResult::success;
+}
+
+// RGBA8 CopyTiles accepts arbitrary byte offsets into its linear buffer, while VkBufferImageCopy requires texel
+// alignment. Stage only the occupied texels through aligned transfer scratch; leave partial-tile padding alone.
+inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, bool upload) {
+    auto& region = p.buffer_image_copies.front();
+    const VkDeviceSize row_bytes = VkDeviceSize(region.imageExtent.width) * 4;
+    const VkDeviceSize pitch = VkDeviceSize(region.bufferRowLength) * 4;
+    const auto rows = region.imageExtent.height;
+    VkDeviceSize scratch_offset = 0;
+    if (!vk.copy_scratch || !vk.copy_scratch(row_bytes * rows, p.tile_scratch, scratch_offset)) return false;
+    const auto app_offset = region.bufferOffset;
+    const auto add_copy = [&](VkDeviceSize linear, VkDeviceSize scratch, VkDeviceSize bytes) {
+        p.tile_rows.push_back(upload ? VkBufferCopy{linear, scratch, bytes} : VkBufferCopy{scratch, linear, bytes});
+    };
+    if (row_bytes == pitch) {
+        add_copy(app_offset, scratch_offset, row_bytes * rows);
+    } else {
+        for (std::uint32_t row = 0; row < rows; ++row)
+            add_copy(app_offset + row * pitch, scratch_offset + row * row_bytes, row_bytes);
+    }
+    region.bufferOffset = scratch_offset;
+    region.bufferRowLength = 0;
+    return true;
 }
 
 // CopyResource: the whole buffer, or every subresource of two textures of the same shape.
@@ -2286,6 +2312,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
+                if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty() &&
+                    p.buffer_image_copies.front().bufferOffset % 4 && !detail::stage_unaligned_tile(vk, p, upload))
+                    return ReplayResult::unsupported;
                 const bool depth24_footprint = result == ReplayResult::success && image.depth24_as_float &&
                     !p.buffer_image_copies.empty() &&
                     p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -3106,7 +3135,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VkBuffer source = p.source.buffer;
                 std::vector<VkBufferImageCopy> converted;
                 const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
-                if (p.has_depth24) {
+                if (p.tile_scratch) {
+                    vk.copy_buffer(command_buffer, source, p.tile_scratch, std::uint32_t(p.tile_rows.size()),
+                                   p.tile_rows.data());
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    source = p.tile_scratch;
+                } else if (p.has_depth24) {
                     // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -3133,8 +3168,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
                 if (!p.has_depth24) {
-                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
+                    const auto target = p.tile_scratch ? p.tile_scratch : p.binding.buffer;
+                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, target,
                                             std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                    if (p.tile_scratch) {
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        vk.copy_buffer(command_buffer, p.tile_scratch, p.binding.buffer,
+                                       std::uint32_t(p.tile_rows.size()), p.tile_rows.data());
+                    }
                 } else {
                     // The floats land tightly packed in the scratch buffer; the pass turns them into the footprint's words.
                     VkBufferImageCopy region = p.buffer_image_copies[0];

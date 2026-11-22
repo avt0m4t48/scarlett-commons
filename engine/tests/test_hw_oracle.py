@@ -194,6 +194,18 @@ class ToolchainFallbacks(unittest.TestCase):
             o._probe()
         self.assertEqual(seen, [None])
 
+    def test_a_launcher_quarantined_by_defender_is_unavailable(self):
+        o = self.oracle()
+        o.exe, o.dll = "leonida_hw_oracle_0123456789.exe", "amdhip64_7.dll"
+        blocked = OSError("Operation did not complete successfully because the file contains a virus")
+        blocked.winerror = 225              # only set by Python on Windows
+        with unittest.mock.patch.object(runner.subprocess, "run", side_effect=blocked):
+            with self.assertRaisesRegex(runner.Unavailable, "Defender.*exclusion"):
+                o._launch("k.co", ["k0"])
+        with unittest.mock.patch.object(runner.subprocess, "run", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                o._launch("k.co", ["k0"])
+
     def test_v5_that_does_not_assemble_is_unavailable(self):
         o, _ = self.probe(loads={5})
         o._assemble = lambda text, wave=32: (None, "unknown argument") if o.code_object else ("k.co", "")

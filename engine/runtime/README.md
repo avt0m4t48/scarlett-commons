@@ -228,8 +228,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 
 `gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
 and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
-`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
-motor and trigger.
+`gameinput_probe [--seconds N] [--rumble] [--force-feedback]` is the manual check on a real pad: it prints live
+readings, plays each motor and trigger, and holds a constant force on a pad that reports a force-feedback motor.
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the

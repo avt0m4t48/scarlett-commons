@@ -362,6 +362,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
+              # v_med3 with a NaN in S2 or in two operands, by the same measured rule (derivations in the .asm headers)
+              "ps_fnan_med3_s2": (0x40a00000, 0x40a00000, 0xc0200000, 0x40e00000),
+              "ps_f16_fnan_med3": (0xaaaa4500, 0xaaaa4500, 0xaaaac100, 0xaaaa4700),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
               # 16-bit float v_cmp, all 16 predicates, e32 and e64 with swapped operands (.asm headers)
@@ -404,6 +407,10 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
                                "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_fnan_med3_s2": {"VKH_SGPRS": "0x1000,0,16,0",
+                                 "VKH_HEAP": "0x1000=0x40a00000,0x1004=0x40e00000,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_f16_fnan_med3": {"VKH_SGPRS": "0x1000,0,16,0",
+                                  "VKH_HEAP": "0x1000=0x00004500,0x1004=0x00004700,0x1008=0x00007e01,0x100c=0x0000c100"},
              # f32 VOPC with a NaN, 64-bit integer VOPC: inputs from memory (derivations in the .asm headers)
              "ps_vcmp_f32_nan": {"VKH_SGPRS": "0x1000,0,16,0",
                                  "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000"},

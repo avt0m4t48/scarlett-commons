@@ -179,6 +179,36 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
 
+    def test_cli_json_over_the_carve_index_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        index = os.path.join(self.work.root, "index.json")
+        with open(index, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm, "--json", index], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite the carve index", p.stderr)
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_inside_the_disasm_folder_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        listing_path = os.path.join(self.work.disasm, "ps_heap.s")
+        with open(listing_path, "rb") as f:
+            before = f.read()
+        tool = os.path.join(ROOT, "tools", "heap_index_census.py")
+        p = subprocess.run([sys.executable, "-I", tool, self.work.disasm, "--json", listing_path],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must not write inside the disasm folder", p.stderr)
+        with open(listing_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        # A name that does not exist yet is refused too: the folder itself is the input.
+        p = subprocess.run([sys.executable, "-I", tool, self.work.disasm, "--json",
+                            os.path.join(self.work.disasm, "report.json")], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.work.disasm, "report.json")))
+
 
 if __name__ == "__main__":
     unittest.main()

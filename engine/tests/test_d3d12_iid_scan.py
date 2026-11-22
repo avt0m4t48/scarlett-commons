@@ -149,6 +149,28 @@ class IidScan(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("ERROR", p.stderr)
 
+    def test_cli_json_over_an_input_image_is_refused(self):
+        dll = self.image("f.dll", pe32plus({}, QUEUE.bytes_le))
+        with open(dll, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", dll], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite", p.stderr)
+        with open(dll, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_over_the_header_is_refused(self):
+        dll = self.image("g.dll", b"MZ")
+        with open(self.header, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", self.header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite", p.stderr)
+        with open(self.header, "rb") as f:
+            self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

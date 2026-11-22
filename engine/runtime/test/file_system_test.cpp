@@ -5,7 +5,10 @@
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
 #include <windows.h>
 
+#include <aclapi.h>
+
 #include <algorithm>
+#include <clocale>
 #include <cstdio>
 #include <filesystem>
 #include <initializer_list>
@@ -266,6 +269,67 @@ int main() {
         check(std::find(names.begin(), names.end(), std::wstring(L"Éclair.txt")) == names.end() &&
                   contains(names, L"plain.txt"),
               "and the listing hides it, as the file system's compare does");
+    }
+
+    // Duplicates are decided by _wcsicmp (same_name) in the title's locale, not by a lower-cased key: under .UTF-8,
+    // _wcslwr_s folds U+00C9 and U+00E9 while _wcsicmp keeps them apart.
+    {
+        write_path(overlay / "loc" / L"Éclair.txt", "overlay");
+        write_path(package / "loc" / L"éclair.txt", "package");
+        const char* old = std::setlocale(LC_CTYPE, nullptr);
+        const std::string saved = old ? old : "C";
+        if (std::setlocale(LC_CTYPE, ".UTF-8")) {
+            const int expected = _wcsicmp(L"Éclair.txt", L"éclair.txt") == 0 ? 1 : 2;
+            const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\loc\\*");
+            int files = 0;
+            for (const auto& n : names)
+                if (n != L"." && n != L"..") ++files;
+            check(files == expected, "under .UTF-8 the merged listing keeps exactly the names _wcsicmp tells apart");
+        }
+        std::setlocale(LC_CTYPE, saved.c_str());
+    }
+
+    // A marker folder that cannot be listed (listing denied, lookups by path still allowed) is not "no markers":
+    // the deleted file stays hidden, as GetFileAttributesW already reports it.
+    {
+        write_path(package / "acl" / "a.txt", "package");
+        write_path(package / "acl" / "b.txt", "package");
+        check(delete_w(L"GAME:\\acl\\a.txt") != FALSE, "DeleteFileW hides a.txt");
+        const std::wstring marks = (overlay / ".gta6rt-deleted" / "acl").wstring();
+        PACL old_dacl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        bool denied = false;
+        if (GetNamedSecurityInfoW(marks.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                  &old_dacl, nullptr, &sd) == ERROR_SUCCESS) {
+            EXPLICIT_ACCESS_W deny{};
+            deny.grfAccessPermissions = FILE_LIST_DIRECTORY;
+            deny.grfAccessMode = DENY_ACCESS;
+            deny.grfInheritance = NO_INHERITANCE;
+            BuildTrusteeWithNameW(&deny.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+            PACL new_dacl = nullptr;
+            if (SetEntriesInAclW(1, &deny, old_dacl, &new_dacl) == ERROR_SUCCESS) {
+                denied = SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT,
+                                               DACL_SECURITY_INFORMATION, nullptr, nullptr, new_dacl,
+                                               nullptr) == ERROR_SUCCESS;
+                LocalFree(new_dacl);
+            }
+        }
+        WIN32_FIND_DATAW probe{};
+        const HANDLE ph = ::FindFirstFileW((marks + L"\\*").c_str(), &probe);
+        const bool listing_denied = ph == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED;
+        if (ph != INVALID_HANDLE_VALUE) ::FindClose(ph);
+        if (denied && listing_denied) {
+            check(attributes_w(L"GAME:\\acl\\a.txt") == INVALID_FILE_ATTRIBUTES, "a.txt is still missing by path");
+            const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\acl\\*");
+            check(!contains(names, L"a.txt") && contains(names, L"b.txt"),
+                  "a marker folder that cannot be listed still hides its deleted files");
+        } else {
+            std::printf("SKIP could not deny listing the marker folder\n");
+        }
+        if (denied)
+            SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  nullptr, nullptr, old_dacl, nullptr);
+        if (sd) LocalFree(sd);
     }
 
     // A delete hides the package file without removing it.

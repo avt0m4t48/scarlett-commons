@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -515,8 +516,18 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
                 const bool dir = (m.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 if (!dir || std::filesystem::is_regular_file(marks / m.cFileName / kRemovedDirMarker, ec))
                     deleted_here.insert(ascii_key(m.cFileName));
+                if (ec) markers_exact = false;  // the folder's marker could not be checked: ask deleted() per entry
             } while (::FindNextFileW(mh, &m));
+            if (::GetLastError() != ERROR_NO_MORE_FILES) markers_exact = false;  // an incomplete scan
             ::FindClose(mh);
+        } else {
+            // Only a missing marker folder means "nothing deleted here". Any other failure (a folder that cannot be
+            // listed although its markers can be queried by path, for one) leaves the decision to deleted().
+            const DWORD e = ::GetLastError();
+            if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                has_markers = true;
+                markers_exact = false;
+            }
         }
     }
     auto entry_deleted = [&](const wchar_t* name) {
@@ -526,14 +537,13 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         entry_parts.push_back(name);
         return deleted(r.overlay, entry_parts);
     };
-    // Names already listed, folded the way same_name (_wcsicmp) compares them: _wcslwr_s uses the same locale rule.
-    std::unordered_set<std::wstring> seen;
-    auto key = [](const wchar_t* name) {
-        std::wstring k = name;
-        _wcslwr_s(k.data(), k.size() + 1);
-        return k;
+    // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds É and é, _wcsicmp not).
+    struct NoCase {
+        bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
     };
-    for (const auto& e : out) seen.insert(key(e.cFileName));
+    std::set<std::wstring, NoCase> seen;
+    for (const auto& e : out) seen.insert(e.cFileName);
 
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
@@ -546,7 +556,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
-            if (seen.insert(key(found.cFileName)).second) out.push_back(found);
+            if (seen.insert(found.cFileName).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
         ::FindClose(h);
     };

@@ -7,7 +7,9 @@
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
-// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
+// BOX16 builds (blas_box16_*: half boxes, which check-build compares bit for bit with tools/xdxr_bvh.py encode_box16),
+// including coordinates past the half range and below its smallest normal, and a refit.
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -121,9 +123,10 @@ struct Built {
 
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
 // `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
+// `box16`: BOX16 inner nodes.
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
-               const std::vector<Geometry>* moved = nullptr, bool into_other = false) {
+               const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false) {
     std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -165,7 +168,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         total += geo.triangle_count;
     }
     XdxrLayout layout;
-    EXPECT(layout.compute(total, false));
+    EXPECT(layout.compute(total, false, box16));
     Buffer dst = make(gpu, layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
     EXPECT(dst.buffer && scratch.buffer);
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires
@@ -355,6 +358,33 @@ int main(int argc, char** argv) {
         const Geometry g = grid(12, 4, false);              // R32 indices, stride 16; the small-sort path
         const std::vector<Geometry> after_grid = {move(g, 0.3f)};
         if (build_blas(gpu, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
+    }
+
+    // BOX16 inner nodes: the same tree with half boxes rounded outward (64-byte nodes instead of 128).
+    {
+        Built h0, h1, h2, h3, h4;                          // build_blas appends to a Built's triangles
+        if (build_blas(gpu, builder, dir, "blas_box16_random", {soup(1000)}, h0, 0, nullptr, false, true)) return 1;
+        if (build_blas(gpu, builder, dir, "blas_box16_sort_tiles", {soup(5000)}, h1, 200, nullptr, false, true)) return 1;
+        Geometry a16 = soup(40), b16 = soup(25);
+        b16.vertex_data[3 * 3 * 3] = std::nanf("");                // an inactive triangle: an empty box
+        if (build_blas(gpu, builder, dir, "blas_box16_two_geometries", {a16, b16}, h2, 0, nullptr, false, true)) return 1;
+        // Coordinates the half format cannot hold: past 65504 (inf outward, HALF_MAX inward), between 2^-14 and
+        // 2^-24 and below (no denormal halves: 0 or +-2^-14), exact halves, and ordinary triangles the rays hit.
+        Geometry x = soup(24);
+        const float odd[][9] = {
+            {70000.0f, 1.0f, 2.0f, 70001.0f, 3.0f, 2.5f, 69999.0f, 2.0f, 1.5f},
+            {-65520.0f, -65504.0f, 65504.0f, -65519.0f, -65500.0f, 65505.0f, -65000.0f, -65503.0f, 65490.0f},
+            {3.0e-5f, -2.0e-6f, 1.0e-7f, 6.0e-5f, 4.0e-5f, -1.0e-9f, -3.0e-5f, 6.103515625e-5f, 0.0f},
+            {-0.0f, 1.0e-30f, -1.0e-30f, 2.0f, 0.5f, 0.25f, 1.0f, -0.125f, 0.0f},
+            {1e30f, -1e30f, 5.0f, 1e30f, -1e30f, 6.0f, -1e30f, 1e30f, 5.5f},
+            {1.0009766f, -2.0019531f, 3.0f, 1.0f, -2.0f, 3.0029297f, 1.0004883f, -2.0f, 3.0f},
+        };
+        for (const auto& t : odd) x.vertex_data.insert(x.vertex_data.end(), t, t + 9);
+        x.triangle_count += sizeof odd / sizeof odd[0];
+        if (build_blas(gpu, builder, dir, "blas_box16_extremes", {x}, h3, 0, nullptr, false, true)) return 1;
+        const Geometry big = soup(3000);
+        const std::vector<Geometry> after = {move(big, 1.5f)};
+        if (build_blas(gpu, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
     }
 
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address

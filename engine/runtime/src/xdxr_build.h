@@ -5,8 +5,9 @@
 // XdxrLayout gives the byte layout of a structure from its element count alone: the same numbers answer
 // GetRaytracingAccelerationStructurePrebuildInfo and place the records when the build is recorded. The region
 // order (header, parent table, elements, nodes) is the one tools/xdxr_bvh.py writes (an ASSUMPTION there: a shader
-// reaches each region through the header). Nodes are BOX32, grouped four consecutive children at a time in Morton
-// order, level by level from the elements up; the root is the last node.
+// reaches each region through the header). Nodes are BOX32 (128 bytes, float boxes) or, when the layout asks for
+// them, BOX16 (64 bytes, half boxes rounded outward), grouped four consecutive children at a time in Morton order,
+// level by level from the elements up; the root is the last node.
 //
 // XdxrBuilder records the dispatches into a command buffer. Every address is a buffer device address; `bias` is
 // added to the BLAS addresses read from instance descs (the distance between the application's GPU virtual
@@ -28,9 +29,10 @@ namespace leonida {
 
 struct XdxrLayout {
     static constexpr std::uint32_t header_size = 64;
-    static constexpr std::uint32_t node_size = 128;  // BOX32
 
     bool tlas = false;
+    bool box16 = false;                // inner nodes are BOX16
+    std::uint32_t node_size = 128;     // BOX32 128 bytes, BOX16 64
     std::uint32_t elements = 0;        // triangles (BLAS) or instances (TLAS)
     std::uint32_t element_size = 64;   // a leaf, or a 128-byte instance record
     std::vector<std::uint32_t> level_counts;  // nodes per level, from the one above the elements to the root (1)
@@ -48,10 +50,12 @@ struct XdxrLayout {
     static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
 
-    // False when the count would overflow the 32-bit offsets of the format.
-    bool compute(std::uint32_t count, bool top_level) {
+    // False when the count would overflow the 32-bit offsets of the format. `half_boxes`: BOX16 inner nodes.
+    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false) {
         *this = XdxrLayout{};
         tlas = top_level;
+        box16 = half_boxes;
+        node_size = box16 ? 64u : 128u;
         elements = count;
         element_size = tlas ? 128u : 64u;
         std::uint64_t below = count;
@@ -206,8 +210,9 @@ private:
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
         Addr dst, scratch, src0, src1, src2, bias;
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
-                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, tlas = 0;
+                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
     };
+    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2 };  // xdxr_build.comp FLAG_TLAS, FLAG_BOX16
     static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }
@@ -222,7 +227,7 @@ private:
         p.nodes_off = l.nodes_off;
         p.parents_off = l.parents_off;
         p.total_size = l.size;
-        p.tlas = l.tlas ? 1u : 0u;
+        p.flags = (l.tlas ? flag_tlas : 0u) | (l.box16 ? flag_box16 : 0u);
         return p;
     }
 

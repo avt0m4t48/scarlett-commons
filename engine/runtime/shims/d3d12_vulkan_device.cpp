@@ -4718,10 +4718,13 @@ public:
         *out = {};
         auto& vk = state_.context->vk;
         if (desc && state_.context->xdxr_acceleration_structures()) {
-            // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
-            // are exact. An update refits (no sort); the build's scratch size covers it.
+            // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
+            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h), so the sizes are exact. An update refits (no
+            // sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
+                build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
             if (build.is_tlas) {
                 build.instance_count = desc->NumDescs;
             } else {
@@ -4739,7 +4742,9 @@ public:
                 }
             }
             leonida::XdxrLayout layout;
-            if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas)) return;
+            if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas,
+                                leonida::VulkanContext::xdxr_box16(build)))
+                return;
             out->ResultDataMaxSizeInBytes = layout.size;
             out->ScratchDataSizeInBytes = layout.scratch;
             out->UpdateScratchDataSizeInBytes = layout.scratch;

@@ -62,6 +62,7 @@ TRI_VERTS = {TRI0: (0, 1, 2), TRI1: (1, 3, 2), TRI2: (2, 3, 4), TRI3: (2, 4, 0)}
 
 FLT_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 HALF_MAX = 65504.0
+HALF_MIN_NORMAL = 2.0 ** -14
 INF = math.inf
 
 
@@ -107,11 +108,20 @@ def _half_step(bits, up):
 
 def half_round(x, up):
     """Round a float to a half that is >= x (up) or <= x, so a quantised box still contains the exact one. Values
-    beyond the half range become +-inf, which the decoder clamps to +-FLT_MAX: still conservative."""
+    beyond the half range become +-inf, which the decoder clamps to +-FLT_MAX: still conservative. No denormal half
+    is produced: a value below the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its
+    side, because a decoder that flushes half denormals to zero would otherwise shrink the box. The GPU builder
+    (runtime/src/xdxr_build.comp half_directed) computes the same bits."""
     if x > HALF_MAX:
         return 0x7C00 if up else _half_bits(HALF_MAX)
     if x < -HALF_MAX:
         return _half_bits(-HALF_MAX) if up else 0xFC00
+    if abs(x) < HALF_MIN_NORMAL:
+        if x == 0:
+            return _half_bits(x)                    # keeps the sign of a zero
+        if x > 0:
+            return _half_bits(HALF_MIN_NORMAL) if up else 0x0000
+        return 0x8000 if up else _half_bits(-HALF_MIN_NORMAL)
     b = _half_bits(x)
     v = _half_value(b)
     if (up and v < x) or (not up and v > x):
@@ -728,6 +738,43 @@ def validate(data, expect_bottom=None):
     return errs
 
 
+def box16_rounding(data):
+    """Checks that every BOX16 child box of a bottom-level BVH holds exactly encode_box16 of the exact box of the
+    triangles under that child: the bits, not just containment. The exact box comes from the leaves' own vertices, so
+    this needs nothing but the buffer. A triangle with a NaN vertex has an empty box, as in the builder. Returns a list
+    of problems (empty = every BOX16 word matches)."""
+    errs = []
+    root = struct.unpack_from("<I", data, 48)[0]
+    empty = ([INF] * 3, [-INF] * 3)
+    memo = {}
+
+    def exact(p):
+        if p in memo:
+            return memo[p]
+        kind, off = ptr_type(p), ptr_offset(p)
+        if kind <= TRI3:
+            pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
+            box = empty if any(math.isnan(c) for q in pts for c in q) else _bounds(pts)
+        else:
+            kids = struct.unpack_from("<4I", data, off)
+            boxes = [exact(k) for k in kids if k != INVALID]
+            boxes = [b for b in boxes if all(b[0][c] <= b[1][c] for c in range(3))]
+            box = _union(boxes) if boxes else empty
+            if kind == BOX16:
+                for i, k in enumerate(kids):
+                    want = encode_box16(*(exact(k) if k != INVALID else empty))
+                    got = struct.unpack_from("<3I", data, off + 16 + 12 * i)
+                    if tuple(got) != tuple(want):
+                        errs.append(f"BOX16 {p:#x} child {i}: {[hex(w) for w in got]}, expected "
+                                    f"{[hex(w) for w in want]}")
+        memo[p] = box
+        return box
+
+    if root != INVALID:
+        exact(root)
+    return errs
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -766,6 +813,8 @@ def check_build(directory, rays=300, seed=1):
             if other != n:
                 mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        if desc["kind"] == "blas" and not errs:
+            errs += box16_rounding(data)
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]
@@ -841,6 +890,7 @@ def selftest(seed=1, rays=400, verbose=False):
     for name, tris, b16, pair in cases:
         data, info = build_blas(tris, box16=b16, pair=pair)
         errs = validate(data, expect_bottom=True)
+        errs += box16_rounding(data)
         mem = Memory()
         mem.place(0x10000, data)
         bad = 0

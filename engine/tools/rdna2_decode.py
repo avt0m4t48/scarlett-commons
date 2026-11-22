@@ -409,7 +409,7 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     return n + (1 if tfe else 0)
 
 
-def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
+def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | None, int]:
     """Decode one RDNA2 instruction at byte offset `pc`. Returns (ins_dict_or_None, byte_length)."""
     if pc + 4 > len(code):
         return None, len(code) - pc
@@ -926,6 +926,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
         if entry is None:
             return None, 4
         name, spec = entry
+        if opc == 0x140 and mcpu.startswith("gfx101"):
+            name = "v_mad_legacy_f32"
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
@@ -1397,13 +1399,13 @@ def format_insn(ins: dict) -> str:
     return f"\t{head:<40s}; encoding: [{enc_str}]"
 
 
-def decode_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
+def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
     """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
     insns = []
     invalid = 0
     off = 0
     while off < len(code):
-        ins, nbytes = _decode_one(code, off, wave32)
+        ins, nbytes = _decode_one(code, off, wave32, mcpu)
         if ins is None:
             invalid += 1
             off += max(4, nbytes)
@@ -1414,8 +1416,8 @@ def decode_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name:
     return {"name": name, "code_start": code_start, "insns": insns, "invalid": invalid}
 
 
-def disasm_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
+def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
     """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`."""
-    info = decode_bytes(code, wave32=wave32, code_start=code_start, name=name)
+    info = decode_bytes(code, mcpu=mcpu, wave32=wave32, code_start=code_start, name=name)
     lines = [format_insn(ins) for ins in info["insns"]]
     return "\n".join(lines) + ("\n" if lines else ""), info["invalid"]

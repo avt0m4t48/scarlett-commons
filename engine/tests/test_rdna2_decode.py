@@ -81,6 +81,15 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual((ins["op"], ins["args"], ins["mods"]),
                                  (name, expected["args"], expected["mods"]))
 
+    def test_vop3_legacy_mad_fma_target(self):
+        code = words(0xD5400001, 0x04120702)
+        self.assertEqual(rdna2_decode.decode_bytes(code)["insns"][0]["op"], "v_mad_legacy_f32")
+        for cpu, op in (("gfx1013", "v_mad_legacy_f32"), ("gfx1030", "v_fma_legacy_f32")):
+            with self.subTest(cpu=cpu):
+                asm, invalid, _ = shader_disasm.disasm(code, cpu, backend="python")
+                self.assertEqual(invalid, 0)
+                self.assertIn(op + " v1, v2, v3, v4", asm)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000

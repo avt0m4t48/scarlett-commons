@@ -254,6 +254,13 @@ It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 
 `gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
 own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
+The game's `atexit` handlers and static destructors go to a table of the run's own (the CRT's process-wide one is
+shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
+returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
+program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
+holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). Not covered
+yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local destructor callback
+(`_register_thread_local_exe_atexit_callback`); both still reach the host CRT.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The

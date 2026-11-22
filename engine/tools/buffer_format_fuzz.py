@@ -456,8 +456,8 @@ def encode_element(name, regs, instr="xyzw", route="translator"):
 
 def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
     """-> {code: [elements, mismatches, known]}. A mismatch is a store that differs from the hardware model (route "hw").
-    known counts the stores of a two-component format whose bytes differ between the hardware route and the translator's
-    (x, y): the hardware did what the model says, the translator will not. Those are not part of the validated count."""
+    known counts the stores of a two-component format whose bytes differ between the hardware route and a plain (x, y) one (the translator
+    agrees with the hardware here since SHADER-364). They are counted apart from the validated elements."""
     from hw_oracle import asm
     jobs, kernels = [], []
     for code, name in fmts:
@@ -577,7 +577,7 @@ def report(title, results, fmts):
         cases_total += cases - known
         known_total += known
         bad_total += len(bad)
-        note = f"  (+{known} known difference: hardware (x, w), translator (x, y))" if known else ""
+        note = f"  (+{known} take channels (x, w), not (x, y), counted apart)" if known else ""
         print(f"  {title:<14} {code:>3} {name:<22} {cases - known:>7} validated  {'ok' if not bad else f'MISMATCH {len(bad)}'}{note}")
         for first, want, got in bad[:3]:
             shown = first.hex() if isinstance(first, bytes) else [f"{w:08x}" for w in first]
@@ -634,8 +634,8 @@ def main():
                 for instr in ("xyzw", "xy"):
                     c, b_, k = report(f"store {instr} {path}", run_stores(oracle, family, fmts, path, rng, instr), fmts)
                     total, bad, known = total + c, bad + b_, known + k
-        print(f"{total} validated elements, {bad} mismatches; plus {known} known-difference elements "
-              "(two-component buffer_store_format_*: hardware (x, w), translator (x, y); RDNA2 unmeasured)")
+        print(f"{total} validated elements, {bad} mismatches; plus {known} two-component "
+              "buffer_store_format_* elements (identity selectors: channels (x, w)), counted apart, which the translator matches since SHADER-364")
         return 1 if bad else 0
     finally:
         oracle.close()

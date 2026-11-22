@@ -8,9 +8,8 @@ tbuffer's own) and `buffer_store_format_xyzw` of every format added with the SCA
 2_10_10_10 / 10_10_10_2 families, with edge values, NaN, infinity and denormals, and compares every word.
 
 Existing formats are only checked for their table entry (size, kind, widths against the GFX10 name): their decode and
-encode is unchanged and covered by test_buffer_load_format.py, test_norm_decode.py and the GPU fixtures. Two places
-where an existing store differs from the 880M, and the two-component buffer_store_format_* routing (x, w) that the
-translator does not do, are pinned at the end as expected failures (OlderStoresDifferFromTheGpu).
+encode is covered by test_buffer_load_format.py, test_norm_decode.py and the GPU fixtures. The three places where an
+older store used to differ from the 880M are pinned at the end (OlderStoresFollowTheGpu).
 """
 import os
 import random
@@ -167,7 +166,7 @@ class StoresMatchTheModel(unittest.TestCase):
                     got = b"".join(memory.get(OUT_BASE + 4 * i, 0).to_bytes(4, "little") for i in range(4))
                     want = bytearray(b"".join(SENTINEL.to_bytes(4, "little") for _ in range(4)))
                     size = model.element_size(name)
-                    want[:size] = model.encode_element(name, row)
+                    want[:size] = model.encode_element(name, row, "xyzw", "hw")
                     self.assertEqual(got, bytes(want), (name, [f"{w:08x}" for w in row]))
 
 
@@ -229,10 +228,11 @@ class HandWorkedValues(unittest.TestCase):
         self.assertEqual(store(45, [0x3F000000, 0, 0, 0])[0] & 3, 1)              # 10_10_10_2_SNORM, 2 bit x: 0.5 -> 1
 
 
-class OlderStoresDifferFromTheGpu(unittest.TestCase):
-    """Stores of formats that were in the table before this change, where the Radeon 880M (RDNA3.5) gives other bytes
-    (docs/buffer_formats.md). They are left as they were, so these assertions of the hardware's words fail today; when
-    someone fixes the store the expected failure turns into an unexpected success and says so."""
+class OlderStoresFollowTheGpu(unittest.TestCase):
+    """Stores of formats that were in the table before the SCALED / SINT / small-float change, in the three places where they
+    used to differ from the Radeon 880M (RDNA3.5) and a real gfx1036 (docs/buffer_formats.md). Main's SHADER-358 (f16 toward
+    zero) and SHADER-364 (exact NORM rounding, two-component DST_SEL) fixed them while this branch was open; these keep them
+    pinned to the oracle's words."""
 
     def store(self, code, regs, instr="xyzw"):
         memory = {IN_BASE + 4 * i: w for i, w in enumerate(regs)}
@@ -240,21 +240,17 @@ class OlderStoresDifferFromTheGpu(unittest.TestCase):
         run(translate_store(code, instr), memory)
         return memory[OUT_BASE]
 
-    @unittest.expectedFailure
     def test_two_component_mubuf_store_takes_x_and_w_on_the_880m(self):
-        # KNOWN DIFFERENCE, RDNA2 unmeasured: buffer_store_format_xyzw of (1, 2, 3, 4) into 8_8_SINT writes 01 04 on the
-        # Radeon 880M and buffer_store_format_xy writes 01 00; the translator writes (x, y) = 01 02 for both.
-        # (tbuffer_store_format_* takes (x, y) on the 880M too, so there it agrees.)
+        # With the identity selectors of this V#, buffer_store_format_xyzw of (1, 2, 3, 4) into 8_8_SINT writes 01 04 and
+        # buffer_store_format_xy writes 01 00 (880M and gfx1036); the runtime's X,Y,0,1 takes (x, y), tbuffer too.
         self.assertEqual(self.store(19, [1, 2, 3, 4]) & 0xFFFF, 0x0401)
         self.assertEqual(self.store(19, [1, 2, 3, 4], "xy") & 0xFFFF, 0x0001)
 
-    @unittest.expectedFailure
     def test_16_float_store_rounds_toward_zero_and_saturates(self):
         # 65520.0 is the tie between 65504 and infinity: nearest even says infinity, the hardware 0x7BFF
         self.assertEqual(self.store(13, [0x47FFE000, 0, 0, 0]) & 0xFFFF, 0x7BFF)
         self.assertEqual(self.store(13, [0x3EFFFFFF, 0, 0, 0]) & 0xFFFF, 0x37FF)     # 0.49999997: truncated, not 0x3800
 
-    @unittest.expectedFailure
     def test_unorm_store_rounds_the_exact_product(self):
         # 0x37C000C0 * 65535 is a hair under 1.5: the hardware stores 1, an f32 product rounds up to 1.5 and stores 2
         self.assertEqual(self.store(7, [0x37C000C0, 0, 0, 0]) & 0xFFFF, 1)

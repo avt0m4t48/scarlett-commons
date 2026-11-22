@@ -106,9 +106,12 @@ def load_names(path, source=None):
     out = collections.defaultdict(dict)
     ambiguous = collections.defaultdict(set)
     with open(path, encoding="utf-8-sig", newline="") as fh:
-        for row in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        for row in reader:
             if source and row.get("source") != source:
                 continue
+            if row["bank"] is None or row["stream_id"] is None:   # a row cut short, e.g. by an interrupted write
+                raise ValueError(f"{path}: line {reader.line_num} has no bank or stream_id")
             bank = row["bank"].replace("\\", "/")
             sid = int(row["stream_id"], 16) & 0x1FFFFFFF
             if sid in out[bank]:

@@ -47,13 +47,37 @@ def publish(path, data):
         tmp.unlink(missing_ok=True)
 
 
-def same_file(first, second):
-    """Whether two paths are one file on disk (another spelling, a case-insensitive volume); False if either is
-    missing."""
+def file_identity(path):
+    """(device, inode) of an existing file, or None: two names with one identity are one file on disk."""
     try:
-        return os.path.samefile(first, second)
+        st = os.stat(path)
     except OSError:
-        return False
+        return None
+    return (st.st_dev, st.st_ino) if st.st_ino else None
+
+
+def remove_replaced(directory, replaced, rows):
+    """Remove the files of `replaced` (names the rows had before they were switched) from `directory`; returns
+    how many could not be removed.
+
+    Only a .dds file by its bare name in this folder is removed, never manifest.json, and never a file a row still
+    names: by the same name, by a name that differs in letter case only, or by any other spelling of the same file
+    on disk (on Windows and macOS that can be the file the pass has just published). Each file is looked at once:
+    one stat per named row and one per replaced name, not one per pair."""
+    names = [row["File"] for row in rows if isinstance(row.get("File"), str)]
+    named = {os.path.normcase(name) for name in names}
+    on_disk = {file_identity(directory / name) for name in names} - {None}
+    left = 0
+    for name in sorted(replaced):
+        if Path(name).name != name or not name.lower().endswith(".dds") or os.path.normcase(name) in named:
+            continue
+        if file_identity(directory / name) in on_disk:
+            continue
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError:
+            left += 1
+    return left
 
 
 def candidate(row, profile):
@@ -122,20 +146,7 @@ def complete_pool(source, directory, manifest, settings):
     # Only now that the manifest names the full chains: the files they replace would otherwise stay in the folder,
     # named by no row, so every completed texture would be stored twice. A file another row still names is kept,
     # and so is one that can't be removed (in use): the export is complete either way.
-    still_named = {os.path.normcase(row["File"]) for row in manifest["Textures"] if isinstance(row.get("File"), str)}
-    left = 0
-    for name in sorted(superseded):
-        # Only a .dds file by its bare name in this pool's folder, never manifest.json; and not a name that differs
-        # from a file some row names in letter case only, which on Windows and macOS is that very file.
-        if (Path(name).name != name or not name.lower().endswith(".dds")
-                or os.path.normcase(name) in still_named
-                or any(same_file(directory / name, directory / row["File"])
-                       for row in manifest["Textures"] if isinstance(row.get("File"), str))):
-            continue
-        try:
-            (directory / name).unlink(missing_ok=True)
-        except OSError:
-            left += 1
+    left = remove_replaced(directory, superseded, manifest["Textures"]) if superseded else 0
     if left:
         print(f"assets: {directory.name}: {left} replaced DDS file(s) could not be removed (in use?) and stay next "
               "to the full-chain files", file=sys.stderr)

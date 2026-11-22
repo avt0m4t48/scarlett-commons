@@ -145,6 +145,26 @@ class TextureAssets(unittest.TestCase):
         names = self.complete_with_row_file("notes.txt")
         self.assertIn("notes.txt", names)
 
+    def test_removal_looks_at_each_file_once_not_once_per_pair(self):
+        # 50 rows and 50 replaced files: 100 files to look at, not 2,500 pairs. A pool completes most of its
+        # textures in one pass, so a per-pair check takes minutes to hours on a real one.
+        rows = [dict(File=f"{i:06d}_bcpack_v1-strict.dds") for i in range(50)]
+        replaced = {f"{i:06d}.dds" for i in range(50)}
+        for name in [row["File"] for row in rows] + sorted(replaced):
+            (self.folder / name).write_bytes(b"dds")
+        stat, calls = os.stat, []
+
+        def counted(path, *args, **kwargs):
+            calls.append(path)
+            return stat(path, *args, **kwargs)
+
+        with mock.patch.object(ttpf_assets.os, "stat", counted), \
+                mock.patch.object(ttpf_assets.os.path, "samefile", side_effect=AssertionError("per-pair check")):
+            self.assertEqual(ttpf_assets.remove_replaced(self.folder, replaced, rows), 0)
+        self.assertLessEqual(len(calls), 100, len(calls))
+        # The replaced files are gone and the rows' files stay.
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted(row["File"] for row in rows))
+
     def test_only_a_file_in_the_pool_folder_is_removed(self):
         # A row is trusted for a file name, not for a path: nothing outside the pool's folder is touched.
         outside = self.folder.parent / "outside.dds"

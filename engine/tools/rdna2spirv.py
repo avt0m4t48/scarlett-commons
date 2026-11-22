@@ -9169,6 +9169,214 @@ class Gen:
                     f = _emit(f"OpExtInst %float %glsl FClamp {safe} %f0 %f1")
                 r = self.tou(f)
             self.dst(a[0], r)
+        elif op == "v_ldexp_f64":
+            # Binary64 load-exponent: D.f64 = S0.f64 * 2^(S1.i32), lowered bit-exactly on the (lo, hi) dword pair
+            # using only 32-bit integer ops (no OpCapability Float64 or Int64 required, even with clamp).
+            # Measured natively on gfx1036 (wave32 & wave64, game MODE: ieee=0, dx10_clamp=1, denorm16_64=3):
+            # - +-0, +-inf, and NaNs (both qNaN and sNaN under ieee=0) pass through unchanged (after S0 abs/neg).
+            # - Subnormal inputs are normalized before scaling; subnormal outputs shift right by 1 - e2 (1..53)
+            #   and round to nearest even (with carry into bit 52 giving +-min_norm; sh >= 54 flushes to +-0).
+            # - VOP3 clamp applies in both denorm16_64=3 and 0 (dx10_clamp=1: NaN/-0/<0 -> +0.0, >1.0 -> 1.0).
+            # - VOP3 omod (mul:2/mul:4/div:2) is ignored by hardware when denorm16_64=3 and active when 0, so it is
+            #   rejected as MODE-dependent rather than guessed.
+            if any(m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            d = a[0]
+            if d["k"] != "vgpr" or d.get("n") != 2:
+                raise Unsupported(op + " destination")
+            sv = a[1]
+            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv.get("f64_literal"):
+                lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+            elif sv["k"] == "fimm":
+                bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            elif sv["k"] == "imm":
+                v = sv["v"]
+                if -16 <= v <= 64 or v > 0xFFFFFFFF or v < -0x80000000:
+                    bits = v & 0xFFFFFFFFFFFFFFFF
+                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                else:
+                    # RDNA2 places a 32-bit literal constant in bits [63:32] of an f64 operand (measured on gfx1036).
+                    lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
+            else:
+                raise Unsupported(op + " operand")
+            n = self.src_u(a[2])
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                hi = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                hi = t
+            e, em1, isnorm, isden, sgn, m_hi, m_or, m_nz, sub, fin = (self.tmp() for _ in range(10))
+            self.emit(f"{e} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
+            self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
+            self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(2046)}")         # exponent field 1..2046
+            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{sgn} = OpBitwiseAnd %uint {hi} {self.cu(0x80000000)}")
+            self.emit(f"{m_hi} = OpBitwiseAnd %uint {hi} {self.cu(0x000FFFFF)}")
+            self.emit(f"{m_or} = OpBitwiseOr %uint {m_hi} {lo}")
+            self.emit(f"{m_nz} = OpINotEqual %bool {m_or} {self.cu(0)}")
+            self.emit(f"{sub} = OpLogicalAnd %bool {isden} {m_nz}")
+            self.emit(f"{fin} = OpLogicalOr %bool {isnorm} {sub}")
+            # Normalize finite non-zero input into 53-bit significand (sig_hi[20] = 1, sig_lo) and exponent field ef.
+            norm_hi, m_hi_nz, msb_hi_i, msb_hi, lsh_a_raw, lsh_a, rsh_a, a_hi1, a_hi2, a_hi, a_lo = \
+                (self.tmp() for _ in range(11))
+            self.emit(f"{norm_hi} = OpBitwiseOr %uint {m_hi} {self.cu(0x00100000)}")
+            self.emit(f"{m_hi_nz} = OpINotEqual %bool {m_hi} {self.cu(0)}")
+            self.emit(f"{msb_hi_i} = OpExtInst %int %glsl FindUMsb {m_hi}")
+            self.emit(f"{msb_hi} = OpBitcast %uint {msb_hi_i}")
+            self.emit(f"{lsh_a_raw} = OpISub %uint {self.cu(20)} {msb_hi}")
+            self.emit(f"{lsh_a} = OpExtInst %uint %glsl UMin {lsh_a_raw} {self.cu(20)}")  # 1..20 when m_hi != 0
+            self.emit(f"{rsh_a} = OpISub %uint {self.cu(32)} {lsh_a}")                    # 12..31
+            self.emit(f"{a_hi1} = OpShiftLeftLogical %uint {m_hi} {lsh_a}")
+            self.emit(f"{a_hi2} = OpShiftRightLogical %uint {lo} {rsh_a}")
+            self.emit(f"{a_hi} = OpBitwiseOr %uint {a_hi1} {a_hi2}")
+            self.emit(f"{a_lo} = OpShiftLeftLogical %uint {lo} {lsh_a}")
+            msb_lo_i, msb_lo, msb_lo_c, lsh_b, b_lt32, lsh_b1, rsh_b1, b1_hi, b1_lo, lsh_b2_raw, lsh_b2, b2_hi, b_hi, b_lo = \
+                (self.tmp() for _ in range(14))
+            self.emit(f"{msb_lo_i} = OpExtInst %int %glsl FindUMsb {lo}")
+            self.emit(f"{msb_lo} = OpBitcast %uint {msb_lo_i}")
+            self.emit(f"{msb_lo_c} = OpExtInst %uint %glsl UMin {msb_lo} {self.cu(31)}")
+            self.emit(f"{lsh_b} = OpISub %uint {self.cu(52)} {msb_lo_c}")                 # 21..52
+            self.emit(f"{b_lt32} = OpULessThan %bool {lsh_b} {self.cu(32)}")
+            self.emit(f"{lsh_b1} = OpExtInst %uint %glsl UMin {lsh_b} {self.cu(31)}")
+            self.emit(f"{rsh_b1} = OpISub %uint {self.cu(32)} {lsh_b1}")
+            self.emit(f"{b1_hi} = OpShiftRightLogical %uint {lo} {rsh_b1}")
+            self.emit(f"{b1_lo} = OpShiftLeftLogical %uint {lo} {lsh_b1}")
+            self.emit(f"{lsh_b2_raw} = OpISub %uint {lsh_b} {self.cu(32)}")
+            self.emit(f"{lsh_b2} = OpExtInst %uint %glsl UMin {lsh_b2_raw} {self.cu(20)}")
+            self.emit(f"{b2_hi} = OpShiftLeftLogical %uint {lo} {lsh_b2}")
+            self.emit(f"{b_hi} = OpSelect %uint {b_lt32} {b1_hi} {b2_hi}")
+            self.emit(f"{b_lo} = OpSelect %uint {b_lt32} {b1_lo} {self.cu(0)}")
+            sub_hi, sub_lo, sub_lsh, sub_ef, sig_hi, sig_lo, ef = (self.tmp() for _ in range(7))
+            self.emit(f"{sub_hi} = OpSelect %uint {m_hi_nz} {a_hi} {b_hi}")
+            self.emit(f"{sub_lo} = OpSelect %uint {m_hi_nz} {a_lo} {b_lo}")
+            self.emit(f"{sub_lsh} = OpSelect %uint {m_hi_nz} {lsh_a} {lsh_b}")
+            self.emit(f"{sub_ef} = OpISub %uint {self.cu(1)} {sub_lsh}")
+            self.emit(f"{sig_hi} = OpSelect %uint {isnorm} {norm_hi} {sub_hi}")
+            self.emit(f"{sig_lo} = OpSelect %uint {isnorm} {lo} {sub_lo}")
+            self.emit(f"{ef} = OpSelect %uint {isnorm} {e} {sub_ef}")
+            # Clamp S1 to [-4096, 4096] (enough to overflow or underflow any binary64) and add to ef.
+            nc_i, e2_i, e2, e2m1, valid, over = (self.tmp() for _ in range(6))
+            self.emit(f"{nc_i} = OpExtInst %int %glsl SClamp {self.as_int(n)} "
+                      f"{self.as_int(self.cu(0xFFFFF000))} {self.as_int(self.cu(4096))}")
+            self.emit(f"{e2_i} = OpIAdd %int {self.as_int(ef)} {nc_i}")
+            self.emit(f"{e2} = OpBitcast %uint {e2_i}")
+            self.emit(f"{e2m1} = OpISub %uint {e2} {self.cu(1)}")
+            self.emit(f"{valid} = OpULessThan %bool {e2m1} {self.cu(2046)}")              # 1..2046
+            self.emit(f"{over} = OpSGreaterThan %bool {e2_i} {self.as_int(self.cu(2046))}")
+            e2_sh, sig_m, norm_r_hi0, norm_r_hi, inf_hi = (self.tmp() for _ in range(5))
+            self.emit(f"{e2_sh} = OpShiftLeftLogical %uint {e2} {self.cu(20)}")
+            self.emit(f"{sig_m} = OpBitwiseAnd %uint {sig_hi} {self.cu(0x000FFFFF)}")
+            self.emit(f"{norm_r_hi0} = OpBitwiseOr %uint {sgn} {sig_m}")
+            self.emit(f"{norm_r_hi} = OpBitwiseOr %uint {norm_r_hi0} {e2_sh}")
+            self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
+            # Subnormal / underflow (e2 <= 0): shift 53-bit significand right by sh = 1 - e2 and round to nearest even.
+            sh_i, under, sh_ci, sh_c, sh_lt32, sh_eq32 = (self.tmp() for _ in range(6))
+            self.emit(f"{sh_i} = OpISub %int {self.as_int(self.cu(1))} {e2_i}")
+            self.emit(f"{under} = OpSGreaterThan %bool {sh_i} {self.as_int(self.cu(53))}")
+            self.emit(f"{sh_ci} = OpExtInst %int %glsl SClamp {sh_i} {self.as_int(self.cu(1))} "
+                      f"{self.as_int(self.cu(53))}")
+            self.emit(f"{sh_c} = OpBitcast %uint {sh_ci}")
+            self.emit(f"{sh_lt32} = OpULessThan %bool {sh_c} {self.cu(32)}")
+            self.emit(f"{sh_eq32} = OpIEqual %bool {sh_c} {self.cu(32)}")
+            # Path 1: 1 <= sh <= 31
+            s1, rs1, sm1, q1_hi, q1_lo1, q1_lo2, q1_lo, half1, hm1, mask1, rem1, gt1, eq1 = \
+                (self.tmp() for _ in range(13))
+            self.emit(f"{s1} = OpExtInst %uint %glsl UMin {sh_c} {self.cu(31)}")
+            self.emit(f"{rs1} = OpISub %uint {self.cu(32)} {s1}")
+            self.emit(f"{sm1} = OpISub %uint {s1} {self.cu(1)}")
+            self.emit(f"{q1_hi} = OpShiftRightLogical %uint {sig_hi} {s1}")
+            self.emit(f"{q1_lo1} = OpShiftRightLogical %uint {sig_lo} {s1}")
+            self.emit(f"{q1_lo2} = OpShiftLeftLogical %uint {sig_hi} {rs1}")
+            self.emit(f"{q1_lo} = OpBitwiseOr %uint {q1_lo1} {q1_lo2}")
+            self.emit(f"{half1} = OpShiftLeftLogical %uint {self.cu(1)} {sm1}")
+            self.emit(f"{hm1} = OpShiftLeftLogical %uint {half1} {self.cu(1)}")
+            self.emit(f"{mask1} = OpISub %uint {hm1} {self.cu(1)}")
+            self.emit(f"{rem1} = OpBitwiseAnd %uint {sig_lo} {mask1}")
+            self.emit(f"{gt1} = OpUGreaterThan %bool {rem1} {half1}")
+            self.emit(f"{eq1} = OpIEqual %bool {rem1} {half1}")
+            # Path 2: sh == 32
+            gt2, eq2 = self.tmp(), self.tmp()
+            self.emit(f"{gt2} = OpUGreaterThan %bool {sig_lo} {self.cu(0x80000000)}")
+            self.emit(f"{eq2} = OpIEqual %bool {sig_lo} {self.cu(0x80000000)}")
+            # Path 3: 33 <= sh <= 53
+            s3_raw, s3_ci, s3, s3m1, q3_lo, half3, hm3, mask3, rem3, lo_nz, lo_z, r3_gt, r3_eq, r3_eq_nz, gt3, eq3 = \
+                (self.tmp() for _ in range(16))
+            self.emit(f"{s3_raw} = OpISub %int {sh_ci} {self.as_int(self.cu(32))}")
+            self.emit(f"{s3_ci} = OpExtInst %int %glsl SClamp {s3_raw} {self.as_int(self.cu(1))} "
+                      f"{self.as_int(self.cu(21))}")
+            self.emit(f"{s3} = OpBitcast %uint {s3_ci}")
+            self.emit(f"{s3m1} = OpISub %uint {s3} {self.cu(1)}")
+            self.emit(f"{q3_lo} = OpShiftRightLogical %uint {sig_hi} {s3}")
+            self.emit(f"{half3} = OpShiftLeftLogical %uint {self.cu(1)} {s3m1}")
+            self.emit(f"{hm3} = OpShiftLeftLogical %uint {half3} {self.cu(1)}")
+            self.emit(f"{mask3} = OpISub %uint {hm3} {self.cu(1)}")
+            self.emit(f"{rem3} = OpBitwiseAnd %uint {sig_hi} {mask3}")
+            self.emit(f"{lo_nz} = OpINotEqual %bool {sig_lo} {self.cu(0)}")
+            self.emit(f"{lo_z} = OpLogicalNot %bool {lo_nz}")
+            self.emit(f"{r3_gt} = OpUGreaterThan %bool {rem3} {half3}")
+            self.emit(f"{r3_eq} = OpIEqual %bool {rem3} {half3}")
+            self.emit(f"{r3_eq_nz} = OpLogicalAnd %bool {r3_eq} {lo_nz}")
+            self.emit(f"{gt3} = OpLogicalOr %bool {r3_gt} {r3_eq_nz}")
+            self.emit(f"{eq3} = OpLogicalAnd %bool {r3_eq} {lo_z}")
+            # Combine paths and round to nearest even.
+            q23_lo, gt23, eq23, q_hi, q_lo, gt, eq, odd_u, odd, tie, up, inc, ql_inc, carry_b, carry, qh_inc = \
+                (self.tmp() for _ in range(16))
+            self.emit(f"{q23_lo} = OpSelect %uint {sh_eq32} {sig_hi} {q3_lo}")
+            self.emit(f"{gt23} = OpSelect %bool {sh_eq32} {gt2} {gt3}")
+            self.emit(f"{eq23} = OpSelect %bool {sh_eq32} {eq2} {eq3}")
+            self.emit(f"{q_hi} = OpSelect %uint {sh_lt32} {q1_hi} {self.cu(0)}")
+            self.emit(f"{q_lo} = OpSelect %uint {sh_lt32} {q1_lo} {q23_lo}")
+            self.emit(f"{gt} = OpSelect %bool {sh_lt32} {gt1} {gt23}")
+            self.emit(f"{eq} = OpSelect %bool {sh_lt32} {eq1} {eq23}")
+            self.emit(f"{odd_u} = OpBitwiseAnd %uint {q_lo} {self.cu(1)}")
+            self.emit(f"{odd} = OpINotEqual %bool {odd_u} {self.cu(0)}")
+            self.emit(f"{tie} = OpLogicalAnd %bool {eq} {odd}")
+            self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
+            self.emit(f"{inc} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
+            self.emit(f"{ql_inc} = OpIAdd %uint {q_lo} {inc}")
+            self.emit(f"{carry_b} = OpULessThan %bool {ql_inc} {q_lo}")
+            self.emit(f"{carry} = OpSelect %uint {carry_b} {self.cu(1)} {self.cu(0)}")
+            self.emit(f"{qh_inc} = OpIAdd %uint {q_hi} {carry}")
+            den_hi0, den_hi, den_lo, nv_hi, nv_lo, sc_hi, sc_lo, r_hi, r_lo = (self.tmp() for _ in range(9))
+            self.emit(f"{den_hi0} = OpBitwiseOr %uint {sgn} {qh_inc}")
+            self.emit(f"{den_hi} = OpSelect %uint {under} {sgn} {den_hi0}")
+            self.emit(f"{den_lo} = OpSelect %uint {under} {self.cu(0)} {ql_inc}")
+            self.emit(f"{nv_hi} = OpSelect %uint {over} {inf_hi} {den_hi}")
+            self.emit(f"{nv_lo} = OpSelect %uint {over} {self.cu(0)} {den_lo}")
+            self.emit(f"{sc_hi} = OpSelect %uint {valid} {norm_r_hi} {nv_hi}")
+            self.emit(f"{sc_lo} = OpSelect %uint {valid} {sig_lo} {nv_lo}")
+            self.emit(f"{r_hi} = OpSelect %uint {fin} {sc_hi} {hi}")
+            self.emit(f"{r_lo} = OpSelect %uint {fin} {sc_lo} {lo}")
+            if "clamp" in mods:
+                # DX10 clamp to [+0.0, 1.0]: NaN, -0.0, and negative values -> +0.0; > 1.0 (incl. +inf) -> 1.0.
+                re, re_all, rm_hi, rm_or, rm_nz, r_nan, r_neg, to_zero = (self.tmp() for _ in range(8))
+                gt_hi, eq_hi, lo_gt0, eq_gt, to_one, c1_hi, c1_lo, c2_hi, c2_lo = (self.tmp() for _ in range(9))
+                self.emit(f"{re} = OpBitwiseAnd %uint {r_hi} {self.cu(0x7FF00000)}")
+                self.emit(f"{re_all} = OpIEqual %bool {re} {self.cu(0x7FF00000)}")
+                self.emit(f"{rm_hi} = OpBitwiseAnd %uint {r_hi} {self.cu(0x000FFFFF)}")
+                self.emit(f"{rm_or} = OpBitwiseOr %uint {rm_hi} {r_lo}")
+                self.emit(f"{rm_nz} = OpINotEqual %bool {rm_or} {self.cu(0)}")
+                self.emit(f"{r_nan} = OpLogicalAnd %bool {re_all} {rm_nz}")
+                self.emit(f"{r_neg} = OpUGreaterThanEqual %bool {r_hi} {self.cu(0x80000000)}")
+                self.emit(f"{to_zero} = OpLogicalOr %bool {r_neg} {r_nan}")
+                self.emit(f"{gt_hi} = OpUGreaterThan %bool {r_hi} {self.cu(0x3FF00000)}")
+                self.emit(f"{eq_hi} = OpIEqual %bool {r_hi} {self.cu(0x3FF00000)}")
+                self.emit(f"{lo_gt0} = OpINotEqual %bool {r_lo} {self.cu(0)}")
+                self.emit(f"{eq_gt} = OpLogicalAnd %bool {eq_hi} {lo_gt0}")
+                self.emit(f"{to_one} = OpLogicalOr %bool {gt_hi} {eq_gt}")
+                self.emit(f"{c1_hi} = OpSelect %uint {to_one} {self.cu(0x3FF00000)} {r_hi}")
+                self.emit(f"{c1_lo} = OpSelect %uint {to_one} {self.cu(0)} {r_lo}")
+                self.emit(f"{c2_hi} = OpSelect %uint {to_zero} {self.cu(0)} {c1_hi}")
+                self.emit(f"{c2_lo} = OpSelect %uint {to_zero} {self.cu(0)} {c1_lo}")
+                r_hi, r_lo = c2_hi, c2_lo
+            self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
+            self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
             r = self.tmp()

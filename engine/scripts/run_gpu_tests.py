@@ -747,7 +747,7 @@ def run_suite(a, work: str) -> int:
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
-        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
+        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
@@ -938,7 +938,8 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 khr = os.environ.get("LEONIDA_FMA") == "khr"
-                ok, detail = judge_fma_fused(dump_words(msg), khr=khr)
+                exact = os.environ.get("LEONIDA_FMA") == "exact"   # SHADER-497: as strict as khr
+                ok, detail = judge_fma_fused(dump_words(msg), khr=khr, exact=exact)
                 results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.

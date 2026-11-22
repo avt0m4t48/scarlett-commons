@@ -77,6 +77,81 @@ void log_once(const char* what, int value) {
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+// The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory.
+std::filesystem::path pipeline_cache_path() {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length >= path.size()) return {};
+    path.resize(length);
+    return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
+}
+
+// A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
+// and deny writers while the view is in use.
+class PipelineCacheSeed {
+public:
+    explicit PipelineCacheSeed(const std::filesystem::path& path) {
+        if (path.empty()) return;
+        file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER length{};
+        constexpr auto header_size = static_cast<LONGLONG>(sizeof(VkPipelineCacheHeaderVersionOne));
+        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size)
+            return;
+        const HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping) return;
+        data_ = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mapping);
+        if (data_) size_ = static_cast<std::size_t>(length.QuadPart);
+    }
+
+    ~PipelineCacheSeed() {
+        if (data_) UnmapViewOfFile(data_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+
+    PipelineCacheSeed(const PipelineCacheSeed&) = delete;
+    PipelineCacheSeed& operator=(const PipelineCacheSeed&) = delete;
+
+    const void* data() const { return data_; }
+    std::size_t size() const { return size_; }
+
+    bool compatible(const leonida::cached_pso::Identity& identity) const {
+        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
+        VkPipelineCacheHeaderVersionOne header{};
+        // The header is little-endian, like the host. The driver interprets the opaque payload.
+        std::memcpy(&header, data_, sizeof(header));
+        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+               header.vendorID == identity.vendor && header.deviceID == identity.device &&
+               std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
+    }
+
+private:
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    const void* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                             const leonida::cached_pso::Identity& identity) {
+    const PipelineCacheSeed seed(pipeline_cache_path());
+    if (!seed.data()) return VK_NULL_HANDLE;
+    if (!seed.compatible(identity)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.bin does not match this Vulkan device\n");
+        return VK_NULL_HANDLE;
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                           nullptr, 0, seed.size(), seed.data()};
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    if (create_cache(device, &create, nullptr, &cache) != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined the pipeline cache seed\n");
+        return VK_NULL_HANDLE;
+    }
+    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.bin\n", seed.size());
+    return cache;
+}
+
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
 // for a wave32 shader on a 64-wide default, reads lanes that are not its own). Logged once per stage with the first
 // shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
@@ -420,6 +495,23 @@ struct DeviceState {
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
+    std::once_flag pipeline_cache_once;
+    VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+
+    VkPipelineCache pipeline_cache() {
+        std::call_once(pipeline_cache_once, [this] {
+            const auto& vk = context->vk;
+            if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
+            pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            if (pipeline_cache_handle) return;
+            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+                pipeline_cache_handle = VK_NULL_HANDLE;
+        });
+        // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
+        return pipeline_cache_handle;
+    }
+
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
@@ -2987,7 +3079,7 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
+        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
             return E_FAIL;
 
@@ -3075,8 +3167,8 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, VK_NULL_HANDLE, 1, &info, nullptr,
-                                                          &pipeline) != VK_SUCCESS)
+        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
@@ -4188,6 +4280,8 @@ public:
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        if (state_.pipeline_cache_handle)
+            state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);

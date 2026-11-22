@@ -271,6 +271,14 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
 
 bool is_folder(const Roots& r, const std::vector<std::wstring>& parts) { return view(r, parts).kind == Kind::Directory; }
 
+// Whether two console paths name the same entry: names compare without case, as the lookups do.
+bool same_entry(const std::vector<std::wstring>& a, const std::vector<std::wstring>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!same_name(a[i].c_str(), b[i].c_str())) return false;
+    return true;
+}
+
 std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
 }
@@ -347,6 +355,12 @@ Target write_target(const std::wstring& path, bool copy_up) {
     const Roots r = roots();
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+
+    // The folder has to exist in the title's view, as CreateDirectory, MoveFile and CopyFile require: without the
+    // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
+    // below a package file (which then read as a folder) and inside a folder the title had removed. The overlay may
+    // still lack a folder only the package has, so it is mirrored here, which the title cannot see.
+    if (!is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
 
     Target t;
     t.path = join(r.overlay, parts);
@@ -451,6 +465,12 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
 
     const Roots r = roots();
     if (r.game.empty()) {
+        error = ERROR_PATH_NOT_FOUND;
+        return false;
+    }
+    // The folder being listed has to exist in the title's view. The host would still enumerate a package folder the
+    // title removed (its "." and ".."), and a folder that is missing is a missing path, not a missing file.
+    if (!is_folder(r, dirs)) {
         error = ERROR_PATH_NOT_FOUND;
         return false;
     }
@@ -909,12 +929,31 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
+    if (same_entry(src, dst)) {
+        // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
+        // name and changes nothing, and renames when only the case differs. Here the case of a name is the overlay's
+        // when the overlay holds it, so a package file gets an overlay copy under the new spelling (no marker: the
+        // listing takes the overlay's entry and skips the package's as the same name); a package folder is left
+        // where it is, as for any other move of one.
+        if (src == dst) return TRUE;
+        if (from_view.kind == Kind::Directory && from_view.in_package) return fail_bool(ERROR_ACCESS_DENIED);
+        if (from_view.in_overlay)
+            return ::MoveFileExW(overlay_from.c_str(), overlay_to.c_str(), flags & MOVEFILE_WRITE_THROUGH);
+        std::error_code same_ec;
+        std::filesystem::create_directories(overlay_to.parent_path(), same_ec);
+        if (same_ec) return fail_bool(static_cast<DWORD>(same_ec.value()));
+        if (!::CopyFileW(join(r.game, src).c_str(), overlay_to.c_str(), TRUE)) return FALSE;
+        DWORD flush_error = 0;
+        if ((flags & MOVEFILE_WRITE_THROUGH) != 0 && !flush_file(overlay_to, flush_error)) return fail_bool(flush_error);
+        return TRUE;
+    }
+
     const View to_view = view(r, dst);
     if (to_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
     if (to_view.kind == Kind::File && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
     if (!is_folder(r, parent_of(dst))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
-    const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
     std::error_code ec;
     std::filesystem::create_directories(overlay_to.parent_path(), ec);
     if (ec) return fail_bool(static_cast<DWORD>(ec.value()));

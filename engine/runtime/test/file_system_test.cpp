@@ -178,8 +178,10 @@ int main() {
         if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
     }
 
-    // A new file, in folders the package does not have.
+    // A new file, in a folder the package does not have: the title makes the folder first, as it must on the host.
     {
+        const auto make_folder = resolve<CreateDirectoryWFn>("kernel32.dll", "CreateDirectoryW");
+        check(make_folder && make_folder(L"GAME:\\save", nullptr) != FALSE, "CreateDirectoryW makes GAME:\\save");
         const HANDLE h = create_w(L"GAME:\\save\\slot1.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CREATE_ALWAYS makes a new console file");
         DWORD written = 0;
@@ -216,8 +218,8 @@ int main() {
         SetLastError(0);
         WIN32_FIND_DATAW none{};
         const HANDLE missing = first_w(L"GAME:\\missing\\*", &none);
-        check(missing == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "a pattern with no match reports ERROR_FILE_NOT_FOUND");
+        check(missing == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "a listing inside a folder that does not exist reports ERROR_PATH_NOT_FOUND, as the host does");
     }
 
     // A delete hides the package file without removing it.
@@ -696,6 +698,145 @@ int main() {
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
         rt::fs::configure(package, overlay);
+    }
+
+    // An open that writes needs its folder to exist in the title's view, and a failed open changes nothing.
+    {
+        const auto overlay_has = [&](const wchar_t* name) { return std::filesystem::exists(overlay / name); };
+        write_path(package / "rules" / "file.txt", "package");
+        write_path(package / "rules" / "gone" / "only.txt", "package");
+
+        SetLastError(0);
+        HANDLE h = create_w(L"GAME:\\nodir\\sub\\x.dat", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                            nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "a write-open of an existing file in a missing folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\nodir") == INVALID_FILE_ATTRIBUTES && !overlay_has(L"nodir"),
+              "the failed open did not create the missing folders");
+
+        SetLastError(0);
+        h = create_w(L"GAME:\\nodir2\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS in a missing folder fails with ERROR_PATH_NOT_FOUND, as on the host");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\nodir2") == INVALID_FILE_ATTRIBUTES && !overlay_has(L"nodir2"),
+              "and creates neither the folder nor the file");
+
+        SetLastError(0);
+        h = create_w(L"GAME:\\rules\\file.txt\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS below a package file fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const DWORD file_attributes = attributes_w(L"GAME:\\rules\\file.txt");
+        check(file_attributes != INVALID_FILE_ATTRIBUTES && (file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0,
+              "and the package file is still a file in the title's view");
+
+        check(delete_w(L"GAME:\\rules\\gone\\only.txt") != FALSE && rmdir_w(L"GAME:\\rules\\gone") != FALSE,
+              "a package folder is emptied and removed");
+        SetLastError(0);
+        h = create_w(L"GAME:\\rules\\gone\\new.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS inside a removed folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\rules\\gone") == INVALID_FILE_ATTRIBUTES,
+              "and does not bring the removed folder back");
+
+        // The folders that do exist still work: one only the package has, and one the title made.
+        h = create_w(L"GAME:\\rules\\new.dat", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "CREATE_NEW in a folder only the package has still succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(overlay_has(L"rules\\new.dat") && !std::filesystem::exists(package / "rules" / "new.dat"),
+              "and the file is in the overlay");
+        check(mkdir_w(L"GAME:\\rules\\made", nullptr) != FALSE, "a folder the title makes");
+        h = create_w(L"GAME:\\rules\\made\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "takes a new file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // A listing needs its folder to exist in the title's view: a removed or missing folder is a missing path, not an
+    // empty folder and not a missing file.
+    {
+        write_path(package / "listing" / "old" / "a.txt", "package");
+        WIN32_FIND_DATAW found{};
+        check(delete_w(L"GAME:\\listing\\old\\a.txt") != FALSE && rmdir_w(L"GAME:\\listing\\old") != FALSE,
+              "a package folder is emptied and removed (listing)");
+        SetLastError(0);
+        HANDLE h = first_w(L"GAME:\\listing\\old\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "FindFirstFileW inside a removed package folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\never\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "FindFirstFileW inside a folder that never existed fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\old", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "FindFirstFileW of the removed folder's own name is ERROR_FILE_NOT_FOUND: its parent exists");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\nothing*.bin", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a pattern that matches nothing in an existing folder is still ERROR_FILE_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        check(list(first_w, next_w, find_close, L"GAME:\\listing\\*").size() == 2,
+              "and the emptied parent lists only . and ..");
+    }
+
+    // A move onto the same name succeeds and changes nothing; a rename that changes only the case renames.
+    {
+        const auto names_in = [&](const wchar_t* pattern) { return list(first_w, next_w, find_close, pattern); };
+        const auto has_exact = [](const std::vector<std::wstring>& names, const wchar_t* name) {
+            for (const std::wstring& n : names)
+                if (n == name) return true;
+            return false;
+        };
+        write_path(package / "moves" / "pkg.dat", "package");
+        write_path(package / "moves" / "same.dat", "package");
+        check(mkdir_w(L"GAME:\\moves\\dir", nullptr) != FALSE, "an overlay folder for the case rename");
+        HANDLE h = create_w(L"GAME:\\moves\\save.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD written = 0;
+        if (h != INVALID_HANDLE_VALUE) {
+            ::WriteFile(h, "save", 4, &written, nullptr);
+            ::CloseHandle(h);
+        }
+
+        check(move_w(L"GAME:\\moves\\save.dat", L"GAME:\\moves\\save.dat") != FALSE,
+              "MoveFileW of an overlay file onto itself succeeds");
+        check(move_w(L"GAME:\\moves\\same.dat", L"GAME:\\moves\\same.dat") != FALSE,
+              "MoveFileW of a package file onto itself succeeds");
+        check(read_path(package / "moves" / "same.dat") == "package" && !std::filesystem::exists(overlay / "moves" / "same.dat"),
+              "and a package file moved onto itself is neither copied nor hidden");
+        HANDLE r = create_w(L"GAME:\\moves\\same.dat", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(r != INVALID_HANDLE_VALUE && read_handle(r) == "package", "it still reads");
+        if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
+
+        check(move_w(L"GAME:\\moves\\save.dat", L"GAME:\\moves\\SAVE.DAT") != FALSE,
+              "MoveFileW renames an overlay file to the same name in another case");
+        std::vector<std::wstring> names = names_in(L"GAME:\\moves\\*");
+        check(has_exact(names, L"SAVE.DAT") && !has_exact(names, L"save.dat") && count(names, L"save.dat") == 1,
+              "the listing shows the new case, once");
+        check(read_path(overlay / "moves" / "SAVE.DAT") == "save", "and the bytes are the same");
+
+        check(move_w(L"GAME:\\moves\\pkg.dat", L"GAME:\\moves\\PKG.DAT") != FALSE,
+              "MoveFileW renames a package file to the same name in another case");
+        names = names_in(L"GAME:\\moves\\*");
+        check(has_exact(names, L"PKG.DAT") && !has_exact(names, L"pkg.dat") && count(names, L"pkg.dat") == 1,
+              "the listing shows the package file under its new case, once");
+        r = create_w(L"GAME:\\moves\\pkg.dat", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(r != INVALID_HANDLE_VALUE && read_handle(r) == "package", "and it opens under either case");
+        if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
+        check(read_path(package / "moves" / "pkg.dat") == "package", "the package file is untouched");
+
+        check(move_w(L"GAME:\\moves\\dir", L"GAME:\\moves\\DIR") != FALSE,
+              "MoveFileW renames an overlay folder to the same name in another case");
+        check(has_exact(names_in(L"GAME:\\moves\\*"), L"DIR"), "the listing shows the folder's new case");
+        check(move_w(L"GAME:\\moves", L"GAME:\\moves") != FALSE, "MoveFileW of a package folder onto itself succeeds");
+        SetLastError(0);
+        check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
+              "a case rename of a package folder is refused like any other move of one");
     }
 
     std::filesystem::remove_all(root);

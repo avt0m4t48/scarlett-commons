@@ -360,7 +360,9 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
     // below a package file (which then read as a folder) and inside a folder the title had removed. The overlay may
     // still lack a folder only the package has, so it is mirrored here, which the title cannot see.
-    if (!is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
+    // T:'s scratch folder is the exception: it creates its parent folders, as merged with RT-218.
+    const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
+    if (!scratch && !is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
 
     Target t;
     t.path = join(r.overlay, parts);

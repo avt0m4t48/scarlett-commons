@@ -4665,7 +4665,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
         EXPECT(rt::d3d12_xs::is_device_proxy(device.p));
         EXPECT(rt::d3d12_xs::device_proxy_slot_count(device.p) == 80);  // ID3D12Device11
@@ -4993,7 +4993,7 @@ int main() {
             EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_inner))));
             Ref<ID3D12Device> fallback_device;
             EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
-                                                               reinterpret_cast<void**>(&fallback_device.p))));
+                                                               reinterpret_cast<void**>(&fallback_device.p), /*console_lists=*/false)));
             rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
             D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{TRUE};
             EXPECT(fallback_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8,

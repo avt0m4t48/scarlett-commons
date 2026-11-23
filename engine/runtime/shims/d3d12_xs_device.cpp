@@ -63,6 +63,9 @@ struct DeviceProxy {
     // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4): the queue proxy
     // writes it on detection and every object shares it — the queue/list slot tails shift +2 under the newer one.
     std::atomic<unsigned char> console_layout{0};  // 0 unknown, 1 older, 2 newer
+    // Set by create_device_proxy: false hands real (PC-shaped) lists back from CreateCommandList for callers
+    // compiled against the PC headers.
+    bool console_lists = true;
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -452,8 +455,9 @@ struct ChildProxy {
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
     // Queues only: the console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4),
-    // detected by a fence reaching slot 16/17. Unused on fences and allocators. Concurrent Signal/Wait calls
-    // on the same queue can race the detection write, so it is atomic like the shared device flag.
+    // detected by a fence reaching slot 16/17 or SignalX slot 25. Unused on fences and allocators. A queue is
+    // used from many threads, so the cache of the device's shared detection is atomic like the shared flag
+    // itself.
     static constexpr unsigned char kQueueLayoutUnknown = 0;
     static constexpr unsigned char kQueueLayoutOlder = 1;   // PC order; PresentX 30, SignalX 23
     static constexpr unsigned char kQueueLayoutNewer = 2;   // +2 shift; PresentX 32, SignalX 25
@@ -866,15 +870,15 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // signals only through SignalX never reaches Signal/Wait at 16/17, and an unanswered SignalX
             // returns S_OK having signalled nothing, leaving a waiter on that fence value hanging.
             const bool newer = [&] {
-                if (self->queue_layout == ChildProxy::kQueueLayoutNewer) return true;
+                const unsigned char own = self->queue_layout.load(std::memory_order_relaxed);
+                if (own == ChildProxy::kQueueLayoutNewer) return true;
                 const unsigned char shared =
                     self->device->console_layout.load(std::memory_order_relaxed);
-                return self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
-                       shared == ChildProxy::kQueueLayoutNewer;
+                return own == ChildProxy::kQueueLayoutUnknown && shared == ChildProxy::kQueueLayoutNewer;
             }();
             if (Slot == 16 || Slot == 17) {
                 if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
-                    self->queue_layout = ChildProxy::kQueueLayoutNewer;
+                    self->queue_layout.store(ChildProxy::kQueueLayoutNewer, std::memory_order_relaxed);
                     self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
                                                        std::memory_order_relaxed);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
@@ -883,8 +887,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 }
                 if (newer) return hr_to_u64(S_OK);  // proven newer: a non-fence Signal/Wait arg is malformed,
                 // not evidence of the older layout — do not downgrade the shared detection on it
-                if (self->queue_layout == ChildProxy::kQueueLayoutUnknown) {
-                    self->queue_layout = ChildProxy::kQueueLayoutOlder;
+                if (self->queue_layout.load(std::memory_order_relaxed) ==
+                    ChildProxy::kQueueLayoutUnknown) {
+                    self->queue_layout.store(ChildProxy::kQueueLayoutOlder, std::memory_order_relaxed);
                     self->device->console_layout.store(ChildProxy::kQueueLayoutOlder,
                                                        std::memory_order_relaxed);
                 }
@@ -919,7 +924,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     self->real, reinterpret_cast<UINT64*>(a1)));
             }
             if (Slot == (newer ? 25u : 23u) ||
-                (Slot == 25u && self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
+                (Slot == 25u && self->queue_layout.load(std::memory_order_relaxed) ==
+                                    ChildProxy::kQueueLayoutUnknown &&
                  self->device->console_layout.load(std::memory_order_relaxed) ==
                      ChildProxy::kQueueLayoutUnknown)) {
                 // SignalX: console Signal (older 23, newer 25); the extra X word is dropped. The slot-25
@@ -928,7 +934,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 // methods sit at 14/15/23 there.
                 if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
                     if (Slot == 25u && !newer) {
-                        self->queue_layout = ChildProxy::kQueueLayoutNewer;
+                        self->queue_layout.store(ChildProxy::kQueueLayoutNewer,
+                                                 std::memory_order_relaxed);
                         self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
                                                            std::memory_order_relaxed);
                     }
@@ -1513,6 +1520,14 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
                                                  static_cast<D3D12_COMMAND_LIST_TYPE>(type),
                                                  reinterpret_cast<ID3D12CommandAllocator*>(unwrap_object(allocator)),
                                                  reinterpret_cast<ID3D12PipelineState*>(pso), *riid, nullptr);
+    if (!self->console_lists) {
+        // PC caller (create_device_proxy's console_lists=false): the real list answers every PC slot, and the
+        // console-only pieces (slot 148, the shifted tail) are simply not there for this caller to reach.
+        return self->real->CreateCommandList(static_cast<UINT>(node_mask),
+                                             static_cast<D3D12_COMMAND_LIST_TYPE>(type),
+                                             reinterpret_cast<ID3D12CommandAllocator*>(unwrap_object(allocator)),
+                                             reinterpret_cast<ID3D12PipelineState*>(pso), *riid, out);
+    }
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandList(
         static_cast<UINT>(node_mask), static_cast<D3D12_COMMAND_LIST_TYPE>(type),
@@ -1923,7 +1938,7 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_lists) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -1934,6 +1949,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->real = real;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->slot_count = detect_slot_count(real);
+    proxy->console_lists = console_lists;
     proxy->refs.store(1, std::memory_order_relaxed);
 
     const unsigned slot_count = proxy->slot_count;

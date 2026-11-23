@@ -388,6 +388,7 @@ int check_slots(const Backend& b) {
         // The console queue tail answers S_OK instead of refusing: frame pacing flows through those
         // methods, the contract xs_proxy_mock checks too. The two methods the proxy models — SignalX at
         // 23 and PresentX at 30 on the older layout the 16/17 calls above pinned — are checked below.
+        // The fence tail below is still refused — nothing console-shaped was measured past its public chain.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
             if (slot == 23 || slot == 30) continue;
             before = qhits(slot);
@@ -411,13 +412,14 @@ int check_slots(const Backend& b) {
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
         }
-        // The objects still work after the tail calls.
+        // The objects still work after the console-only calls.
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
         if (wait_for(label, fence.p, 10)) return 1;
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
-    std::printf("%s: every public queue and fence slot forwarded and counted; console tail answered\n", label);
+    std::printf("%s: every public queue and fence slot forwarded and counted; queue tail S_OK, fence tail "
+                "refused\n", label);
     return 0;
 }
 

@@ -53,7 +53,10 @@ namespace rt::d3d12_xs {
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
 // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
 // device interface the PC device implements.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
+// `console_lists` shapes the command lists CreateCommandList returns: true (the title path) gives the
+// console-shaped object the Xbox ABI calls; false hands the real list back for callers compiled against
+// the PC headers (the GPU test harnesses), whose vtable indices past slot 26 do not exist in console order.
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_lists = true);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);

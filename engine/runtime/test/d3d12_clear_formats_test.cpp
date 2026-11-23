@@ -136,14 +136,15 @@ bool read_plane(Plane& plane, std::vector<unsigned char>& pixels) {
 // The two results of a case: false when the device could not run it at all.
 enum class Result { ok, not_created, failed };
 
-Result clear_color(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, const Color& full, const Color& part,
-                   std::vector<unsigned char>& pixels) {
+Result clear_color(ID3D12Device* device, DXGI_FORMAT format, DXGI_FORMAT resource_format, unsigned bytes,
+                   const Color& full, const Color& part, std::vector<unsigned char>& pixels) {
     Run run;
     if (!run.create(device)) return Result::failed;
     Ref<ID3D12Resource> image;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    const D3D12_RESOURCE_DESC texture = texture_desc(format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const D3D12_RESOURCE_DESC texture = texture_desc(resource_format != DXGI_FORMAT_UNKNOWN ? resource_format : format,
+                                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))))
         return Result::not_created;
@@ -151,7 +152,10 @@ Result clear_color(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, con
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&rtv_heap.p)))) return Result::failed;
     const auto handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(image.p, nullptr, handle);
+    D3D12_RENDER_TARGET_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(image.p, resource_format != DXGI_FORMAT_UNKNOWN ? &view : nullptr, handle);
     run.list->ClearRenderTargetView(handle, full.data(), 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
     run.list->ClearRenderTargetView(handle, part.data(), 1, &rect);
@@ -211,6 +215,7 @@ struct ColorCase {
     DXGI_FORMAT format;
     unsigned bytes;
     const std::vector<Color>* colors;
+    DXGI_FORMAT resource = DXGI_FORMAT_UNKNOWN;  // a TYPELESS format the resource is created with; format is the view
 };
 
 // Out-of-range values clamp in the normalised classes; NaN is 0 there. NaN is left out of the float classes, whose
@@ -252,15 +257,31 @@ const ColorCase kColorCases[] = {
     {"FLOAT", "R32G32B32A32_FLOAT", DXGI_FORMAT_R32G32B32A32_FLOAT, 16, &kFloat},
     {"FLOAT", "R11G11B10_FLOAT", DXGI_FORMAT_R11G11B10_FLOAT, 4, &kFloat},
     {"UINT", "R8_UINT", DXGI_FORMAT_R8_UINT, 1, &kUint},
+    {"UINT", "R8G8_UINT", DXGI_FORMAT_R8G8_UINT, 2, &kUint},
     {"UINT", "R16_UINT", DXGI_FORMAT_R16_UINT, 2, &kUint},
+    {"UINT", "R16G16_UINT", DXGI_FORMAT_R16G16_UINT, 4, &kUint},
     {"UINT", "R8G8B8A8_UINT", DXGI_FORMAT_R8G8B8A8_UINT, 4, &kUint},
+    {"UINT", "R10G10B10A2_UINT", DXGI_FORMAT_R10G10B10A2_UINT, 4, &kUint},
+    {"UINT", "R16G16B16A16_UINT", DXGI_FORMAT_R16G16B16A16_UINT, 8, &kUint},
     {"UINT", "R32_UINT", DXGI_FORMAT_R32_UINT, 4, &kUint},
+    {"UINT", "R32G32_UINT", DXGI_FORMAT_R32G32_UINT, 8, &kUint},
     {"UINT", "R32G32B32A32_UINT", DXGI_FORMAT_R32G32B32A32_UINT, 16, &kUint},
     {"SINT", "R8_SINT", DXGI_FORMAT_R8_SINT, 1, &kSint},
+    {"SINT", "R8G8_SINT", DXGI_FORMAT_R8G8_SINT, 2, &kSint},
     {"SINT", "R16_SINT", DXGI_FORMAT_R16_SINT, 2, &kSint},
+    {"SINT", "R16G16_SINT", DXGI_FORMAT_R16G16_SINT, 4, &kSint},
     {"SINT", "R8G8B8A8_SINT", DXGI_FORMAT_R8G8B8A8_SINT, 4, &kSint},
+    {"SINT", "R16G16B16A16_SINT", DXGI_FORMAT_R16G16B16A16_SINT, 8, &kSint},
     {"SINT", "R32_SINT", DXGI_FORMAT_R32_SINT, 4, &kSint},
+    {"SINT", "R32G32_SINT", DXGI_FORMAT_R32G32_SINT, 8, &kSint},
     {"SINT", "R32G32B32A32_SINT", DXGI_FORMAT_R32G32B32A32_SINT, 16, &kSint},
+    // A TYPELESS resource cleared through the typed view its default maps to. A view that changes the class (UINT or
+    // SINT view of a TYPELESS resource) is not covered: the layer ignores the RTV's format, so the clear converts
+    // for the resource's class.
+    {"TYPELESS", "R8_TYPELESS as UNORM", DXGI_FORMAT_R8_UNORM, 1, &kUnorm, DXGI_FORMAT_R8_TYPELESS},
+    {"TYPELESS", "R8G8_TYPELESS as UNORM", DXGI_FORMAT_R8G8_UNORM, 2, &kUnorm, DXGI_FORMAT_R8G8_TYPELESS},
+    {"TYPELESS", "R16G16_TYPELESS as FLOAT", DXGI_FORMAT_R16G16_FLOAT, 4, &kFloat, DXGI_FORMAT_R16G16_TYPELESS},
+    {"TYPELESS", "R32G32_TYPELESS as FLOAT", DXGI_FORMAT_R32G32_FLOAT, 8, &kFloat, DXGI_FORMAT_R32G32_TYPELESS},
 };
 
 struct DepthCase {
@@ -332,12 +353,12 @@ int main() {
                 const Color& full = colors[i];
                 const Color& part = colors[(i + 1) % colors.size()];
                 std::vector<unsigned char> actual, expected;
-                const Result want = clear_color(host.p, c.format, c.bytes, full, part, expected);
+                const Result want = clear_color(host.p, c.format, c.resource, c.bytes, full, part, expected);
                 if (want != Result::ok) {
                     ++tally.skipped;  // WARP itself does not offer the format as a render target here
                     continue;
                 }
-                const Result got = clear_color(ours.p, c.format, c.bytes, full, part, actual);
+                const Result got = clear_color(ours.p, c.format, c.resource, c.bytes, full, part, actual);
                 if (got == Result::not_created) {
                     ++tally.not_exposed;
                     if (!reported_exposure) std::printf("not exposed: %-6s %s\n", c.group, c.name);

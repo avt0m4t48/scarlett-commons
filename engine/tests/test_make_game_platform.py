@@ -270,6 +270,32 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertIn("gta6rt_tls_host.dll", err.getvalue())
         self.assertFalse(os.path.exists(self.out))
 
+    def test_runtime_build_starts_powershell_by_its_full_path(self):
+        # The stage started "powershell" by name. CreateProcess searches System32 but not
+        # System32\WindowsPowerShell\v1.0, so on a PC whose PATH had lost that folder the stage ended in a
+        # FileNotFoundError traceback after the earlier stages had run.
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        system_root = os.path.join(self.root, "Windows")
+        folder = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0")
+        os.makedirs(folder)
+        exe = os.path.join(folder, "powershell.exe")
+        with open(exe, "wb"):
+            pass
+        with mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.dict(os.environ, {"SystemRoot": system_root, "PATH": ""}), \
+                mock.patch.object(make_game, "run") as run, \
+                mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"})
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], exe)
+        self.assertIn(os.path.join(self.root, "scripts", "build_runtime.ps1"), command)
+
+    def test_powershell_is_the_bare_name_where_the_file_is_not_at_its_usual_place(self):
+        with mock.patch.dict(os.environ, {"SystemRoot": os.path.join(self.root, "nowhere")}):
+            self.assertEqual(make_game.windows_powershell(), "powershell")
+
 
 class ConfiguredCrossToolsTest(unittest.TestCase):
     def test_reads_cmakes_compiler_files_newest_last(self):

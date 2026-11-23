@@ -70,7 +70,7 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator };
+enum class Kind { device, queue, fence, resource, allocator, list };
 
 constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
@@ -130,6 +130,16 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
+        case Kind::list: {
+            // The mock answers every graphics-command-list interface so the proxy sees the full 82-slot chain.
+            const IID lists[] = {__uuidof(ID3D12CommandList),         __uuidof(ID3D12GraphicsCommandList),
+                                 __uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList2),
+                                 __uuidof(ID3D12GraphicsCommandList3), __uuidof(ID3D12GraphicsCommandList4),
+                                 __uuidof(ID3D12GraphicsCommandList5), __uuidof(ID3D12GraphicsCommandList6),
+                                 __uuidof(ID3D12GraphicsCommandList7), __uuidof(ID3D12GraphicsCommandList8)};
+            for (const IID& list_iid : lists) if (IsEqualIID(iid, list_iid)) return true;
+            return false;
+        }
         default: return false;
     }
 }
@@ -162,13 +172,14 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
     for (std::uint32_t i = 0; in && i < static_cast<std::uint32_t>(count) && i < 4; ++i) m->array[slot][i] = in[i];
 }
 
-// `words` are the call's first five words (a1..a5), copied into the thunk's own frame.
+// `words` are the call's first six words (a1..a6), copied into the thunk's own frame.
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
-    const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
+    const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3], a5 = words[4], a6 = words[5];
     if (m->kind == Kind::device) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 12: return static_cast<std::uint32_t>(mock_create(m, Kind::list, a5, a6));    // CreateCommandList
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -188,7 +199,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
 
 template <unsigned Slot>
 std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
-                               std::uint64_t a5) {
+                               std::uint64_t a5, std::uint64_t a6) {
     if constexpr (Slot == 0) {
         return static_cast<std::uint32_t>(mock_query(self, reinterpret_cast<const IID*>(a1),
                                                      reinterpret_cast<void**>(a2)));
@@ -202,8 +213,8 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
         // forwarding them as stack arguments let MSVC tail-call mock_call and write into the caller's saved
         // registers (an optimized build corrupted the test's own locals that way).
         ++self->calls[Slot];
-        const std::uint64_t words[] = {a1, a2, a3, a4, a5};
-        std::memcpy(self->args[Slot], words, sizeof(words));
+        const std::uint64_t words[] = {a1, a2, a3, a4, a5, a6};
+        std::memcpy(self->args[Slot], words, 5 * sizeof(words[0]));
         return mock_call(self, Slot, words);
     }
 }
@@ -230,10 +241,10 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, 0, 0, 0, 0, 0, 0,
-                                                  0, 0, 0);
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0,
+                                                  0, 0, 0, 0);
 }
 
 HRESULT hr_of(std::uint64_t value) {
@@ -648,7 +659,60 @@ int check_allocators() {
     return 0;
 }
 
-// ---- 7. The console tail and the guard region ----
+// ---- 7. Command lists (device slot 12): the console-shaped proxy and AllocateUploadMemory ----
+
+int check_lists() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const real_allocator = mock->last_child;
+    // CreateCommandList(node_mask, type, allocator, pso, iid, out): the allocator proxy is unwrapped on the way
+    // in and the list comes back console-shaped.
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                     word(&list))) == S_OK);
+    Mock* const real = mock->last_child;
+    EXPECT(real->kind == Kind::list && mock->args[12][2] == word(real_allocator));
+    EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(real));
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs + 2);  // allocator + list
+    // The console object body sits at +0x18 with the write cursor pinned at the record limits.
+    const auto* body = reinterpret_cast<const std::uint64_t*>(word(list) + 0x18);
+    // Object offsets +0x18/+0x28/+0x30 are body[0]/body[2]/body[3]: the cursor is pinned at both record limits.
+    EXPECT(body[0] == body[2] && body[0] == body[3]);
+    // GetDevice answers with the Xbox-ABI device.
+    void* found = nullptr;
+    const IID device_iid = __uuidof(ID3D12Device);
+    EXPECT(hr_of(raw(list, 7, word(&device_iid), word(&found))) == S_OK && found == device);
+    EXPECT(release(found) >= 1);
+    // A forwarded console slot: Dispatch is console 14 (PC slot 14 too — order holds through 26).
+    EXPECT(hr_of(raw(list, 14, 1, 1, 1)) == S_OK && real->calls[14] == 1);
+    // Console-only extras (27-30) and the unmeasured tail are recorded and return 0, never forwarded.
+    EXPECT(raw(list, 27, 1, 2, 3, 4) == 0 && real->calls[27] == 0);
+    EXPECT(raw(list, 148, 0, 16) == 0);  // AllocateUploadMemory(0, ...) refuses
+    // AllocateUploadMemory carves from the upload arena; a later root SRV gets a real address for it.
+    const std::uint64_t p1 = raw(list, 148, 4096, 64);
+    const std::uint64_t p2 = raw(list, 148, 16, 16);
+    EXPECT(p1 && p2 > p1 && (p1 & 63) == 0 && p2 >= p1 + 4096);
+    // Console 43 -> PC 39 (SetComputeRootShaderResourceView): the arena pointer crosses as a GPU VA (the mock
+    // device cannot map a real buffer, so the fallback arena translates to the same address).
+    EXPECT(hr_of(raw(list, 43, 0, p1)) == S_OK && real->calls[39] == 1 && real->args[39][1] == p1);
+    // The console tail past the PC chain is refused with E_NOTIMPL only when the mapped PC slot is missing.
+    EXPECT(hr_of(raw(list, 146, word(list), 0)) == S_OK && real->calls[80] == 1);  // enhanced Barrier -> GCL7 80
+    EXPECT(release(list) == 0 && real->refs == 0);
+    EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: lists come back console-shaped (cursor pinned, GetDevice, Dispatch forwarded, extras "
+                "recorded); AllocateUploadMemory hands out arena pointers a root SRV receives\n", g_label);
+    return 0;
+}
+
+// ---- 8. The console tail and the guard region ----
 
 int check_tail(bool want_guarded) {
     Mock* mock = nullptr;
@@ -774,7 +838,7 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators())
+        check_alloc_failures() || check_allocators() || check_lists())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

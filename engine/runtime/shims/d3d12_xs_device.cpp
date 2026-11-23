@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <mutex>
 #include <new>
 #include <memory>
 #include <utility>
@@ -54,10 +55,14 @@ struct DeviceProxy {
     // The PresentX state (window, presenter, XboxPresentation) the first queue PresentX builds on this device,
     // under LEONIDA_VULKAN_DEVICE; always null elsewhere. Opaque: PresentState is defined with the queue proxy.
     void* present_state = nullptr;
+    // The upload-memory arena console list slot 148 (AllocateUploadMemory) carves from; always null until the
+    // first call. Opaque: UploadArena is defined with the list proxy.
+    void* upload_state = nullptr;
 };
 
-// Freed in proxy_release; defined with the queue proxy where PresentState is complete.
+// Freed in proxy_release; defined where the states are complete.
 void destroy_present_state(void* present_state);
+void destroy_upload_state(void* upload_state);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -165,6 +170,7 @@ unsigned long proxy_release(DeviceProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         destroy_present_state(self->present_state);
+        destroy_upload_state(self->upload_state);
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -1031,10 +1037,139 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
 // and return 0 without a PC call: a wrong forward is worse than a clean refusal.
 
 constexpr unsigned kListSlots = 160;
+// ---- Upload memory (console list slot 148, AllocateUploadMemory) ----
+//
+// On the console the CPU and GPU share one address space: the pointer AllocateUploadMemory(size, alignment)
+// returns is written by the CPU and handed to the GPU unchanged — the package measures it going straight into a
+// root SRV (docs/d3d12_xs_console_abi.md §5.3, d3d12_command_objects.md §3.3a). A PC has two address spaces, so
+// each arena chunk is a persistently-mapped UPLOAD-heap buffer: the title gets the CPU pointer and writes the
+// very memory the GPU samples, and the root-descriptor setters translate a chunk address to the buffer's device
+// address (the same backing memory) before forwarding. Translation covers the six root VA setters (console
+// 41-46); VAs inside view structs (IASetVertexBuffers/IASetIndexBuffer) and ExecuteIndirect arguments are not
+// rewritten yet and stay title addresses.
+
+struct UploadChunk {
+    UploadChunk* next;
+    ID3D12Resource* resource;      // the mapped buffer; released with the chunk
+    std::uint8_t* cpu_base;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base;
+    std::size_t size;
+    std::size_t used;
+};
+
+struct UploadArena {
+    UploadChunk* chunks = nullptr;
+    std::mutex lock;
+};
+
+constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
+
+UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
+    auto* chunk = new (std::nothrow) UploadChunk{};
+    if (!chunk) return nullptr;
+    chunk->size = size;
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* resource = nullptr;
+    const HRESULT hr = device->real->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
+    void* cpu = nullptr;
+    if (SUCCEEDED(hr) && resource && SUCCEEDED(resource->Map(0, nullptr, &cpu)) && cpu &&
+        resource->GetGPUVirtualAddress() != 0) {
+        chunk->resource = resource;
+        chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
+        chunk->gpu_base = resource->GetGPUVirtualAddress();
+        return chunk;
+    }
+    if (resource) resource->Release();
+    // A device that cannot hand out a mapped buffer (a mock, or an older layer without buffer device
+    // addresses) still gets memory to write; upload_translate leaves its addresses alone.
+    auto* cpu_fallback = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!cpu_fallback) {
+        delete chunk;
+        return nullptr;
+    }
+    chunk->cpu_base = cpu_fallback;
+    chunk->gpu_base = reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cpu_fallback);
+    return chunk;
+}
+
+std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_t alignment) {
+    if (!device || !size) return 0;
+    alignment = alignment < 16 ? 16 : alignment;  // every measured call asked for 16
+    auto*& state = device->upload_state;
+    if (!state) state = new (std::nothrow) UploadArena;
+    auto* arena = static_cast<UploadArena*>(state);
+    if (!arena) return 0;
+    std::lock_guard<std::mutex> lock(arena->lock);
+    const std::size_t need = static_cast<std::size_t>(size);
+    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
+        const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
+        if (aligned + need <= chunk->size) {
+            chunk->used = aligned + need;
+            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+        }
+    }
+    const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
+    UploadChunk* chunk = upload_chunk_new(device, chunk_size);
+    if (!chunk) {
+        std::fprintf(stderr, "[rt] d3d12_xs: AllocateUploadMemory(%llu, %llu) failed\n",
+                     static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment));
+        return 0;
+    }
+    chunk->next = arena->chunks;
+    arena->chunks = chunk;
+    const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
+    chunk->used = aligned + need;
+    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+}
+
+// An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
+// real resource VA the title already holds — passes through.
+std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
+    auto* arena = static_cast<UploadArena*>(device ? device->upload_state : nullptr);
+    if (!arena) return va;
+    std::lock_guard<std::mutex> lock(arena->lock);
+    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
+        const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
+        if (va >= base && va < base + chunk->size) return chunk->gpu_base + (va - base);
+    }
+    return va;
+}
+
+void destroy_upload_state(void* upload_state) {
+    auto* arena = static_cast<UploadArena*>(upload_state);
+    if (!arena) return;
+    for (UploadChunk* chunk = arena->chunks; chunk;) {
+        UploadChunk* next = chunk->next;
+        if (chunk->resource) {
+            chunk->resource->Unmap(0, nullptr);
+            chunk->resource->Release();
+        } else {
+            VirtualFree(chunk->cpu_base, 0, MEM_RELEASE);
+        }
+        delete chunk;
+        chunk = next;
+    }
+    delete arena;
+}
+
 constexpr unsigned kListNotForwarded = ~0u;
 constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleBarrier = 146;
+constexpr unsigned kConsoleAllocateUpload = 148;
 
 constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
@@ -1169,6 +1304,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4);
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            if constexpr (Slot == kConsoleAllocateUpload) {
+                return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+            }
             return 0;  // unmodelled console slot: recorded above, never a PC call
         } else {
             if (pc >= self->pc_slot_count) {
@@ -1192,6 +1330,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a1 = unwrap_object(a1);
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
+            } else if constexpr (Slot >= 41 && Slot <= 46) {
+                // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
+                // chunk's device address (d3d12_xs_console_abi.md §5.3 measures slots 41/43/45 for the compute
+                // side; the graphics setters interleave on even slots).
+                a2 = upload_translate(self->device, a2);
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 UnwrappedArray heaps;
                 if (!heaps.fill(a2, a1)) return 0;  // void on the PC side; the call simply does not happen

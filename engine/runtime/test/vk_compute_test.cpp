@@ -36,6 +36,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -136,6 +137,44 @@ int main(int argc, char** argv) {
             return 2;
         }
         heap_init.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
+    // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
+    // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
+    // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
+    // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
+    // shares bytes with the dispatch's output.
+    const char* heap_file_env = std::getenv("VKC_HEAP_FILE");
+    std::string heap_file_path;
+    uint64_t heap_file_at = 0;
+    std::vector<char> heap_file;
+    if (heap_file_env) {
+        const std::string spec(heap_file_env);
+        const std::size_t at_sign = spec.rfind('@');
+        heap_file_path = spec.substr(0, at_sign);
+        if (at_sign != std::string::npos) {
+            const char* digits = spec.c_str() + at_sign + 1;
+            const bool hex = digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X');
+            const char* body = hex ? digits + 2 : digits;
+            const auto first = static_cast<unsigned char>(*body);
+            if (!(hex ? std::isxdigit(first) : std::isdigit(first))) {
+                std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(body, &end, hex ? 16 : 10);
+            if (end == body || *end || parsed > (1ull << 32) || heap_file_path.empty()) {
+                std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            heap_file_at = parsed;
+        }
+        std::ifstream hf(heap_file_path, std::ios::binary);
+        heap_file.assign(std::istreambuf_iterator<char>(hf), {});
+        if (heap_file.empty()) {
+            std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
+            return 2;
+        }
     }
     uint32_t out_words = 0;
     if (out_words_env) {
@@ -260,6 +299,11 @@ int main(int argc, char** argv) {
     // Output buffer = heap. Host-visible so the result can be read back directly.
     VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
     if (out_words > words) words = out_words;
+    // The heap file may need more than the dispatch's own output words; round its end up to a word.
+    if (!heap_file.empty()) {
+        const VkDeviceSize need = VkDeviceSize(heap_file_at + heap_file.size() + 3) / 4;
+        if (need > words) words = need;
+    }
     // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
     // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
     const bool bvh = !std::strcmp(argv[3], "bvh");
@@ -291,6 +335,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!heap_init.empty()) std::memcpy(map, heap_init.data(), heap_init.size());
+    }
+    if (!heap_file.empty()) {
+        std::memcpy(static_cast<char*>(map) + heap_file_at, heap_file.data(), heap_file.size());
+        std::printf("heap file: %s at 0x%llx (%zu bytes)\n", heap_file_path.c_str(),
+                    static_cast<unsigned long long>(heap_file_at), heap_file.size());
     }
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a

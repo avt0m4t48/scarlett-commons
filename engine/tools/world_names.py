@@ -403,10 +403,13 @@ class NameDictionary:
 
 def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
                      derive_lod: bool = False, rpf9_names=()) -> NameDictionary:
+    def scan_failed(error):
+        raise error
+
     dictionary = NameDictionary()
     for path in manifests:
         if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, onerror=scan_failed):
                 dirs.sort()
                 if "manifest.json" in files and os.path.basename(root).lower() == "models":
                     dictionary.add_manifest(os.path.join(root, "manifest.json"))

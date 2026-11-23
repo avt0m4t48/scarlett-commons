@@ -1040,7 +1040,12 @@ if(TARGET Vulkan::Headers)
       add_test(NAME vk_overlapping_occlusion COMMAND vk_overlapping_occlusion_test
                "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
                "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv")
-      set_tests_properties(vk_overlapping_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+      # The same test as a device without pipelineStatisticsQuery runs it (MoltenVK), on whatever device is here.
+      add_test(NAME vk_overlapping_occlusion_no_statistics COMMAND vk_overlapping_occlusion_test
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv" --no-statistics)
+      set_tests_properties(vk_overlapping_occlusion vk_overlapping_occlusion_no_statistics
+                           PROPERTIES SKIP_RETURN_CODE 77)
     endif()
   endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.

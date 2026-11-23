@@ -1,4 +1,4 @@
-"""Differential checks for the 47 binary64 VALU instruction forms translated by main.
+"""Differential checks for the 50 binary64 VALU instruction forms translated by main.
 
 The reference below decodes IEEE-754 words itself. Finite arithmetic is performed with
 Fractions and rounded to binary64; it shares no implementation with the translator, its
@@ -50,16 +50,19 @@ CONDS = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt",
 ROUND = ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64")
 BASE = (*ROUND, "v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
         "v_div_fixup_f64", "v_div_fmas_f64", "v_frexp_mant_f64", "v_frexp_exp_i32_f64",
+        "v_ldexp_f64", "v_cvt_f64_i32", "v_cvt_f64_u32",
         *(f"v_cmp_{c}_f64" for c in CONDS), *(f"v_cmpx_{c}_f64" for c in CONDS),
         "v_cmp_class_f64", "v_cmpx_class_f64")
-OP_FORMS = {op: "round" if op in ROUND else "unary" if op in ("v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_frexp_mant_f64", "v_frexp_exp_i32_f64") else "binary" if op == "v_add_f64" else "ternary" if op in ("v_div_fixup_f64", "v_div_fmas_f64") else "compare" if "cmp_" in op and "class" not in op else "class" for op in BASE}
+OP_FORMS = {op: "round" if op in ROUND else "unary" if op in ("v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_frexp_mant_f64", "v_frexp_exp_i32_f64") else "binary" if op == "v_add_f64" else "ternary" if op in ("v_div_fixup_f64", "v_div_fmas_f64") else "ldexp" if op == "v_ldexp_f64" else "from_int" if op in ("v_cvt_f64_i32", "v_cvt_f64_u32") else "compare" if "cmp_" in op and "class" not in op else "class" for op in BASE}
 EXPORT = "exp mrt0 v8, v9, v10, v11 done vm"
 KNOWN_DIVERGENCES = {
     "f64-omod": "SHADER-721: f64 output modifiers; owned by @fiestorra.",
     "double-neg-abs": "TEST-912 (#4172): spirv_mini_interp rounds binary64 OpFNegate/FAbs through binary32, changing values as well as NaN payloads.",
     "fclamp-nan-zero": "FClamp NaN and signed-zero results are driver-dependent after f64 clamp/omod.",
-    "div-fixup-nan-s0": "RDNA2 ISA maps NaN(S0) to signed infinity; current translator preserves the NaN payload.",
+    "ldexp-f64-mode": ("#6218: main's v_ldexp_f64 ignores a MODE.FP_ROUND toward-zero write (a subnormal result rounds to "
+                       "nearest even, an overflow gives inf instead of the largest finite value)."),
 }
+KNOWN_PROBE_OP = {"ldexp-f64-mode": "v_ldexp_f64"}   # the --known probe of every other label is a v_add_f64 case
 
 
 class HarnessError(Exception):
@@ -211,15 +214,19 @@ def compare(cond, a, b):
 
 
 def fixup(s0, s1, s2):
+    """v_div_fixup_f64 under the game's MODE (IEEE off), as measured on RDNA2 gfx1036 and recorded in docs/design.md
+    (the v_div_fixup_f16/f64 row, #2477): a NaN in S2 or S1 passes through unchanged (a signalling one is not quieted
+    with IEEE=0); the underflow cutoff is exp(S2) - exp(S1) <= -1076; there is no overflow check; NaN(S0) gives
+    signed infinity."""
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= -1076: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
 
 
@@ -242,6 +249,41 @@ def rounded_unary(op, bits):
              "v_rndne_f64": round, "v_floor_f64": math.floor}[op](x)
     if value == 0 and bits >> 63: return 0x8000000000000000
     return from_float(float(value))
+
+
+def ldexp_bits(x, n, clamp=False, mode=0):
+    """v_ldexp_f64 under the game's MODE, as measured on RDNA2 gfx1036 (recorded with main's lowering, a59367f7):
+    zeros, infinities and NaNs (a signalling one too, IEEE=0) pass through; any other x gives x * 2^n rounded once by
+    MODE.FP_ROUND[3:2] (``mode``: 0 nearest even, 3 toward zero, where an overflow gives the largest finite value;
+    both measured on gfx1031 in #6218), subnormal results included and denormals kept. DX10 clamp sends NaN, -0 and
+    negatives to +0 and anything above 1.0 to 1.0."""
+    if is_nan(x) or is_inf(x) or is_zero(x):
+        out = x
+    else:
+        # |x| lies in [2^-1074, 2^1024), so with |n| >= 2200 x * 2^n overflows or falls below half the smallest
+        # subnormal for every x: clipping n there changes no result and keeps the Fraction small.
+        out = round_fraction(to_fraction(x) * Fraction(2) ** max(-2200, min(2200, n)), mode, negative_zero=bool(x >> 63))
+    if clamp:
+        if is_nan(out) or out >> 63: out = 0
+        elif to_float(out) > 1.0: out = 0x3FF0000000000000
+    return out
+
+
+def int_to_bits(op, word, clamp=False):
+    """v_cvt_f64_i32 / v_cvt_f64_u32: every 32-bit integer is a binary64, so the conversion is exact."""
+    value = float(word - (1 << 32) if op == "v_cvt_f64_i32" and word >> 31 else word)
+    if clamp: value = min(1.0, max(0.0, value))
+    return from_float(value)
+
+
+def read_word(tok, vgpr, sgpr):
+    """A 32-bit integer operand: vN, sN, an inline integer or a 32-bit literal."""
+    tok = tok.strip()
+    if re.fullmatch(r"[sv]\d+", tok):
+        return (vgpr if tok[0] == "v" else sgpr).get(int(tok[1:]), 0) & M32
+    if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", tok):
+        return int(tok, 0) & M32
+    raise HarnessError(f"bad 32-bit source {tok!r}")
 
 
 def read_source(tok, vgpr, sgpr):
@@ -281,8 +323,17 @@ def parse_source_args(line):
     return bits[0], bits[1].rstrip(","), [x.strip() for x in args]
 
 
-def ref_program(lines, include_known=False):
-    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, M32
+FMA_FOLD_ZERO_SIGN = ("a Vulkan driver may fold an all-constant Fma without keeping the sign of a zero that comes from an "
+                      "underflowing product (observed on an NVIDIA RTX 4070, where the same Fma on runtime operands gives the "
+                      "IEEE sign), so a GPU zero with the opposite sign is not judged")
+
+
+def ref_program(lines, include_known=False, notes=None, lane_mask=M32):
+    """The four exported words. ``notes`` (a list) receives (kind, destination register) for results a GPU oracle may
+    legitimately get wrong in a known way (see FMA_FOLD_ZERO_SIGN). ``lane_mask`` is the EXEC mask the program starts
+    with: all 32 lanes of a wave32 for the translator and Vulkan oracles (the translator exposes a full mask), the single
+    lane the hardware kernel runs for --oracle hw (a v_cmpx result is read back through exec_lo)."""
+    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, lane_mask & M32
     for line in lines:
         s = line.strip()
         if not s or s.startswith((";", "exp ", "s_endpgm")): continue
@@ -342,16 +393,21 @@ def ref_program(lines, include_known=False):
             if op == "v_cvt_f32_f64": vgpr[int(dst[1:])] = out
             else:
                 d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
+        elif op == "v_ldexp_f64":
+            clamp = a[1].endswith(" clamp")
+            n = read_word(a[1].replace(" clamp", ""), vgpr, sgpr)
+            x, n = read_source(a[0], vgpr, sgpr), n - (1 << 32) if n >> 31 else n
+            out = ldexp_bits(x, n, clamp, mode)
+            if not include_known and out != ldexp_bits(x, n, clamp):
+                raise SkipCase(f"KNOWN_DIVERGENCE ldexp-f64-mode: {KNOWN_DIVERGENCES['ldexp-f64-mode']}")
+            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
+        elif op in ("v_cvt_f64_i32", "v_cvt_f64_u32"):
+            clamp = a[0].endswith(" clamp")
+            out = int_to_bits(op, read_word(a[0].replace(" clamp", ""), vgpr, sgpr), clamp)
+            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
         elif op == "v_div_fixup_f64":
-            args = [read_source(t, vgpr, sgpr) for t in a[:3]]
-            s0, s1, s2 = args
-            ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
-            normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
-                               and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
-            if not include_known and is_nan(s0) and normal_division:
-                raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
-            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))
+            # NaN(S0) gives signed infinity, measured on RDNA2 gfx1036 (TEST-983; the translator has it since #2477, 48a1a98b).
+            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*[read_source(t, vgpr, sgpr) for t in a[:3]]))
         elif op == "v_frexp_mant_f64":
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(frexp(read_source(a[0], vgpr, sgpr))[0])
         elif op == "v_frexp_exp_i32_f64":
@@ -376,8 +432,13 @@ def ref_program(lines, include_known=False):
             if any(is_nan(t) or is_inf(t) for t in (x, y, z)):
                 raise SkipCase("non-finite v_div_fmas_f64 operands are not judged")
             exact = to_fraction(x) * to_fraction(y) + to_fraction(z)
-            if vcc: exact *= 1 << 64
-            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(round_fraction(exact))
+            # With VCC set the result is scaled by 2^+128 when exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise: the
+            # gfx1036 measurement in the docs/design.md v_div_fmas row (the older rule was a fixed 2^64).
+            if vcc: exact *= Fraction(2) ** (128 if ((z >> 52) & 0x7FF) > 1023 else -128)
+            d = int(dst[2:-1].split(":")[0]); result = round_fraction(exact)
+            if notes is not None and is_zero(z) and exact != 0 and is_zero(result) and (result ^ z) & 0x8000000000000000:
+                notes.append(("fma-fold-zero-sign", d))      # an underflowing product against an opposite-signed zero
+            vgpr[d], vgpr[d + 1] = bits_to_words(result)
         else:
             raise HarnessError(f"reference does not implement {op}")
     return [vgpr.get(r, 0) & M32 for r in range(8, 12)]
@@ -467,6 +528,7 @@ def run_gpu(lines, name, tmpdir, gpu):
 # tools/fmisc_diff.py): IEEE off so output modifiers apply, DX10_CLAMP on. Directives an architecture cannot set make
 # the program a counted skip (runner.Oracle.run returns the reason).
 HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
+HW_LANE_MASK = 0x1      # hw_kernel runs one thread of a wave32: exec_lo is 1, so v_cmpx leaves 1 or 0, not 0xffffffff
 
 
 def hw_kernel(lines):
@@ -493,6 +555,30 @@ def rand_bits(rng):
     if rng.random() < .2:
         return rng.choice((0, 0x8000000000000000, EXP, 0xFFF0000000000000, QNAN, 0xFFF0000000000001, 1, 0x8000000000000001))
     return rng.getrandbits(64) & 0xFFEFFFFFFFFFFFFF | (rng.getrandbits(1) << 63) | (rng.randrange(1, 2047) << 52)
+
+
+def ldexp_source_bits(rng):
+    """Subnormals of every width and the binary64 boundaries, which rand_bits rarely gives (v_ldexp_f64 normalizes a
+    subnormal S0 and rounds a subnormal result). A low word of all ones at any exponent makes the rounding carry into
+    the high word, which a random significand almost never does."""
+    e = rng.randint(1, 2046) << 52
+    return (rng.getrandbits(1) << 63) | rng.choice((
+        1, 2, 3, FRAC, 1 << 51, rng.getrandbits(rng.randint(1, 52)) or 1, rng.getrandbits(52) or 1,
+        1 << 52, (1 << 52) | FRAC, 0x7FEFFFFFFFFFFFFF, 0x3FEFFFFFFFFFFFFF, 0x3FF0000000000000,
+        e | FRAC, e | rng.getrandbits(20) << 32 | M32, rng.getrandbits(20) << 32 | M32))
+
+
+def ldexp_exponent(rng, x):
+    """S1 for v_ldexp_f64: mostly one that puts x * 2^S1 next to the subnormal range or the overflow edge."""
+    e = (x >> 52) & 0x7FF
+    k = rng.random()
+    if k < 0.1:
+        return rng.choice((0, 1, -1, 0x7FFFFFFF, -0x80000000, 2098, -2098, 4096, -4096, 4097, -4097))
+    if k < 0.6 and 0 < e < 0x7FF:
+        return rng.choice((1 - e, -e, -51 - e, -52 - e, -53 - e, 2046 - e)) + rng.randint(-3, 3)
+    if k < 0.75 and e == 0:
+        return rng.randint(-60, 1100)
+    return rng.randint(-2200, 2200)
 
 
 def gen_source(rng, idx, allow_literal=True, bus=None):
@@ -530,7 +616,12 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         vg[r], vg[r + 1] = lo, hi
         setup_lines += [f"v_mov_b32 v{r}, 0x{lo:08x}", f"v_mov_b32 v{r+1}, 0x{hi:08x}"]
     if op == "v_add_f64": body_lines.append(f"s_round_mode {0 if known_case else rng.choice((0, 4, 8, 12))}")
-    high_literal = op in ROUND or op in ("v_add_f64", "v_cvt_f32_f64") or "cmp" in op or "class" in op
+    # Literal width in the printed listing: forms whose translator reads a 32-bit literal as the upper half of the f64 operand
+    # (the ISA rule, measured on gfx1036) get 32-bit literals; the others get a full-width one. v_frexp_*, v_rsq_f64 and
+    # v_sqrt_f64 and v_rcp_f64 moved to the first group when main's translator started reading their literal as the upper half
+    # only (the CPU run skips v_rcp, so only --oracle gpu shows it).
+    high_literal = (op in ROUND or op in ("v_add_f64", "v_cvt_f32_f64", "v_frexp_mant_f64", "v_frexp_exp_i32_f64",
+                                          "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_ldexp_f64") or "cmp" in op or "class" in op)
     bus = [set(), False, 32 if high_literal else 64]
     if op in ROUND:
         src = maybe_word_modifier(rng, gen_source(rng, 0, allow_literal, bus))
@@ -545,12 +636,37 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         suffix = " mul:2" if known_case == "f64-omod" else " clamp" if known_case == "fclamp-nan-zero" else ""
         if known_case == "fclamp-nan-zero": left, right = "0x7ff80001", "1.0"
         body_lines.append(f"{op} v[8:9], {left}, {right}{suffix}")
-    elif op == "v_div_fixup_f64":
-        if known_case == "div-fixup-nan-s0":
-            setup_lines += ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x7ff80000"]
-            body_lines.append(f"{op} v[8:9], v[12:13], 1.0, 2.0")
+    elif op == "v_ldexp_f64" and known_case == "ldexp-f64-mode":
+        # DBL_MAX * 2 toward zero stays DBL_MAX (inf on main without #6218).
+        body_lines += ["s_round_mode 12", "v_mov_b32 v10, 0xffffffff", "v_mov_b32 v11, 0x7fefffff", "v_mov_b32 v16, 1",
+                       "v_ldexp_f64 v[8:9], v[10:11], v16"]
+    elif op == "v_ldexp_f64":
+        # MODE.FP_ROUND first in 30% of the cases: toward zero or back to nearest even (the translator refuses +-inf).
+        if rng.random() < 0.3: body_lines.append(f"s_round_mode {rng.choice((0, 12))}")
+        # S0 as for the other forms, a data pair half the time refilled (in the body, so --max-ops keeps it) with a
+        # subnormal or a boundary value; S1 in v16 (or an inline integer) aimed at the subnormal and overflow edges.
+        src = gen_source(rng, 0, allow_literal, bus)
+        if src.startswith("v[") and rng.random() < 0.5:
+            r = int(src[2:src.index(":")])
+            vg[r], vg[r + 1] = bits_to_words(ldexp_source_bits(rng))
+            body_lines += [f"v_mov_b32 v{r}, 0x{vg[r]:08x}", f"v_mov_b32 v{r + 1}, 0x{vg[r + 1]:08x}"]
+        src = maybe_word_modifier(rng, src)
+        n = ldexp_exponent(rng, read_source(src, vg, sg))
+        n_tok = str(n) if -16 <= n <= 64 and rng.random() < 0.25 else "v16"
+        if n_tok == "v16": body_lines.append(f"v_mov_b32 v16, 0x{n & M32:08x}")
+        body_lines.append(f"{op} v[8:9], {src}, {n_tok}" + (" clamp" if rng.random() < 0.2 else ""))
+    elif op in ("v_cvt_f64_i32", "v_cvt_f64_u32"):
+        k = rng.random()
+        if k < 0.15: src = str(rng.choice((-16, -1, 0, 1, 64)))
+        elif k < 0.25 and allow_literal: src = f"0x{rng.getrandbits(32) | 0x100:08x}"      # never an inline value
+        elif k < 0.4: src = f"s{rng.randrange(4, 8)}"
         else:
-            body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
+            word = rng.choice((0, 1, M32, 0x80000000, 0x7FFFFFFF, 0x80000001, rng.getrandbits(32),
+                               rng.getrandbits(rng.randint(1, 32))))
+            body_lines.append(f"v_mov_b32 v16, 0x{word:08x}"); src = "v16"
+        body_lines.append(f"{op} v[8:9], {src}" + (" clamp" if rng.random() < 0.1 else ""))
+    elif op == "v_div_fixup_f64":
+        body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
     elif op == "v_div_fmas_f64":
         # VCC is initialized true so the f64 scaled FMA path is exercised deterministically.
         body_lines += ["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
@@ -580,7 +696,8 @@ def output_kind(lines):
         elif s.startswith("v_mov_b32 v9,"): high = "int"
         elif s.startswith("v_cvt_f32_f64 v8,"): low = "f32"
         elif s.startswith("v_frexp_exp_i32_f64 v8,"): low = "int"
-        elif any(s.startswith(op + " v[8:9],") for op in (*ROUND, "v_add_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fixup_f64", "v_div_fmas_f64", "v_frexp_mant_f64")):
+        elif any(s.startswith(op + " v[8:9],") for op in (*ROUND, "v_add_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fixup_f64", "v_div_fmas_f64", "v_frexp_mant_f64",
+                                                          "v_ldexp_f64", "v_cvt_f64_i32", "v_cvt_f64_u32")):
             low, high = "f64", "f64"
     return low, high
 
@@ -625,11 +742,14 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
         for line in lines:
             if " mul:" in line or " div:" in line:
                 return "skip", f"KNOWN_DIVERGENCE f64-omod: {KNOWN_DIVERGENCES['f64-omod']}", None, None
-            if " clamp" in line and "f64" in line:
+            # v_ldexp_f64 clamps with integer ops on the result word (no FClamp), and an integer converted to binary64
+            # is never NaN or -0, so the clamp of these three forms is judged.
+            if " clamp" in line and "f64" in line and not line.lstrip().startswith(("v_ldexp_f64 ", "v_cvt_f64_i32 ", "v_cvt_f64_u32 ")):
                 return "skip", f"KNOWN_DIVERGENCE fclamp-nan-zero: {KNOWN_DIVERGENCES['fclamp-nan-zero']}", None, None
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
-    try: expected = ref_program(lines, include_known)
+    notes = []
+    try: expected = ref_program(lines, include_known, notes, HW_LANE_MASK if oracle == "hw" else M32)
     except SkipCase as exc: return "skip", str(exc), None, None
     except (ArithmeticError, IndexError, KeyError, ValueError) as exc:
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None
@@ -646,7 +766,13 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
     try: actual = run_gpu(lines, name, tmp, gpu) if oracle == "gpu" else translate(lines, name, tmp)
     except (rdna2spirv.Unsupported, UnsupportedConstruct, SkipCase) as exc: return "skip", f"{type(exc).__name__}: {exc}", expected, None
     except (IndexError, KeyError, ValueError, OverflowError) as exc: return "skip", f"translator/interpreter limitation: {type(exc).__name__}: {exc}", expected, None
-    return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
+    if equivalent(expected, actual, output_kind(lines)): return "match", "", expected, actual
+    if oracle == "gpu":
+        for kind, d in notes:
+            if kind == "fma-fold-zero-sign" and d in (8, 10):
+                flipped = list(expected); flipped[d - 8 + 1] ^= 0x80000000      # the high word of v[d:d+1]
+                if equivalent(flipped, actual, output_kind(lines)): return "skip", FMA_FOLD_ZERO_SIGN, expected, actual
+    return "mismatch", "word comparison", expected, actual
 
 
 def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=None, include_known=False):
@@ -682,8 +808,7 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
     sequence = [(op, True, None) for op in ops] if sweep else []
     sequence += [(rng.choice(ops), False, None) for _ in range(programs)]
     if known:
-        sequence += [("v_div_fixup_f64" if label == "div-fixup-nan-s0" else "v_add_f64", True, label)
-                     for label in KNOWN_DIVERGENCES]
+        sequence += [(KNOWN_PROBE_OP.get(label, "v_add_f64"), True, label) for label in KNOWN_DIVERGENCES]
     cases = []
     for idx, (op, is_sweep, known_case) in enumerate(sequence):
         setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)
@@ -721,7 +846,20 @@ def self_test():
              round_fraction(Fraction(1) + Fraction(1, 1 << 53), 1) == 0x3FF0000000000001,
              round_fraction(-(Fraction(1) + Fraction(1, 1 << 53)), 2) == 0xBFF0000000000001,
              round_fraction(Fraction(1 << 1024), 3) == 0x7FEFFFFFFFFFFFFF,
-             len(BASE) == 47]
+             ldexp_bits(0x3FF0000000000000, -1074) == 1,                     # 2^-1074, the smallest subnormal
+             ldexp_bits(0x3FF0000000000000, -1075) == 0,                     # half of it: a tie, to even (zero)
+             ldexp_bits(0xBFF8000000000000, -1075) == 0x8000000000000001,    # -0.75 ulp rounds to -1 ulp
+             ldexp_bits(0x3FEFFFFFFFFFFFFF, -1022) == 0x0010000000000000,    # carries into the smallest normal
+             ldexp_bits(0x3FF0000000000000, 1024) == EXP,
+             ldexp_bits(0x0000000000000001, 1074) == 0x3FF0000000000000,     # a subnormal S0 scaled back up
+             ldexp_bits(0x7FF0000000000001, 5) == 0x7FF0000000000001,        # a signalling NaN passes through
+             ldexp_bits(0x8000000000000000, 5, clamp=True) == 0,
+             ldexp_bits(0x3FF0000000000000, 1, clamp=True) == 0x3FF0000000000000,
+             ldexp_bits(0x7FEFFFFFFFFFFFFF, 1, mode=3) == 0x7FEFFFFFFFFFFFFF,        # toward zero: overflow stays finite
+             ldexp_bits(0x3FEFFFFFFFFFFFFF, -1022, mode=3) == 0x000FFFFFFFFFFFFF,    # truncates, no carry to min normal
+             int_to_bits("v_cvt_f64_u32", M32) == 0x41EFFFFFFFE00000,
+             int_to_bits("v_cvt_f64_i32", 0x80000000) == 0xC1E0000000000000,
+             len(BASE) == 50]
     for i, ok in enumerate(tests, 1): print(f"{'ok' if ok else 'FAIL'} reference invariant {i}")
     # A planted output error must be reported and remain observable after shrinking.
     lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff80000",
@@ -768,7 +906,7 @@ def main(argv=None):
     if bad: print(f"unknown opcode(s): {','.join(bad)}", file=sys.stderr); return 2
     if args.list_ops:
         for op in BASE: print(op)
-        print("Excluded (not translated by main): v_mul_f64, v_min_f64, v_max_f64, v_fract_f64, v_cvt_f64_f32, v_ldexp_f64, v_mad_f64, v_cvt_i32_f64, v_cvt_u32_f64, v_div_scale_f64")
+        print("Excluded (not translated by main): v_mul_f64, v_min_f64, v_max_f64, v_fract_f64, v_cvt_f64_f32, v_mad_f64, v_cvt_i32_f64, v_cvt_u32_f64, v_div_scale_f64")
         return 0
     if args.self_test: return 0 if self_test() else 1
     gpu = hw = None

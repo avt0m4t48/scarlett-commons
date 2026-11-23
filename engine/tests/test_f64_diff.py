@@ -24,12 +24,16 @@ class F64DiffTests(unittest.TestCase):
     def test_cli_self_test(self):
         self.assertEqual(self.command("--self-test").returncode, 0)
 
-    def test_lists_47_supported_forms_and_exclusions(self):
+    def test_lists_50_supported_forms_and_exclusions(self):
         result = self.command("--list-ops")
         listed = [line for line in result.stdout.splitlines() if line.startswith("v_")]
+        excluded = next(line for line in result.stdout.splitlines() if line.startswith("Excluded"))
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(len(listed), 47)
-        self.assertIn("v_div_scale_f64", result.stdout)
+        self.assertEqual(len(listed), 50)
+        self.assertIn("v_div_scale_f64", excluded)
+        for op in ("v_ldexp_f64", "v_cvt_f64_i32", "v_cvt_f64_u32"):     # translated by main (a59367f7, 524d1e92)
+            self.assertIn(op, listed)
+            self.assertNotIn(op, excluded)
 
     def test_exit_2_for_invalid_cli(self):
         self.assertEqual(self.command("--ops", "v_not_real_f64").returncode, 2)
@@ -86,16 +90,37 @@ class F64DiffTests(unittest.TestCase):
         self.assertIn("implementation-defined", reason)
         self.assertIsNone(actual)
 
-    def test_div_fixup_nan_s0_is_skipped_by_default_and_runs_with_known(self):
-        setup, body, _, _ = fd.make_case(random.Random(1), "v_div_fixup_f64", known_case="div-fixup-nan-s0")
-        lines = setup + body
+    def test_div_fixup_nan_s0_gives_signed_infinity_in_reference_and_translator(self):
+        # Measured on RDNA2 gfx1036 (TEST-983); the translator has it since #2477 (48a1a98b). Not a known divergence any more.
+        self.assertNotIn("div-fixup-nan-s0", fd.KNOWN_DIVERGENCES)
+        cases = (("v_mov_b32 v13, 0x7ff80000", "1.0", "2.0", fd.EXP),                  # qNaN, +/+
+                 ("v_mov_b32 v13, 0xfff80000", "-1.0", "2.0", fd.EXP | 0x8000000000000000),     # -qNaN, sign_out negative
+                 ("v_mov_b32 v13, 0x7ff00000", "1.0", "-2.0", fd.EXP | 0x8000000000000000))     # low word set below: sNaN
+        for index, (hi, s1, s2, want) in enumerate(cases):
+            lines = ["v_mov_b32 v12, 0x00000001" if index == 2 else "v_mov_b32 v12, 0x00000000", hi,
+                     f"v_div_fixup_f64 v[8:9], v[12:13], {s1}, {s2}"]
+            self.assertEqual(fd.words_to_bits(*fd.ref_program(lines)[:2]), want)
+            with tempfile.TemporaryDirectory() as tmp:
+                status, reason, expected, actual = fd.run_one(lines, f"ps_f64_fixup_nan_s0_{index}", tmp)
+            self.assertEqual(status, "match", (reason, expected, actual))
+            self.assertEqual(fd.words_to_bits(*actual[:2]), want)
+
+    def test_known_divergence_forms_are_excluded_by_default_and_run_with_known(self):
+        forms = {"f64-omod": ["v_add_f64 v[8:9], v[10:11], 1.0 mul:2"],
+                 "fclamp-nan-zero": ["v_add_f64 v[8:9], 0x7ff80001, 1.0 clamp"],
+                 "double-neg-abs": ["v_add_f64 v[8:9], -|v[8:9]|, 1.0"],
+                 "ldexp-f64-mode": ["s_round_mode 12", "v_mov_b32 v10, 0xffffffff", "v_mov_b32 v11, 0x7fefffff",
+                                    "v_ldexp_f64 v[8:9], v[10:11], 1"]}
+        self.assertEqual(set(forms), set(fd.KNOWN_DIVERGENCES))
         with tempfile.TemporaryDirectory() as tmp:
-            skipped = fd.run_one(lines, "ps_f64_fixup_default", tmp)
-            self.assertEqual(skipped[0], "skip")
-            self.assertIn("div-fixup-nan-s0", skipped[1])
-            known = fd.run_one(lines, "ps_f64_fixup_known", tmp, include_known=True)
-        # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
-        self.assertEqual(known[0], "match")
+            for label, lines in forms.items():
+                with self.subTest(label=label):
+                    skipped = fd.run_one(lines, "ps_f64_known_default", tmp)
+                    self.assertEqual(skipped[0], "skip")
+                    self.assertIn(f"KNOWN_DIVERGENCE {label}", skipped[1])
+                    self.assertIsNone(skipped[2])
+                    executed = fd.run_one(lines, "ps_f64_known_run", tmp, include_known=True)
+                    self.assertIn(executed[0], ("match", "mismatch"))     # really executed, not skipped
 
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
@@ -122,9 +147,26 @@ class F64DiffTests(unittest.TestCase):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")
         self.assertNotIn("KNOWN_DIVERGENCE", normal.stdout)
-        # the known NaN(S0) case runs and, since the translator follows the ISA there, matches
-        self.assertEqual(known.returncode, 0, known.stdout)
-        self.assertNotIn("MISMATCH:", known.stdout)
+        self.assertIn(f"{len(fd.KNOWN_DIVERGENCES)} total", known.stdout)       # one program per known divergence
+        self.assertNotIn("KNOWN_DIVERGENCE", known.stdout)                       # none of them is skipped
+        # The CPU translator reproduces none of the v_add_f64 ones any more; a reproduced one exits 1. The ldexp one
+        # reproduces until #6218 lands, so it is the only program allowed to mismatch.
+        counts, skips, failures = fd.run_batch(["v_add_f64"], 0, 1, sweep=False, known=True, all_failures=True)
+        self.assertEqual(sum(counts.values()), len(fd.KNOWN_DIVERGENCES), dict(skips))
+        self.assertTrue(all(lines[-1].startswith("v_ldexp_f64 ") for lines, *_ in failures), failures)
+        self.assertEqual(known.returncode, 1 if failures else 0, known.stdout + known.stderr)
+        stdout = io.StringIO()
+        original = fd.translate
+
+        def planted(listing, name, temp):     # a translator that gets only the clamp form wrong
+            out = original(listing, name, temp)
+            if any(" clamp" in line for line in listing): out[2] ^= 1   # an exactly compared word (a NaN result is not)
+            return out
+        with mock.patch.object(fd, "translate", planted), contextlib.redirect_stdout(stdout):
+            code = fd.main(["--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures"])
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH:", stdout.getvalue())
+        self.assertIn(" clamp", stdout.getvalue())   # the shrunk program of a known form is printed
 
     def test_sabotaged_translator_mismatch_and_shrinking(self):
         lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff80000",
@@ -201,9 +243,11 @@ class F64DiffTests(unittest.TestCase):
             ("sign_out_negative_from_s1", three, self.NEG2, one, three | self.NZ),
             ("sign_out_positive_both_negative", self.NEG3, self.NEG2, self.NEG1, three),
             ("sign_out_clears_s0_sign", self.NEG3, one, one, three),
-            ("nan_s2_quiets_s2", one, one, self.SNAN, 0x7FF8000000000001),
+            ("snan_s2_passes_unquieted", one, one, self.SNAN, self.SNAN),
+            ("qnan_s2_passes", one, one, qn2, qn2),
             ("nan_s2_beats_nan_s1", one, self.SNAN, qn2, qn2),
-            ("nan_s1_quiets_s1", one, self.SNAN, one, 0x7FF8000000000001),
+            ("snan_s1_passes_unquieted", one, self.SNAN, one, self.SNAN),
+            ("negative_snan_s1_keeps_its_sign", one, self.NZ | self.SNAN, one, self.NZ | self.SNAN),
             ("nan_s2_beats_zero_over_zero", one, self.PZ, qn2, qn2),
             ("zero_over_zero", one, self.PZ, self.NZ, 0xFFF8000000000000),
             ("inf_over_inf", one, self.PINF, self.NINF, 0xFFF8000000000000),
@@ -214,15 +258,195 @@ class F64DiffTests(unittest.TestCase):
             ("inf_over_y", one, self.NEG2, self.NINF, self.PINF),
             ("nan_s0_to_signed_inf_isa_rule", self.QNAN, one, one, self.PINF),
             ("nan_s0_to_signed_inf_negative", self.QNAN, self.NEG2, one, self.NINF),
-            ("underflow_edge_still_passes_s0", three, e(1075), e(1), three),
-            ("underflow_to_zero", three, e(1076), e(1), self.PZ),
-            ("underflow_beats_nan_s0", self.QNAN, e(1076), e(1), self.PZ),
-            ("overflow_edge_still_passes_s0", three, e(1), e(1024), three),
-            ("overflow_to_inf", three, e(1), e(1025), self.PINF),
+            ("underflow_gap_1074_passes_s0", three, e(1075), e(1), three),
+            ("underflow_gap_1075_passes_s0", three, e(1076), e(1), three),
+            ("underflow_gap_1076_gives_zero", three, e(1077), e(1), self.PZ),
+            ("underflow_gap_1076_negative_zero", three, e(1077) | self.NZ, e(1), self.NZ),
+            ("underflow_beats_nan_s0", self.QNAN, e(1077), e(1), self.PZ),
+            ("nan_s0_gap_1075_is_inf", self.QNAN, e(1076), e(1), self.PINF),
+            ("no_overflow_check_gap_1023", three, e(1), e(1024), three),
+            ("no_overflow_check_gap_1024", three, e(1), e(1025), three),
+            ("no_overflow_check_maximum_gap", three, e(1), e(2046), three),
         ]
         for name, s0, s1, s2, want in table:
             with self.subTest(case=name):
                 self.assertEqual(fd.fixup(s0, s1, s2), want)
+
+    def test_div_fmas_scale_follows_exp_of_s2(self):
+        # docs/design.md v_div_fmas row (measured on gfx1036): VCC set scales fma(S0, S1, S2) by 2^128 when
+        # exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise.
+        pair = lambda r, v: [f"v_mov_b32 v{r}, 0x{v & 0xFFFFFFFF:08x}", f"v_mov_b32 v{r + 1}, 0x{v >> 32:08x}"]
+        vcc_set, vcc_clear = "v_cmp_eq_i32_e32 vcc_lo, 0, 0", "v_cmp_eq_i32_e32 vcc_lo, 0, 1"
+        cases = [
+            ("S2 = 1.0 scales down: 2 * 2^-128", self.ONE, vcc_set, 0x38000000),
+            ("S2 = nextbelow(2.0) scales down: (3 - 2^-52) ties to 3, times 2^-128", 0x3FFFFFFFFFFFFFFF, vcc_set, 0x38080000),
+            ("S2 = 2.0 scales up: 3 * 2^128", self.TWO, vcc_set, 0x48080000),
+            ("VCC clear is the plain fma", self.TWO, vcc_clear, 0x40080000),
+        ]
+        for name, s2, vcc, want_hi in cases:
+            with self.subTest(case=name):
+                got = fd.ref_program([*pair(12, self.ONE), *pair(14, self.ONE), *pair(10, s2), vcc,
+                                      "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], v[10:11]"])
+                self.assertEqual(fd.words_to_bits(*got[:2]) >> 32, want_hi)
+
+    # A Fma of constant operands whose product underflows, against an opposite-signed zero: the RTX 4070 driver folds it
+    # to the wrong zero sign (the same Fma on runtime operands is IEEE: -0), so a GPU result that differs only in that
+    # sign is a counted skip (FMA_FOLD_ZERO_SIGN), never a pass for anything else.
+    TINY = "0x1a700000"                       # high word of 2^-600
+    FMAS_UNDERFLOW = ["v_mov_b32 v12, 0x0", f"v_mov_b32 v13, {TINY}", "v_mov_b32 v14, 0x0",
+                      "v_mov_b32 v15, 0x9a700000"]               # 2^-600 * -2^-600 underflows to -0
+
+    def fmas(self, addend):
+        return [*self.FMAS_UNDERFLOW, f"v_div_fmas_f64 v[8:9], v[12:13], v[14:15], {addend}"]
+
+    def test_ref_program_flags_an_underflowing_fma_against_an_opposite_zero(self):
+        for addend, flagged in (("0", True), ("-0.0", False), ("1.0", False)):
+            with self.subTest(addend=addend):
+                notes = []
+                words = fd.ref_program(self.fmas(addend), notes=notes)
+                self.assertEqual(notes, [("fma-fold-zero-sign", 8)] if flagged else [])
+                if flagged: self.assertEqual(words[:2], [0, 0x80000000])          # the IEEE result is -0
+        notes = []                      # symmetric: a +0 result against a -0 addend is flagged too (its GPU sign is unobserved)
+        fd.ref_program([*self.FMAS_UNDERFLOW[:3], f"v_mov_b32 v15, {self.TINY}",
+                        "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], -0.0"], notes=notes)
+        self.assertEqual(notes, [("fma-fold-zero-sign", 8)])
+
+    def test_fma_zero_sign_skip_is_vendor_neutral_and_gpu_only(self):
+        for vendor in ("NVIDIA", "AMD", "Intel"):
+            self.assertNotIn(vendor, fd.FMA_FOLD_ZERO_SIGN.replace("an NVIDIA RTX 4070", ""))     # only the observation names a device
+        self.assertIn("RTX 4070", fd.FMA_FOLD_ZERO_SIGN)
+        lines = self.fmas("0")
+        expected = fd.ref_program(lines)
+        flipped = [expected[0], expected[1] ^ 0x80000000, expected[2], expected[3]]
+        with tempfile.TemporaryDirectory() as tmp:
+            hw = mock.Mock()
+            hw.run.return_value = [flipped]
+            status, reason, _, _ = fd.run_one(lines, "ps_f64_fold_hw", tmp, "hw", hw)
+        self.assertEqual(status, "mismatch")                          # real hardware zero signs are always judged
+        self.assertNotEqual(reason, fd.FMA_FOLD_ZERO_SIGN)
+
+    def test_gpu_zero_sign_difference_of_a_folded_fma_is_a_counted_skip(self):
+        lines = self.fmas("0")
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = fd.ref_program(lines)
+            def gpu(words):
+                return mock.patch.object(fd, "run_gpu", return_value=words)
+            with gpu([expected[0], expected[1] ^ 0x80000000, expected[2], expected[3]]):      # +0 instead of -0
+                status, reason, _, actual = fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})
+            self.assertEqual((status, reason), ("skip", fd.FMA_FOLD_ZERO_SIGN))
+            self.assertEqual(actual[1], 0)
+            with gpu(list(expected)):
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "match")
+            with gpu([expected[0], expected[1] ^ 0x80000000, expected[2] ^ 1, expected[3]]):  # something else differs too
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+            with gpu([expected[0] ^ 1, expected[1], expected[2], expected[3]]):               # a real low-word mismatch
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+            normal = self.fmas("1.0")                                                           # no zero involved: a flip is real
+            wrong = fd.ref_program(normal)
+            with gpu([wrong[0], wrong[1] ^ 0x80000000, wrong[2], wrong[3]]):
+                self.assertEqual(fd.run_one(normal, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+
+    def test_ldexp_table(self):
+        one, tiny = 0x3FF0000000000000, 0x0000000000000001
+        cases = [
+            (one, -1074, False, tiny),                                  # the smallest subnormal
+            (one, -1075, False, 0),                                     # half of it: a tie, rounded to even (zero)
+            (0x3FF8000000000000, -1075, False, tiny),                   # 0.75 ulp rounds up
+            (0xBFF8000000000000, -1076, False, 0x8000000000000000),     # -0.375 ulp: -0
+            (0x3FFC000000000000, -1073, False, 0x0000000000000004),     # 3.5 ulp: a tie, to even (4)
+            (0x3FEFFFFFFFFFFFFF, -1022, False, 0x0010000000000000),     # rounding carries into the smallest normal
+            (0x3FEFFFFFFFFFFFFF, -1023, False, 0x0008000000000000),     # (2^53 - 1) / 2^54 ulp of 2^-1022: 2^51 ulp
+            (0x7FEFFFFFFFFFFFFF, 1, False, fd.EXP),                     # overflow
+            (0xFFEFFFFFFFFFFFFF, 1, False, 0xFFF0000000000000),
+            (0x000FFFFFFFFFFFFF, 1, False, 0x001FFFFFFFFFFFFE),         # the largest subnormal doubled: a normal
+            (tiny, 1074, False, one),                                   # a subnormal S0 is normalized first
+            (tiny, 2 ** 31 - 1, False, fd.EXP),                         # S1 is a signed 32-bit word, saturated
+            (0x7FEFFFFFFFFFFFFF, -2 ** 31, False, 0),
+            (0x8000000000000000, 100, False, 0x8000000000000000),       # zeros, infinities and NaNs pass through
+            (0xFFF0000000000000, -100, False, 0xFFF0000000000000),
+            (0x7FF0000000000001, 3, False, 0x7FF0000000000001),         # a signalling NaN too (IEEE=0)
+            (0x7FF0000000000001, 3, True, 0),                           # clamp: NaN, -0 and negatives give +0
+            (0x8000000000000000, 0, True, 0),
+            (0xBFF0000000000000, -2000, True, 0),
+            (one, 1, True, one),                                        # and anything above 1.0 gives 1.0
+            (fd.EXP, 0, True, one),
+            (0x3FE0000000000000, 0, True, 0x3FE0000000000000),
+        ]
+        for x, n, clamp, want in cases:
+            with self.subTest(x=hex(x), n=n, clamp=clamp):
+                self.assertEqual(fd.ldexp_bits(x, n, clamp), want)
+        # Through the program reference: S0 modifiers on the pair, S1 as a register word or an inline integer.
+        self.assertEqual(fd.ref_program(["v_mov_b32 v12, 0", "v_mov_b32 v13, 0x3ff00000", "v_mov_b32 v16, 0xfffffffe",
+                                         "v_ldexp_f64 v[8:9], -|v[12:13]|, v16"]), [0, 0xBFD00000, 0, 0])
+        self.assertEqual(fd.ref_program(["v_ldexp_f64 v[8:9], 1.0, -2 clamp"]), [0, 0x3FD00000, 0, 0])
+        self.assertEqual(fd.ref_program(["v_ldexp_f64 v[8:9], 0x40000000, 3"]), [0, 0x40300000, 0, 0])   # 2.0 * 8
+        # MODE.FP_ROUND toward zero (mode 3): no rounding up, and an overflow gives the largest finite value.
+        for x, n, clamp, rtz, rne in [(0x7FEFFFFFFFFFFFFF, 1, False, 0x7FEFFFFFFFFFFFFF, fd.EXP),
+                                      (0xFFEFFFFFFFFFFFFF, 1, False, 0xFFEFFFFFFFFFFFFF, 0xFFF0000000000000),
+                                      (0x3FF0000000000003, -1023, False, 0x0008000000000001, 0x0008000000000002),
+                                      (0x3FEFFFFFFFFFFFFF, -1022, False, 0x000FFFFFFFFFFFFF, 0x0010000000000000),
+                                      (0x3FF8000000000000, -1075, False, 0, tiny),
+                                      (0xBFF8000000000000, -1075, False, 0x8000000000000000, 0x8000000000000001),
+                                      (0x7FEFFFFFFFFFFFFF, 1, True, one, one),                  # clamp after rounding
+                                      (0x3FF0000000000001, 5, False, 0x4040000000000001, 0x4040000000000001)]:   # exact
+            with self.subTest(x=hex(x), n=n, clamp=clamp, mode=3):
+                self.assertEqual(fd.ldexp_bits(x, n, clamp, mode=3), rtz)
+                self.assertEqual(fd.ldexp_bits(x, n, clamp), rne)
+        rtz_program = ["s_round_mode 12", "v_mov_b32 v12, 3", "v_mov_b32 v13, 0x3ff00000", "v_mov_b32 v16, 0xfffffc01",
+                       "v_ldexp_f64 v[8:9], v[12:13], v16"]
+        self.assertEqual(fd.ref_program(rtz_program, include_known=True), [1, 0x00080000, 0, 0])
+        self.assertEqual(fd.ref_program(rtz_program[:1] + ["s_round_mode 0"] + rtz_program[1:]), [2, 0x00080000, 0, 0])
+        with self.assertRaisesRegex(fd.SkipCase, "KNOWN_DIVERGENCE ldexp-f64-mode"):   # main rounds it to nearest
+            fd.ref_program(rtz_program)
+        self.assertEqual(fd.ref_program(rtz_program[:-1] + ["v_ldexp_f64 v[8:9], v[12:13], 2"]),
+                         [3, 0x40100000, 0, 0])                                             # exact: judged in both modes
+
+    def test_cvt_from_int_table(self):
+        for op, word, want in [("v_cvt_f64_u32", 0xFFFFFFFF, 4294967295.0), ("v_cvt_f64_u32", 0x80000001, 2147483649.0),
+                               ("v_cvt_f64_i32", 0x80000001, -2147483647.0), ("v_cvt_f64_i32", 0x80000000, -2147483648.0),
+                               ("v_cvt_f64_i32", 0xFFFFFFFF, -1.0), ("v_cvt_f64_u32", 0, 0.0)]:
+            with self.subTest(op=op, word=hex(word)):
+                lo, hi = fd.bits_to_words(fd.from_float(want))
+                self.assertEqual(fd.ref_program([f"v_mov_b32 v16, 0x{word:08x}", f"{op} v[8:9], v16"]), [lo, hi, 0, 0])
+        self.assertEqual(fd.ref_program(["v_cvt_f64_i32 v[8:9], -16"]), [0, 0xC0300000, 0, 0])
+        self.assertEqual(fd.ref_program(["v_cvt_f64_i32 v[8:9], -16 clamp"]), [0, 0, 0, 0])
+
+    def test_new_forms_match_the_translator(self):
+        # The cvt forms run on tests/spirv_interp.py (a %double result): a 32-bit integer converts exactly there now.
+        ops = ["v_ldexp_f64", "v_cvt_f64_i32", "v_cvt_f64_u32"]
+        counts, skips, failures = fd.run_batch(ops, 150, 7, max_ops=3, all_failures=True)
+        self.assertEqual(failures, [])
+        self.assertEqual(counts["mismatch"], 0)
+        self.assertGreater(counts["match"], 120, dict(skips))
+        self.assertEqual({reason.split(":")[0] for reason in skips} - {"KNOWN_DIVERGENCE ldexp-f64-mode"}, set())
+        with tempfile.TemporaryDirectory() as tmp:
+            for lines in (["v_mov_b32 v16, 0xffffffff", "v_cvt_f64_u32 v[8:9], v16"],
+                          ["s_mov_b32 s4, 0x80000001", "v_cvt_f64_i32 v[8:9], s4"],
+                          ["v_mov_b32 v12, 0xffffffff", "v_mov_b32 v13, 0x3fefffff", "v_mov_b32 v16, 0xfffffc02",
+                           "v_ldexp_f64 v[8:9], v[12:13], v16"],          # rounding carries into the high word: 2^-1022
+                          ["v_mov_b32 v12, 0", "v_mov_b32 v13, 0x3ff00000", "v_mov_b32 v16, 0xfffffbcd",
+                           "v_ldexp_f64 v[8:9], v[12:13], v16"],          # 2^-1075: half the smallest subnormal, ties to +0
+                          ["v_mov_b32 v12, 1", "v_mov_b32 v13, 0", "v_mov_b32 v16, 1074",
+                           "v_ldexp_f64 v[8:9], v[12:13], v16"],          # S1 past 1000: 2^-1074 * 2^1074 = 1.0
+                          ["v_mov_b32 v12, 0xffffffff", "v_mov_b32 v13, 0x3fffffff", "v_mov_b32 v16, 0xfffffbcc",
+                           "v_ldexp_f64 v[8:9], v[12:13], v16"],          # just under 2^-1075 (a shift of 54): +0
+                          ["v_mov_b32 v12, 0", "v_mov_b32 v13, 0", "v_ldexp_f64 v[8:9], -v[12:13], 3 clamp"],   # -0 clamps to +0
+                          ["v_mov_b32 v16, 2", "v_cvt_f64_u32 v[8:9], v16 clamp"],          # an integer is never NaN or -0
+                          ["v_mov_b32 v16, 0xfffffffe", "v_cvt_f64_i32 v[8:9], v16 clamp"],
+                          ["v_mov_b32 v12, 0xffffffff", "v_mov_b32 v13, 0x800fffff", "v_mov_b32 v16, 1",
+                           "v_ldexp_f64 v[8:9], -v[12:13], v16 clamp"]):
+                with self.subTest(op=lines[-1]):
+                    self.assertEqual(fd.run_one(lines, "ps_f64_new", tmp)[0], "match")   # the clamp of these forms is judged
+
+    def test_ldexp_exponents_reach_both_edges(self):
+        rng, hits = random.Random(3), set()
+        for _ in range(400):
+            setup, body, vg, sg = fd.make_case(rng, "v_ldexp_f64")
+            want = fd.ref_program(setup + body, include_known=True)     # the full reference, MODE writes included
+            bits = fd.words_to_bits(want[0], want[1])
+            hits.add("subnormal" if fd.is_subnormal(bits) else "inf" if fd.is_inf(bits) else "zero" if fd.is_zero(bits) else
+                     "nan" if fd.is_nan(bits) else "normal")
+        self.assertEqual(hits, {"subnormal", "inf", "zero", "nan", "normal"})
 
     def test_frexp_table(self):
         half = 0x3FE0000000000000
@@ -277,8 +501,8 @@ class F64DiffTests(unittest.TestCase):
         """Answers each raw kernel with the reference's own result, as a hardware stand-in; flip corrupts v_trunc_f64."""
         device = "fake gfx1036"
 
-        def __init__(self, flip=False, reason=None):
-            self.flip, self.reason, self.calls, self.closed = flip, reason, [], False
+        def __init__(self, flip=False, reason=None, lane_mask=fd.HW_LANE_MASK):
+            self.flip, self.reason, self.lane_mask, self.calls, self.closed = flip, reason, lane_mask, [], False
 
         def run(self, kernels):
             self.calls.append(list(kernels))
@@ -288,7 +512,7 @@ class F64DiffTests(unittest.TestCase):
                     out.append(self.reason)
                     continue
                 try:
-                    words = fd.ref_program(kernel.lines[:-3], True)   # drop the store epilogue
+                    words = fd.ref_program(kernel.lines[:-3], True, None, self.lane_mask)   # drop the store epilogue
                 except (fd.SkipCase, ArithmeticError, IndexError, KeyError, ValueError):
                     out.append("assembler rejected: fake")
                     continue
@@ -324,6 +548,50 @@ class F64DiffTests(unittest.TestCase):
         self.assertGreater(len(fake.calls[0]), 40)           # sweep + programs
         matches = int(out.split("hw: ")[1].split(" match")[0])
         self.assertGreater(matches, 60)
+
+    def test_literal_width_follows_how_main_reads_each_form(self):
+        # main's translator reads a printed 32-bit literal of these forms as the upper half of the f64 operand (the ISA rule);
+        # a full-width text literal there is read as its low 32 bits (CPU seeds 1-3 then mismatch on v_frexp_*, v_rsq, v_sqrt).
+        def literals(op, count=300):
+            found = []
+            for seed in range(count):
+                setup, body, _, _ = fd.make_case(random.Random(seed), op)
+                found += [t for line in body for t in line.replace(",", " ").split() if t.startswith("0x")]
+            return found
+        for op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_add_f64", "v_trunc_f64",
+                   "v_ldexp_f64"):
+            with self.subTest(op=op):
+                found = literals(op)
+                self.assertTrue(found)
+                self.assertTrue(all(len(t) <= 10 for t in found), [t for t in found if len(t) > 10][:3])
+        self.assertTrue(any(len(t) == 18 for t in literals("v_div_fixup_f64")))        # still full-width here
+        self.assertTrue(any(len(t) == 18 for t in literals("v_div_fmas_f64")))
+
+    def test_hw_oracle_models_the_single_lane_exec_mask_of_v_cmpx(self):
+        # Reported on gfx1036 at 7bd5f01d: "word 1: expected 00000001 ffffffff, actual 00000001 00000001". The hardware kernel
+        # runs one thread of a wave32, so a v_cmpx result read back through exec_lo is 1 (hit) or 0, never 0xffffffff.
+        lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff00000", "v_mov_b32 v14, 0x00000000",
+                 "v_mov_b32 v15, 0x3ff00000", "s_mov_b32 s10, exec_lo", "v_cmpx_eq_f64_e64 v[12:13], v[14:15]",
+                 "s_mov_b32 s22, exec_lo", "s_mov_b32 exec_lo, s10", "v_mov_b32 v9, s22"]
+        self.assertEqual(fd.ref_program(lines, True)[1], 0xFFFFFFFF)                 # the translator-side model: all 32 lanes
+        self.assertEqual(fd.ref_program(lines, True, None, fd.HW_LANE_MASK)[1], 1)   # one lane
+        with tempfile.TemporaryDirectory() as tmp:
+            one_lane = self.FakeHW()
+            status = fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", one_lane)
+            self.assertEqual(status[0], "match", status)
+            self.assertEqual(status[2][1], 1)                                        # the reference expects the one-lane mask
+            full_wave = self.FakeHW(lane_mask=0xFFFFFFFF)                            # the old assumption is now a mismatch
+            self.assertEqual(fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", full_wave)[0], "mismatch")
+            self.assertEqual(fd.run_one(lines, "ps_f64_hw_exec", tmp)[0], "match")     # the translator oracle still sees 0xffffffff
+
+    def test_hw_oracle_campaign_with_v_cmpx_forms_matches_a_one_lane_machine(self):
+        fake = self.FakeHW()
+        code, out, _, _ = self.run_main(fake, "--ops", "v_cmpx_lt_f64,v_cmpx_eq_f64,v_cmpx_class_f64", "--programs", "60", "--seed", "3")
+        self.assertEqual(code, 0, out)
+        self.assertIn(" 0 mismatch", out)
+        wrong = self.FakeHW(lane_mask=0xFFFFFFFF)
+        code, out, _, _ = self.run_main(wrong, "--ops", "v_cmpx_lt_f64,v_cmpx_eq_f64,v_cmpx_class_f64", "--programs", "10", "--seed", "3")
+        self.assertEqual(code, 1, out)
 
     def test_hw_oracle_with_known_runs_known_cases_against_the_reference(self):
         fake = self.FakeHW()

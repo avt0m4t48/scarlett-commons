@@ -30,8 +30,9 @@ it stops, is not seen. The counts are a lower bound. A stray `E8` or `FF 15` byt
 could add a site, which is rare. Output is import names, counts, conditions and RVAs only, no instruction bytes.
 
 `--json` prints every import the image names (or every one `--import`/`--dll` selects), including those with no
-call site (`"calls": 0`), with `"fatal"` empty when none of its sites is fatal. The table's "N import(s) called" counts
-only the entries with `calls > 0`, so on the same image the JSON has more entries than that line says.
+call site (`"calls": 0`), with `"fatal"` empty when none of its sites is fatal. The table's last line,
+"N of M import(s) called directly", gives both numbers: M imports named (or selected), N of them with at least one
+direct call site. The rest are reached only through a stored pointer or a tail jump, or not at all.
 """
 import argparse
 import json
@@ -281,7 +282,8 @@ def main(argv=None):
     called = sum(1 for e in imports.values() if e["calls"])
     with_fatal = sum(1 for e in imports.values() if e["fatal"])
     sites = sum(len(e["fatal"]) for e in imports.values())
-    print(f"{called} import(s) called, {with_fatal} with a fatal result check, {sites} fatal site(s)")
+    print(f"{called} of {len(imports)} import(s) called directly, {with_fatal} with a fatal result check, "
+          f"{sites} fatal site(s)")
     return 0
 
 

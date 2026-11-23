@@ -148,7 +148,7 @@ class ImportFailFastTest(unittest.TestCase):
         self.assertTrue(lines[1].startswith(FOO))
         self.assertIn("eax == 0 (3)", lines[1])
         fatal = sum(1 for c in CASES if c[3])
-        self.assertEqual(lines[-1], f"3 import(s) called, 3 with a fatal result check, {fatal} fatal site(s)")
+        self.assertEqual(lines[-1], f"3 of 3 import(s) called directly, 3 with a fatal result check, {fatal} fatal site(s)")
 
     def test_cli_json_has_hex_rvas_and_import_selects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,7 +172,7 @@ class ImportFailFastTest(unittest.TestCase):
             _, plain, _ = run_cli(path)
             _, every, _ = run_cli(path, "--all")
         self.assertEqual(len(plain.splitlines()), 2)
-        self.assertEqual(plain.splitlines()[-1], "1 import(s) called, 0 with a fatal result check, 0 fatal site(s)")
+        self.assertEqual(plain.splitlines()[-1], "1 of 3 import(s) called directly, 0 with a fatal result check, 0 fatal site(s)")
         self.assertEqual(len(every.splitlines()), 5)
 
     def test_cli_exits_2_for_a_missing_or_non_pe_file(self):

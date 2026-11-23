@@ -3,7 +3,8 @@
 //     50, 75) are refused without reaching the device, the others get the real objects behind the proxies;
 //   - fences with and without ID3D12Fence1: 11 or 12 public slots, QueryInterface and slot 11 to match;
 //   - fence slot 12: the address of a completed value that follows the real fence, from a CPU Signal through the
-//     proxy and from a signal the proxy never sees, up to device removal, with the descriptor's code pointer unused;
+//     proxy and from a signal the proxy never sees, up to device removal, with the descriptor's code pointer unused, and
+//     the completion event left open when another reference keeps the real fence alive past the proxy;
 //   - creation that fails, that returns S_OK with no object, a null IID or output, and an interface the real object
 //     has but the proxy does not model;
 //   - OpenSharedHandle of a fence (as ID3D12Fence, IUnknown, Fence1), of a non-fence object, of an invalid handle,
@@ -575,6 +576,25 @@ int check_fence_completed_value() {
         Mock* const quiet_mock = mock->last_child;
         EXPECT(quiet && hr_of(raw(quiet, 10, 3)) == S_OK && raw(quiet, 8) == 3 && quiet_mock->calls[9] == 0);
         EXPECT(release(quiet) == 0 && quiet_mock->refs == 0);
+
+        // Another reference keeps the real fence alive past the proxy. Its pending completion still names the
+        // mirror's event and cannot be cancelled, so the event stays open and a later signal sets it.
+        void* shared = make_fence(device);
+        Mock* const shared_mock = mock->last_child;
+        EXPECT(shared && raw(shared, 12, 0, 0, 0) != 0);
+        const ULONGLONG armed_by = GetTickCount64() + 1000;
+        while (!fence_armed_for(shared_mock, kCompletedValue + 1) && GetTickCount64() < armed_by) Sleep(1);
+        EXPECT(fence_armed_for(shared_mock, kCompletedValue + 1));
+        ++shared_mock->refs;  // the other holder
+        EXPECT(release(shared) == 0 && shared_mock->refs == 1);
+        AcquireSRWLockExclusive(&shared_mock->lock);
+        const HANDLE pending = shared_mock->armed_event;
+        ReleaseSRWLockExclusive(&shared_mock->lock);
+        DWORD handle_flags = 0;
+        EXPECT(pending && GetHandleInformation(pending, &handle_flags));
+        fence_signal(shared_mock, kCompletedValue + 1);
+        EXPECT(WaitForSingleObject(pending, 0) == WAIT_OBJECT_0);
+        --shared_mock->refs;
 
         // Out of memory for the mirror: slot 12 returns null, and the next call works.
         void* starved = make_fence(device);

@@ -318,14 +318,21 @@ int main() {
             DWORD status;
             DWORD_PTR context;
         };
+        // The contexts are arbitrary and distinct. kNoContext is what the helpers return when there is no value.
+        constexpr DWORD_PTR kSessionContext = 7;
+        constexpr DWORD_PTR kRequestContext = 9;
+        constexpr DWORD_PTR kLaterSessionContext = 11;
+        constexpr DWORD_PTR kSendContext = 0x51;
+        constexpr DWORD_PTR kNoContext = ~DWORD_PTR{0};
         static std::vector<Event> events;  // a synchronous session: every callback runs on this thread
+        events.clear();
         const WINHTTP_STATUS_CALLBACK record = [](HINTERNET handle, DWORD_PTR context, DWORD status, LPVOID, DWORD) {
             events.push_back({handle, status, context});
         };
         const auto context_of = [&](HINTERNET handle) -> DWORD_PTR {
-            DWORD_PTR value = ~DWORD_PTR{0};
+            DWORD_PTR value = kNoContext;
             DWORD size = sizeof(value);
-            return query_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, &size) ? value : ~DWORD_PTR{0};
+            return query_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, &size) ? value : kNoContext;
         };
         const auto set_context = [&](HINTERNET handle, DWORD_PTR value) {
             return set_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value)) != FALSE;
@@ -333,43 +340,47 @@ int main() {
         const auto context_at = [&](HINTERNET handle, DWORD status) -> DWORD_PTR {
             for (const Event& e : events)
                 if (e.handle == handle && e.status == status) return e.context;
-            return ~DWORD_PTR{0};
+            return kNoContext;
         };
 
         const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
         set_callback(session, record, WINHTTP_CALLBACK_FLAG_HANDLES, 0);
-        check(set_context(session, 7), "WINHTTP_OPTION_CONTEXT_VALUE can be set on a session");
+        check(set_context(session, kSessionContext), "WINHTTP_OPTION_CONTEXT_VALUE can be set on a session");
         const HINTERNET connection = connect(session, L"127.0.0.1", 1, 0);
         const HINTERNET request = open_request(connection, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
                                                WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-        check(context_of(connection) == 7 && context_of(request) == 7,
+        check(context_of(connection) == kSessionContext && context_of(request) == kSessionContext,
               "a connection and a request start with the session's context");
-        check(context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == 7 &&
-                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == 7,
+        check(context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == kSessionContext &&
+                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == kSessionContext,
               "and their HANDLE_CREATED callbacks carry it");
 
-        check(set_context(request, 9) && context_of(request) == 9 && context_of(connection) == 7,
+        check(set_context(request, kRequestContext) && context_of(request) == kRequestContext &&
+                  context_of(connection) == kSessionContext,
               "a context set on the request replaces the inherited one for that request only");
-        check(set_context(session, 11) && context_of(connection) == 7 && context_of(request) == 9,
+        check(set_context(session, kLaterSessionContext) && context_of(connection) == kSessionContext &&
+                  context_of(request) == kRequestContext,
               "a context set on the session later does not change handles that exist");
         const HINTERNET late = connect(session, L"127.0.0.1", 1, 0);
-        check(context_of(late) == 11, "a connection made after that starts with the new one");
+        check(context_of(late) == kLaterSessionContext, "a connection made after that starts with the new one");
 
         const HINTERNET sent = open_request(connection, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
                                             WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-        check(context_of(sent) == 7, "a request starts with its connection's context, not the session's");
-        send(sent, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0x51);
-        check(context_of(sent) == 0x51, "the context WinHttpSendRequest is given replaces the inherited one");
+        check(context_of(sent) == kSessionContext,
+              "a request starts with its connection's context, not the session's");
+        send(sent, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, kSendContext);
+        check(context_of(sent) == kSendContext,
+              "the context WinHttpSendRequest is given replaces the inherited one");
 
         close(sent);
         close(request);
         close(late);
         close(connection);
         close(session);
-        check(context_at(sent, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 0x51 &&
-                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 9 &&
-                  context_at(late, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 11 &&
-                  context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 7,
+        check(context_at(sent, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == kSendContext &&
+                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == kRequestContext &&
+                  context_at(late, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == kLaterSessionContext &&
+                  context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == kSessionContext,
               "HANDLE_CLOSING carries each handle's own context");
     }
 

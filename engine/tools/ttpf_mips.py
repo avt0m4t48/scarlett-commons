@@ -933,11 +933,14 @@ class Pool:
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
-                    cache[key] = bytes(raw)
+                    decoded = bytes(raw)
                 elif codec == 8:
-                    cache[key] = zlib.decompress(raw)
+                    inflater = zlib.decompressobj()
+                    decoded = inflater.decompress(raw, csize + 1)
+                    if len(decoded) > csize or not inflater.eof:
+                        raise ValueError("zlib chunk is truncated or exceeds its declared size")
                 elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
-                    cache[key] = bcpack.decode(
+                    decoded = bcpack.decode(
                         raw, codec, csize,
                         allow_provisional=(bcpack_mode == "provisional"),
                         history=bcpack_history,
@@ -946,8 +949,9 @@ class Pool:
                     raise BcpackRequired(
                         f"range touches a BCPack chunk (codec {codec})"
                     )
-                if len(cache[key]) != csize:
+                if len(decoded) != csize:
                     raise ValueError("decoded chunk length disagrees with its range")
+                cache[key] = decoded
             lo, hi = max(start, virt), min(start + size, virt + csize)
             out[lo - start:hi - start] = cache[key][lo - virt:hi - virt]
         return bytes(out)

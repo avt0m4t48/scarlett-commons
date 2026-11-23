@@ -507,6 +507,21 @@ int main() {
         CHECK(by64.size() == 1 && by64[0]->name == "fspx/pair_64" && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(wrapped(state16)), &ambiguous).empty() && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        // Slot 67 with all four pairs (RT-99): the payload the proxy builds carries kind 0, so each program finds
+        // its own translation, where the bare kind-6 program above is ambiguous.
+        {
+            const std::vector<std::uint8_t> kind1(20, 0x22), kind7(24, 0x77);
+            for (const auto* state : {&state32, &state64}) {
+                const FspxPart parts[] = {{0, state->data(), state->size()}, {1, kind1.data(), kind1.size()},
+                                          {6, code.data(), code.size()}, {7, kind7.data(), kind7.size()}};
+                const auto built = fspx_payload_from_parts(parts);
+                const ComputeProgram program = compute_program(built);
+                CHECK(program.kind == ComputeProgram::Kind::fspx && program.bytes == code && program.state == *state);
+                const auto found = pair.program_candidates("cs", program, &ambiguous);
+                CHECK(found.size() == 1 && !ambiguous &&
+                      found[0]->name == (state == &state32 ? "fspx/pair_32" : "fspx/pair_64"));
+            }
+        }
         // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
         write("pair_64", module(1));
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
@@ -516,6 +531,35 @@ int main() {
         const auto bare = pair.program_candidates("cs", compute_program(code), &ambiguous);
         CHECK(bare.size() == 1 && bare[0]->name == "fspx/pair_32" && !ambiguous);
         std::filesystem::remove_all(dir);
+    }
+
+    // fspx_payload_from_parts: the slot-67 pairs as one payload, and every inconsistent pair refused before a read.
+    {
+        const auto code = fspx_code(0x5000);
+        const std::vector<std::uint8_t> state(28, 0x11), kind1(20, 0x22), kind7(24, 0x77);
+        const auto build = [&](std::initializer_list<FspxPart> parts) {
+            return fspx_payload_from_parts(std::span<const FspxPart>(parts.begin(), parts.size()));
+        };
+        const auto full = build({{0, state.data(), 28}, {1, kind1.data(), 20}, {6, code.data(), code.size()},
+                                 {7, kind7.data(), 24}});
+        CHECK(!full.empty() && full.size() % 16 == 0);
+        const FspxParts parsed = fspx_parts(full);
+        CHECK(std::vector<std::uint8_t>(parsed.code.begin(), parsed.code.end()) == code);
+        CHECK(std::vector<std::uint8_t>(parsed.state.begin(), parsed.state.end()) == state);
+        // Kinds 1 and 7 are optional (null pointer and zero size), as in the DLL's reader.
+        CHECK(compute_program(build({{0, state.data(), 28}, {1, nullptr, 0}, {6, code.data(), code.size()},
+                                     {7, nullptr, 0}})).state == state);
+        // A wild pointer with a size that is refused is never read; neither is anything after a refused pair.
+        const void* wild = reinterpret_cast<const void*>(std::uintptr_t(0x10));
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {7, wild, kFspxPartLimit + 1}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, nullptr, code.size()}}).empty());          // size without pointer
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), 0}}).empty());                // pointer without size
+        CHECK(build({{0, state.data(), 28}, {1, wild, 0}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, nullptr, 0}, {6, code.data(), code.size()}}).empty());           // no kind 0
+        CHECK(build({{0, state.data(), 28}, {7, kind7.data(), 24}}).empty());              // no kind 6
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {5, kind7.data(), 24}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");

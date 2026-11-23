@@ -2718,10 +2718,22 @@ HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const le
     }
 }
 
+// The console's ID3D12PipelineState goes past the public interface, which ends at slot 8 (GetCachedBlob). The
+// FidelityFX DLL calls slot 11 on every compute pipeline it creates (docs/d3d12_command_objects.md, "Pipeline slot 11
+// sizes the compute scratch"). These three are declared here, ahead of Object's virtual destructor, so they are vtable
+// slots 9, 10 and 11 under MSVC and GCC alike; declared in PipelineState itself they would come after the destructor,
+// which takes one slot under MSVC and two under GCC. d3d12_fspx_compute_test calls slot 11 through the vtable.
+class XboxPipelineStateStubs : public ID3D12PipelineStateStubs {
+public:
+    virtual HRESULT STDMETHODCALLTYPE xbox_slot9(UINT64, UINT64, UINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE xbox_slot10(UINT64, UINT64, UINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE xbox_slot11(UINT64, UINT64, void** out) = 0;
+};
+
 // A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
 // translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 class PipelineState final
-    : public Child<PipelineState, ID3D12PipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+    : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
 public:
     // {8d2f6c14-b0e7-4a93-9c58-1f4a7e3b6d20}
@@ -2774,6 +2786,30 @@ public:
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
         if (!blob) return S_OK;
         *blob = new CachedBlob(leonida::cached_pso::encode(device_.pso_identity, cache_key_));
+        return S_OK;
+    }
+
+    // Slots 9 and 10: console methods no caller is known to use; refused, and named once in the log.
+    HRESULT STDMETHODCALLTYPE xbox_slot9(UINT64, UINT64, UINT64) override {
+        log_once("console pipeline slot called (not implemented); slot", 9);
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE xbox_slot10(UINT64, UINT64, UINT64) override {
+        log_once("console pipeline slot called (not implemented); slot", 10);
+        return E_NOTIMPL;
+    }
+
+    // Slot 11, called by the FidelityFX DLL as (0, 0, &obj) after it creates a pipeline. It reads one dword through
+    // obj's slot 3 (the shape of ID3DBlob::GetBufferPointer), multiplies it by 1024, releases obj through slot 2, and
+    // creates and binds a compute scratch buffer before a dispatch only when that value is non-zero (measured in the
+    // DLL's code, docs/d3d12_command_objects.md). The answer is a blob holding 0: none of the 1.0.2.1 DLL's 29 programs
+    // enables scratch (COMPUTE_PGM_RSRC2.SCRATCH_EN clear in all 29) or has a scratch instruction (measured), and a
+    // translated module keeps its private data in SPIR-V, not in a console scratch buffer. With 0 the DLL creates no
+    // scratch buffer and skips list slot 141. The arguments are logged once when they are not the measured zeros.
+    HRESULT STDMETHODCALLTYPE xbox_slot11(UINT64 a, UINT64 b, void** out) override {
+        if (a || b) log_once("console pipeline slot 11 with unexpected arguments; first", int(a ? a : b));
+        if (!out) return E_POINTER;
+        *out = static_cast<ID3DBlob*>(new CachedBlob(std::vector<std::uint8_t>(4, 0)));
         return S_OK;
     }
 

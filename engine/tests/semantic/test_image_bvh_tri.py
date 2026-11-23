@@ -11,6 +11,9 @@ and TRI3 (2,4,0). Byte `type` of the word at +60 holds two selectors: bits [1:0]
 the second, where 0/1/2 name the triangle's vertex 0/1/2. The weights below are written by hand and checked against
 a plain-Python solve of the 2x2 system.
 
+The descriptor dword0 is 0x10: the base in 256-byte units (0x1000). The GPU measured this nonzero base against the
+CPU walker on the real-BVH first call, so this case also pins the `<< 8`, not a masked byte address.
+
     python -m unittest tests/semantic/test_image_bvh_tri.py -v
 """
 import struct

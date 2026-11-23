@@ -149,6 +149,16 @@ class IidScan(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("ERROR", p.stderr)
 
+    def test_cli_json_over_a_missing_directory_fails_cleanly(self):
+        dll = self.image("i.dll", b"MZ")
+        target = os.path.join(self.tmp.name, "missing_dir", "out.json")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", target], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("ERROR: cannot write", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(target))
+
     def test_cli_json_over_an_input_image_is_refused(self):
         dll = self.image("f.dll", pe32plus({}, QUEUE.bytes_le))
         with open(dll, "rb") as f:

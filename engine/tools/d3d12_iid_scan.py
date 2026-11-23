@@ -171,9 +171,13 @@ def main(argv: list[str] | None = None) -> int:
                 print("  WARNING: these d3d12_xs.dll imports may be IID data, so an absent IID proves nothing for "
                       "this image: " + ", ".join(r["possible_iid_imports"]))
     if args.json:
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"header": os.path.basename(header), "iids": len(iids), "images": results}, f, indent=2)
-            f.write("\n")
+        try:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"header": os.path.basename(header), "iids": len(iids), "images": results}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

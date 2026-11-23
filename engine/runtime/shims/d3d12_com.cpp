@@ -783,6 +783,7 @@ public:
         if (cmd.is_tlas) {
             cmd.instances_va = in.InstanceDescs;
             cmd.instance_count = in.NumDescs;
+            cmd.instance_pointers = in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
         } else {
             for (UINT i = 0; i < in.NumDescs; ++i) {
                 const D3D12_RAYTRACING_GEOMETRY_DESC* gd =

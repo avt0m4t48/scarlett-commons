@@ -74,6 +74,7 @@ struct ResourceBinding {
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
+    const std::uint8_t* host = nullptr;  // mapped CPU-written bytes (UPLOAD/write-back), for small CPU-side reads
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
@@ -772,6 +773,23 @@ struct ShaderUserData {
 };
 static_assert(sizeof(ShaderUserData) == 144);
 
+// A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
+// capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
+enum class HostReadStatus { ok, absent, not_cpu_written };
+
+enum class ReplayResult {
+    success,
+    list_open,
+    unresolved_resource,
+    invalid_subresource,
+    invalid_clear,
+    invalid_copy,
+    invalid_predication,
+    invalid_query,
+    invalid_indirect_arguments,
+    unsupported
+};
+
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -830,6 +848,9 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Host bytes for a whole console VA range; `not_cpu_written` when it names GPU-writable memory. For small
+    // CPU-written inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
+    std::function<HostReadStatus(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
     // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
@@ -863,6 +884,10 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
+    // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
+    // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
+    // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
+    std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
@@ -901,19 +926,6 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
-};
-
-enum class ReplayResult {
-    success,
-    list_open,
-    unresolved_resource,
-    invalid_subresource,
-    invalid_clear,
-    invalid_copy,
-    invalid_predication,
-    invalid_query,
-    invalid_indirect_arguments,
-    unsupported
 };
 
 namespace detail {
@@ -993,6 +1005,7 @@ struct Prepared {
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
@@ -2929,6 +2942,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.pipeline = *pipeline;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
+            p.khr_instances = 0;
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
             } else {
@@ -2939,6 +2953,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (build->update && build->src_va) {
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
+                }
+                if (build->is_tlas && build->instance_pointers && build->instance_count) {
+                    if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
+                    return vk.prepare_khr_instances(*build, p.khr_instances);
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
@@ -3827,8 +3845,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
                 g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-                g.geometry.instances.arrayOfPointers = VK_FALSE;
-                g.geometry.instances.data.deviceAddress = addr(build->instances_va);
+                g.geometry.instances.arrayOfPointers = p.khr_instances ? VK_TRUE : VK_FALSE;
+                g.geometry.instances.data.deviceAddress =
+                    p.khr_instances ? p.khr_instances : addr(build->instances_va);
                 geoms.push_back(g);
                 ranges.push_back({build->instance_count, 0, 0, 0});
             } else {

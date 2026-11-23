@@ -1673,6 +1673,8 @@ public:
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
             binding.buffer_offset = arena_offset_;
+            // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
+            // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
             // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
             // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
@@ -1761,6 +1763,7 @@ public:
         }
         binding.buffer = buffer_;
         binding.size = desc_.Width;
+        binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(mapped_) : nullptr;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -1866,6 +1869,7 @@ public:
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
         binding.va = va_;
+        binding.host = cpu_writable() ? device_.arena.mapped + va_ : nullptr;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -2272,6 +2276,15 @@ private:
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD || heap_.Type == D3D12_HEAP_TYPE_READBACK) return true;
         return heap_.Type == D3D12_HEAP_TYPE_CUSTOM && heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
                heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    }
+
+    // Only these heaps hold bytes the CPU writes. READBACK is CPU-visible but GPU-written, and DEFAULT arena memory
+    // is also GPU-written; both can hold stale bytes at replay time, so host_at() must not read them as inputs.
+    bool cpu_writable() const {
+        if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD) return true;
+        return heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+               (heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK ||
+                heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE);
     }
 
     DeviceState& device_;
@@ -5221,7 +5234,8 @@ public:
             VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
             g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
             g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-            g.geometry.instances.arrayOfPointers = VK_FALSE;
+            g.geometry.instances.arrayOfPointers =
+                desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? VK_TRUE : VK_FALSE;
             geoms.push_back(g);
             max_prims.push_back(desc->NumDescs);
         } else {

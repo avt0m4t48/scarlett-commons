@@ -14,10 +14,12 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
+--timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
 import json
 import math
+import ntpath
 import os
 import re
 import shlex
@@ -38,7 +40,7 @@ def _make_parent(path: str) -> None:
 
 
 def norm(path: str) -> str:
-    return path.replace("\\", "/").rstrip("/")
+    return ntpath.normpath(path).replace("\\", "/").rstrip("/")
 
 
 def map_path(arg: str, windows_root: str, root: str) -> str | None:
@@ -149,13 +151,23 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
         if not key or not equals or "\0" in assignment:
             return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
         env[key] = value
+    timeout = args.timeout
+    if "TIMEOUT" in props:
+        try:
+            ctest_timeout = float(props["TIMEOUT"])
+        except (TypeError, ValueError):
+            return "fail", "invalid CTest TIMEOUT"
+        if not math.isfinite(ctest_timeout) or ctest_timeout < 0:
+            return "fail", "invalid CTest TIMEOUT"
+        if ctest_timeout > 0:
+            timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=args.timeout)
+                              timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
-        return "fail", f"timed out after {args.timeout} s\n{out}"
+        return "fail", f"timed out after {timeout} s\n{out}"
     except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
         return "fail", f"could not start {argv[0]}: {e.strerror or e}"
     elapsed = time.monotonic() - start
@@ -169,10 +181,13 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
     required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
     forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
+        if any(re.search(pattern, out, re.DOTALL) for pattern in skip_patterns):
+            return "skip", f"matched CTest SKIP_REGULAR_EXPRESSION: {detail}"
         passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
         if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
             passed = False
@@ -207,6 +222,17 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_property(entry) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or "value" not in entry:
+        return False
+    name, value = entry["name"], entry["value"]
+    if name == "WORKING_DIRECTORY":
+        return isinstance(value, str) and "\0" not in value
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+        return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
+    return True
+
+
 def valid_test_row(test) -> bool:
     if not isinstance(test, dict) or not isinstance(test.get("name"), str):
         return False
@@ -215,10 +241,7 @@ def valid_test_row(test) -> bool:
     if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
         return False
     entries = test.get("properties", [])
-    return isinstance(entries, list) and all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
-        for entry in entries
-    )
+    return isinstance(entries, list) and all(valid_test_property(entry) for entry in entries)
 
 
 def read_tests(path: str) -> list[dict] | None:
@@ -244,7 +267,8 @@ def main() -> int:
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
-    ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
+    ap.add_argument("--timeout", type=positive_seconds, default=120.0,
+                    help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()

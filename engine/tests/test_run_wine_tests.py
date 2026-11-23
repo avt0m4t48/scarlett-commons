@@ -50,6 +50,18 @@ class PathMappingTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(rwt.map_path(path, WINDOWS_ROOT, "/repo"))
 
+    def test_parent_segments_cannot_escape_windows_root(self):
+        self.assertIsNone(rwt.map_path("D:/win/root/../outside.exe", WINDOWS_ROOT, "/repo"))
+        self.assertEqual(rwt.map_path("D:/win/root/inside/../runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+
+    def test_dot_and_repeated_separators_normalize_before_mapping(self):
+        self.assertEqual(rwt.map_path("D:/win/root/./runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+        self.assertEqual(rwt.map_path("D:/win/root//sub//runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "sub", "runner.exe"))
+        self.assertIsNone(rwt.map_path("D:/win/root/../../outside.exe", WINDOWS_ROOT, "/repo"))
+
     def test_wine_path_uses_the_z_drive(self):
         self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
 
@@ -212,11 +224,26 @@ class RunTestTest(unittest.TestCase):
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
+    def test_skip_output_overrides_a_normal_exit_status(self):
+        skip_pattern = "SKIP: missing adapter"
+        exe = self.program("skip.py", f"print({skip_pattern!r})\nraise SystemExit(3)\n")
+        for expression in (skip_pattern, ["different reason", skip_pattern]):
+            with self.subTest(expression=expression):
+                entry = ctest_entry("skip", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": expression})
+                status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("SKIP_REGULAR_EXPRESSION", detail)
+
+        entry = ctest_entry("no_match", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": ["different reason"]})
+        status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+        self.assertEqual(status, "fail", detail)
+
     def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
-        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
+        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
+                      {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
             with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
@@ -229,6 +256,24 @@ class RunTestTest(unittest.TestCase):
         status, detail = self.run_entry(ctest_entry("slow", self.command_for(slow)))
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
+
+    def test_a_short_ctest_timeout_still_fails_a_will_fail_test(self):
+        slow = self.program("slow_failure.py", "import sys, time\ntime.sleep(1)\nsys.exit(1)\n")
+        entry = ctest_entry("slow_failure", self.command_for(slow), {"TIMEOUT": 0.2, "WILL_FAIL": True})
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("timed out after 0.2 s", detail)
+
+    def test_ctest_timeout_cannot_remove_or_extend_the_runner_limit(self):
+        exe = self.exiting(0)
+        for timeout in (0, "20"):
+            with self.subTest(timeout=timeout):
+                entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
+                result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
+                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                    status, detail = self.run_entry(entry)
+                self.assertEqual(status, "pass", detail)
+                self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
 
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
@@ -436,6 +481,11 @@ class MainTest(unittest.TestCase):
             {"properties": {"TIMEOUT": 10}},
             {"properties": [{"name": "TIMEOUT"}]},
             {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": 42}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": "D:/win/\0root"}]},
+            {"properties": [{"name": "PASS_REGULAR_EXPRESSION", "value": [42]}]},
+            {"properties": [{"name": "FAIL_REGULAR_EXPRESSION", "value": {"bad": True}}]},
+            {"properties": [{"name": "SKIP_REGULAR_EXPRESSION", "value": None}]},
             {"name": []},
         ):
             with self.subTest(fields=fields):
@@ -454,6 +504,21 @@ class MainTest(unittest.TestCase):
         self.assertIn("[FAIL] unbuilt", out)
         self.assertIn("no command", out)
         self.assertEqual(err, "")
+
+    def test_ctest_property_strings_and_expression_lists_are_valid_inventory(self):
+        properties = {
+            "WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact",
+            "PASS_REGULAR_EXPRESSION": ["good", "also good"],
+            "FAIL_REGULAR_EXPRESSION": "unexpected",
+            "SKIP_REGULAR_EXPRESSION": [],
+            "MEASUREMENTS": {"custom": "value"},
+        }
+        row = ctest_entry("ok", self.command("ok.py"), properties)
+        with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+            code, _, err = self.run_main([row], "--require", "ok")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        launch.assert_called_once()
 
     def test_an_explicit_empty_tests_list_is_accepted(self):
         code, out, _ = self.run_main_json({"tests": []})

@@ -559,6 +559,9 @@ void restore_pso_vtable(PsoName& p) {
     // afterwards; find_pso skips restored entries, so nothing reads the copy past this point.
     delete[] p.vtable_copy;
     p.vtable_copy = nullptr;
+    // Drops the reference hook_pso_names took; the builder still holds its own here, so this cannot free the object.
+    using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(void*);
+    reinterpret_cast<ReleaseFn>(p.original_vtable[2])(p.object);
 }
 
 void restore_all_pso_vtables() {
@@ -631,6 +634,9 @@ void hook_pso_names(uint64_t out_ptr, int number) {
     std::memcpy(copy, orig, kSlots * sizeof(void*));
     copy[4] = reinterpret_cast<void*>(&pso_set_private_data);
     copy[6] = reinterpret_cast<void*>(&pso_set_name);
+    // Hold a reference until the vtable is restored, so the later write-back never lands in freed memory.
+    using AddRefFn = ULONG(STDMETHODCALLTYPE*)(void*);
+    reinterpret_cast<AddRefFn>(orig[1])(object);
     g_pso_names.push_back({number, object, orig, false, copy});
     *static_cast<void***>(object) = copy;
 }

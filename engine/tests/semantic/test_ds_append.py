@@ -1,10 +1,9 @@
 """ds_append / ds_consume (runtime/test/shaders/cs_w32_ds_append.asm, cs_w64_ds_append.asm; docs/design.md).
 
-One LDS add / subtract of the wave's active-lane count at the offset address, done by the first active lane; every
-active lane gets the old value, inactive lanes keep vD. tests/semantic/spirv_mini_interp.py gives every invocation
-its own LDS (run_workgroup does not share Workgroup memory), so these tests check the parts that do not need shared
-LDS: the count, which lane performs the op (only its LDS copy changes), the returned value in every active lane, and
-the inactive lanes. The shared-LDS words are the GPU fixtures' (both GPUs, wave64 native and emulated). Before, both
+One LDS add / subtract of the wave's active-lane count at the offset address, done once for the wave; every active
+lane gets the old value, inactive lanes keep vD. tests/semantic/spirv_mini_interp.py's run_workgroup shares
+Workgroup memory between the invocations, so every lane reads back the one changed word: the op ran once, with the
+active count. The GPU fixtures check the same words on hardware (both GPUs, wave64 native and emulated). Before, both
 raised Unsupported.
 """
 import os
@@ -30,7 +29,7 @@ def header(name):
 
 
 def run(wave, exec_words, op="ds_append", off=0):
-    """LDS word [off] = 100 in every invocation's copy; EXEC = exec_words; `op` v8; every lane stores
+    """LDS word [off] = 100; EXEC = exec_words; `op` v8; every lane stores
     (v8, its LDS word) at 8 * lane. Returns [(v8, lds) per lane]."""
     lines = ["v_mov_b32 v8, 0xdead", "v_mov_b32 v1, 0", "v_mov_b32 v2, 100", f"ds_write_b32 v1, v2 offset:{off}"]
     lines += [f"s_mov_b32 exec_lo, {exec_words[0]:#x}"] + ([f"s_mov_b32 exec_hi, {exec_words[1]:#x}"] if wave == 64 else [])
@@ -47,16 +46,12 @@ def run(wave, exec_words, op="ds_append", off=0):
 
 
 def expect(wave, exec_bits, op):
-    """Plain-Python reference (shared LDS seen from the performing lane): the first active lane's LDS changes by the
-    active count, every active lane returns the old value, inactive lanes keep 0xdead."""
+    """Plain-Python reference (one shared LDS): the word changes once by the active count, so every lane reads the new
+    word back; every active lane returns the old value, inactive lanes keep 0xdead."""
     act = [l for l in range(wave) if exec_bits >> l & 1]
     cnt = len(act)
-    out = []
-    for l in range(wave):
-        ret = 100 if l in act else 0xDEAD
-        lds = (100 + cnt if op == "ds_append" else 100 - cnt) & 0xFFFFFFFF if act and l == act[0] else 100
-        out.append((ret, lds))
-    return out
+    lds = (100 + cnt if op == "ds_append" else 100 - cnt) & 0xFFFFFFFF
+    return [(100 if l in act else 0xDEAD, lds) for l in range(wave)]
 
 
 class DsAppend(unittest.TestCase):

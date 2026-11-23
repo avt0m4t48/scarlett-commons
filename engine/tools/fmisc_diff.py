@@ -33,7 +33,9 @@ Every rule was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows d
 
 Not judged (the program is skipped with the reason, counted): a denormal operand or result (whether f32 denormals
 are flushed is the MODE question, SHADER-35), a NaN whose payload is later read as an integer (payloads are not
-modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both).
+modelled), the clamp of a NaN and an output modifier whose result is a zero (tools/f32_fuzz.py measures both), and
+an output modifier on a signalling-NaN result (the translator's multiply quiets it, which a later v_cmp_class sees;
+whether the hardware does is not measured).
 
 Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the forms where the translator is known to
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
@@ -466,6 +468,8 @@ def fvalue(tok, st):
 
 def out_mods(w, mods):
     om = mods.get("omod")
+    if om and is_nan(w) and not w & 0x400000:
+        raise Uncertain("output modifier on a signalling NaN")
     if om and not (is_nan(w) or is_inf(w)):
         v = to_frac(w) * _OMOD[om]
         if v == 0:

@@ -84,6 +84,10 @@ class Reference(unittest.TestCase):
             one("v_fract_f32_e64 v1, v2 mul:2", v={2: 0x40000000})                         # omod on a zero
         with self.assertRaises(d.Uncertain):
             one("v_fract_f32_e64 v1, v2 clamp", v={2: d.PINF})                             # clamp of a NaN
+        with self.assertRaises(d.Uncertain):                                                # omod on an sNaN
+            one("v_ldexp_f32 v1, v2, v3 mul:2", v={2: SNAN, 3: 0x7FFFFFFF})
+        self.assertEqual(one("v_ldexp_f32 v1, v2, v3", v={2: SNAN, 3: 0x7FFFFFFF}), SNAN)    # no omod: kept
+        self.assertTrue(d.is_nan(one("v_ldexp_f32 v1, v2, v3 div:2", v={2: QNAN, 3: 1})))  # a quiet NaN is fine
 
     def test_compares(self):
         v = {2: 0x3F800000, 3: QNAN, 4: 0xBF800000}

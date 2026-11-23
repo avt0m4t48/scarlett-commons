@@ -488,6 +488,9 @@ if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
+  add_executable(d3d12_xs_frame_events_test test/d3d12_xs_frame_events_test.cpp)
+  add_test(NAME d3d12_xs_frame_events COMMAND d3d12_xs_frame_events_test)
+
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.

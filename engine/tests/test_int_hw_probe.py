@@ -121,6 +121,62 @@ class IntHwProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("WAVE_DIFF", out.getvalue())
 
+    def test_json_preflight_rejects_bad_paths_before_hw_or_translator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_file = os.path.join(tmp, "not_a_dir")
+            Path(existing_file).write_text("x", encoding="utf-8")
+            bad_paths = [
+                "",
+                "   ",
+                tmp,
+                os.path.join(existing_file, "out.json"),
+                os.path.join(existing_file, "nested", "out.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    err = io.StringIO()
+                    with unittest.mock.patch.object(probe, "run_translator", side_effect=AssertionError("ran translator")), \
+                         unittest.mock.patch.object(probe, "run_hw", side_effect=AssertionError("opened hw_oracle")), \
+                         unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=AssertionError("opened oracle")), \
+                         redirect_stderr(err):
+                        rc = probe.main(["--oracle", "both", "--group", "salu_bfe_past31", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err.getvalue())
+
+    def test_json_write_oserror_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "out.json")
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(probe, "run_translator", return_value={"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}), \
+                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 redirect_stdout(out), redirect_stderr(err):
+                rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("disk full", err.getvalue())
+
+
+# v_bfe_u32 / v_bfe_i32 words measured natively on an AMD Radeon 610M (gfx1036, RDNA2), wave32 and wave64 identical:
+# `python -I tools/int_hw_probe.py --oracle both --group valu_bfe_past31`. A field that would run past bit 31 stops
+# there and v_bfe_i32 sign-extends from bit 31 (0xd2f90159, offset 28, width 16 gives 0xfffffffd, not 0xd); offset
+# and width are read from bits [4:0] only (offset 36 is 4, width 32 is 0).
+VALU_BFE_GFX1036 = {
+    "v_bfe_past31_vgpr": [0xFFFFFFFD, 0x0000000D, 0xFFFFFFFD, 0x0000000D],
+    "v_bfe_past31_sign": [0x00000001, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF],
+    "v_bfe_high_bits": [0x00000015, 0x00000000, 0xFFFFFFFD, 0x00000000],
+    "v_bfe_past31_const": [0xFFFFFFFD, 0x0000000D, 0xFFFFFFFD, 0x00000000],
+}
+
+
+class ValuBfeMeasuredOnRdna2(unittest.TestCase):
+    def test_translator_gives_the_gfx1036_words(self):
+        cases = [c for c in probe.build_cases() if c.group == "valu_bfe_past31"]
+        self.assertEqual(sorted(c.name for c in cases), sorted(VALU_BFE_GFX1036))
+        got = probe.run_translator(cases)
+        for name, want in VALU_BFE_GFX1036.items():
+            with self.subTest(case=name):
+                self.assertEqual(got[name], want)
+
 
 if __name__ == "__main__":
     unittest.main()

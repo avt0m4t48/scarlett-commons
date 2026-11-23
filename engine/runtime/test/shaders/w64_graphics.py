@@ -15,7 +15,12 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
 A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
 checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
 second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-lane run of a device that can require
-it, and W64G_REF=<dir> compares every run of the other device with those files (equal for A and B, different for C).
+it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
+files (equal for A and B, different for C).
+
+A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
+A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
+invocations), and tiers A and B assume 32 or 64 live lanes (TEST-433).
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -23,8 +28,13 @@ Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per 
 doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. RADV packs
 62 or 64 vertices into a wave64 and 30 or 32 into a wave32, so the 32-lane run is a repacking, not the two halves of
 the 64-lane waves: a stricter test of tiers A and B, which key every word on the vertex index.
+
+The gs_w64_* fixtures are legacy geometry shaders, switched the same way (gewave32 covers the whole NGG stage). Each is
+drawn after vs_ids with VKH_GS, finds its triangle from the vertex number vs_ids passes in TEXCOORD0, and stores four
+words per triangle to the heap; gs_w64_c_lane_id is the geometry probe. RADV puts at most 42 GS invocations in a wave64.
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -101,6 +111,21 @@ def _a_one_lane(i):
     return (7777 if on else 1000 + x, 3000 + 11 * on, 4000 + y + 13 * on, x % 4)
 
 
+def _a_permlane(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, x + 64 * (y ^ 1), 64 * y + x, 64 * y + x)
+
+
+def _a_swizzle(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * (y ^ 1), (x ^ 1) + 64 * y, 64 * y + x, (x & ~1) + 64 * (y & ~1))
+
+
+def _a_bpermute(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, (x ^ 1) + 64 * (y ^ 1), 64 * y + x, (x & ~1) + 64 * (y | 1))
+
+
 def _c_vote_else(i):
     return (7 if _on(i) else None, _on(i), 0, 0)               # r0 of the other pixels: 0 or 5 by the partition
 
@@ -124,18 +149,26 @@ def _vs_b_readlane_uniform(i):
 
 
 def _vs_c_lane_id(i):
-    return (None, None, i, 0)                                  # r0, r1 = the lane the vertex got
+    return (None, None, i, 0)                                  # r0, r1 = the lane the vertex got (gs_: the triangle)
+
+
+def _gs_a_ring(i):                                             # gs_w64_* fixtures: i is the triangle
+    return (i, 3 * i + 1, 77, 0)
 
 
 VS_ENV = {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}
 VS_VERTICES = 960        # 15 rows of 64 vertices: several waves at either size, and partial ones
 VS_RECORDS = 0x1000 // 4  # heap word of vertex 0's record (4 words per vertex); below it, the atomic's counter and slots
+GS_ENV = {"VKH_SGPRS": "0,0,0,0,0,0,65536,0x30000000", "VKH_HEAP": "0=0"}   # V# in s[4:7]: the GS entry sets s3
 
 
 # name -> (tier, expected words per pixel (None = not fixed), environment of the draw)
 FIXTURES = {
     "ps_w64_a_skip": ("A", _a_skip, {}),
     "ps_w64_a_one_lane": ("A", _a_one_lane, {}),
+    "ps_w64_a_permlane": ("A", _a_permlane, {}),
+    "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
+    "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
@@ -155,10 +188,12 @@ FIXTURES = {
     "vs_w64_c_bcnt_export": ("C", _c_bcnt, VS_ENV),
     "vs_w64_c_readlane": ("C", _c_readlane, VS_ENV),
     "vs_w64_c_lane_id": ("C", _vs_c_lane_id, VS_ENV),
+    "gs_w64_a_ring": ("A", _gs_a_ring, GS_ENV),
+    "gs_w64_c_lane_id": ("C", _vs_c_lane_id, GS_ENV),
 }
 
-VS_PROBE = "vs_w64_c_lane_id"
-_vs_applied = {}
+PROBES = {"vs": "vs_w64_c_lane_id", "gs": "gs_w64_c_lane_id"}   # per stage: the largest lane id shows the wave size
+_applied = {}
 
 
 def _radv_perftest(size):
@@ -169,30 +204,34 @@ def _radv_perftest(size):
     return ",".join(flags + ["gewave32"] * (size == 32))
 
 
-def _vs_wave_size(tools, spirv, size, tmp):
-    """Whether a vertex draw at `size` really ran at that wave size: the largest lane id of VS_PROBE is 32..63 in a
-    wave64 VS and below 32 in a wave32 one. Size 32 also needs size 64 to work, so that the two draws differ."""
-    if size not in _vs_applied:
+def _wave_size(tools, spirv, stage, size, tmp):
+    """Whether a vertex or geometry draw at `size` really ran at that wave size: the largest lane id of the stage's
+    probe is 32..63 in a wave64 and below 32 in a wave32. Size 32 also needs size 64 to work, so the draws differ."""
+    if (stage, size) not in _applied:
         def top(s):
-            words = _draw_vs(tools, spirv, VS_PROBE, s, tmp)[0]
+            words = _draw_heap(tools, spirv, PROBES[stage], s, tmp)[0]
             return None if words is None else max(w[0] for w in words)
         lane64, lane32 = top(64), top(32)
-        _vs_applied[64] = lane64 is not None and 32 <= lane64 < 64
-        _vs_applied[32] = _vs_applied[64] and lane32 is not None and lane32 < 32
-    return _vs_applied[size]
+        _applied[stage, 64] = lane64 is not None and 32 <= lane64 < 64
+        _applied[stage, 32] = _applied[stage, 64] and lane32 is not None and lane32 < 32
+    return _applied[stage, size]
 
 
-def _draw_vs(tools, spirv, name, size, tmp):
-    """(records, heap) of one vertex draw at `size` (None: as the environment says), or (None, message)."""
+def _draw_heap(tools, spirv, name, size, tmp):
+    """(records, heap) of one vs_/gs_ draw at `size` (None: as the environment says), or (None, message). A vertex
+    fixture stores one record per vertex; a geometry fixture, drawn after vs_ids, one per triangle."""
     env = dict(os.environ, **FIXTURES[name][2])
     if size:
         env["RADV_PERFTEST"] = _radv_perftest(size)
     raw, heap = Path(tmp) / f"{name}.{size}.raw", Path(tmp) / f"{name}.{size}.heap"
     env.update(VKH_VERTICES=str(VS_VERTICES), VKH_HEAP_DUMP=str(heap))
     env.pop("VKH_SUBGROUP_SIZE", None)
-    # The triangles have zero area, so no pixel is drawn and any fragment shader does.
-    cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
-           os.path.join(spirv, "ps_w64_a_skip.spv"), str(raw)]
+    vs, records = os.path.join(spirv, name + ".spv"), VS_VERTICES
+    if name.startswith("gs_"):
+        env["VKH_GS"] = vs
+        vs, records = os.path.join(spirv, "vs_ids.spv"), VS_VERTICES // 3
+    # The triangles have zero area (a GS fixture emits no primitive), so no pixel is drawn and any fragment shader does.
+    cmd = [os.path.join(tools, "vk_harness" + EXE), vs, os.path.join(spirv, "ps_w64_a_skip.spv"), str(raw)]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
@@ -200,18 +239,21 @@ def _draw_vs(tools, spirv, name, size, tmp):
     if r.returncode or not heap.is_file():
         return None, f"exit {r.returncode}: {' | '.join(out.strip().splitlines()[-3:])}"
     words = list(struct.unpack("<%dI" % (65536 // 4), heap.read_bytes()))
-    return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(VS_VERTICES)], words
+    return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(records)], words
+
+
+_device_min = [None]   # the smallest subgroup size vk_harness reported for the device
 
 
 def draw(tools, spirv, name, size, tmp):
     """(words per pixel, heap words or None, applied) of one draw. `applied`: the required size took effect (size
     None: no size asked, applied is None). The words are None when the draw failed; then `heap` is the message."""
     tier, expect, extra = FIXTURES[name]
-    if name.startswith("vs_"):
-        words, heap = _draw_vs(tools, spirv, name, size, tmp)
+    if name.startswith(("vs_", "gs_")):
+        words, heap = _draw_heap(tools, spirv, name, size, tmp)
         if words is None:
             return None, heap, None
-        return words, heap, _vs_wave_size(tools, spirv, size, tmp) if size else None
+        return words, heap, _wave_size(tools, spirv, name[:2], size, tmp) if size else None
     env = dict(os.environ, **extra)
     env.pop("VKH_SUBGROUP_SIZE", None)
     if size:
@@ -230,6 +272,9 @@ def draw(tools, spirv, name, size, tmp):
     data = raw.read_bytes()
     if len(data) != W * H * 16:
         return None, f"{len(data)} bytes of pixels, expected {W * H * 16}", None
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if m:
+        _device_min[0] = int(m.group(1))
     applied = None
     if size:
         applied = f"fragment subgroup size: {size}\n" in out.replace("\r", "")
@@ -296,6 +341,13 @@ def check(tools, spirv, name):
             if size is None or applied:
                 runs[size] = (words, heap)
         compared = False
+        # Tiers A and B mean exact on 32 or 64 live lanes. A device whose subgroups can be narrower than 32 (Intel:
+        # 8..32) and that could not be held to 32 or 64 may run fewer live lanes than it reports (UHD 770: 16 live
+        # behind a reported 32): reads across them return garbage.
+        if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs \
+                and _device_min[0] is not None and _device_min[0] < 32:
+            return Skip(f"SKIP (the fragment stage may run fewer live lanes than 32 here ({_device_min[0]}..) "
+                        "and 32 or 64 could not be required: tiers A and B assume 32 or 64 live lanes)")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
@@ -320,7 +372,11 @@ def check(tools, spirv, name):
             for size, (words, heap) in runs.items():
                 if size == 64:
                     continue
+                if tier == "C" and comparable(name, ref_words, None) != comparable(name, words, None):
+                    return "a partition-invariant word differs from the 64-lane reference"
                 if tier == "C":
+                    if comparable(name, ref_words, None) != comparable(name, words, None):
+                        return "a word that must not depend on the partition differs from the 64-lane reference"
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
@@ -336,7 +392,13 @@ def main(argv):
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    names = [a for a in argv[1:] if a in FIXTURES] or sorted(FIXTURES)
+    start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    requested = argv[start:]
+    unknown = [a for a in requested if a not in FIXTURES]
+    if unknown:
+        print(f"Unknown fixture name{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}", file=sys.stderr)
+        return 1
+    names = requested or sorted(FIXTURES)
     failed = 0
     for name in names:
         problem = check(os.path.abspath(tools), spirv, name)

@@ -20,7 +20,8 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; other Input variables read zero, except the built-ins named in `builtins` (name -> function of the
+wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, except the built-ins named in
+`builtins` (name -> function of the
 lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
 can be seeded (default zero).
 
@@ -231,6 +232,7 @@ class _Module:
             self.consts[res] = False
         elif op == "OpConstantNull":
             self.consts[res] = self.zero(a[0])
+            self.id_type[res] = a[0]
         elif op == "OpConstantComposite":
             self.consts[res] = tuple(self.consts[x] for x in a[1:])
         elif op == "OpVariable":
@@ -313,6 +315,8 @@ class _Wave:
                         value = wave
                     elif builtins and b in builtins:
                         value = builtins[b](lane.index) & MASK
+                    elif b in ("BaseVertex", "BaseInstance"):
+                        value = 0     # a draw with no vertex/instance offset, unless `builtins` seeds one
                     elif b is None:
                         value = mod.zero(pointee)
                     else:
@@ -491,8 +495,9 @@ class _Wave:
             return a[1] if self.bool_of(lane, a[0]) else a[2]
         if op == "OpSwitch":
             sel = self.int_of(lane, a[0])
+            mask = (1 << self.m.bits(self.m.id_type[a[0]])) - 1
             for k in range(2, len(a) - 1, 2):
-                if int(a[k], 0) == sel:
+                if (int(a[k], 0) & mask) == sel:
                     return a[k + 1]
             return a[1]
         raise UnsupportedConstruct(op)

@@ -365,6 +365,26 @@ class TestSwizzleSearchPermutationMatching(unittest.TestCase):
 
 
 class TestSwizzleSearchCliAndRender(unittest.TestCase):
+    @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
+    def test_default_tile_target_previews_a_short_complete_row(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "two_tiles.bin"
+            preview = Path(td) / "preview.png"
+            red_block = bytes.fromhex("00 f8 00 00 00 00 00 00")
+            green_block = bytes.fromhex("e0 07 00 00 00 00 00 00")
+            blob.write_bytes(red_block * 64 + green_block * 64)
+
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), str(blob), "--tile", "512", "--widths", "64",
+                 "--out", str(preview)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with Image.open(preview) as image:
+                self.assertEqual(image.size, (64, 32))
+                expected_row = bytes((255, 0, 0)) * 32 + bytes((0, 255, 0)) * 32
+                self.assertEqual(image.tobytes(), expected_row * 32)
+
     @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
     def test_cli_bad_numeric_arguments_are_usage_errors(self):
         """Bad --bpe/--tile/--widths/--tiles must be usage errors, not arithmetic tracebacks."""
@@ -480,6 +500,29 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
                     self.assertIn("overwrite", result.stderr.lower())
                     self.assertEqual(blob.read_bytes(), original)
                     self.assertEqual(output.read_bytes(), original)
+
+    @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
+    def test_preview_ranks_thin_candidates_by_their_existing_edges(self) -> None:
+        from PIL import Image
+
+        green = bytes.fromhex("e007 0000 00000000")
+        white = bytes.fromhex("ffff 0000 00000000")
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "input.bin"
+            preview = Path(td) / "preview.png"
+            # Two complete green tiles for an 8x8 candidate. The narrower
+            # candidate also samples a third tile and sees a green/white edge.
+            blob.write_bytes(green * 4 + white * 2)
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), str(blob), "--tile", "16",
+                 "--widths", "4,8", "--tiles", "3", "--out", str(preview)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with Image.open(preview) as image:
+                self.assertEqual(image.size, (8, 8))
+                self.assertEqual(image.getcolors(), [(64, (0, 255, 0))])
+            self.assertNotIn("nan", result.stdout.lower())
 
     @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
     def test_render_bc1_synthetic_output(self):

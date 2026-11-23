@@ -8,6 +8,9 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <initializer_list>
 
 namespace {
 
@@ -29,6 +32,33 @@ int fail(const char* stage, unsigned long value) {
 }  // namespace
 
 int main() {
+    for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
+        HMODULE host = GetModuleHandleW(dll);
+        if (!host) return fail("host module handle", GetLastError());
+        auto command_a = reinterpret_cast<decltype(&GetCommandLineA)>(GetProcAddress(host, "GetCommandLineA"));
+        auto command_w = reinterpret_cast<decltype(&GetCommandLineW)>(GetProcAddress(host, "GetCommandLineW"));
+        if (!command_a || !command_w || std::strcmp(command_a(), GetCommandLineA()) != 0 ||
+            std::wcscmp(command_w(), GetCommandLineW()) != 0 ||
+            !std::strstr(command_a(), "host-shim-probe") || !std::wcsstr(command_w(), L"host-shim-probe"))
+            return fail("dynamic command line matches direct imports", 0);
+        auto process_id = reinterpret_cast<decltype(&GetCurrentProcessId)>(GetProcAddress(host, "GetCurrentProcessId"));
+        if (!process_id || process_id() != GetCurrentProcessId())
+            return fail("unshimmed host export", GetLastError());
+        SetLastError(0);
+        if (GetProcAddress(host, "LeonidaNoSuchHostExport") || GetLastError() != ERROR_PROC_NOT_FOUND)
+            return fail("missing host export", GetLastError());
+        auto create_file = reinterpret_cast<decltype(&CreateFileW)>(GetProcAddress(host, "CreateFileW"));
+        if (!create_file) return fail("dynamic CreateFileW", GetLastError());
+        HANDLE file = create_file(L"GAME:\\host_shim_probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return fail("dynamic GAME: open", GetLastError());
+        char data[4]{};
+        DWORD count = 0;
+        const BOOL read = ReadFile(file, data, sizeof(data), &count, nullptr);
+        CloseHandle(file);
+        if (!read || count != sizeof(data) || std::memcmp(data, "shim", sizeof(data)) != 0)
+            return fail("dynamic GAME: contents", 0);
+    }
     HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
     if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
     // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.
@@ -68,10 +98,10 @@ int main() {
     reinterpret_cast<Close>(vtable[17])(obj, queue);
     reinterpret_cast<Release>(vtable[2])(obj);
 
-    // A class not served yet (XNetworkingImpl) is refused, with the out pointer cleared.
-    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    // A class not served (an id no runtime class has) is refused, with the out pointer cleared.
+    const GUID unserved = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
     void* out = reinterpret_cast<void*>(1);
-    hr = query(&networking, networking, &out);
+    hr = query(&unserved, unserved, &out);
     if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)
         return fail("QueryApiImpl refuses an unprovided class and clears its out pointer", static_cast<unsigned long>(hr));
     hr = uninit();

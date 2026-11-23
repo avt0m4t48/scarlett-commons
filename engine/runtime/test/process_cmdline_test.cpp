@@ -112,6 +112,66 @@ void check_winmain(const std::wstring& program, const std::vector<std::wstring>&
         }
     }
 }
+
+// msvcrt.dll's __getmainargs/__wgetmainargs (what a MinGW or old-MSVC CRT startup calls) hand out the game's argv and
+// the process environment. The wide environment (_wenviron) does not exist until a wide environment function has run,
+// and the narrow table is reallocated by _putenv, so both must be read at the call, not remembered by
+// set_command_line (RT-136). `name=value` must be found in `env`, whatever was set before or after set_command_line.
+template <typename C, typename Fn>
+bool env_has(Fn getmainargs, const C* entry) {
+    int argc = 0;
+    C** argv = nullptr;
+    C** env = nullptr;
+    if (getmainargs(&argc, &argv, &env, 0, nullptr) != 0 || argc < 1 || !argv || !argv[0] || !env) return false;
+    for (C** e = env; *e; ++e) {
+        if constexpr (sizeof(C) == 1) {
+            if (std::strcmp(reinterpret_cast<const char*>(*e), reinterpret_cast<const char*>(entry)) == 0) return true;
+        } else {
+            if (std::wcscmp(reinterpret_cast<const wchar_t*>(*e), reinterpret_cast<const wchar_t*>(entry)) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+void check_getmainargs_environment() {
+    using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
+    using Wide = int(__cdecl*)(int*, wchar_t***, wchar_t***, int, void*);
+    const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find("msvcrt.dll", "__wgetmainargs"));
+    if (!narrow_fn || !wide_fn) {
+        std::fprintf(stderr, "FAIL msvcrt.dll!__getmainargs/__wgetmainargs are not shimmed\n");
+        ++failures;
+        return;
+    }
+    // First use of the wide environment in this process: set_command_line runs before anything made _wenviron.
+    // main() hosts start with only the narrow table; if a toolchain change made _wenviron exist, the first-call
+    // checks below no longer prove the creation path, so say so rather than pass silently.
+    if (_wenviron) std::printf("note: _wenviron already exists at startup; its lazy creation is not exercised\n");
+    rt::process::set_command_line(L"game.exe", {L"-x"});
+    if (_putenv_s("LEONIDA_RT136_A", "before") != 0 ||  // narrow only; the wide table is built on first use
+        !env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_A=before")) {
+        std::fprintf(stderr, "FAIL __wgetmainargs: no environment (or one without LEONIDA_RT136_A) at the first call\n");
+        ++failures;
+    }
+    if (!env_has<char>(narrow_fn, "LEONIDA_RT136_A=before")) {
+        std::fprintf(stderr, "FAIL __getmainargs: no environment (or one without LEONIDA_RT136_A)\n");
+        ++failures;
+    }
+    // A variable set after set_command_line reallocates the CRT's table; a pointer kept from before would dangle.
+    if (_putenv_s("LEONIDA_RT136_B", "after") != 0 || _wputenv_s(L"LEONIDA_RT136_C", L"after") != 0) {
+        std::fprintf(stderr, "FAIL _putenv_s/_wputenv_s did not set the test variables\n");
+        ++failures;
+    }
+    if (!env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_B=after") || !env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_C=after")) {
+        std::fprintf(stderr, "FAIL __wgetmainargs: an environment variable set after set_command_line is missing\n");
+        ++failures;
+    }
+    if (!env_has<char>(narrow_fn, "LEONIDA_RT136_B=after") || !env_has<char>(narrow_fn, "LEONIDA_RT136_C=after")) {
+        std::fprintf(stderr, "FAIL __getmainargs: an environment variable set after set_command_line is missing\n");
+        ++failures;
+    }
+}
 }  // namespace
 
 int main() {
@@ -126,11 +186,23 @@ int main() {
     check_non_ascii(L"\u0394\u0416\u6F22 x", "an argument outside any single-byte code page");
 
     check_import_names();
+    check_getmainargs_environment();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
     check_winmain(L"game.exe", {}, L"", "no arguments");
     // A byte above 0x7f in the narrow program name is part of the name, not the end of it.
     check_winmain(L"caf\u00e9.exe", {L"-x"}, L"-x", "a non-ASCII program name");
+
+    // If the entry thread exits via ExitThread() without going through end_run(), run_entry() must preserve its exit
+    // code (and claim g_exited before closing g_done).
+    {
+        auto exit_thread_entry = +[](void*) -> DWORD { ExitThread(42); };
+        const int code = rt::process::run_entry(reinterpret_cast<void*>(exit_thread_entry), 0);
+        if (code != 42) {
+            std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
+            ++failures;
+        }
+    }
 
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "

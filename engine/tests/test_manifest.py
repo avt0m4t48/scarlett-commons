@@ -182,6 +182,32 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("OK", out.getvalue())
 
+    def test_verify_rejects_resize_between_size_check_and_hashing(self) -> None:
+        rel = "alpha.bin"
+        path = os.path.join(self.pkg, rel)
+        original = self.files[rel]
+        grown = original + b" appended after the size check"
+        os.makedirs(os.path.dirname(self.out_manifest), exist_ok=True)
+        with open(self.out_manifest, "w", encoding="utf-8") as f:
+            json.dump({"files": {rel: {"size": len(original), "sha256": hashlib.sha256(grown).hexdigest()}}}, f)
+
+        getsize = os.path.getsize
+
+        def getsize_then_grow(name: str) -> int:
+            size = getsize(name)
+            if name == path:
+                with open(path, "ab") as f:
+                    f.write(grown[len(original):])
+            return size
+
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs), contextlib.redirect_stdout(io.StringIO()):
+                with open(path, "wb") as f:
+                    f.write(original)
+                with patch.object(os.path, "getsize", side_effect=getsize_then_grow):
+                    with self.assertRaisesRegex(manifest.ManifestError, r"alpha\.bin.*size changed before hashing"):
+                        manifest.verify(self.pkg, self.out_manifest, jobs=jobs)
+
     def test_verify_detects_missing_file(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
@@ -336,6 +362,17 @@ class ManifestCliTest(unittest.TestCase):
         result = self.run_cli("verify", self.pkg, "--manifest", manifest_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "OK")
+
+    def test_cli_verify_refuses_an_empty_manifest_for_a_folder_with_files(self):
+        # A create that was cut short, or a mistyped --manifest, used to print OK without checking a file.
+        empty = os.path.join(self.tmp.name, "empty.json")
+        with open(empty, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"files": {}}\n')
+        result = self.run_cli("verify", self.pkg, "--manifest", empty)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("lists no files", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_cli_verify_failure_exit_code(self):
         self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
@@ -639,6 +676,30 @@ class ManifestDigestCaseTest(unittest.TestCase):
                     self.assert_files_unchanged(self.payloads)
                     with open(self.out, "rb") as f:
                         self.assertEqual(f.read(), before)
+
+
+class ManifestPosixBackslashTest(unittest.TestCase):
+    @unittest.skipIf(os.sep == "\\", "backslashes are path separators on Windows")
+    def test_posix_literal_backslash_does_not_collide_with_subdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = os.path.join(tmp, "pkg")
+            os.makedirs(os.path.join(pkg, "sub"))
+            with open(os.path.join(pkg, "sub", "a.dat"), "wb") as f:
+                f.write(b"nested")
+            with open(os.path.join(pkg, "sub\\a.dat"), "wb") as f:
+                f.write(b"literal-backslash")
+            out = os.path.join(tmp, "manifest.json")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(manifest.create(pkg, out, jobs=1), 0)
+            entries = manifest.load_manifest(out)
+            self.assertEqual(sorted(entries), ["sub/a.dat", "sub\\a.dat"])
+            self.assertEqual(entries["sub/a.dat"]["size"], len(b"nested"))
+            self.assertEqual(entries["sub\\a.dat"]["size"], len(b"literal-backslash"))
+            verify_out = io.StringIO()
+            with contextlib.redirect_stdout(verify_out):
+                self.assertEqual(manifest.verify(pkg, out, jobs=1), 0)
+            self.assertEqual(verify_out.getvalue(), "OK\n")
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

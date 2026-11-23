@@ -240,6 +240,22 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    const std::vector<std::uint32_t> shader_code[] = {read_spv(argv[1]), read_spv(argv[2])};
+    bool dynamic_storage = false;
+    for (int stage = 0; stage < 2; ++stage) {
+        const auto& code = shader_code[stage];
+        if (code.empty()) {
+            std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
+            return 1;
+        }
+        dynamic_storage = dynamic_storage || leonida::vk_test::spirv_declares_capability(
+            code.data(), code.size() * sizeof(code[0]), leonida::vk_test::spv_storage_image_array_dynamic_indexing);
+    }
+    if (dynamic_storage && !have.features.shaderStorageImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderStorageImageArrayDynamicIndexing\n");
+        return unsupported;
+    }
+    enable.features.shaderStorageImageArrayDynamicIndexing = dynamic_storage;
     // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
     const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;
     if (atomic_mode) {
@@ -435,11 +451,7 @@ int main(int argc, char** argv) {
     VkShaderModule vs, fs;
     bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
-        const auto code = read_spv(argv[1 + stage]);
-        if (code.empty()) {
-            std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
-            return 1;
-        }
+        const auto& code = shader_code[stage];
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};

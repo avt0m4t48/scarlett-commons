@@ -127,6 +127,13 @@ int main(int argc, char** argv) {
         return 77;
     }
     f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
+    const bool dynamic_storage = spirv_declares_capability(code.data(), code.size(),
+        leonida::vk_test::spv_storage_image_array_dynamic_indexing);
+    if (dynamic_storage && !have.shaderStorageImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderStorageImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderStorageImageArrayDynamicIndexing = dynamic_storage;
     // Typed image_load fetches through the sampled arrays without StorageImageReadWithoutFormat (55, SHADER-151).
     if (filled && spirv_declares_capability(code.data(), code.size(), 55)) {
         std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");

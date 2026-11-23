@@ -497,12 +497,14 @@ class TypedGatherShaders(unittest.TestCase):
 
 
 class StoreAndLoad(unittest.TestCase):
-    def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
+    def test_a_shader_that_also_stores_needs_write_without_format_and_both_indexing_capabilities(self):
         m = Module(translate(["v_mov_b32 v4, 1", "v_mov_b32 v5, 2",
                               "image_store v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "s_waitcnt vmcnt(0)"]))
         self.assertIn("StorageImageWriteWithoutFormat", m.caps)
+        self.assertIn("StorageImageArrayDynamicIndexing", m.caps)
+        self.assertIn("SampledImageArrayDynamicIndexing", m.caps)
         self.assertNotIn("StorageImageReadWithoutFormat", m.caps)
         self.assertNotIn("OpImageRead", m.text)
         self.assertEqual(set(m.binding.values()), {0, 1, 2, 8, 9, 10})

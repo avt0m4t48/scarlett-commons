@@ -240,6 +240,7 @@ class Gen:
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
         self.uses_dynamic_sampled_index = False
+        self.uses_dynamic_storage_index = False
         self.uses_subgroup = False
         self.uses_tex_array = False
         self.uses_storage = False
@@ -10945,6 +10946,11 @@ class Gen:
         self.uses_dynamic_sampled_index = True
         self.emit(f"{ptr} = OpAccessChain {ptr_type} {array} {index}")
 
+    def dynamic_storage_access(self, ptr, ptr_type, array, index):
+        """Index a storage image array with the runtime descriptor lookup result."""
+        self.uses_dynamic_storage_index = True
+        self.emit(f"{ptr} = OpAccessChain {ptr_type} {array} {index}")
+
     def cube_coords(self, f):
         """(s, t, face) of a cube sample -> the 6-layer 2D-array view. The hardware takes s and t in [1, 2]
         (sc / |cubema| + 1.5) and the third coordinate as 8 * slice + face."""
@@ -11465,7 +11471,7 @@ class Gen:
 
         def view(cls):
             ip, im = self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
+            self.dynamic_storage_access(ip, f"%_ptr_UC_stv{cls}_{di}", f"%stv{cls}_{di}", idx)
             self.emit(f"{im} = OpLoad %stimg{cls}_{di} {ip}")
             return im
 
@@ -11645,7 +11651,7 @@ class Gen:
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
+            self.dynamic_storage_access(ip, f"%_ptr_UC_stv{cls}_{di}", f"%stv{cls}_{di}", idx)
             self.emit(f"{img} = OpLoad %stimg{cls}_{di} {ip}")
             self.emit(f"OpImageWrite {img} {iv} {texel}")
 
@@ -11873,7 +11879,7 @@ class Gen:
             coords = atomic_coords(3)
             iv, ip = self.tmp(), self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg3 %simages3d {idx}")
+            self.dynamic_storage_access(ip, "%_ptr_UC_simg3", "%simages3d", idx)
             if op in self.IMG_ATOMICS_EXTRA:
                 self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
                 return
@@ -11910,7 +11916,7 @@ class Gen:
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
             ip = self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg %simages {idx}")
+            self.dynamic_storage_access(ip, "%_ptr_UC_simg", "%simages", idx)
             if op in self.IMG_ATOMICS_EXTRA:
                 self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
                 return
@@ -13071,6 +13077,8 @@ def assemble(gen):
         caps.append("ShaderClockKHR")
     if gen.uses_dynamic_sampled_index:
         caps.append("SampledImageArrayDynamicIndexing")
+    if gen.uses_dynamic_storage_index:
+        caps.append("StorageImageArrayDynamicIndexing")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if gen.reads_store_views:
@@ -15833,6 +15841,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "PhysicalStorageBufferAddresses": "bufferDeviceAddress",
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
              "SampledImageArrayDynamicIndexing": "shaderSampledImageArrayDynamicIndexing",
+             "StorageImageArrayDynamicIndexing": "shaderStorageImageArrayDynamicIndexing",
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",

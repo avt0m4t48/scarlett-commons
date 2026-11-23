@@ -22,6 +22,7 @@ inline constexpr bool shader_fma_in_headers = false;
 #endif
 
 inline constexpr std::uint32_t spv_sampled_image_array_dynamic_indexing = 29;
+inline constexpr std::uint32_t spv_storage_image_array_dynamic_indexing = 31;
 
 // Find OpCapability (17) in a binary module.
 inline bool spirv_declares_capability(const void* data, std::size_t bytes, std::uint32_t capability) {

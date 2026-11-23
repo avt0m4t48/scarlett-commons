@@ -230,6 +230,14 @@ void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonid
                              "subgroup size)\n", entry.stage.c_str());
 }
 
+// VK_FORMAT_A8_UNORM_KHR where the Vulkan headers have VK_KHR_maintenance5. Older headers have no A8 render targets:
+// VulkanDeviceInfo::a8_render_target is then never set, so this is never used as UNDEFINED.
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+constexpr VkFormat kA8UnormFormat = VK_FORMAT_A8_UNORM_KHR;
+#else
+constexpr VkFormat kA8UnormFormat = VK_FORMAT_UNDEFINED;
+#endif
+
 struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects = 0;
@@ -961,7 +969,7 @@ struct DeviceState {
                              desc.Format);
                     return {};
                 }
-                Format alpha{VK_FORMAT_A8_UNORM_KHR, VK_IMAGE_ASPECT_COLOR_BIT};
+                Format alpha{kA8UnormFormat, VK_IMAGE_ASPECT_COLOR_BIT};
                 alpha.a8_as_alpha = true;
                 return alpha;
             }
@@ -3610,7 +3618,7 @@ public:
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
             graphics_.color_formats[i] = desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.info.a8_render_target
-                                             ? VK_FORMAT_A8_UNORM_KHR
+                                             ? kA8UnormFormat
                                              : vulkan_format(desc.RTVFormats[i], false).format;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
@@ -9380,9 +9388,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
     if (info.a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-#endif
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);

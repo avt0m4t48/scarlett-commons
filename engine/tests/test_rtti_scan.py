@@ -166,7 +166,7 @@ class RttiScanCoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_tool(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_type_descriptor_detection_and_parsing(self):
         rdata = bytearray(0x1000)

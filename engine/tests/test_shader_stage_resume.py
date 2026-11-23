@@ -54,7 +54,7 @@ class EmptyUnpackTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "junk.dxbc"), "wb") as f:
                 f.write(b"DXBC" + bytes(60))     # no parts: nothing to unpack
-            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("ERROR", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -62,7 +62,7 @@ class EmptyUnpackTest(unittest.TestCase):
 
     def test_empty_folder_fails_clearly(self):
         with tempfile.TemporaryDirectory() as d:
-            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
@@ -528,7 +528,8 @@ class MergePublishesLastTest(unittest.TestCase):
 
     def merge(self, out):
         tool = os.path.join(make_game.TOOLS, "rdna2spirv.py")
-        return subprocess.run([sys.executable, "-I", tool, out, "--out", out, "--merge"], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", tool, out, "--out", out, "--merge"],
+                              capture_output=True, text=True, errors="replace")
 
     def test_a_failed_stub_write_leaves_no_index_and_a_retry_publishes_it(self):
         with tempfile.TemporaryDirectory() as out:

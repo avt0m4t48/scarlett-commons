@@ -736,7 +736,7 @@ class ArchiveTest(unittest.TestCase):
 
     def test_cli_writes_counts_and_no_values(self):
         out = os.path.join(self.tmp.name, "out.json")
-        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"], capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -747,7 +747,7 @@ class ArchiveTest(unittest.TestCase):
     def test_decode_rejects_negative_frames(self):
         result = subprocess.run(
             [sys.executable, "-I", TOOL, self.rpf, "--decode", str(self.offsets[1]), "--frames", "-1"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--frames must be 0 or more", result.stderr)
@@ -776,7 +776,7 @@ class ArchiveTest(unittest.TestCase):
 
         result = subprocess.run(
             [sys.executable, "-I", TOOL, path, "--decode", str(root), "--frames", "3"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, errors="replace", check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         animation = json.loads(result.stdout)["packs"][0]["animations"][0]
@@ -795,7 +795,7 @@ class ArchiveTest(unittest.TestCase):
             pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
             root, *_ = write_rpf(self.rpf, pages)
             result = subprocess.run([sys.executable, "-I", TOOL, self.rpf, "--decode", str(root)],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, errors="replace")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["packs"][0]["animations"][0]["decoded_frames"], NF)
 
@@ -815,7 +815,7 @@ class ArchiveTest(unittest.TestCase):
             r = subprocess.run(
                 [sys.executable, "-I", TOOL, self.rpf, os.path.join(self.tmp.name, "o.json"),
                  "--budget", value],
-                capture_output=True, text=True,
+                capture_output=True, text=True, errors="replace",
             )
             self.assertEqual(r.returncode, 2, value)
             self.assertIn("--budget", r.stderr)
@@ -823,11 +823,11 @@ class ArchiveTest(unittest.TestCase):
 
     def test_bad_arguments(self):
         for args in (["--jobs", "0", "x.json"], [], ["x.json", "--start", "-1"]):
-            r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, args)
         missing = os.path.join(self.tmp.name, "missing.rpf")
         r = subprocess.run([sys.executable, "-I", TOOL, missing, os.path.join(self.tmp.name, "o.json")],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 1)
         self.assertIn("missing.rpf", r.stderr)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
@@ -835,7 +835,7 @@ class ArchiveTest(unittest.TestCase):
         open(empty, "wb").close()
         for source in (empty, self.tmp.name):
             r = subprocess.run([sys.executable, "-I", TOOL, source, os.path.join(self.tmp.name, "o.json")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertNotEqual(r.returncode, 0, source)
             self.assertNotIn("Traceback", r.stderr)
 
@@ -845,7 +845,7 @@ class ArchiveTest(unittest.TestCase):
             data = f.read()
         other = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, other, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("output must not overwrite the input archive", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
@@ -854,7 +854,7 @@ class ArchiveTest(unittest.TestCase):
 
     def test_output_that_is_a_directory_is_refused_before_the_scan(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, self.tmp.name, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("is a directory", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
@@ -862,7 +862,7 @@ class ArchiveTest(unittest.TestCase):
     def test_output_in_a_missing_folder_is_created(self):
         out = os.path.join(self.tmp.name, "reports", "sub", "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)

@@ -46,7 +46,7 @@ class DisasmFailureTest(unittest.TestCase):
     def run_tool(self, llvm_mc: str, out: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=llvm_mc)
         return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1"],
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True, errors="replace", env=env)
 
     def fake(self, body: str) -> str:
         path = os.path.join(self.dir, "fake_mc.py")
@@ -147,7 +147,8 @@ class DisasmInputTest(unittest.TestCase):
 
     def run_tool(self, *args: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=self.mc)
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, env=env)
+        return subprocess.run([sys.executable, "-I", TOOL, *args],
+                              capture_output=True, text=True, errors="replace", env=env)
 
     def write(self, name: str, data: bytes) -> None:
         with open(os.path.join(self.src, name), "wb") as f:
@@ -296,8 +297,8 @@ class DisasmInputTest(unittest.TestCase):
         with open(os.path.join(out, "old.s"), "w", encoding="utf-8") as f:
             f.write("; usable\n")
         env = dict(os.environ, LLVM_MC="definitely-not-an-llvm-mc")
-        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out], capture_output=True, text=True,
-                           env=env)
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out],
+                           capture_output=True, text=True, errors="replace", env=env)
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("could not be started", p.stderr)
         self.assertTrue(os.path.isfile(os.path.join(out, "old.s")))   # pruning waits for a successful decode

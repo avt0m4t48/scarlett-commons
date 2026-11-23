@@ -55,7 +55,7 @@ class TestBatchGlb(unittest.TestCase):
                 with self.subTest(source=source, output=output):
                     result = subprocess.run(
                         [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
-                        capture_output=True, text=True, check=False,
+                        capture_output=True, text=True, errors="replace", check=False,
                     )
                     self.assertEqual(result.returncode, 1)
                     self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)

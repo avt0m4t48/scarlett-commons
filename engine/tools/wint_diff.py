@@ -22,6 +22,10 @@ What is modelled:
   * carries: v_add/sub/subrev_co_u32 e64 (carry out to a mask), v_add/sub/subrev_co_ci_u32 e64 (carry in from a
     mask) and e32 (VCC in and out); v_mad_u64_u32 / v_mad_i64_i32 with a mask carry-out (bit 64 of the 65-bit sum;
     for the signed form, the sign of the exact result, as in docs/design.md).
+  * clamp on the six carry ops (e64 only): D saturates, to 0xffffffff on an add's carry out and to 0 on a sub's
+    borrow, and the mask still gets the real carry or borrow (docs/design.md "Integer clamp": measured on gfx1035
+    through tools/hw_oracle and on gfx1036 in #1746). --oracle hw generates these forms too, but this tool has not
+    run them on a GPU yet.
   * 32-bit integer VOP1/VOP2 (e32 and e64) and VOP3-only ops (OPS32), and 16-bit integer ops in their e64 / VOP3
     form with op_sel (OPS16): the result goes to the half op_sel[n] names and the other half is kept.
   * sources: VGPRs, SGPRs s4..s19 (seeded with s_mov_b32), integer inline constants -16..64; at most two scalar
@@ -266,6 +270,9 @@ class Gen:
             return f"s{r.choice(SREGS)}"
         return str(r.randint(-16, 64))
 
+    def clamp(self):
+        return " clamp" if self.r.random() < 0.35 else ""
+
     def exec_lines(self):
         def word():
             return self.r.choice(EXEC_EDGES + (None,) * 3) or self.r.getrandbits(32)
@@ -329,9 +336,13 @@ class Gen:
                     bus.discard(cin)
                     cin = co
                 a, b = self.src(bus), self.src(bus)
-                return [f"{name}_e64 v{d}, {co}, {a}, {b}, {cin}"]
+                if r.random() < 0.2:
+                    # one source all ones: the carry (borrow) in alone decides the carry (borrow) out, and the sum's
+                    # low word equals the other source
+                    a, b = (a, "-1") if r.random() < 0.5 else ("-1", b)
+                return [f"{name}_e64 v{d}, {co}, {a}, {b}, {cin}{self.clamp()}"]
             a, b = self.src(bus), self.src(bus)
-            return [f"{name}_e64 v{d}, {co}, {a}, {b}"]
+            return [f"{name}_e64 v{d}, {co}, {a}, {b}{self.clamp()}"]
         if cat == "mad64":
             co = self.wrote(r.choice(ms))
             dd, cc = r.choice(PAIRS), r.choice(PAIRS)
@@ -481,11 +492,20 @@ class State:
 def step(st, line):
     op, _, rest = line.partition(" ")
     osel = None
+    clamp = rest.endswith(" clamp")
+    if clamp:
+        rest = rest[:-len(" clamp")]
     m = _MODS.search(rest)
     if m:
         osel = [int(x) for x in m.group(1).split(",")]
         rest = rest[:m.start()]
     args = [a.strip() for a in rest.split(",")]
+    base = op[:-4] if op.endswith(("_e32", "_e64")) else op
+    # the modifiers first: s_mov_b32, v_mbcnt and v_writelane return early below and would run with them
+    if clamp and not (base in CARRY and op.endswith("_e64")):
+        raise RefError(f"{op}: clamp is modelled only on the e64 carry ops")
+    if osel is not None and base not in OPS16:
+        raise RefError(f"{op}: op_sel is modelled only on the 16-bit ops")
     if op == "s_mov_b32":
         v = st.val(args[1], 0)
         if args[0] == "exec_lo":
@@ -504,7 +524,6 @@ def step(st, line):
     if op == "v_writelane_b32":
         st.vget(int(args[0][1:]))[int(args[2])] = st.sget(args[1])
         return
-    base = op[:-4] if op.endswith(("_e32", "_e64")) else op
     if base.startswith(("v_cmp_", "v_cmpx_")):
         cmpx = base.startswith("v_cmpx_")
         c = base[len("v_cmpx_" if cmpx else "v_cmp_"):]
@@ -532,6 +551,8 @@ def step(st, line):
         co = 0
         for lane in st.lanes():
             res, c = CARRY[base](st.val(args[2], lane), st.val(args[3], lane), (cin >> lane) & 1)
+            if clamp and c:
+                res = M32 if base.startswith("v_add_") else 0
             new[lane] = res
             co |= c << lane
         st.v[int(args[0][1:])] = new
@@ -842,7 +863,7 @@ def main(argv=None):
             kind = ("vop3 32-bit" if name in OPS32 and OPS32[name][0] == "vop3" else
                     f"{OPS32[name][0]} 32-bit (e32/e64)" if name in OPS32 else
                     "16-bit e64/VOP3, op_sel" if name in OPS16 else
-                    "carry" if name in CARRY else "mad64, mask carry" if name in MAD64 else
+                    "carry, clamp (e64)" if name in CARRY else "mad64, mask carry" if name in MAD64 else
                     "compare -> EXEC" if name.startswith("v_cmpx_") else
                     "compare -> mask" if name.startswith("v_cmp_") else
                     "mask select" if name == "v_cndmask_b32" else

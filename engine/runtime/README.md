@@ -149,8 +149,8 @@ helper carries a 16 KiB array for it), swaps slots 0 and that clone's index on t
 clone's index into `gta6rt.exe`'s `_tls_index`. Every thread the OS starts from then on has a fresh copy of
 `gta6rt.exe`'s TLS at that index from its first instruction, so nothing has to run on a new thread first, including
 code that runs in an earlier DLL's `DLL_THREAD_ATTACH`. Slot 0 then holds a block nothing reads, which the executable's
-template copy replaces on the loading thread, on threads started later, and through `install_tls_for_thread()` on
-older ones, exactly as a DLL's copy replaces a helper's; the OS frees both slots at thread exit. The move cannot be made
+template copy replaces on the loading thread, on threads started later, and, from `load()` itself, on threads that
+were already running, exactly as a DLL's copy replaces a helper's; the OS frees both slots at thread exit. The move cannot be made
 later: MSVC keeps the address of a TLS slot in a frame across calls (`zlib_inflate` in `shader_library.h` does), so
 a thread that already runs gta6rt's code cannot be moved wherever it is stopped. The startup trace records the move at
 the first executable (`tls_index0`). DLLs keep the helper indices and work next to the executable as before.

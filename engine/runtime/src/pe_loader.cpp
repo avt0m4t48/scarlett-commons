@@ -761,8 +761,9 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
 // of this process.
 //
 // What makes that safe:
-//  - The slot is the helper's, and nothing reads the helper's variable, so swapping the pointer under a running
-//    thread disturbs nothing; the thread cannot be in mapped code of a module whose load() has not returned.
+//  - The slot is the helper's, and nothing reads the helper's variable; slot 0 (kMainImageSlot) holds gta6rt.exe's
+//    original block, which nothing reads after reserve_tls_index0 moved gta6rt's TLS. So swapping the pointer under a
+//    running thread disturbs nothing; the thread cannot be in mapped code of a module whose load() has not returned.
 //  - The swap is made with g_tls_lock held exclusively, so no thread is inside its attach or detach event meanwhile.
 //  - A thread whose detach event has run is skipped (`ended`), and so is one with no TLS array or no helper block:
 //    Windows is about to free, or never built, what the block would go into.

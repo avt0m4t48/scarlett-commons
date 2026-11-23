@@ -45,8 +45,6 @@ ALLOWLIST = {
 # expected to be replaced, so an entry here never has to be kept in step with another PR: fixing the file,
 # or deleting it, simply removes it from the debt.  Do not move a file here to silence the guard.
 DEBT = {
-    "test_alu_dot2acc_f16.py": "private oracle; v_dot2acc_f16 is not implemented in the translator yet",
-    "test_ballot_votes.py": "private SPIR-V interpreter; should translate a hand-written listing instead",
     "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
     "test_alu_cndmask_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_int_to_float.py": "private oracle merged before this guard (2026-11-22); should translate a listing",

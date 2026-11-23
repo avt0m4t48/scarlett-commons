@@ -577,6 +577,20 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_R_UpperArm_O", ped), 2)
         # Numbered aliases (e.g. SPINE1) must not prefix-match a different numbered bone (SPINE10).
         self.assertEqual(skinned_glb.infer_ped_parent("GM_C_SPINE1", ped), 0)
+        # Duplicate earlier ped bone names must not shift the inferred joint index onto another bone.
+        ident = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        dup_skel = [
+            {"name": "SKEL_ROOT", "parent": None, "bind_matrix": ident},
+            {"name": "AUX_pin", "parent": 0, "bind_matrix": ident},
+            {"name": "AUX_pin", "parent": 0, "bind_matrix": ident},
+            {"name": "SKEL_R_UpperArm01", "parent": 0, "bind_matrix": ident},
+            {"name": "SKEL_L_UpperArm01", "parent": 0, "bind_matrix": ident},
+        ]
+        jset = skinned_glb.JointSet(dup_skel)
+        self.assertEqual(
+            skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", jset.ped_by_name, jset._by_name),
+            4,
+        )
 
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(

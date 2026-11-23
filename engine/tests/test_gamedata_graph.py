@@ -152,6 +152,21 @@ class GamedataGraphTest(unittest.TestCase):
         with open(bin_path, "rb") as f:
             self.assertEqual(f.read(), content)
 
+    def test_json_cannot_replace_a_carved_payload_via_external_hard_link(self):
+        self.add(ALPHA)
+        self.finish()
+        payload = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        report = os.path.join(self.root, "alias.json")
+        try:
+            os.link(payload, report)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        r = self.run_tool(self.carve, "--json", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        with open(payload, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
     def test_fresh_json_inside_carve_dir_is_allowed(self):
         self.add(ALPHA)
         self.finish()

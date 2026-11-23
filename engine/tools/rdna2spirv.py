@@ -4109,19 +4109,21 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {m}")
         return p
 
-    def lds_access(self, addr, byte_off, fn):
+    def lds_access(self, addr, byte_off, fn, bound=None):
         """One LDS dword access: fn(pointer) emits it and returns its uint result id (a load, an atomic's old value)
         or None (a store). Without lds_bound this is fn(lds_ptr(...)), the wrapped access shaders always had. With
         it (SHADER-309: the program reaches past its RSRC2 allocation, or the array was shrunk to it), the dword
         index is checked: RDNA2 LDS does not wrap, an access outside the allocation reads 0 and its write is dropped
-        (RDNA2 ISA sections 3.6.1 and 3.6.6), so the access runs only in range and the result is 0 otherwise."""
-        if self.lds_bound is None:
+        (RDNA2 ISA sections 3.6.1 and 3.6.6), so the access runs only in range and the result is 0 otherwise. `bound`
+        (dwords) checks this one access even when lds_bound is unset."""
+        bound = self.lds_bound if bound is None else bound
+        if bound is None:
             return fn(self.lds_ptr(addr, byte_off))
         s1, i, ok, p = self.tmp(), self.tmp(), self.tmp(), self.tmp()
         pre, do, end = self.tmp() + "_lb", self.tmp() + "_lin", self.tmp() + "_lend"
         self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
         self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
-        self.emit(f"{ok} = OpULessThan %bool {i} {self.cu(self.lds_bound)}")
+        self.emit(f"{ok} = OpULessThan %bool {i} {self.cu(bound)}")
         self.emit(f"OpBranch {pre}")
         self.emit(f"{pre} = OpLabel")
         self.emit(f"OpSelectionMerge {end} None")
@@ -4138,31 +4140,49 @@ class Gen:
         self.emit(f"{v} = OpPhi %uint {r} {done_lbl} {self.cu(0)} {pre}")
         return v
 
-    def lds_load(self, addr, byte_off):
+    def lds_load(self, addr, byte_off, bound=None):
         def f(p):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint {p}")
             return v
-        return self.lds_access(addr, byte_off, f)
+        return self.lds_access(addr, byte_off, f, bound)
+
+    def lds_cross_bound(self):
+        """Bound (dwords) for the next dword a dword-crossing access reaches: the allocation, never wrapped to dword 0,
+        even in a shader whose other accesses keep the wrapped power-of-two array."""
+        if self.lds_bound is not None:
+            return self.lds_bound
+        return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
         self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
 
+    def lds_next_in_bounds(self, addr, byte_off):
+        """Bool: the dword after the one at (addr + byte_off) is inside the allocation (lds_cross_bound)."""
+        s1, i, ok = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off + 1)}")
+        self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
+        self.emit(f"{ok} = OpULessThan %bool {i} {self.cu(self.lds_cross_bound())}")
+        return ok
+
     def lds_u16_cross_read(self, addr, byte_off, w, sh):
         """A 16-bit LDS read at byte 3 of a dword (bit offset `sh` 24) also takes byte 0 of the next dword, as RDNA2
         LDS reads it in unaligned mode (llc -mcpu=gfx1030 -mattr=+unaligned-access-mode emits one ds_read_u16 at
-        offset 3). Returns (word, bit offset) for the 16-bit extract; the next dword is only read when crossing."""
-        cross, lo, hi, comb, w2, sh2 = (self.tmp() for _ in range(6))
+        offset 3; gfx1036 hardware agrees). When that byte is past the allocation the whole read returns 0, as on
+        gfx1036. Returns (word, bit offset) for the 16-bit extract; the next dword is only read when crossing."""
+        cross, lo, hi, both, comb, w2, sh2 = (self.tmp() for _ in range(7))
         x_do, x_end = self.tmp() + "_x", self.tmp() + "_xend"
         self.emit(f"{cross} = OpIEqual %bool {sh} {self.cu(24)}")
         pre = self.current_label_placeholder()
         self.emit(f"OpSelectionMerge {x_end} None")
         self.emit(f"OpBranchConditional {cross} {x_do} {x_end}")
         self.emit(f"{x_do} = OpLabel")
-        nxt = self.lds_load(addr, byte_off + 1)
+        ok = self.lds_next_in_bounds(addr, byte_off)
+        nxt = self.lds_load(addr, byte_off + 1, self.lds_cross_bound())
         self.emit(f"{lo} = OpShiftRightLogical %uint {w} {self.cu(24)}")
         self.emit(f"{hi} = OpShiftLeftLogical %uint {nxt} {self.cu(8)}")
-        self.emit(f"{comb} = OpBitwiseOr %uint {lo} {hi}")
+        self.emit(f"{both} = OpBitwiseOr %uint {lo} {hi}")
+        self.emit(f"{comb} = OpSelect %uint {ok} {both} {self.cu(0)}")
         last = self.current_label_placeholder()
         self.emit(f"OpBranch {x_end}")
         self.emit(f"{x_end} = OpLabel")
@@ -4296,13 +4316,28 @@ class Gen:
                 t1, t2 = self.tmp(), self.tmp()
                 self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
                 self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {pos}")
-            self.lds_access(addr, off, sub_dword)
-            if bits == 16:
-                # A halfword at byte 3 writes its high byte to byte 0 of the next dword.
-                cross, hb, x_do, x_end = self.tmp(), self.tmp(), self.tmp() + "_x", self.tmp() + "_xend"
+            if bits != 16:
+                self.lds_access(addr, off, sub_dword)
+            else:
+                # A halfword at byte 3 writes its high byte to byte 0 of the next dword. When that byte is past the
+                # allocation the whole write is dropped, as on gfx1036 (the low byte is not written either).
+                cross, ok, nok, drop, keep, both, hb = (self.tmp() for _ in range(7))
+                k_do, k_end = self.tmp() + "_k", self.tmp() + "_kend"
+                x_do, x_end = self.tmp() + "_x", self.tmp() + "_xend"
                 self.emit(f"{cross} = OpIEqual %bool {sh2} {self.cu(24)}")
+                ok = self.lds_next_in_bounds(addr, off)
+                self.emit(f"{nok} = OpLogicalNot %bool {ok}")
+                self.emit(f"{drop} = OpLogicalAnd %bool {cross} {nok}")
+                self.emit(f"{keep} = OpLogicalNot %bool {drop}")
+                self.emit(f"{both} = OpLogicalAnd %bool {cross} {ok}")
+                self.emit(f"OpSelectionMerge {k_end} None")
+                self.emit(f"OpBranchConditional {keep} {k_do} {k_end}")
+                self.emit(f"{k_do} = OpLabel")
+                self.lds_access(addr, off, sub_dword)
+                self.emit(f"OpBranch {k_end}")
+                self.emit(f"{k_end} = OpLabel")
                 self.emit(f"OpSelectionMerge {x_end} None")
-                self.emit(f"OpBranchConditional {cross} {x_do} {x_end}")
+                self.emit(f"OpBranchConditional {both} {x_do} {x_end}")
                 self.emit(f"{x_do} = OpLabel")
                 self.emit(f"{hb} = OpShiftRightLogical %uint {fld} {self.cu(8)}")
 
@@ -4310,7 +4345,7 @@ class Gen:
                     t1, t2 = self.tmp(), self.tmp()
                     self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {self.cu(0xFFFFFF00)}")
                     self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {hb}")
-                self.lds_access(addr, off + 1, next_byte0)
+                self.lds_access(addr, off + 1, next_byte0, self.lds_cross_bound())
                 self.emit(f"OpBranch {x_end}")
                 self.emit(f"{x_end} = OpLabel")
         elif name in self.LDS_ATOMICS:

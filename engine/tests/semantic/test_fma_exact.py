@@ -190,6 +190,27 @@ class FmaExactTests(unittest.TestCase):
                          (0x00000000, 0xBF800000, 0x00000000), (0xBF800000, 0x3F800000, 0x3F800000)])
         self.assertEqual(got, [0x00000000, 0x80000000, 0x00000000, 0x00000000])
 
+    def test_zero_addend_keeps_the_sign_of_an_underflowing_product(self):
+        # Normal x and y whose product still underflows after the 2^96 scale, plus +0: the exact result is -0 for a
+        # negative product. The split path gave -0 + +0 = +0, with f32 denormals kept and flushed (reported in #5231).
+        # (-2^-126)(2^-120) + 0; (2^-126)(2^-120) - 0; (1.5 2^-100)(-2^-30) + 0 is the denormal -1.5 2^-130;
+        # (-1.5 2^-100)(2^-126) + 0
+        triples = [(0x80800000, 0x03800000, 0x00000000), (0x00800000, 0x03800000, 0x80000000),
+                   (0x0DC00000, 0xB0800000, 0x00000000), (0x8DC00000, 0x00800000, 0x00000000)]
+        self.assertEqual(fma_words(triples), [0x80000000, 0x00000000, 0x800C0000, 0x80000000])
+        self.assertEqual(fma_words(triples, run=run_split_flushing), [0x80000000, 0x00000000, 0x80000000, 0x80000000])
+        rng = random.Random(245)
+        group = []
+        for _ in range(64):
+            ex = rng.randint(-126, -121)
+            x, y = word(rng, ex, ex), word(rng, -126, -247 - ex)           # |x*y| < 2^-245
+            group.append((x, y, rng.getrandbits(1) << 31))
+        for run in (run_split, run_split_flushing):
+            for i in range(0, len(group), 4):
+                for (x, y, z), got in zip(group[i:i + 4], fma_words(group[i:i + 4], run=run)):
+                    with self.subTest(run=run.__name__, x=f"{x:08x}", y=f"{y:08x}", z=f"{z:08x}"):
+                        self.assertEqual(f"{got:08x}", f"{(x ^ y) & 0x80000000:08x}")
+
     def test_tiny_addend_breaks_a_tie_of_a_big_product(self):
         # x*y = (1 + 2^-12)^2 * 2^126 is a tie; the 2^-64 scaling of that path used to turn z = 2^-100 into 0, which
         # rounded to the even neighbour 0x7e801000 instead of 0x7e801001.

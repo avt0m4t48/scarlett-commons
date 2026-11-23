@@ -1188,7 +1188,9 @@ class Gen:
         |z| < 2^-46), and a factor below 2^-100 is traded 2^64 against one above 2^-20, so the low split halves stay
         normal on a driver that flushes f32 denormals. Infinite or NaN operands, and finite ones whose product is
         beyond even the scaled range (the result is +-inf), take the plain Fma, except that finite x and y with an
-        infinite z give z (a split Fma turns an overflowing x*y and the other infinity into a NaN). Exact (checked
+        infinite z give z (a split Fma turns an overflowing x*y and the other infinity into a NaN), and normal x and y
+        with a zero z give the rounded x*y (the split path turns an underflowing negative product plus +0 into +0, not
+        -0). Exact (checked
         against an exact rational reference in tests/semantic/test_fma_exact.py) for finite operands with a normal or
         zero result, with f32 denormals kept or flushed; a result in the denormal range is scaled back with a second
         rounding, and a denormal operand follows the driver's denormal mode, as for every f32 operation here."""
@@ -1214,7 +1216,8 @@ class Gen:
 
         up64, dn64, up96, dn96 = (self.fconst(2.0 ** e) for e in (64, -64, 96, -96))
         mx, my, mz = mag(x), mag(y), mag(z)
-        mp0 = mag(op("OpFMul", x, y))
+        p0 = op("OpFMul", x, y)
+        mp0 = mag(p0)
         big = op("OpLogicalOr", above(mp0, 0x7E7FFFFF), above(mz, 0x7E7FFFFF), ty="%bool")    # >= 2^126 (or inf)
         tiny = self.emit_land(below(mp0, 0x19800000), below(mz, 0x28800000))                   # < 2^-76, < 2^-46
         xsm = op("OpULessThan", mx, my, ty="%bool")
@@ -1266,7 +1269,12 @@ class Gen:
                  op("OpISub", sbits, self.cu(1), ty="%uint"), ty="%uint")
         v = op("OpBitcast", op("OpSelect", self.emit_land(even, inexact), adj, sbits, ty="%uint"))
         rs = sel(op("OpFOrdEqual", v, "%f0", ty="%bool"), th, op("OpFAdd", th, v))
-        rr = op("OpFMul", rs, fr)
+        # z = +-0 with normal x and y: the exact x*y + z is x*y, which is not zero, so the one rounding of x*y is the
+        # result. The split path loses the sign of a product that underflows even after the 2^96 scale: p rounds to
+        # -0, th = p + z1 is -0 + +0 = +0, and so is the result where the exact one is -0.
+        xy_normal = self.emit_land(above(mx, 0x007FFFFF), above(my, 0x007FFFFF))
+        times = self.emit_land(op("OpIEqual", mz, self.cu(0), ty="%bool"), xy_normal)
+        rr = sel(times, p0, op("OpFMul", rs, fr))
         special = op("OpLogicalOr", op("OpLogicalOr", above(mx, 0x7F7FFFFF), above(my, 0x7F7FFFFF), ty="%bool"),
                      op("OpLogicalOr", above(mz, 0x7F7FFFFF), op("OpIsNan", rr, ty="%bool"), ty="%bool"), ty="%bool")
         g = op("OpExtInst", "%glsl Fma", x, y, z)

@@ -16593,6 +16593,22 @@ def _read_shard_markers(out):
     return markers
 
 
+def _missing_shard_summary(indices, expected):
+    """Describe gaps in sorted unique indices without allocating the full missing range."""
+    valid = [i for i in indices if i < expected]
+    missing_count = expected - len(valid)
+    if not missing_count:
+        return ""
+    preview, start = [], 0
+    for stop in (*valid, expected):
+        preview.extend(range(start, min(stop, start + 16 - len(preview))))
+        if len(preview) == 16:
+            break
+        start = stop + 1
+    omitted = missing_count - len(preview)
+    return f", missing {preview}" + (f" ({omitted} more)" if omitted else "")
+
+
 def merge_shard_parts(out):
     """{shader: meta} from index.part*.json, after checking the set is complete and not empty.
 
@@ -16614,6 +16630,7 @@ def merge_shard_parts(out):
         indices.append(int(m.group(1)))
     if len(set(indices)) != len(indices):
         raise ShardSetError(f"index.part*.json has two parts with the same index: {sorted(indices)}")
+    indices.sort()
     plan_jobs = None
     plan = os.path.join(out, "shards.json")
     if os.path.isfile(plan):
@@ -16639,18 +16656,17 @@ def merge_shard_parts(out):
     elif plan_jobs is not None:
         expected = plan_jobs
     if expected is not None:
-        missing = [i for i in range(expected) if i not in set(indices)]
+        missing = _missing_shard_summary(indices, expected)
         extra = [i for i in indices if i >= expected]
         if missing or extra:
             raise ShardSetError(
                 f"incomplete shard set: {len(indices)} of {expected} parts (0..{expected - 1})"
-                + (f", missing {missing}" if missing else "")
+                + missing
                 + (f", unexpected {extra}" if extra else "")
                 + "; let every --shard run finish before --merge")
-    elif indices != list(range(len(indices))):
-        gap = [i for i in range(max(indices) + 1) if i not in set(indices)]
-        raise ShardSetError(f"incomplete shard set: parts {sorted(indices)} are not contiguous from 0"
-                            + (f", missing {gap}" if gap else "")
+    elif indices[-1] != len(indices) - 1:
+        raise ShardSetError(f"incomplete shard set: parts {indices} are not contiguous from 0"
+                            + _missing_shard_summary(indices, indices[-1] + 1)
                             + "; without a shard count the merge refuses a set with a gap")
     if markers and set(markers) != set(indices):
         raise ShardSetError(f"index parts and shard markers disagree: parts {sorted(set(indices))}, "

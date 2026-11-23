@@ -112,6 +112,24 @@ class MergeShardPartsTest(unittest.TestCase):
         self.part(1, {"b": {}})
         self.assertEqual(sorted(R.merge_shard_parts(str(self.out))), ["a", "b"])
 
+    def test_legacy_set_with_double_digit_indices_merges(self):
+        for i in range(12):
+            self.part(i, {str(i): {}})
+        self.assertEqual(set(R.merge_shard_parts(str(self.out))), {str(i) for i in range(12)})
+
+    def test_large_gaps_have_a_bounded_diagnostic(self):
+        self.part(0, {"a": {}})
+        self.part(10_000, {"b": {}})
+        for expected in (None, 10_001):
+            with self.subTest(expected=expected):
+                if expected:
+                    self.plan(expected)
+                message = self.merge_error()
+                self.assertIn("incomplete shard set", message)
+                self.assertIn("missing [1, 2", message)
+                self.assertIn("9983 more", message)
+                self.assertLess(len(message), 300)
+
     def test_plan_and_markers_that_agree_merge(self):
         self.part(0, {"a": {}})
         self.part(1, {"b": {}})

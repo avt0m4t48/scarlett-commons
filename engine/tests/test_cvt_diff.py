@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -278,6 +279,18 @@ class Translated(unittest.TestCase):
             # 0.5 + 3 * 2^-11 times 65535 rounded in binary32 is 32863.5, which a second rounding takes to 32864
             c.translate_listing = lambda l, n, t: [0x80608060] + real(l, n, t)[1:]
             self.assertIn("expected 0x805f805f, actual 0x80608060", c.check(lines))
+        finally:
+            c.translate_listing = real
+
+    def test_a_short_export_is_caught(self):
+        # zip alone compared only the words both oracles have, so a translator exporting two of the four passed
+        lines = ["v_mov_b32 v9, 0x3803", "v_cvt_pknorm_u16_f16 v8, v9, v9"]
+        real = c.translate_listing
+        try:
+            c.translate_listing = lambda l, n, t: real(l, n, t)[:2]
+            self.assertEqual(c.check(lines), "exported 2 words, want 4")
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(c.run_one(lines, "ps_cvt_short", tmp), ("mismatch", "exported 2 words, want 4"))
         finally:
             c.translate_listing = real
 

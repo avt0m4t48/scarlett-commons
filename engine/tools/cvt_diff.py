@@ -627,6 +627,14 @@ def check(lines, name="ps_cvt_case"):
     with tempfile.TemporaryDirectory(prefix="cvt-diff-") as tmp:
         want = reference(lines)
         got = translate_listing(lines, name, tmp)
+    return compare(want, got)
+
+
+def compare(want, got):
+    """None when the translator exported the same words as the reference, else what differs. A short export is a
+    difference too: zip alone would compare only the words both sides have."""
+    if len(got) != len(want):
+        return f"exported {len(got)} words, want {len(want)}"
     for i, (w, g) in enumerate(zip(want, got)):
         if w != (g & M32):
             return f"word {i} (v{EXPORT_REGS[i]}): expected 0x{w:08x}, actual 0x{g:08x}"
@@ -645,10 +653,8 @@ def run_one(lines, name, tmpdir, events=None):
         return ("skip", f"{type(e).__name__}: {e}")
     except (IndexError, KeyError, ValueError) as e:
         return ("skip", f"translator error {type(e).__name__}: {e}")
-    for i, (w, g) in enumerate(zip(want, got)):
-        if w != (g & M32):
-            return ("mismatch", f"word {i} (v{EXPORT_REGS[i]}): expected 0x{w:08x}, actual 0x{g:08x}")
-    return ("match", "")
+    detail = compare(want, got)
+    return ("mismatch", detail) if detail else ("match", "")
 
 
 # ---- the suites ----

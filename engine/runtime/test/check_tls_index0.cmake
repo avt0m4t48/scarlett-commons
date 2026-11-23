@@ -28,6 +28,12 @@ foreach(mode run init)
   file(REMOVE "${trace}")
 endforeach()
 
+# Wine's GetTempPathW falls back to the user's Temp folder when TMP and TEMP name a missing one, so the reservation
+# cannot fail there; under an emulator (Wine for a cross build) this part is skipped.
+if(RUNNER OR DEFINED ENV{WINEPREFIX})
+  message(STATUS "Wine: the missing-TMP refusal is not checked (GetTempPathW falls back to another folder)")
+  return()
+endif()
 set(missing "${TRACE_DIR}/leonida_no_such_temp")
 file(REMOVE_RECURSE "${missing}")
 foreach(mode run init dry-run)

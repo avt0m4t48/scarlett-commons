@@ -28,17 +28,36 @@
 // The triangle's long edge passes exactly through the centres of the pixels with row - col == 32 (32 of them); the
 // top-left rule leaves them uncovered (a right edge), so they must be the clear colour; they are counted apart. Every
 // other pixel (4064 of 4096) is compared exactly. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+// Built a second time with LEONIDA_M15_GUEST, this file is tiny_guest_draw.exe, which runs the same draws and the same
+// pixel checks as a `gta6rt --run` guest (test/run_guest_draw.cmake). Its device comes from an imported
+// d3d12_xs.dll!D3D12XboxCreateDevice, which gta6rt's shim registry answers (LEONIDA_D3D12=vulkan, LEONIDA_SHADERS=
+// <folder>/spirv); the folder build.py wrote is argv[1]. It links nothing from src/ or shims/, so the checks that need
+// the runtime's internals (the shader library, the replay result, the proxy's ref count, validation) stay in the host
+// build. On success it prints one marker line, after every check.
+#ifndef LEONIDA_M15_GUEST
 #include "vk_test_device.h"
+#endif
 #include "d3d12_test_shaders.h"
+#ifndef LEONIDA_M15_GUEST
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#endif
 #include "../src/gfx10_descriptors.h"
+#ifndef LEONIDA_M15_GUEST
 #include "../src/shader_library.h"
+#endif
 
 #include <array>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 
-#ifndef LEONIDA_TEST_M15_DIR
+#ifdef LEONIDA_M15_GUEST
+// Resolved at link time against test/fixtures/d3d12_xs_stub.cpp (which fails), at run time by gta6rt's shim registry.
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params,
+                                                                      const IID* riid, void** out);
+#elif !defined(LEONIDA_TEST_M15_DIR)
 #error "LEONIDA_TEST_M15_DIR must name the folder build.py wrote (spirv/index.json, fssm/*.fssm)"
 #endif
 
@@ -81,6 +100,16 @@ std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t recor
 
 }  // namespace
 
+#ifdef LEONIDA_M15_GUEST
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // the marker reaches the launcher even if the process dies after it
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: tiny_guest_draw <folder build.py wrote (spirv/index.json, fssm/*.fssm)>\n");
+        return 2;
+    }
+    // The FSSM programs the index entries are keyed by; the shim's device finds the index through LEONIDA_SHADERS.
+    const std::filesystem::path root_dir = argv[1];
+#else
 int main() {
     vktest::Device d;
     const auto device_status = d.initialize();
@@ -89,15 +118,18 @@ int main() {
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
+#endif
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m15.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m15.fssm");
     EXPECT(vs_program.size() >= 4 && ps_program.size() == 0x110);
     const float scale[4] = {0.5f, 2.0f, 1.0f, 1.0f};  // ps_m15.asm's table at offset 0x100
     EXPECT(std::memcmp(ps_program.data() + 0x100, scale, sizeof(scale)) == 0);
+#ifndef LEONIDA_M15_GUEST
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     EXPECT(library.find("vs", leonida::sha256_hex(vs_program)) && library.find("ps", leonida::sha256_hex(ps_program)));
     EXPECT(library.find("ps", leonida::sha256_hex(ps_program))->uses_code_base);
+#endif
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     // A program the index does not know (the VS's bytes with one word changed) must be refused by the PSO.
     auto unknown_program = vs_program;
@@ -117,6 +149,19 @@ int main() {
 
     std::vector<Pixel> pixels(target_extent * target_extent);
     {
+#ifdef LEONIDA_M15_GUEST
+        // The import the game uses is the guest's only way to a device. With LEONIDA_D3D12=vulkan the shim returns the
+        // Vulkan device behind the Xbox-ABI proxy; the host's D3D12 device cannot build the PSO from FSSM containers,
+        // and the link-time stub returns no device, so either of those fails below.
+        const std::uint32_t device_params[24] = {};  // the 24-word block the shim logs; it does not create from it
+        const IID device_iid = __uuidof(ID3D12Device);
+        Ref<ID3D12Device> device;
+        const HRESULT created = D3D12XboxCreateDevice(nullptr, device_params, &device_iid, reinterpret_cast<void**>(&device.p));
+        if (FAILED(created) || !device.p) {
+            std::fprintf(stderr, "D3D12XboxCreateDevice failed (hr=0x%08lx)\n", static_cast<unsigned long>(created));
+            return 1;
+        }
+#else
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
@@ -132,6 +177,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
+#endif
 
         // Root signature: [0] a descriptor table of one SRV (s0:s1, the table's console VA), [1] four 32-bit
         // constants (s2, s3: the draw's offset; s4: the PS's bias; s5 unused). No input layout: the VS fetches.
@@ -281,7 +327,9 @@ int main() {
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
+#ifndef LEONIDA_M15_GUEST
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+#endif
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
         void* mapped = nullptr;
@@ -297,7 +345,9 @@ int main() {
         allocator.reset();
         queue.reset();
         fence.reset();
+#ifndef LEONIDA_M15_GUEST
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+#endif
     }
 
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};
@@ -334,6 +384,11 @@ int main() {
     // The long edge is a right edge of the triangle, which the top-left rule leaves uncovered: all 32 are the clear colour.
     EXPECT(edge == 32 && edge_triangle + edge_clear == edge && edge_triangle == 0);
     EXPECT(!mismatches);
+#ifdef LEONIDA_M15_GUEST
+    // Printed only here, after every check: test/run_guest_draw.cmake wants exactly this line and exit code 0.
+    std::printf("M1.5 guest: PASS, %u of %u pixels exact, %u edge pixels the clear colour\n",
+                target_extent * target_extent - edge, target_extent * target_extent, edge_clear);
+#else
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
@@ -343,5 +398,6 @@ int main() {
                 "table and root constants, V# vertex fetch from the arena, PS constants "
                 "through the code base\n",
                 target_extent * target_extent - edge, target_extent * target_extent, edge, edge_triangle, edge_clear);
+#endif
     return 0;
 }

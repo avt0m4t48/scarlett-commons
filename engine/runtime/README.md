@@ -456,3 +456,28 @@ $env:LEONIDA_VK_VALIDATION = '1'
 ### Predicate capture lifetime
 
 `vk_predicate_capture_test` checks full-width predicate snapshots, offset rebinding and reset with 32 gated submissions, then reuses completed command-buffer slots. Run explicitly on a Vulkan GPU with conditional rendering; it uses only synthetic data.
+
+### A synthetic guest draws its first offscreen frame
+
+On a Windows Vulkan build, configure CMake with `-DLEONIDA_TEST_GUEST_DRAW=ON` and build the
+`tiny_guest_draw` and `gta6rt` targets. With llvm-mc, spirv-as and spirv-val available at configure
+time, run `ctest --test-dir runtime/build -C Release -R "^d3d12_translated_draw_guest$" -V`.
+The loader maps the test executable. It imports the Xbox device factory, submits three draws using two
+handwritten shaders, reads back a 64×64 offscreen texture and checks every pixel.
+
+The guest also builds independently of the shader tools. To produce the same synthetic fixture on
+another machine, run `python -I runtime/test/shaders/build.py m15_shaders vs_m15 ps_m15` from the
+checkout with llvm-mc, spirv-as and spirv-val available. Copy the whole resulting folder to the test
+machine. For Wine, make the runtime executable, its runtime DLLs, the guest executable and the fixture
+accessible in the same Wine prefix. For example, from their containing directory with the guest and
+fixture beside the loader:
+
+```sh
+fixture=$(winepath -w "$PWD/m15_shaders")
+shaders=$(winepath -w "$PWD/m15_shaders/spirv")
+guest=$(winepath -w "$PWD/tiny_guest_draw.exe")
+LEONIDA_D3D12=vulkan LEONIDA_SHADERS="$shaders" wine ./gta6rt.exe --run "$guest" -- "$fixture"
+```
+
+A passing run exits zero and prints `M1.5 guest: PASS, 4064 of 4096 pixels exact, 32 edge pixels the clear colour`.
+The 32 diagonal pixels must all match the clear colour exactly. The fixture does not create a window.

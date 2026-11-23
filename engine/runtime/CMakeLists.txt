@@ -2290,6 +2290,48 @@ if(TARGET Vulkan::Headers)
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
+
+    # M1.5 as a `gta6rt --run` guest: test/d3d12_translated_draw_test.cpp built again with LEONIDA_M15_GUEST as
+    # tiny_guest_draw.exe, whose only device is the D3D12XboxCreateDevice it imports from d3d12_xs.dll. The import
+    # library comes from a failing stub built into fixtures/stubs, away from the guest, so only gta6rt's shim registry
+    # can answer it. The guest links nothing from src/ or shims/ and can be
+    # copied with its ordinary CRT dependencies, given the m15 folder as its argument. test/run_guest_draw.cmake checks the exit code and the marker line.
+    # Opt-in: it needs a Vulkan GPU and the guest cannot tell a missing one from a bug, so default runs are unchanged.
+    option(LEONIDA_TEST_GUEST_DRAW
+           "Build tiny_guest_draw.exe and run the M1.5 draw through gta6rt --run (needs a Vulkan GPU)" OFF)
+    if(LEONIDA_TEST_GUEST_DRAW)
+      # Share the import stub with the tiny_frame clear/readback guest from PR #3488.
+      if(NOT TARGET d3d12_xs_stub)
+        add_library(d3d12_xs_stub SHARED test/fixtures/d3d12_xs_stub.cpp test/fixtures/d3d12_xs_stub.def)
+        target_compile_definitions(d3d12_xs_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(d3d12_xs_stub PRIVATE /W4 /permissive- /utf-8)
+        set_target_properties(d3d12_xs_stub PROPERTIES
+          OUTPUT_NAME d3d12_xs
+          PREFIX ""
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+          ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+        )
+      endif()
+      add_executable(tiny_guest_draw test/d3d12_translated_draw_test.cpp)
+      target_link_libraries(tiny_guest_draw PRIVATE d3d12_xs_stub Vulkan::Headers)
+      target_compile_definitions(tiny_guest_draw PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_M15_GUEST)
+      target_compile_options(tiny_guest_draw PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(tiny_guest_draw PROPERTIES
+        OUTPUT_NAME tiny_guest_draw
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/guest_draw/$<CONFIG>"
+      )
+      # This guest can use a synthetic fixture produced on another machine. Register the automated test
+      # if the tools to generate the fixture are available locally.
+      if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING AND TARGET d3d12_translated_draw_test AND TARGET gta6rt)
+        add_dependencies(tiny_guest_draw d3d12_translated_draw_test gta6rt)
+        add_test(NAME d3d12_translated_draw_guest
+                 COMMAND ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt> -DGUEST=$<TARGET_FILE:tiny_guest_draw>
+                         -DFIXTURE=${LEONIDA_M15_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_draw.cmake)
+        set_tests_properties(d3d12_translated_draw_guest PROPERTIES TIMEOUT 180)
+      else()
+        message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
+      endif()
+    endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
     if(TARGET bvh_builder_test)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)

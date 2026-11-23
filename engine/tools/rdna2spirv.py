@@ -16080,8 +16080,11 @@ def merge_shard_parts(out):
                             f"markers {sorted(markers)}")
     merged = {}
     for part in parts:
-        with open(part, encoding="utf-8") as f:
-            doc = _js.load(f)
+        try:
+            with open(part, encoding="utf-8") as f:
+                doc = _js.load(f)
+        except (OSError, ValueError) as e:
+            raise ShardSetError(f"cannot read {part}: {e}; delete that part and run --shard <i>/<n> again") from None
         if not isinstance(doc, dict):
             raise ShardSetError(f"{part} does not contain a shader index object")
         merged.update(doc)

@@ -50,6 +50,11 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <memory>
+
+namespace leonida {
+class FrameTokenSource;
+}
 
 namespace rt::d3d12_xs {
 
@@ -88,6 +93,8 @@ unsigned device_proxy_slot_count(const void* device);
 
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
+
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

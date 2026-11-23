@@ -250,6 +250,7 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
+
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;

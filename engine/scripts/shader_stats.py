@@ -59,7 +59,7 @@ def load_stats(path):
     """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, strict=True)
         header = reader.fieldnames or []
         missing = [c for c in REQUIRED if c not in header]
         if missing:

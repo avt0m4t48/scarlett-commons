@@ -950,6 +950,16 @@ if(TARGET Vulkan::Headers)
     endif()
   endforeach()
   if(BUILD_TESTING)
+    if(WIN32)
+      # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
+      add_executable(host_adapter_test test/host_adapter_test.cpp)
+      target_link_libraries(host_adapter_test PRIVATE Vulkan::Headers dxgi)
+      target_compile_definitions(host_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(host_adapter_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+      add_test(NAME host_adapter COMMAND host_adapter_test)
+    endif()
     add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"

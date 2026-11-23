@@ -11817,7 +11817,8 @@ class Gen:
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
-                uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias)
+                uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias,
+                                                       a[3])
                 off = None
 
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
@@ -12614,16 +12615,20 @@ class Gen:
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
-    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias):
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
-        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), floored and clamped to the image's
-        levels. Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the
-        shift is exact for any address mode at that level. Only a trilinear blend of two levels differs: the
-        coarser level moves by offset / 2 of its texels instead of offset. Implicit samples become Grad samples with
-        the derivatives of the original coordinate (scaled by 2^bias for _b): the LOD and anisotropy are those of the
-        unshifted sample, even when the offset changes from pixel to pixel."""
+        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
+        MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
+        with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
+        records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
+        none, whose LOD the runtime holds in [0, 0.25]
+        (gfx10_descriptors.h vulkan_sampler). Texel offsets apply before wrapping and clamping, and an integer
+        offset commutes with them, so the shift is exact for any address mode at that level. Only a trilinear blend
+        of two levels differs: the coarser level moves by offset / 2 of its texels instead of offset. Implicit
+        samples become Grad samples with the derivatives of the original coordinate (scaled by 2^bias for _b): the
+        LOD and anisotropy are those of the unshifted sample, even when the offset changes from pixel to pixel."""
         self.uses_query = True
         ci = lambda v: self.as_int(self.cu(v))
         lv, lvm = self.tmp(), self.tmp()
@@ -12648,12 +12653,42 @@ class Gen:
                 qb = self.tmp()
                 self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
                 level_f = qb
+        mip = None
+        if level_f is not None:
+            lit = self.sgpr_imm.get(s_op["r"] + 2)
+            if lit is not None:
+                mip = lit >> 26 & 3
+            else:
+                mip = self.tmp()
+                self.emit(f"{mip} = OpBitFieldUExtract %uint {self.load_reg('sgpr', s_op['r'] + 2)} "
+                          f"{self.cu(26)} {self.cu(2)}")
+            if mip == 0:
+                level_f = None
         if level_f is None:
             level = ci(0)
         else:
-            fl, li, lo = self.tmp(), self.tmp(), self.tmp()
+            static = isinstance(mip, int)
+            fl, li = self.tmp(), self.tmp()               # linear: the finer of the two blended levels
             self.emit(f"{fl} = OpExtInst %float %glsl Floor {level_f}")
             self.emit(f"{li} = OpConvertFToS %int {fl}")
+            if not static or mip != 2:                    # point (and 3): nearest level, a tie rounds up
+                # floor + (fraction >= 0.5), not floor(lod + 0.5): lod - floor(lod) is exact in binary32, the sum
+                # is not (0x3f000001 + 0.5 rounds to 1.0, and 0x3effffff + 0.5 rounds up to 1.0 as well).
+                fr, up, inc, near = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{fr} = OpFSub %float {level_f} {fl}")
+                self.emit(f"{up} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")
+                self.emit(f"{inc} = OpSelect %int {up} {ci(1)} {ci(0)}")
+                self.emit(f"{near} = OpIAdd %int {li} {inc}")
+                if static:
+                    li = near
+                else:
+                    lin, none, pick, sel = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{lin} = OpIEqual %bool {mip} {self.cu(2)}")
+                    self.emit(f"{pick} = OpSelect %int {lin} {li} {near}")
+                    self.emit(f"{none} = OpIEqual %bool {mip} {self.cu(0)}")
+                    self.emit(f"{sel} = OpSelect %int {none} {ci(0)} {pick}")
+                    li = sel
+            lo = self.tmp()
             self.emit(f"{lo} = OpExtInst %int %glsl SClamp {li} {ci(0)} {lvm}")
             level = lo
         # Size of that level: 1D int, 2D v2int, 2D array / 3D v3int (array: width, height, layers).

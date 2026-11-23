@@ -39,7 +39,7 @@ Meshlet group (first u32 has bit 31 set):
     +0x5C         u32, 0x200 (as in the `63 30` block)
     +0x60         f32 x3 bias        +0x6C  u32 axis order, 0, 1 or 2
     +0x70         f32 x3 scale       +0x7C  f32 UV scale for type-8 slots (4.0f in every block measured)
-    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x26, 0x27 and
+    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x25, 0x26, 0x27 and
     0x28 = 4 bytes, and 0x63 in the `63 30` block = 12 bytes. The vertex count is the span
     from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
     Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
@@ -84,9 +84,10 @@ SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
 OTHER_HEADER_SIZE = 0x80
 # A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
-# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
+# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8. Skinned blocks also use type 5 for joint indices.
 SLOT_TYPES = {1: "octahedral normal, 10 + 10 bits unorm", 2: "2 x f32 or a packed position", 3: "3 x f32",
-              6: "RGBA8", 7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
+              5: "joint indices in skin slots", 6: "RGBA8",
+              7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
               8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
 
 

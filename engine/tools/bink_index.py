@@ -186,7 +186,11 @@ def scan_target(target, skip_report=None):
     if os.path.isdir(target):
         base = target
         paths = []
-        for root, _dirs, files in os.walk(target):
+
+        def scan_failed(error):
+            raise error
+
+        for root, _dirs, files in os.walk(target, onerror=scan_failed):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):

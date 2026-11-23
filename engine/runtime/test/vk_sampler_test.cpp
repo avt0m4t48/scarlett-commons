@@ -118,7 +118,8 @@ int main(int argc, char** argv) {
     std::printf("device: %s, driver 0x%x, Vulkan %u.%u.%u\n", props.deviceName, props.driverVersion,
                 VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
                 VK_API_VERSION_PATCH(props.apiVersion));
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64) {
@@ -152,6 +153,12 @@ int main(int argc, char** argv) {
     enable12.bufferDeviceAddress = VK_TRUE;
     enable12.runtimeDescriptorArray = VK_TRUE;
     enable12.descriptorIndexing = have12.descriptorIndexing;
+    // The translated vs_ids reads BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3, as in
+    // vk_harness and vk_texture_test. Without the feature, creating its module breaks
+    // VUID-VkShaderModuleCreateInfo-pCode-08740.
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    enable11.shaderDrawParameters = have11.shaderDrawParameters;
+    enable12.pNext = &enable11;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;

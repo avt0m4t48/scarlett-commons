@@ -993,7 +993,8 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 khr = os.environ.get("LEONIDA_FMA") == "khr"
-                ok, detail = judge_fma_fused(dump_words(msg), khr=khr)
+                exact = os.environ.get("LEONIDA_FMA") == "exact"   # SHADER-497: as strict as khr
+                ok, detail = judge_fma_fused(dump_words(msg), khr=khr, exact=exact)
                 results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.

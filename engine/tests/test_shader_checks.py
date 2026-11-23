@@ -1010,6 +1010,23 @@ class FmaFusedChecks(unittest.TestCase):
         self.assertIn("word 0", problem)
         self.assertIn("OpFmaKHR", problem)
 
+    def test_exact_is_as_strict_as_khr(self):
+        # SHADER-497: --fma exact builds the single rounding from plain f32 ops, so a split word is a failure there
+        # too, as under khr; only --fma glsl accepts it.
+        ok, detail = check.judge_fma_fused(check.FMA_FUSED, khr=False, exact=True)
+        self.assertTrue(ok)
+        self.assertIn("--fma exact", detail)
+        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, khr=False, exact=True)
+        self.assertFalse(ok)
+        self.assertIn("word 0", detail)
+        self.assertIn("--fma exact", detail)
+        out = "out[0..7] = " + " ".join(map(str, self.RADV_SPLIT)) + "\n"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(check.os.environ, {"LEONIDA_FMA": "exact"}), \
+                patch.object(check, "run", return_value=(0, out)):
+            problem = check.fma_fused_test("tools", tmp)
+        self.assertIn("word 0", problem)
+        self.assertIn("--fma exact", problem)
+
     def test_wrong_f16_or_garbage_f32_fails_under_both_modes(self):
         bad_f16 = check.FMA_FUSED[:7] + [0x00007352]
         bad_f32 = [0x12345678] + check.FMA_FUSED[1:]

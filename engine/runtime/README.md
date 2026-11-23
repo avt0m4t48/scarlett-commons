@@ -111,6 +111,16 @@ bytewise case behavior for narrow API and import-name lookups. `Module::name`, m
 and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
 `LoadLibrary`/`GetModuleHandle` API conversions.
 
+The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
+`insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
+([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
+vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
+address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
+line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
+them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
+hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
+real: natively on a Zen host, through the handler on an Intel one.
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,

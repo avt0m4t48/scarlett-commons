@@ -569,16 +569,27 @@ class LinuxBackend(unittest.TestCase):
         self.assertEqual(registers(), {"k0": (0xE0AC0001, 0x84, 32)})
         for fields in ({"properties": 0x040A},      # also wants the dispatch pointer
                        {"properties": 0x0400},      # no kernarg pointer
-                       {"group": 1024},             # LDS
                        {"private": 64},             # scratch memory
                        {"rsrc3": 1},
                        {"rsrc2": 0x85},             # the private segment
                        {"rsrc2": 0x86},             # three user SGPRs
-                       {"rsrc2": 0x84 | 1 << 15}):  # an LDS size
+                       {"group": 65536 + 512}):     # more LDS than a workgroup gets
             with self.assertRaises(RuntimeError, msg=str(fields)):
                 registers(**fields)
         with self.assertRaises(ValueError):          # a descriptor cut short
             drm.kernel_registers(relocatable([(".rodata", bytes(32), 0), (".text", bytes(256), 0)], [("k0.kd", 1, 0)]))
+
+    def test_the_group_segment_becomes_the_lds_size_field(self):
+        def registers(**fields):
+            return drm.kernel_registers(relocatable([(".rodata", self.descriptor(**fields), 0), (".text", bytes(256), 0)],
+                                                    [("k0", 2, 0), ("k0.kd", 1, 0)]))
+        # The assembler leaves COMPUTE_PGM_RSRC2.LDS_SIZE (bits 15..23, 512-byte units) 0 and records the size in the
+        # descriptor's group segment: measured on gfx1036, 4096 bytes of LDS give group 4096 and rsrc2 0x84.
+        self.assertEqual(registers(group=4096), {"k0": (0xE0AC0001, 0x84 | 8 << 15, 32)})
+        self.assertEqual(registers(group=4), {"k0": (0xE0AC0001, 0x84 | 1 << 15, 32)})    # rounded up to 512
+        self.assertEqual(registers(group=65536), {"k0": (0xE0AC0001, 0x84 | 128 << 15, 32)})
+        # A descriptor that already carries a size gets the group segment's, as the HIP runtime programs it.
+        self.assertEqual(registers(rsrc2=0x84 | 1 << 15), {"k0": (0xE0AC0001, 0x84, 32)})
 
     def test_launcher_tokens_carry_the_offset_and_the_registers(self):
         offsets = {"k0": 0, "k1": 256}
@@ -678,6 +689,23 @@ class OnHardware(unittest.TestCase):
                    "v_cvt_f32_f16 v9, v8", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
         self.assertEqual(self.oracle.run([program]), [[0xABCD3C00, 0x3F800000, 0, 0]])
 
+    def test_a_kernel_gets_the_lds_its_descriptor_asks_for(self):
+        # The group segment is the workgroup's LDS. A lane writes 0x1234 there, a barrier, and reads it back; the
+        # Linux launcher has to program COMPUTE_PGM_RSRC2.LDS_SIZE from the descriptor for this to read back.
+        kernel = asm.Kernel(["v_mov_b32 v1, 0x1234", "ds_write_b32 v0, v1", "s_barrier", "ds_read_b32 v8, v0",
+                             "s_waitcnt lgkmcnt(0)", "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"],
+                            wave=32, threads=1, words=4, lds=4096)
+        self.assertEqual(self.oracle.run([kernel]), [[0x1234, 0, 0, 0]])
+
+    def test_more_than_4096_words_of_output(self):
+        # 1024 threads store 8 dwords each. The Linux launcher capped its buffer at 4096 words, which is fewer than
+        # image_fuzz's 64x64 cases (16,384) and this one need.
+        lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
+        lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
+        lines += ["s_waitcnt vmcnt(0)"]
+        kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
+        self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
+
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
         good, rejected = self.oracle.run([PROG, bad])
@@ -688,6 +716,16 @@ class OnHardware(unittest.TestCase):
 
 class KernelResources(unittest.TestCase):
     """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
+
+    def test_lds_reaches_the_descriptor_and_the_metadata(self):
+        # The descriptor's group segment is where the Linux launcher reads the LDS size from (COMPUTE_PGM_RSRC2.
+        # LDS_SIZE), so a wrapped kernel that uses LDS has to declare it there too, not only in the metadata.
+        text, _, _ = asm.module_text([asm.Kernel(["s_endpgm"], lds=4096),
+                                      asm.Kernel(["s_endpgm"], raw=True, lds=8192)], "gfx1150")
+        self.assertEqual(text.count(".amdhsa_group_segment_fixed_size 4096"), 1)
+        self.assertEqual(text.count(".amdhsa_group_segment_fixed_size 8192"), 1)
+        self.assertEqual(text.count("    .group_segment_fixed_size: 4096"), 1)
+        self.assertEqual(text.count("    .group_segment_fixed_size: 8192"), 1)
 
     def test_requested_registers_are_in_the_text(self):
         k = asm.Kernel(["s_endpgm"], wave=32, threads=64, words=8, raw=True, vgprs=40, sgprs=72)

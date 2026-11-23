@@ -960,8 +960,8 @@ def run_hw(oracle, progs, a, tally, results):
         ran = oracle.run(kernels)
     except RuntimeError as e:
         if re.search(r"LDS|group segment|words", str(e)):
-            print("hardware oracle unavailable: this backend cannot run the LDS programs (no LDS support, or more "
-                  f"than 4096 words of output): {str(e)[:200]}")
+            print("hardware oracle unavailable: this backend cannot run these programs (no LDS support, or fewer "
+                  f"output words than they store): {str(e)[:200]}")
             return 77
         raise
     for p, got in zip(which, ran):

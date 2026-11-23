@@ -207,7 +207,8 @@ def animation(page, frames, tracks, sequences):
 
 
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
-               external_hashes=(), parameters=1, times=None, axis=None):
+               external_hashes=(), parameters=1, times=None, axis=None, node=None, sample_lists=None,
+               node_axis_count=None, node_pairs=None):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -249,22 +250,44 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
             struct.pack_into("<HH", p.b, e + 16, len(points), len(points))
         p.ptr(motion + 0x70, table)
         struct.pack_into("<HH", p.b, motion + 0x78, len(times), len(times))
-    if axis is not None:       # a type-3 node: {u64 0, u32 3, u32 0, names, (index, value) samples, f32 min, f32 max}
+    if axis is not None:       # a type-3 node: {u64 0, u32 3, u32 0, axes, (index, value) samples, f32 min, f32 max}
         names, samples, lo, hi = axis
-        node = p.alloc(bytes(0x40))
-        struct.pack_into("<I", p.b, node + 8, 3)
-        p.ptr(node + 0x10, p.alloc(b"".join(struct.pack("<I", h) for h in names)))
-        struct.pack_into("<HH", p.b, node + 0x18, len(names), len(names))
-        p.ptr(node + 0x20, p.alloc(b"".join(struct.pack("<If", i, v) for i, v in samples)))
-        struct.pack_into("<HH", p.b, node + 0x28, len(samples), len(samples))
-        struct.pack_into("<ff", p.b, node + 0x30, lo, hi)
+        node_at = p.alloc(bytes(0x40))
+        struct.pack_into("<I", p.b, node_at + 8, 3)
+        p.ptr(node_at + 0x10, p.alloc(b"".join(struct.pack("<IHH", h, 0, 0) for h in names)))
+        struct.pack_into("<HH", p.b, node_at + 0x18, len(names), len(names))
+        p.ptr(node_at + 0x20, p.alloc(b"".join(struct.pack("<If", i, v) for i, v in samples)))
+        struct.pack_into("<HH", p.b, node_at + 0x28, len(samples), len(samples))
+        struct.pack_into("<ff", p.b, node_at + 0x30, lo, hi)
+    elif node is not None:     # (type, [(name hash, u16, u16)], sample count): type 1 or a multi-axis node
+        kind, axes, count = node
+        node_at = p.alloc(bytes(0xB0))
+        struct.pack_into("<I", p.b, node_at + 8, kind)
+        if kind == 1:
+            struct.pack_into("<I", p.b, node_at + 0x20, count)
+        else:
+            p.ptr(node_at + 0x10, p.alloc(b"".join(struct.pack("<IHH", *a) for a in axes)))
+            n_axes = len(axes) if node_axis_count is None else node_axis_count   # override: an axis array overrun
+            struct.pack_into("<HH", p.b, node_at + 0x18, n_axes, n_axes)
+            struct.pack_into("<I", p.b, node_at + anim_clips.NODE_SAMPLE_COUNT_AT[kind], count)
+            if node_pairs is not None:
+                p.ptr(node_at + 0x20, p.alloc(b"".join(struct.pack("<IIII", x, 0, y, 0) for x, y in node_pairs)))
+                struct.pack_into("<HH", p.b, node_at + 0x28, len(node_pairs), len(node_pairs))
+    if axis is not None or node is not None:
         if parameters == 1:
-            p.ptr(motion + 0x138, node)
+            p.ptr(motion + 0x138, node_at)
         else:                  # +0x120 points at a block whose +0x18 is the node
             block = p.alloc(bytes(0x20))
-            p.ptr(block + 0x18, node)
+            p.ptr(block + 0x18, node_at)
             p.ptr(motion + 0x120, block)
             struct.pack_into("<HH", p.b, motion + 0x128, 1, 1)
+    if sample_lists is not None:   # +0x90: per sample {ptr, u16 count} of {u32 child, f32, f32}
+        table = p.alloc(bytes(16 * len(sample_lists)))
+        for i, items in enumerate(sample_lists):
+            p.ptr(table + 16 * i, p.alloc(b"".join(struct.pack("<Iff", *it) for it in items)))
+            struct.pack_into("<HH", p.b, table + 16 * i + 8, len(items), len(items))
+        p.ptr(motion + 0x90, table)
+        struct.pack_into("<HH", p.b, motion + 0x98, len(sample_lists), len(sample_lists))
     matcher = p.alloc(bytes(0x50))
     p.ptr(matcher + 0x20, motion)                     # a pointer at +0x20, like `.motion`
     p.b[matcher + 0x28:matcher + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
@@ -396,6 +419,103 @@ class DecodeTest(unittest.TestCase):
     def test_motion_without_blend_data(self):
         motion = [c for c in self.d["clips"] if c["kind"] == "motion"][0]
         self.assertEqual((motion["times"], motion["node"]), ([], None))      # null +0x70, null +0x138
+        self.assertEqual(motion["samples"], [])                              # null +0x90
+
+    def motion(self, **kw):
+        d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(**kw)))
+        return [c for c in d["clips"] if c["kind"] == "motion"][0]
+
+    def test_type3_samples_map_to_children(self):
+        # three samples over two children: sample 0 and 2 play child 1, sample 1 plays child 0
+        lists = [[(1, 1.0, 1.0)], [(0, 1.0, 0.5)], [(1, 1.0, 1.0)]]
+        motion = self.motion(children=[(1, 2), (3, 4)], axis=([joaat32("speed")], [(0, 0.0), (2, 0.5), (1, 1.0)],
+                                                              0.0, 1.0), sample_lists=lists)
+        self.assertEqual(motion["samples"], lists)
+        kind, axis = motion["node"]
+        self.assertEqual((kind, axis["slots"], axis["sample_count"]), (3, [(0, 0)], 3))
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        pre = "motion_samples:3:"
+        self.assertEqual({k[len(pre):]: v for k, v in stats.items() if k.startswith(pre)},
+                         {"motions": 1, "lists_equal_node_samples": 1, "lists_more_than_children": 1,
+                          "every_list_one_item": 1, "children_in_range": 1, "every_child_sampled": 1,
+                          "sample_k_is_child_k": 0, "items": 3, "items_first_float_1": 3,
+                          "items_second_float_1": 2})
+
+    def test_identity_samples(self):
+        motion = self.motion(children=[(1, 2), (3, 4)], axis=([joaat32("speed")], [(0, 0.0), (1, 1.0)], 0.0, 1.0),
+                             sample_lists=[[(0, 1.0, 1.0)], [(1, 1.0, 1.0)]])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual(stats["motion_samples:3:sample_k_is_child_k"], 1)
+
+    def test_several_items_in_a_list_are_not_identity(self):
+        # list 0 holds children 0 and 1: its first child is 0, but that is not sample k -> child k
+        motion = self.motion(children=[(1, 2), (3, 4)], axis=([joaat32("speed")], [(0, 0.0), (1, 1.0)], 0.0, 1.0),
+                             sample_lists=[[(0, 1.0, 1.0), (1, 1.0, 1.0)], [(1, 1.0, 1.0)]])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual((stats["motion_samples:3:sample_k_is_child_k"], stats["motion_samples:3:every_list_one_item"],
+                          stats["motion_samples:3:every_child_sampled"]), (0, 0, 1))
+
+    def test_malformed_node_keeps_the_time_table(self):
+        times = [(1.5, 1.5, [(0.0, 0.0), (1.5, 1.5)])]
+        motion = self.motion(children=[(1, 2)], times=times, node=(8, [(1, 0, 0)], 1), node_axis_count=0xFFFF)
+        self.assertIsNone(motion["node"])                       # the axis array runs past the page
+        self.assertEqual(len(motion["times"]), 1)
+
+    def test_child_out_of_range_is_counted(self):
+        motion = self.motion(children=[(1, 2)], axis=([joaat32("speed")], [(0, 0.0)], 0.0, 0.0),
+                             sample_lists=[[(5, 1.0, 1.0)]])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual((stats["motion_samples:3:children_in_range"], stats["motion_samples:3:every_child_sampled"]),
+                         (0, 0))
+
+    def test_multi_axis_nodes(self):
+        for kind, n_axes in ((4, 2), (5, 3), (6, 4), (8, 5)):
+            axes = [(joaat32("speed") if i == 0 else 0xABC0 + i, i, 1) for i in range(n_axes)]
+            lists = [[(i % 2, 1.0, 1.0)] for i in range(4)]
+            motion = self.motion(children=[(1, 2), (3, 4)], node=(kind, axes, 4), sample_lists=lists)
+            k, axis = motion["node"]
+            self.assertEqual((k, axis["names"], axis["slots"], axis["sample_count"]),
+                             (kind, [a[0] for a in axes], [(i, 1) for i in range(n_axes)], 4))
+            self.assertNotIn("samples", axis)
+            stats = anim_clips.new_stats()
+            anim_clips.count_motion_blend(motion, stats)
+            self.assertEqual((stats[f"motion_node_axes:{kind}:{n_axes}"],
+                              stats[f"motion_node_axis_name:{kind}:speed"],
+                              stats[f"motion_node_axis_name:{kind}:unresolved"],
+                              stats[f"motion_samples:{kind}:lists_equal_node_samples"],
+                              stats[f"motion_samples:{kind}:every_child_sampled"], stats["motion_axes"]),
+                             (1, 1, n_axes - 1, 1, 1, 0))
+
+    def test_multi_axis_pairs(self):
+        motion = self.motion(children=[(1, 2)], node=(6, [(1, 0, 0)] * 4, 1), node_pairs=[(0xAA, 0xBB), (0xCC, 0xDD)])
+        self.assertEqual(motion["node"][1]["pairs"], [(0xAA, 0xBB), (0xCC, 0xDD)])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual(stats["motion_node_pairs:6:2"], 1)
+        motion = self.motion(children=[(1, 2)], node=(4, [(1, 0, 0)] * 2, 1))      # null +0x20
+        self.assertIsNone(motion["node"][1]["pairs"])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual(stats["motion_node_pairs:4:null"], 1)
+
+    def test_type1_node(self):
+        motion = self.motion(children=[(1, 2)], node=(1, [], 1), sample_lists=[[(0, 1.0, 1.0)]])
+        self.assertEqual(motion["node"], (1, {"names": [], "slots": [], "sample_count": 1}))
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual((stats["motion_node_type:1"], stats["motion_node_axes:1:0"],
+                          stats["motion_samples:1:sample_k_is_child_k"]), (1, 1, 1))
+
+    def test_sample_lists_of_a_two_node_motion_are_not_counted(self):
+        motion = self.motion(children=[(1, 2)], parameters=2, node=(1, [], 1), sample_lists=[[(0, 1.0, 1.0)]] * 3)
+        self.assertEqual(len(motion["samples"]), 3)
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertFalse([k for k in stats if k.startswith("motion_samples:")])
 
     def test_delta2_round_trip(self):
         for n in (1, 2, 8, 9, 63, 64, 65, 129, 200):
@@ -616,7 +736,7 @@ class ArchiveTest(unittest.TestCase):
 
     def test_cli_writes_counts_and_no_values(self):
         out = os.path.join(self.tmp.name, "out.json")
-        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"], capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -627,7 +747,7 @@ class ArchiveTest(unittest.TestCase):
     def test_decode_rejects_negative_frames(self):
         result = subprocess.run(
             [sys.executable, "-I", TOOL, self.rpf, "--decode", str(self.offsets[1]), "--frames", "-1"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--frames must be 0 or more", result.stderr)
@@ -656,7 +776,7 @@ class ArchiveTest(unittest.TestCase):
 
         result = subprocess.run(
             [sys.executable, "-I", TOOL, path, "--decode", str(root), "--frames", "3"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, errors="replace", check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         animation = json.loads(result.stdout)["packs"][0]["animations"][0]
@@ -675,7 +795,7 @@ class ArchiveTest(unittest.TestCase):
             pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
             root, *_ = write_rpf(self.rpf, pages)
             result = subprocess.run([sys.executable, "-I", TOOL, self.rpf, "--decode", str(root)],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, errors="replace")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["packs"][0]["animations"][0]["decoded_frames"], NF)
 
@@ -695,7 +815,7 @@ class ArchiveTest(unittest.TestCase):
             r = subprocess.run(
                 [sys.executable, "-I", TOOL, self.rpf, os.path.join(self.tmp.name, "o.json"),
                  "--budget", value],
-                capture_output=True, text=True,
+                capture_output=True, text=True, errors="replace",
             )
             self.assertEqual(r.returncode, 2, value)
             self.assertIn("--budget", r.stderr)
@@ -703,11 +823,11 @@ class ArchiveTest(unittest.TestCase):
 
     def test_bad_arguments(self):
         for args in (["--jobs", "0", "x.json"], [], ["x.json", "--start", "-1"]):
-            r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, args)
         missing = os.path.join(self.tmp.name, "missing.rpf")
         r = subprocess.run([sys.executable, "-I", TOOL, missing, os.path.join(self.tmp.name, "o.json")],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 1)
         self.assertIn("missing.rpf", r.stderr)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
@@ -715,7 +835,7 @@ class ArchiveTest(unittest.TestCase):
         open(empty, "wb").close()
         for source in (empty, self.tmp.name):
             r = subprocess.run([sys.executable, "-I", TOOL, source, os.path.join(self.tmp.name, "o.json")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertNotEqual(r.returncode, 0, source)
             self.assertNotIn("Traceback", r.stderr)
 
@@ -725,7 +845,7 @@ class ArchiveTest(unittest.TestCase):
             data = f.read()
         other = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, other, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("output must not overwrite the input archive", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
@@ -734,7 +854,7 @@ class ArchiveTest(unittest.TestCase):
 
     def test_output_that_is_a_directory_is_refused_before_the_scan(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, self.tmp.name, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("is a directory", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
@@ -742,7 +862,7 @@ class ArchiveTest(unittest.TestCase):
     def test_output_in_a_missing_folder_is_created(self):
         out = os.path.join(self.tmp.name, "reports", "sub", "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)

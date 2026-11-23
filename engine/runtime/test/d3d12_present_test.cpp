@@ -3,9 +3,9 @@
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
 // back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
-// is read back with GDI on native Windows when the window is in front, the display is in SDR and GDI can read the
-// screen. Under Wine, rootless XWayland can return black for desktop reads, so the swapchain checks confirm the
-// colour there. No shaders or game data.
+// is read back with GDI on native Windows when the window is in front with no other window over its centre, the
+// display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
+// so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string_view>
 #include <vector>
@@ -69,6 +70,50 @@ bool is_hdr_monitor(HWND window) {
     return false;
 }
 
+// The LUID of the DXGI adapter whose output shows the window's monitor, or false when it cannot be told. A Vulkan
+// swapchain made on another adapter (a render-only GPU, such as an Intel iGPU with no monitor attached while the
+// desktop runs on a discrete GPU) is not shown by the desktop compositor at all: a bare vkCreateSwapchainKHR + clear +
+// vkQueuePresentKHR program on the UHD 770 leaves the window's own white background on screen, and GDI, BitBlt with
+// CAPTUREBLT and PrintWindow all read that white, while the same program on the display GPU reads the clear colour.
+bool display_adapter_luid(HWND window, LUID* luid) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            DXGI_ADAPTER_DESC1 adapter_desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target &&
+                SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+                *luid = adapter_desc.AdapterLuid;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when the Vulkan device is known to be a different adapter from the one driving the window's monitor.
+bool device_is_not_display_adapter(const vktest::Device& d, HWND window) {
+    LUID display{};
+    if (!display_adapter_luid(window, &display)) return false;
+    const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"));
+    if (!properties2) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    properties2(d.physical, &properties);
+    if (!id.deviceLUIDValid) return false;
+    return std::memcmp(id.deviceLUID, &display, sizeof(LUID)) != 0;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
@@ -88,6 +133,17 @@ bool has_interactive_window_station() {
     DWORD bytes = 0;
     if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
     return (flags.dwFlags & WSF_VISIBLE) != 0;
+}
+
+// True when the window manager reports this window as the top-level window at a screen point. Being the foreground
+// window does not make it so: an always-on-top window, or one another process showed without taking the foreground,
+// can lie over it, and a GDI read of the screen then returns that window's pixel. WindowFromPoint passes over hidden
+// and disabled windows and over windows that are transparent to hit testing (a click-through overlay,
+// WS_EX_LAYERED | WS_EX_TRANSPARENT), so an overlay of that kind drawn over the point is not noticed, and neither
+// is anything the compositor draws there itself.
+bool is_top_window_at(HWND window, POINT screen_point) {
+    const HWND hit = WindowFromPoint(screen_point);
+    return hit && GetAncestor(hit, GA_ROOT) == window;
 }
 
 void set_client_size(HWND window, int width, int height) {
@@ -478,17 +534,52 @@ int main() {
                 GetClientRect(window, &client);
                 POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
                 ClientToScreen(window, &centre);
-                HDC screen = GetDC(nullptr);
-                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-                ReleaseDC(nullptr, screen);
-                if (pixel == CLR_INVALID) {
+                const auto is_clear_colour = [](COLORREF c) {
+                    return std::abs(GetRValue(c) - 51) <= 3 && std::abs(GetGValue(c) - 153) <= 3 &&
+                           std::abs(GetBValue(c) - 230) <= 3;
+                };
+                // The foreground window can still be covered at its centre, so a read counts only when this window
+                // was the top one there both before and after it. How long the compositor takes to show the last
+                // frame, or to stop showing a window that has just gone, is not known (the 200 ms above is a guess),
+                // so a pixel that is not the clear colour is read again for up to a second. Nothing is presented
+                // meanwhile: a late frame passes, a wrong colour that stays fails.
+                COLORREF pixel = CLR_INVALID, first_pixel = CLR_INVALID;
+                bool covered = false;
+                int reads = 0;
+                for (;;) {
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    HDC screen = GetDC(nullptr);
+                    pixel = GetPixel(screen, centre.x, centre.y);
+                    ReleaseDC(nullptr, screen);
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    if (++reads == 1) first_pixel = pixel;
+                    if (pixel == CLR_INVALID || is_clear_colour(pixel) || reads > 20) break;
+                    Sleep(50);
+                    pump();
+                }
+                if (covered) {
+                    std::printf("another window covers the window centre: on-screen colour check skipped, the "
+                                "colour was checked in the presented images\n");
+                } else if (pixel == CLR_INVALID) {
                     std::printf("GDI cannot read the screen here (GetPixel on the screen DC returns CLR_INVALID): "
                                 "on-screen colour check skipped, the colour was checked in the presented images\n");
                 } else {
                     const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
                     std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-                    EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-                    screen_checked = true;
+                    if (reads > 1)
+                        std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
+                                    GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
+                    if (device_is_not_display_adapter(d, window)) {
+                        // The pixel is what the desktop shows, and the desktop does not show this GPU's swapchain.
+                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop does "
+                                    "not show its swapchain, on-screen colour check skipped, the colour was checked "
+                                    "in the presented images\n");
+                    } else {
+                        EXPECT(is_clear_colour(pixel));
+                        screen_checked = true;
+                    }
                 }
             }
         } else {

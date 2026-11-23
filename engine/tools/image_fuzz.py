@@ -581,7 +581,7 @@ def main() -> int:
     # runtime/build, as docs/shader_validation.md builds it and lds_fuzz/valu_fuzz default to; a Visual Studio build's
     # RelWithDebInfo/Release subfolder is found below.
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work")
+    ap.add_argument("--work", help="keep each run's generated files in a new subfolder here")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--formats", default=",".join(FORMATS))
     ap.add_argument("--oracle", default="translator",
@@ -618,6 +618,18 @@ def main() -> int:
     if a.max_report < 1:
         print("--max-report must be at least 1", file=sys.stderr)
         return 2
+    if a.work:
+        # Reject a --work that is a file, or sits under one, before any fuzz work: os.makedirs would raise a
+        # FileExistsError traceback after the cases were built, and nothing here is retryable anyway.
+        probe = os.path.abspath(a.work)
+        while not os.path.lexists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if os.path.lexists(probe) and not os.path.isdir(probe):
+            print(f"ERROR: --work is not a folder: {a.work}", file=sys.stderr)
+            return 2
     hw_oracle = None
     if "hw" in backends:
         from hw_oracle import runner
@@ -637,11 +649,18 @@ def main() -> int:
             print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2")
     a.build = find_test_program(a.build, HARNESS) or a.build
     cases = make_cases(a.programs, a.seed, formats)
-    work = a.work or tempfile.mkdtemp(prefix="image_fuzz_")
-    os.makedirs(work, exist_ok=True)
     code = 0
     verdicts = {}
     try:
+        try:
+            parent = os.path.abspath(a.work) if a.work else None
+            if parent is not None:
+                os.makedirs(parent, exist_ok=True)
+            work = tempfile.mkdtemp(prefix="image_fuzz_", dir=parent)
+        except OSError as e:
+            print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+            return 2
+        print(f"work dir {work}")
         if "translator" in backends:
             passed, failed, skipped, verdicts = run_translator(cases, a, work)
             summary = f"{passed}/{passed + failed} programs that ran match"

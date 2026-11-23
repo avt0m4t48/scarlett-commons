@@ -35,9 +35,13 @@ EXPECT = {
     "ps_w64_a_permlane": ("A", [], []),
     "ps_w64_a_swizzle": ("A", [], []),
     "ps_w64_a_bpermute": ("A", [], []),
+    "ps_w64_a_uniform_vote": ("A", [], []),
+
+    "ps_w64_a_discard": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),
+    "ps_w64_b_readlane_uniform_lane": ("B", [], ["readlane-uniform"]),
     "ps_w64_b_ballot_atomic": ("B", [], ["aggregated-atomic", "elected-lane"]),
     "ps_w64_c_waterfall_count": ("C", ["stale-scalar"], None),
     "ps_w64_c_bcnt_export": ("C", ["lane-count"], None),
@@ -162,6 +166,9 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._b_waterfall(5 + 64 * 6) == (17 * ((5 & 3) + 4 * (6 & 3)) + 5, (5 & 3) + 4 * (6 & 3), 0, 0)
     assert w64_graphics._b_readfirstlane(10) == (133, 277, 0, 0)
+    assert w64_graphics._a_discard(29 + 64 * 3) == (0xBF800000,) * 4                 # x < 30: discarded
+    assert w64_graphics._a_discard(30 + 64 * 49) == (7 * 49 + 30, 1, 2049, 3)
+    assert w64_graphics._a_discard(31 + 64 * 1) == (0xBF800000,) * 4                 # x % 4 == 3, y odd
     assert w64_graphics._vs_a_skip(1 + 64 * 3) == (7 * 3 + 1, 1, 2000 + 3, 2)        # no whole-quad word in r1
     assert w64_graphics._vs_a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._vs_b_readlane_uniform(70) == (6 + 123, 200, 6 + 123, 277)
@@ -174,3 +181,19 @@ def test_vs_probe_and_radv_perftest(monkeypatch):
     assert w64_graphics._radv_perftest(32) == "nggc,gewave32"
     assert all(w64_graphics.FIXTURES[p][0] == "C" and p.startswith(s) for s, p in w64_graphics.PROBES.items())
     assert w64_graphics.VS_RECORDS * 4 >= 0x100 + 4 * w64_graphics.VS_VERTICES   # the atomic's slots end below the records
+
+
+def test_live_lane_need_skips_on_a_narrow_stage_and_runs_on_a_wide_one(tmp_path, monkeypatch):
+    # The skip is keyed on the measured live width, not on the reported subgroup size or on whether a size could be required.
+    name = "ps_w64_a_one_lane"
+    (tmp_path / (name + ".spv")).write_bytes(b"")
+    words = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
+    monkeypatch.setattr(w64_graphics, "draw", lambda tools, spirv, n, size, tmp: (words, None, False if size else None))
+    monkeypatch.setitem(w64_graphics.NEEDS_LIVE_LANES, name, 32)
+    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 16)
+    skip = w64_graphics.check("tools", str(tmp_path), name)
+    assert isinstance(skip, w64_graphics.Skip) and "16 live lanes" in skip and "needs 32" in skip
+    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 32)
+    assert w64_graphics.check("tools", str(tmp_path), name) == ""
+    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: None)   # probe could not run: judged
+    assert w64_graphics.check("tools", str(tmp_path), name) == ""

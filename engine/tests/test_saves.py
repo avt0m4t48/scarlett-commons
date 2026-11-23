@@ -357,9 +357,12 @@ class AtomicPackTest(unittest.TestCase):
                     link = os.path.join(self.root, "link-" + label)
                     spelling = os.path.relpath(target, self.root) if relative else target
                     self.symlink(spelling, link)
+                    # What the link stores, read back before packing: on Windows an absolute target comes back
+                    # with a \\?\ prefix, so comparing with `spelling` failed there for a link pack() left alone.
+                    stored = os.readlink(link)
                     quiet(saves.pack, self.extracted, link)
                     self.assertTrue(os.path.islink(link))
-                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(os.readlink(link), stored)
                     self.assertEqual(rd(target), self.new)
                     self.assertEqual(os.listdir(target_dir), ["save.jsav"])
 
@@ -421,6 +424,58 @@ class AsavTest(unittest.TestCase):
     def test_rejects_other_magic(self):
         with self.assertRaises(ValueError):
             saves.parse_asav(b"JSAV" + bytes(0x200))
+
+
+class ProfileRecordTest(unittest.TestCase):
+    def test_parse_synthetic_profile(self):
+        # 1644-byte profile record: first 112 bytes non-zero starting u32 10, u32 3
+        dwords = [10, 3, 1, 0x100, 0x12345678, 0x9abcdef0] + list(range(22))
+        payload = saves.build_profile(dwords=dwords, account_id=0x9abcdef012345678)
+        self.assertEqual(len(payload), 1644)
+        prof = saves.parse_profile(payload)
+        self.assertEqual(prof["version"], 10)
+        self.assertEqual(prof["kind"], 3)
+        self.assertEqual(prof["active_bytes"], 112)
+        self.assertEqual(prof["zero_padding_bytes"], 1532)
+        self.assertTrue(prof["zero_padding_clean"])
+        self.assertEqual(prof["account_id"], 0x9abcdef012345678)
+        self.assertEqual(prof["subversion"], 1)
+        self.assertEqual(prof["flags"], 0x100)
+        self.assertEqual(len(prof["dwords"]), 28)
+
+    def test_profile_extract_writes_profile_json(self):
+        payload = saves.build_profile(account_id=0xCAFEF00D)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = os.path.join(tmp, "prof_save"), os.path.join(tmp, "out")
+            write(src, d)
+            quiet(saves.extract, src, out)
+            self.assertTrue(os.path.isfile(os.path.join(out, "profile.json")))
+            pjson = rd_json(os.path.join(out, "profile.json"))
+            self.assertEqual(pjson["version"], 10)
+            self.assertEqual(pjson["kind"], 3)
+            self.assertEqual(pjson["account_id"], 0xCAFEF00D)
+            self.assertEqual(rd(os.path.join(out, "payload.bin")), payload)
+
+    def test_profile_info_output(self):
+        payload = saves.build_profile(account_id=0x11223344)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "prof_save")
+            write(src, d)
+            out = quiet(saves.info, [src])
+            self.assertIn("profile record", out)
+            self.assertIn("version=10", out)
+            self.assertIn("kind=3", out)
+            self.assertIn("active=112B", out)
+
+    def test_profile_rejects_invalid_version_or_kind(self):
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 9, 3) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 10, 2) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(b"\x0a\x00")
 
 
 class MalformedAsavTest(unittest.TestCase):
@@ -516,7 +571,7 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
+        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
@@ -570,6 +625,24 @@ class ImportTest(unittest.TestCase):
             with self.assertRaises(SystemExit):        # two payloads onto one blob (case-insensitive on Windows)
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
+
+    def test_container_names_follow_the_runtime_rule(self):
+        # The same rule as valid_container_name() in runtime/shims/xgameruntime_gamesave.cpp.
+        for good in ("SLOT3", "slots/SAVE_00.sav-1", "a/b/c"):
+            self.assertTrue(saves.valid_container_name(good), good)
+        for bad in ("slot 0", "a..b", "x.", "dir/", "a/b-c/d", "", "é", "a" * 257):
+            self.assertFalse(saves.valid_container_name(bad), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--map", "SLOT3=slot 0/story",
+                                           "--dry-run"])
+            self.assertIn("'slot 0' breaks XGameSaveCreateContainer's naming rule", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--dry-run"])
+            self.assertEqual(err.getvalue(), "")
 
     def test_folder_with_two_payloads_is_refused(self):
         # A folder holding a save and an older backup with the same signature must not import either silently.
@@ -627,6 +700,38 @@ class ImportTest(unittest.TestCase):
 
 class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
+
+    def test_excessive_json_body_nesting_is_a_validation_error(self):
+        # Linux CPython 3.12 can accept 6,000 levels; exercise the C decoder's higher limit too.
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with self.assertRaisesRegex(ValueError, r"JSAV body is not valid UTF-8 JSON"):
+            saves.parse_jsav(data)
+
+    def test_all_read_commands_refuse_excessive_nesting_without_changing_exports(self):
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "deep.jsav"), os.path.join(tmp, "export")
+            index = os.path.join(out, "index.json")
+            prior_block = os.path.join(out, "blocks", "previous.json")
+            write(source, data)
+            write(index, b"previous complete index")
+            write(prior_block, b"previous complete block")
+            for args in (("info", source), ("verify", source),
+                         ("diff", source, source), ("extract", source, out)):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([sys.executable, "-I", TOOL, *args],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV body is not valid UTF-8 JSON", result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(source), data)
+                    self.assertEqual(rd(index), b"previous complete index")
+                    self.assertEqual(rd(prior_block), b"previous complete block")
+                    self.assertEqual(sorted(os.listdir(out)), ["blocks", "index.json"])
+                    self.assertEqual(os.listdir(os.path.join(out, "blocks")), ["previous.json"])
 
     def test_entry_ranges_must_stay_inside_the_json_body(self):
         original, _, _ = make_jsav()
@@ -821,6 +926,27 @@ class PackIndexValidationTest(unittest.TestCase):
                     saves.pack_from_dir(self.extracted)
                 self.assertIn(self.index_path, str(error.exception))
                 self.assertIn("invalid JSON", str(error.exception))
+
+    def test_excessive_json_nesting_names_the_index(self):
+        # The C decoder's limit differs by platform; Linux CPython 3.12 accepts 6,000 levels.
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        with self.assertRaises(ValueError) as error:
+            saves.pack_from_dir(self.extracted)
+        self.assertIn(self.index_path, str(error.exception))
+        self.assertIn("invalid JSON", str(error.exception))
+
+    def test_cli_excessive_json_nesting_preserves_existing_output(self):
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn(self.index_path, result.stderr)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(out), b"previous complete output")
 
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"

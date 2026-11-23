@@ -231,7 +231,8 @@ void check_run_time_load() {
     auto query = reinterpret_cast<Query>(get_proc(rt_mod, "QueryApiImpl"));
     auto uninit_api = reinterpret_cast<Uninit>(get_proc(rt_mod, "UninitializeApiImpl"));
     check(init_ex2(0x2410, 0x0, 0x02, &options) == S_OK, "InitializeApiImplEx2 succeeds offline");
-    const GUID some_class = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+    // An id no runtime class has (made up for this test).
+    const GUID some_class = {0x4c454f4e, 0x4944, 0x4100, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
     void* out = reinterpret_cast<void*>(1);
     check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
           "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");
@@ -377,12 +378,60 @@ void check_run_time_load() {
         using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
         check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
               "slot 14 (XNetworkingVerifyServerCertificate) fails offline");
-        XTaskQueueRegistrationToken token{};
-        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        struct Seen {
+            int calls;
+            Hint hint;
+            uint16_t port;
+        };
+        using HintCallback = void(CALLBACK*)(void*, const Hint*);
+        using PortCallback = void(CALLBACK*)(void*, uint16_t);
+        using RegisterHint = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, HintCallback,
+                                                         XTaskQueueRegistrationToken*);
+        using RegisterPort = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, PortCallback,
+                                                         XTaskQueueRegistrationToken*);
         using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
-        check(reinterpret_cast<Register>(slot(n, 16))(n, nullptr, nullptr, nullptr, &token) == S_OK && token.token &&
-                  reinterpret_cast<Unregister>(slot(n, 17))(n, token, true),
-              "slots 16/17 register and unregister a connectivity-hint callback");
+        const auto register_hint = reinterpret_cast<RegisterHint>(slot(n, 16));
+        const auto register_port = reinterpret_cast<RegisterPort>(slot(n, 6));
+        const auto unregister_hint = reinterpret_cast<Unregister>(slot(n, 17));
+        const auto unregister_port = reinterpret_cast<Unregister>(slot(n, 7));
+        HintCallback on_hint = [](void* ctx, const Hint* h) {
+            auto* s = static_cast<Seen*>(ctx);
+            ++s->calls;
+            if (h) s->hint = *h;
+        };
+        PortCallback on_port = [](void* ctx, uint16_t p) {
+            auto* s = static_cast<Seen*>(ctx);
+            ++s->calls;
+            s->port = p;
+        };
+        XTaskQueueRegistrationToken token{};
+        check(register_hint(n, nullptr, nullptr, nullptr, &token) == E_INVALIDARG &&
+                  register_port(n, nullptr, nullptr, nullptr, &token) == E_INVALIDARG,
+              "slots 6/16 refuse a null callback");
+        XTaskQueueHandle manual = nullptr;
+        XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &manual);
+        Seen hint_seen{0, {9, 9, 9, false, true, true, true}, 0};
+        Seen port_seen{0, {}, 7};
+        XTaskQueueRegistrationToken hint_token{}, port_token{};
+        const bool registered = register_hint(n, manual, &hint_seen, on_hint, &hint_token) == S_OK && hint_token.token &&
+                                register_port(n, manual, &port_seen, on_port, &port_token) == S_OK && port_token.token;
+        const bool none_before_dispatch = hint_seen.calls == 0 && port_seen.calls == 0;
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        const Hint& h = hint_seen.hint;
+        check(registered && none_before_dispatch && hint_seen.calls == 1 && h.level == 1 && h.cost == 0 &&
+                  h.initialized && !h.approaching && !h.over && !h.roaming,
+              "slot 16 sends one initial notification on the queue's completion port: initialized, no connectivity");
+        check(port_seen.calls == 1 && port_seen.port == 0, "slot 6 sends one initial notification too: port 0");
+        check(unregister_hint(n, hint_token, true) && unregister_port(n, port_token, true),
+              "slots 17/7 unregister them");
+        Seen late{};
+        XTaskQueueRegistrationToken late_hint{}, late_port{};
+        const bool unregistered = register_hint(n, manual, &late, on_hint, &late_hint) == S_OK &&
+                                  register_port(n, manual, &late, on_port, &late_port) == S_OK &&
+                                  unregister_hint(n, late_hint, false) && unregister_port(n, late_port, false);
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        check(unregistered && late.calls == 0, "a registration ended before its queue is dispatched sends nothing");
+        XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
         using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
@@ -393,7 +442,7 @@ void check_run_time_load() {
     }
 
     // XPersistentLocalStorageImpl (RT-219): the class id with IXPersistentLocalStorageImpl3's interface id, over a
-    // temporary overlay. The storage folder is <overlay>\persistent.
+    // temporary overlay. The storage folder is <overlay>\.gta6rt-persistent.
     const GUID pls_class = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
     const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
     const std::filesystem::path scratch =
@@ -420,8 +469,8 @@ void check_run_time_load() {
                   path[size - 1] == '\0',
               "slot 4 (GetPath) fills the buffer and reports the bytes used");
         const std::filesystem::path folder = std::filesystem::path(path.c_str());
-        check(folder == scratch / L"overlay" / L"persistent" && std::filesystem::is_directory(folder),
-              "the path is <overlay>\\persistent and the folder exists");
+        check(folder == scratch / L"overlay" / L".gta6rt-persistent" && std::filesystem::is_directory(folder),
+              "the path is <overlay>\\.gta6rt-persistent and the folder exists");
         char tiny[2] = {'x', 'x'};
         used = 99;
         check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
@@ -448,6 +497,49 @@ void check_run_time_load() {
                   XAsyncGetStatus(&too_big, true) == HRESULT_FROM_WIN32(ERROR_DISK_FULL) &&
                   reinterpret_cast<PromptResult>(slot(pls, 7))(pls, &too_big) == HRESULT_FROM_WIN32(ERROR_DISK_FULL),
               "slots 6/7: a prompt for more than the quota fails with ERROR_DISK_FULL");
+
+        {
+            using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+            using FindFirstFn = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+            using FindNextFn = BOOL(WINAPI*)(HANDLE, LPWIN32_FIND_DATAW);
+            using FindCloseFn = BOOL(WINAPI*)(HANDLE);
+            using DeleteFn = BOOL(WINAPI*)(LPCWSTR);
+            const auto create_w = reinterpret_cast<CreateFileWFn>(rt::shims::find("kernel32.dll", "CreateFileW"));
+            const auto first_w = reinterpret_cast<FindFirstFn>(rt::shims::find("kernel32.dll", "FindFirstFileW"));
+            const auto next_w = reinterpret_cast<FindNextFn>(rt::shims::find("kernel32.dll", "FindNextFileW"));
+            const auto close_w = reinterpret_cast<FindCloseFn>(rt::shims::find("kernel32.dll", "FindClose"));
+            const auto delete_w = reinterpret_cast<DeleteFn>(rt::shims::find("kernel32.dll", "DeleteFileW"));
+            auto lists = [&](const wchar_t* pattern, const wchar_t* name) {
+                bool found = false;
+                WIN32_FIND_DATAW fd{};
+                const HANDLE h = first_w(pattern, &fd);
+                if (h == INVALID_HANDLE_VALUE) return false;
+                do found = found || _wcsicmp(fd.cFileName, name) == 0;
+                while (next_w(h, &fd));
+                close_w(h);
+                return found;
+            };
+            std::filesystem::create_directories(scratch / L"game" / L"persistent");
+            std::ofstream(scratch / L"game" / L"persistent" / L"cache.bin", std::ios::binary) << "package";
+            std::ofstream(folder / L"index.bin", std::ios::binary) << "storage";
+
+            check(!lists(L"GAME:\\*", L".gta6rt-persistent") && !lists(L"GAME:\\persistent\\*", L"index.bin"),
+                  "GAME: listings show neither the storage folder nor its files");
+            char bytes[16] = {};
+            DWORD got = 0;
+            const HANDLE h = create_w(L"GAME:\\persistent\\cache.bin", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                ::ReadFile(h, bytes, sizeof bytes - 1, &got, nullptr);
+                ::CloseHandle(h);
+            }
+            check(std::string(bytes) == "package",
+                  "GAME:\\persistent\\cache.bin is the package's file, not the storage file of that name");
+            std::error_code size_ec;
+            check(delete_w(L"GAME:\\persistent\\cache.bin") &&
+                      std::filesystem::file_size(folder / L"cache.bin", size_ec) == 1024,
+                  "deleting the GAME: name leaves the storage file alone");
+        }
 
         void* handle = reinterpret_cast<void*>(1);
         check(reinterpret_cast<Mount>(slot(pls, 8))(pls, "pkg", &handle) == E_NOTIMPL && handle == nullptr,
@@ -489,13 +581,13 @@ void check_run_time_load() {
             {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}},
             {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}},
             system5};
-        bool all = true;
+        bool all_inherited = true;
         for (const GUID& iid : chain) {
             void* same = nullptr;
-            all = all && query(&system_cls, iid, &same) == S_OK && same == sy;
+            all_inherited = all_inherited && query(&system_cls, iid, &same) == S_OK && same == sy;
             if (same) release(same);
         }
-        check(all, "IXSystemImpl5 answers for every interface it inherits (IXSystemImpl .. IXSystemImpl4)");
+        check(all_inherited, "IXSystemImpl5 answers for every interface it inherits (IXSystemImpl .. IXSystemImpl4)");
         check(reinterpret_cast<IdQuery>(slot(sy, 5))(sy, sizeof(buf), buf, &used) == S_OK && used == 45 &&
                   reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 44, buf, &used) ==
                       HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
@@ -511,6 +603,186 @@ void check_run_time_load() {
                   !reinterpret_cast<IsValid>(slot(sy, 7))(sy, nullptr),
               "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
         release(sy);
+    }
+
+    // XPackageImpl, asked for as libHttpClient.GDK.dll does: the class id with IXPackageImpl3's interface id. The
+    // slots with an offline answer agree with the named exports; the others are E_NOTIMPL.
+    const GUID package_cls = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+    const GUID package3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
+    void* pk = nullptr;
+    check(query(&package_cls, package3, &pk) == S_OK && pk, "QueryApiImpl hands out XPackageImpl for IXPackageImpl3");
+    if (pk) {
+        using Ident = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+        using IdentExport = HRESULT(__stdcall*)(size_t, char*);
+        char a[64] = {}, b[64] = {};
+        const auto ident_export = reinterpret_cast<IdentExport>(
+            rt::shims::find("xgameruntime.dll", "XPackageGetCurrentProcessPackageIdentifier"));
+        check(reinterpret_cast<Ident>(slot(pk, 3))(pk, sizeof(a), a) == S_OK && ident_export &&
+                  ident_export(sizeof(b), b) == S_OK && std::strcmp(a, b) == 0,
+              "slot 3 is XPackageGetCurrentProcessPackageIdentifier, the same answer as the export");
+        using IsPackaged = bool(STDMETHODCALLTYPE*)(void*);
+        using IsPackagedExport = bool(__stdcall*)();
+        const auto packaged_export =
+            reinterpret_cast<IsPackagedExport>(rt::shims::find("xgameruntime.dll", "XPackageIsPackagedProcess"));
+        check(packaged_export && reinterpret_cast<IsPackaged>(slot(pk, 4))(pk) == packaged_export(),
+              "slot 4 is XPackageIsPackagedProcess");
+        // Slot 11, XPackageGetUserLocale: one of the package's declared locales, never the host's; nothing written
+        // (but S_OK) when the package declares none.
+        using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+        char tmp[MAX_PATH] = {};
+        GetTempPathA(sizeof(tmp), tmp);
+        const std::string game = std::string(tmp) + "leonida_xpackage_locale_test";
+        CreateDirectoryA(game.c_str(), nullptr);
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
+        char locale[128];
+        std::memset(locale, 'z', sizeof(locale));
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK && locale[0] == 'z',
+              "slot 11 without declared locales: S_OK and nothing written");
+        if (FILE* f = std::fopen((game + "\\MicrosoftGame.Config").c_str(), "wb")) {
+            std::fputs("<Game><Resources><Resource Language=\"zz-ZZ\"/><Resource Language='xx-YY'/></Resources></Game>",
+                       f);
+            std::fclose(f);
+        }
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK &&
+                  (std::strcmp(locale, "zz-ZZ") == 0 || std::strcmp(locale, "xx-YY") == 0) &&
+                  reinterpret_cast<Locale>(slot(pk, 11))(pk, 3, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slot 11 gives one of the package's declared locales, not the host's; a short buffer is refused");
+        DeleteFileA((game + "\\MicrosoftGame.Config").c_str());
+        RemoveDirectoryA(game.c_str());
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+        {
+            // A game folder outside every ANSI code page (U+16A0, a runic letter) reaches MicrosoftGame.Config intact.
+            wchar_t wtmp[MAX_PATH] = {};
+            GetTempPathW(MAX_PATH, wtmp);
+            const std::wstring wide = std::wstring(wtmp) + L"leonida_xpackage_\u16a0ocale";
+            CreateDirectoryW(wide.c_str(), nullptr);
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", wide.c_str());
+            const std::wstring wconfig = wide + L"\\MicrosoftGame.Config";
+            if (FILE* f = _wfopen(wconfig.c_str(), L"wb")) {
+                std::fputs("<Game><Resources><Resource Language=\"qq-QQ\"/></Resources></Game>", f);
+                std::fclose(f);
+            }
+            char wlocale[32] = {};
+            check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(wlocale), wlocale) == S_OK &&
+                      std::strcmp(wlocale, "qq-QQ") == 0,
+                  "slot 11 reads MicrosoftGame.Config from a game folder named outside the ANSI code page");
+            DeleteFileW(wconfig.c_str());
+            RemoveDirectoryW(wide.c_str());
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", nullptr);
+        }
+        // Slots 23-26 are the named exports' content-package mounts: XPackageMount, the path size and path of the
+        // handle, and closing it. XPackageMountHandle is one u64, passed by value.
+        using Mount = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint64_t*);
+        using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, size_t*);
+        using Path = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*);
+        using CloseMount = void(STDMETHODCALLTYPE*)(void*, uint64_t);
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "SLOTDLC_12345678901234567890123=C:\\LeonidaSlotDLC");
+        uint64_t handle = 0;
+        size_t need = 0;
+        char path[MAX_PATH] = {};
+        check(reinterpret_cast<Mount>(slot(pk, 23))(pk, "SLOTDLC_12345678901234567890123", &handle) == S_OK &&
+                  handle != 0,
+              "slot 23 (XPackageMount) mounts a content package and hands out a handle");
+        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == S_OK &&
+                  need == std::strlen("C:\\LeonidaSlotDLC") + 1 &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, handle, need, path) == S_OK &&
+                  std::strcmp(path, "C:\\LeonidaSlotDLC") == 0 &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, handle, need - 1, path) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slots 24/25: the mount's path, and exactly the size XPackageGetMountPath needs");
+        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
+        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+              "slot 26 (XPackageCloseMountHandle) closes the handle");
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
+        using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        struct Progress {
+            uint64_t total, installed, launch;
+            bool launchable, completed;
+        } progress{~0ull, 7, 7, false, false};
+        using GetProgress = void(STDMETHODCALLTYPE*)(void*, void*, Progress*);
+        reinterpret_cast<GetProgress>(slot(pk, 7))(pk, nullptr, &progress);
+        check(progress.launchable && progress.completed && progress.installed == progress.total,
+              "slot 7 (void XPackageGetInstallationProgress) writes an installed, launchable, completed package");
+        using Update = bool(STDMETHODCALLTYPE*)(void*, void*);
+        using UnregProgress = bool(STDMETHODCALLTYPE*)(void*, void*, XTaskQueueRegistrationToken, bool);
+        using UnregInstalled = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        using Uninstall = bool(STDMETHODCALLTYPE*)(void*, const char*);
+        check(!reinterpret_cast<Update>(slot(pk, 8))(pk, nullptr) &&
+                  reinterpret_cast<UnregProgress>(slot(pk, 10))(pk, nullptr, XTaskQueueRegistrationToken{1}, true) &&
+                  reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
+                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
+              "the bool slots 8, 10, 22 and 34 return their documented offline answers");
+        const GUID chain[] = {
+            package_cls,
+            {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
+            {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}},
+            package3};
+        bool all = true;
+        for (const GUID& iid : chain) {
+            void* same = nullptr;
+            all = all && query(&package_cls, iid, &same) == S_OK && same == pk;
+            if (same) release(same);
+        }
+        check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
+        release(pk);
+    }
+    {
+        // XGameImpl (IXGameImpl3 : IXGameImpl2 : IXGameImpl, xgameruntime include/xgame.idl); IXGameImpl's id is the
+        // class id. Slots: 3 XGameGetXboxTitleId, 4 XLaunchNewGame (void), 5 XLaunchRestartOnCrash.
+        const GUID game_cls = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+        const GUID game2 = {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
+        const GUID game3 = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+        void* g = get(game_cls);
+        check(g != nullptr, "QueryApiImpl hands out XGameImpl for its class id");
+        bool every = g != nullptr;
+        for (const GUID& iid : {game2, game3}) {
+            void* same = nullptr;
+            every = every && query(&game_cls, iid, &same) == S_OK && same == g;
+            if (same) release(same);
+        }
+        check(every, "XGameImpl answers for IXGameImpl2's and IXGameImpl3's ids, the same object");
+        if (g) {
+            using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+            using LaunchNew = void(STDMETHODCALLTYPE*)(void*, const char*, const char*, void*);
+            using Restart = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t);
+            char tmp[MAX_PATH] = {};
+            GetTempPathA(sizeof(tmp), tmp);
+            const std::string game = std::string(tmp) + "leonida_xgame_title_test";
+            CreateDirectoryA(game.c_str(), nullptr);
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
+            const std::string config = game + "\\MicrosoftGame.Config";
+            auto write_config = [&](const char* text) {
+                if (FILE* f = std::fopen(config.c_str(), "wb")) {
+                    std::fputs(text, f);
+                    std::fclose(f);
+                }
+            };
+            uint32_t id = 0x5a5a5a5a;
+            DeleteFileA(config.c_str());
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL && id == 0x5a5a5a5a,
+                  "slot 3 (XGameGetXboxTitleId) without a config: E_FAIL, nothing written");
+            write_config("<Game configVersion=\"1\">\n  <TitleId> 1a2B3c4D </TitleId>\n</Game>\n");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == S_OK && id == 0x1A2B3C4Du,
+                  "slot 3 gives the config's <TitleId> (hex, either case, whitespace allowed)");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, nullptr) == E_INVALIDARG,
+                  "slot 3 with a null pointer is E_INVALIDARG");
+            write_config("<Game><TitleId>not-hex</TitleId></Game>");
+            id = 0x5a5a5a5a;
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL && id == 0x5a5a5a5a,
+                  "slot 3 refuses a <TitleId> that is not hex");
+            write_config("<Game><TitleId>123456789</TitleId></Game>");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL, "slot 3 refuses more than 8 hex digits");
+            DeleteFileA(config.c_str());
+            RemoveDirectoryA(game.c_str());
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+            reinterpret_cast<LaunchNew>(slot(g, 4))(g, "other.exe", "", nullptr);
+            check(true, "slot 4 (void XLaunchNewGame) returns offline");
+            check(reinterpret_cast<Restart>(slot(g, 5))(g, "--restarted", 0) == S_OK,
+                  "slot 5 (XLaunchRestartOnCrash) succeeds offline");
+            release(g);
+        }
     }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 

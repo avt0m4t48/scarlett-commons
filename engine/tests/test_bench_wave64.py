@@ -4,13 +4,17 @@ import contextlib
 import fnmatch
 import io
 import os
+from pathlib import Path
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path[:0] = [os.path.join(ROOT, "scripts"), os.path.join(ROOT, "tools")]
 import bench_wave64  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 
 def bench(fail):
@@ -38,6 +42,7 @@ class PartialFailure(unittest.TestCase):
     def test_every_process_ran(self):
         code, out = bench({})
         self.assertEqual(code, 0, out)
+        self.assertIn("65535 workgroups", out)
         self.assertIn("emulated output equals the reference", out)
 
     def test_emulated_config_fails_on_its_second_process(self):
@@ -54,6 +59,24 @@ class PartialFailure(unittest.TestCase):
 
 
 class HarnessError(unittest.TestCase):
+    def test_harness_is_found_in_a_cmake_configuration_subdirectory(self):
+        executable = "vk_compute_test.exe" if os.name == "nt" else "vk_compute_test"
+        output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n4 groups x 64: 0 mismatches\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "RelWithDebInfo" / executable
+            harness.parent.mkdir()
+            harness.touch()
+            argv = ["bench_wave64.py", "--build", tmp, "--procs", "1"]
+            with patch.object(bench_wave64, "build", return_value="test.spv"), \
+                    patch.object(bench_wave64, "segments", return_value=None), \
+                    patch.object(bench_wave64.subprocess, "run") as launch, \
+                    patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                launch.return_value.stdout = output
+                launch.return_value.stderr = ""
+                launch.return_value.returncode = 0
+                self.assertEqual(bench_wave64.main(), 0)
+            self.assertEqual([call.args[0][0] for call in launch.call_args_list], [str(harness)] * 3)
+
     def test_missing_binary_reports_failure(self):
         with patch.object(bench_wave64, "build", lambda work, name, emulate, llvm_mc: "x.spv"), \
                 patch.object(bench_wave64, "segments", lambda spv: None), \
@@ -100,6 +123,32 @@ class DriverSelectors(unittest.TestCase):
             self.assertTrue(self._matches(selector, manifest), f"{selector!r} should match {manifest!r}")
         for other in ("amd-vulkan64.json", "radeon_icd.x86_64.json", "igvk64.json", "intel_icd.x86_64.json"):
             self.assertFalse(self._matches(selector, other), f"{selector!r} must not match {other!r}")
+
+
+class SchedulerSegments(unittest.TestCase):
+    def setUp(self) -> None:
+        self.spirv = Path(self.enterContext(tempfile.TemporaryDirectory())) / "shader.spv"
+
+    def measure(self, assembly: str) -> tuple[int, int] | None:
+        self.spirv.with_suffix(".spvasm").write_text(assembly, encoding="utf-8", newline="\n")
+        return bench_wave64.segments(str(self.spirv))
+
+    def test_unpartitioned_scheduler(self) -> None:
+        assembly = "OpSwitch %pcv %sw_default 0 %blk0 1 %blk1 3 %blk3\n"
+        self.assertEqual(self.measure(assembly), (3, 1))
+
+    def test_partitioned_scheduler(self) -> None:
+        cases = " ".join(f"{case} %blk{case}" for case in (*range(16_383), 16_384))
+        assembly = rdna2spirv.split_big_switch(
+            "%zero = OpConstant %uint 0\n"
+            "OpSelectionMerge %sw_merge None\n"
+            f"OpSwitch %pcv %sw_default {cases}\n"
+            "%sw_default = OpLabel\n"
+            "OpBranch %sw_merge\n"
+        )
+        self.assertIn("OpSwitch %pcc %sw_default", assembly)
+        self.assertEqual(assembly.count("OpSwitch %pcv %swm"), 2)
+        self.assertEqual(self.measure(assembly), (16_384, 1))
 
 
 if __name__ == "__main__":

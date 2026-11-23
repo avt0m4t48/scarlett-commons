@@ -294,6 +294,63 @@ class BlockRunTests(unittest.TestCase):
             measure_stream(block(with_group=False))
 
 
+def block_with_streams(extra, grid=GRID):
+    """block() with more (slot, tag, per-vertex bytes) streams appended after its own, before the group."""
+    n = grid * grid
+    buf = bytearray(block(grid=grid, with_group=False))
+    for slot, tag, data in extra:
+        struct.pack_into("<I", buf, 4 * slot, tag | ((len(buf) // 2) << 8))
+        buf += data * n
+    buf += b"\0" * (-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
+def skin_block(weights, joints, pairs=1):
+    """block() with weight slots 6(/7) (tag 0x26) and joint slots 8(/9) (tag 0x25); weights and joints are
+    8-byte lists (two slots' worth), the first four bytes used when pairs == 1."""
+    extra = [(6, 0x26, bytes(weights[:4])), (8, 0x25, bytes(joints[:4]))]
+    if pairs == 2:
+        extra = [(6, 0x26, bytes(weights[:4])), (7, 0x26, bytes(weights[4:])),
+                 (8, 0x25, bytes(joints[:4])), (9, 0x25, bytes(joints[4:]))]
+    return block_with_streams(extra)
+
+
+class SkinTests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_two_pairs_of_sorted_weights_summing_to_255(self):
+        _, out = measure(skin_block([100, 80, 40, 20, 10, 5, 0, 0], [3, 7, 1, 2, 9, 4, 0, 0], pairs=2))
+        sk = out["skin"]
+        self.assertEqual(sk["blocks"], 1)
+        self.assertEqual(sk["pairs_2"], 1)
+        for k in ("weight_sum_255", "weight_sum_247_255", "weights_descending", "nonzero_indices_distinct",
+                  "zero_weight_zero_index"):
+            self.assertEqual(sk[k], self.N, k)
+        self.assertEqual(sk["index_max_0-15"], 1)
+        self.assertEqual(sk["colour_vertices"], self.N)
+        self.assertEqual(sk["colour_sum_255"], 0)
+
+    def test_failures_are_counted(self):
+        # sum 250, not descending, joint 40 repeated, a zero weight with a non-zero index
+        _, out = measure(skin_block([50, 100, 100, 0], [40, 40, 2, 5]))
+        sk = out["skin"]
+        self.assertEqual(sk["pairs_1"], 1)
+        self.assertEqual(sk["weight_sum_255"], 0)
+        self.assertEqual(sk["weight_sum_247_255"], self.N)
+        self.assertEqual(sk["weights_descending"], 0)
+        self.assertEqual(sk["nonzero_indices_distinct"], 0)
+        self.assertEqual(sk["zero_weight_zero_index"], 0)
+        self.assertEqual(sk["index_max_32-47"], 1)
+
+    def test_no_joint_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["skin"], {})
+
+    def test_joint_slot_without_weights_is_unpaired(self):
+        _, out = measure(block_with_streams([(8, 0x25, bytes((1, 2, 3, 4)))]))
+        self.assertEqual(out["skin"], {"unpaired": 1})
+
+
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end_on_a_fake_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,7 +359,7 @@ class ArchiveTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + body + zlib.compress(b"\x63\x30\x00\x00" * 8))
             out_json = os.path.join(tmp, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out_json, encoding="utf-8") as fh:
                 out = json.load(fh)
@@ -316,7 +373,7 @@ class ArchiveTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(run))
             out_json = os.path.join(tmp, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out_json, encoding="utf-8") as fh:
                 out = json.load(fh)
@@ -324,7 +381,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_directory_scan_uses_stable_archive_order(self):
         with tempfile.TemporaryDirectory() as root:
-            def walk(path):
+            def walk(path, onerror=None):
                 directories = ["z", "a"]
                 yield path, directories, []
                 for directory in directories:
@@ -342,7 +399,7 @@ class ArchiveTests(unittest.TestCase):
             ])
 
     def test_negative_limit_is_an_error(self):
-        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2)
 
     @staticmethod
@@ -356,7 +413,7 @@ class ArchiveTests(unittest.TestCase):
     def test_json_over_an_input_archive_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, data = self._archive(tmp)
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -369,7 +426,7 @@ class ArchiveTests(unittest.TestCase):
             sub = os.path.join(tmp, "pack")
             os.mkdir(sub)
             path, data = self._archive(sub)
-            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             with open(path, "rb") as fh:
@@ -378,7 +435,7 @@ class ArchiveTests(unittest.TestCase):
     def test_json_that_is_a_directory_is_refused_before_the_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -388,7 +445,7 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
             out = os.path.join(tmp, "reports", "vertex", "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["blocks"], 1)
@@ -400,11 +457,66 @@ class ArchiveTests(unittest.TestCase):
             with open(blocker, "w", encoding="utf-8") as fh:
                 fh.write("a file, not a folder")
             out = os.path.join(blocker, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn('"blocks"', r.stdout)
+
+
+def block27(word, grid=GRID):
+    """block() with a tag-0x27 stream in slot 11 (the same word on every vertex), before the group."""
+    buf = bytearray(block(grid=grid, with_group=False))
+    struct.pack_into("<I", buf, 4 * 11, 0x27 | ((len(buf) // 2) << 8))
+    buf += word * (grid * grid)
+    buf += bytes(-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
+def word27(x, y, z, w):
+    """Inverse of tangent_0x27 for components in [-1, 1] and w in 0..3."""
+    return struct.pack("<I", sum(round((c + 1) / 2 * 1023) << s for c, s in ((x, 0), (y, 10), (z, 20))) | w << 30)
+
+
+class Tag27Tests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_decode_is_2_10_10_10_unorm_times_2_minus_1(self):
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(1, 0, 0, 3))[0])
+        self.assertGreater(t[0], 0.999)
+        self.assertEqual(sign, 1.0)
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(0, 0, -1, 0))[0])
+        self.assertLess(t[2], -0.999)
+        self.assertEqual(sign, -1.0)
+        self.assertAlmostEqual(vt.tangent_0x27(2 << 30)[1], 1 / 3)
+
+    def test_tangent_along_u_with_w_as_bitangent_sign(self):
+        # flat grid: face normal +z, dP/du = +x, dP/dv = +y; cross(+z, +x) = +y, so it points along +v and
+        # w = 0 (sign -1) is the "w > 0 exactly when -v" side; w = 3 is the other
+        for w, agree in ((0, True), (3, False)):
+            _, out = measure(block27(word27(1, 0, 0, w)))
+            t = out["tag27"]
+            self.assertEqual(t["11:vertices"], self.N)
+            self.assertEqual(t["11:unit"], self.N)
+            self.assertEqual(t[f"11:w{w}"], self.N)
+            self.assertEqual(t["11:perp_face"], t["11:perp_face_n"])
+            self.assertEqual(t["11:uv3_along_u"], t["11:uv3_n"])
+            self.assertEqual(t["11:uv3_w_plus_minus_v"], t["11:uv3_along_u"] if agree else 0)
+
+    def test_vector_along_the_normal_fails_the_checks(self):
+        _, out = measure(block27(word27(0, 0, 1, 3)))
+        t = out["tag27"]
+        self.assertEqual(t["11:unit"], self.N)
+        self.assertEqual(t["11:perp_face"], 0)
+        self.assertNotIn("11:uv3_along_u", t)
+
+    def test_non_unit_vectors_are_counted(self):
+        _, out = measure(block27(word27(0.5, 0, 0, 3)))
+        self.assertEqual(out["tag27"]["11:unit"], 0)
+
+    def test_no_0x27_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["tag27"], {})
 
 
 class Rpf9ValidationTests(unittest.TestCase):
@@ -412,7 +524,7 @@ class Rpf9ValidationTests(unittest.TestCase):
 
     @staticmethod
     def _run(args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_invalid_headers_are_errors(self):
         cases = [
@@ -452,6 +564,54 @@ class Rpf9ValidationTests(unittest.TestCase):
                     r = self._run([str(path)])
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertEqual(json.loads(r.stdout)["streams"], streams)
+
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the scan used to report an
+        # empty directory and exit 0, hiding the incomplete scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sub = root / "sub"
+            sub.mkdir()
+            (sub / "x.rpf").write_bytes(b"RPF9" + struct.pack("<I", 8))
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                r = self._run([str(root)])
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("error:", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_fails_when_chmod_is_not_enough(self):
+        # The test above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard would go unexercised there. Forcing os.scandir to raise for
+        # one folder reproduces the same PermissionError os.walk hits for real, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sub = root / "sub"
+            sub.mkdir()
+            (sub / "x.rpf").write_bytes(b"RPF9" + struct.pack("<I", 8))
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(str(sub)))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(vt.os, "scandir", scandir):
+                with contextlib.redirect_stderr(err):
+                    code = vt.main([str(root)])
+            self.assertEqual(code, 2, err.getvalue())
+            self.assertIn("error:", err.getvalue())
+            self.assertIn("sub", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

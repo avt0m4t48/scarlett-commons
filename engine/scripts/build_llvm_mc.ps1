@@ -49,15 +49,42 @@ if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
 
 $src = Join-Path $Temp "src"
 $out = Join-Path $Temp "build"
+function Remove-DirectoryRobust([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    # Strip read-only attributes on nested files and folders so Windows allows deletion
+    Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                $_.Attributes = $_.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+            }
+        } catch {}
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+    }
+    cmd.exe /c "rmdir /s /q `"$path`"" 2>$null
+}
+
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
-    if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+    if (Test-Path -LiteralPath $src) { Remove-DirectoryRobust $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
     # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
     # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
     & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
-    & git -C $src sparse-checkout set llvm cmake third-party
+    # libc: LLVM 23 configures only with its shared headers (llvm/CMakeLists.txt, "LLVM libc is not found").
+    & git -C $src sparse-checkout set llvm cmake third-party libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
+}
+# A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
+if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
+    & git -C $src sparse-checkout add libc
+    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout add libc failed." }
 }
 
 # -Keep (or an interrupted build) can leave sources from another -Version.
@@ -99,7 +126,8 @@ $batchText = @(
 ) -join "`r`n"
 [System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
-$p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
+# /s with a second pair of quotes: cmd.exe strips only the outer pair, so a path holding & or ^ stays quoted.
+$p = Start-Process cmd.exe -ArgumentList "/s", "/c", "`"`"$bat`"`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
 $p.WaitForExit()
@@ -118,10 +146,9 @@ New-Item -ItemType Directory -Force $Dest | Out-Null
 $final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
-    try {
-        Remove-Item -LiteralPath $Temp -Recurse -Force
-    } catch {
-        Write-Warning "Installed $final, but cleanup of '$Temp' failed: $($_.Exception.Message)"
+    Remove-DirectoryRobust $Temp
+    if (Test-Path -LiteralPath $Temp) {
+        Write-Warning "Installed $final, but cleanup of '$Temp' failed."
     }
 }
 if (-not $NoEnv) {

@@ -31,6 +31,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <new>
 #include <string>
 #include <tuple>
@@ -276,11 +277,13 @@ bool uav_clear(CommandList& list, std::uint32_t index) {
 bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     Draw d{};
     d.pipeline = Scene::pipeline_id;
-    d.render_targets = {color_view};
+    auto views = std::make_shared<DrawViews>();  // out of line since D3D-391
+    views->render_targets = {color_view};
     d.depth = depth_view;
     const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
-    d.vertex_buffers[0] = {base, 24576, 12};          // by input slot, inlined since D3D-289
-    d.vertex_buffers[1] = {base + 24576, 16384, 8};
+    views->vertex_buffers[0] = {base, 24576, 12};  // by input slot
+    views->vertex_buffers[1] = {base + 24576, 16384, 8};
+    d.views = std::move(views);
     if (indexed) d.index = {base + 40960, 6144, 57};
     d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     d.viewport = {0, 0, 1920, 1080, 0, 1};
@@ -291,6 +294,8 @@ bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     d.instances = 1;
     return list.draw(d);
 }
+
+constexpr char texture_barrier_kind[] = "texture barrier pair (enh.)";
 
 const Kind kinds[] = {
     {"transition pair",
@@ -304,6 +309,17 @@ const Kind kinds[] = {
          return l.barrier(BufferBarrier{y::copy, y::pixel_shading, a::copy_dest, a::shader_resource, Scene::constants});
      },
      1},
+    {texture_barrier_kind,
+     [](CommandList& l, std::uint32_t) {
+         const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+         return l.barrier(TextureBarrier{y::pixel_shading, y::copy, a::shader_resource, a::copy_dest,
+                                         d3d12_layout::shader_resource, d3d12_layout::copy_dest, Scene::texture, all,
+                                         0}) &&
+                l.barrier(TextureBarrier{y::copy, y::pixel_shading, a::copy_dest, a::shader_resource,
+                                         d3d12_layout::copy_dest, d3d12_layout::shader_resource, Scene::texture, all,
+                                         0});
+     },
+     2},
     {"clear RTV, whole view", [](CommandList& l, std::uint32_t) { return l.clear_render_target(color_view, black); }, 1},
     {"clear RTV, 2 rects",
      [](CommandList& l, std::uint32_t) { return l.clear_render_target(color_view, black, two_rects); }, 1},
@@ -562,6 +578,12 @@ int main(int argc, char** argv) {
             },
             reps, warmup);
         check(kind.name, r);
+        // One image barrier for each piece: emit keeps the usual one or two on the stack.
+        if (std::strcmp(kind.name, texture_barrier_kind) == 0 && r.emit.allocations != 0) {
+            std::fprintf(stderr, "FAIL %s: emit makes %.2f heap allocations per command\n", kind.name,
+                         r.emit.allocations);
+            ++failures;
+        }
         if (!self_test) print_row(kind.name, r, csv);
     }
     const auto frame = [&](CommandList& list) {
@@ -577,7 +599,9 @@ int main(int argc, char** argv) {
         CommandList earlier, later;
         Draw plain{};
         plain.pipeline = Scene::bare_id;
-        plain.render_targets = {color_view};
+        auto plain_views = std::make_shared<DrawViews>();
+        plain_views->render_targets = {color_view};
+        plain.views = std::move(plain_views);
         plain.topology = 4;
         plain.viewport = {0, 0, 1920, 1080, 0, 1};
         plain.scissor = {0, 0, 1920, 1080};

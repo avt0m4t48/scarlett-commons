@@ -16,6 +16,7 @@
 // GLSL written to the translator's contract.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -68,10 +69,10 @@ int main() {
     // set-0 bindings for the shader, as the translator does for one that samples.
     const auto program = fssm_program({0x43530003, 0xbf810000});
     const auto container = shader_container(program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_set0_compute_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SET0_SAMPLE_SPV), library / "cs_set0_sample.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_set0_compute_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SET0_SAMPLE_SPV),
+                                library / "cs_set0_sample.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"cs_set0_sample\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(program)
@@ -106,9 +107,9 @@ int main() {
         }
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // Root signature: [0] two constants (s0: the view slot's offset in dwords, s1: the first output element),
-        // [1] a root UAV (s2:s3, the output buffer), [2] the table of views (s4:s5), [3] the table of samplers
-        // (s6:s7).
+        // Root signature, in the console compute layout (rt::rootsig::pack_stage, D3D-448): [0] two constants (s4: the
+        // view slot's offset in dwords, s5: the first output element), [1] a root UAV (s6:s7, the output buffer),
+        // [2] the table of views (s8, its 32-bit VA), [3] the table of samplers (s9).
         D3D12_DESCRIPTOR_RANGE view_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0};
         D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[4] = {};
@@ -309,7 +310,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     // Runs 0, 1 and 3 against the textures; run 2 is the fallback image, whose colour the test does not fix: it
     // must be one colour everywhere, which neither texture gives.

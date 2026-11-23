@@ -9,8 +9,9 @@ there is no partner half to exchange values with (compute and mesh shaders have 
     analyse(blocks, succ, masks, stage) -> {"tier": "A" | "B" | "C", "reasons": [...], "idioms": [...],
                                             "uniform_readlane": {id(ins), ...}}
 
-    A  nothing wave-wide is consumed except votes that only skip lane-masked work, whole-quad masks and
-       per-lane arithmetic: exact as translated, on any subgroup size.
+    A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
+       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
+       whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
        is the same in every lane. Exact (the aggregated atomic up to the order in which lanes get slots), with the
@@ -36,6 +37,7 @@ Standard library only.
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -53,10 +55,12 @@ X = 64          # anything else that depends on the partition
 CTRL = 128      # scalar defined behind a wave-wide vote and read where the def may not have run
 MASKD = 256     # a lane mask used as data
 WFS = 512       # scalar read from the first lane of a waterfall loop
-TAG_BITS = RNK | ELECT | WFS
+ACT_RFL = 1024  # scalar from v_readfirstlane of active-EXEC-only uniform VGPR (valid only inside that EXEC mask)
+TAG_BITS = RNK | ELECT | WFS | ACT_RFL
 
 NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocation-order", ELECT: "elected-lane",
-         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar"}
+         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar",
+         ACT_RFL: "cross-lane"}
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
                                         "analysis-error"})
@@ -94,6 +98,35 @@ MOVREL_OPS = (
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
+UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
+
+
+_TYPE16 = re.compile(r"^[biuf]16$")
+_TYPE = re.compile(r"^[biuf](8|16|24|32|64)$")
+# GFX10 VOP2 16-bit integer ops: in their VOP2 (_e32) encoding they define the whole register (design.md, "16-bit
+# results"); their _e64 forms are opsel-capable and keep the high half
+VOP2_INT16 = {"v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlrev_b16", "v_lshrrev_b16",
+              "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16"}
+
+
+def partial_write(ins, op):
+    """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest (design.md, "16-bit
+    results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
+    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
+    integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
+    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
+    mods = ins.get("mods") or []
+    op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
+    if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
+        return "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_"))
+                                                             for m in mods)
+    name = op.split("_e32")[0].split("_e64")[0].split("_dpp")[0]
+    if name.startswith(("v_pk_", "v_cvt_pk", "v_sad_")):
+        return False
+    first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
+    if not (first and _TYPE16.match(first)):
+        return False
+    return not (name in VOP2_INT16 and "_e64" not in op)
 
 
 def base_op(op):
@@ -112,6 +145,20 @@ def _regs(a):
         return [("v", a["r"] + i) for i in range(a.get("n", 1))]
     if k == "vlist":
         return [("v", r) for r in a["r"]]
+    if k == "slist":
+        regs = []
+        for r in a["r"]:
+            if isinstance(r, int):
+                key = ("s", r)
+            elif isinstance(r, str) and r.startswith("vcc"):
+                key = "vcc"
+            elif isinstance(r, str) and r.startswith("exec"):
+                key = "exec"
+            else:
+                continue
+            if key not in regs:
+                regs.append(key)
+        return regs
     if k == "special":
         t = a.get("t", "")
         if t.startswith("vcc"):
@@ -134,12 +181,31 @@ def _half(a):
     return None
 
 
+def _zero(a):
+    return a.get("k") == "imm" and a.get("v") == 0
+
+
+def _mask64(a):
+    """A whole 64-bit SGPR pair or VCC (a lane mask register), not EXEC and not a 32-bit half."""
+    if a.get("k") == "sgpr":
+        return a.get("n", 1) == 2
+    return a.get("k") == "special" and a.get("t") == "vcc"
+
+
+ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
+            "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
+# Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
+# S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
+OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
+          "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
+
+
 def operands(ins):
     """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
     op, a = base_op(ins["op"]), ins["args"]
     mods = ins.get("mods") or []
     defs, uses = [], []
-    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp")) or op in ("s_endpgm", "s_barrier"):
+    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp", "v_cmpx")) or op in ("s_endpgm", "s_barrier"):
         dests, srcs = [], list(a)
     elif op.startswith(("s_cmp", "s_bitcmp")):
         dests, srcs = [], list(a)
@@ -169,7 +235,7 @@ def operands(ins):
             dests, srcs = [a[0]], list(a[1:])
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
-                and a[1].get("k") in ("sgpr", "special"):
+                and a[1].get("k") in ("sgpr", "special", "slist"):
             dests, srcs = [a[0], a[1]], list(a[2:])
     else:
         dests, srcs = [], []
@@ -203,6 +269,49 @@ class Analysis:
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
+        self.pure_spill_vgprs = self._find_pure_spill_vgprs()
+
+    def _find_pure_spill_vgprs(self):
+        """VGPRs used ONLY as constant-lane scalar spill storage (v_writelane_b32 / v_readlane_b32 with immediate
+        lane 0..63 and non-VGPR source, never read/written as a vector operand, never aliased by v_movrel*, and
+        never holding a lane mask). Every constant lane 0..63 of such a VGPR can be lowered to a parked scalar slot
+        in rdna2spirv.py so SGPR spills past lane 31 stay exact on 32-wide (and narrower) subgroups."""
+        candidates = set()
+        disqualified = set()
+        movrel_min = None
+        for blk in self.blocks:
+            for ins in blk:
+                op = base_op(ins["op"])
+                a = ins["args"]
+                if op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
+                    for x in a:
+                        if x.get("k") == "vgpr":
+                            movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
+                if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0].get("n", 1) == 1 \
+                        and a[2].get("k") == "imm" and a[1].get("k") != "vgpr":
+                    vr = a[0]["r"]
+                    slot = lane_masks.lane_slot(a[0], a[2])
+                    if slot and (slot in self.masks.get(id(ins), {}) or self.is_mask(ins, a[1])):
+                        disqualified.add(vr)
+                    else:
+                        candidates.add(vr)
+                    continue
+                if op == "v_readlane_b32" and len(a) == 3 and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1 \
+                        and a[2].get("k") == "imm":
+                    vr = a[1]["r"]
+                    slot = lane_masks.lane_slot(a[1], a[2])
+                    if slot and slot in self.masks.get(id(ins), {}):
+                        disqualified.add(vr)
+                    else:
+                        candidates.add(vr)
+                    continue
+                for x in a:
+                    for r in _regs(x):
+                        if isinstance(r, tuple) and r[0] == "v":
+                            disqualified.add(r[1])
+        if movrel_min is not None:
+            candidates = {vr for vr in candidates if vr < movrel_min}
+        return frozenset(candidates - disqualified)
 
     # ---- helpers ----
     def is_mask(self, ins, a):
@@ -267,8 +376,10 @@ class Analysis:
                 t[k] = v | X
         x = a["x"] if a["x"] == b["x"] else ("j", blk)
         self.tok.setdefault(x, (None, None, False))
+        u = a["u"] & b["u"]
+        ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
-                "u": a["u"] & b["u"], "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
+                "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
                 "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
 
     @staticmethod
@@ -276,12 +387,13 @@ class Analysis:
         return {k: a.get(k, frozenset()) | b.get(k, frozenset()) for k in set(a) | set(b)}
 
     def entry(self):
-        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "l": {}, "r": {}, "b": {}}
+        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
+                "r": {}, "b": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
         st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
-              "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
         for i, ins in enumerate(self.blocks[n]):
             self.step(n, i, ins, st, ev)
         return st
@@ -349,6 +461,81 @@ class Analysis:
                     else:
                         st[key].pop(r, None)
 
+    def operand_literal(self, n, i, x):
+        """The literal value of a scalar source before instruction `i` of block `n`, else None."""
+        if x.get("abs") or x.get("neg"):
+            return None
+        if x.get("k") == "imm":
+            return x["v"] & 0xFFFFFFFF
+        if x.get("k") == "special" and x.get("t") == "null":
+            return 0
+        if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+            return self.literal_sgpr(n, i, x["r"])
+        return None
+
+    def literal_sgpr(self, n, i, r):
+        """The 32-bit literal SGPR `r` holds before instruction `i` of block `n`, as rdna2spirv's `sgpr_imm` knows
+        it: the value the last writer in this basic block gave it, when that writer is one of the scalar ops below
+        and its sources are literals too. None for any other writer, or none in the block (a run-time value).
+
+        MIRROR of rdna2spirv's `sgpr_imm` folding (it cannot be imported here: this analysis runs before the
+        translator emits a block, so its `sgpr_imm` is empty): s_mov_b32, s_movk_i32, s_mov_b64 (an immediate or an
+        SGPR pair), s_pack_ll/lh/hh_b32_b16, s_bfm_b32, s_not_b32, and the S2 folds s_and_b32, s_lshl_b32,
+        s_lshr_b32, s_mul_i32 (not s_or_b32: rdna2spirv does not record it). Not mirrored, so treated as run-time:
+        s_abs, s_sext, s_min/max, s_add/sub, s_xor/andn2 family, s_bfe, s_absdiff, s_lshlN_add. Keep the two lists
+        in step when rdna2spirv folds another op."""
+        for j in range(i - 1, -1, -1):
+            ins = self.blocks[n][j]
+            if ("s", r) not in [x for d in operands(ins)[0] for x in _regs(d)]:
+                continue
+            op, a = base_op(ins["op"]), ins["args"]
+            if op == "s_mov_b64" and len(a) == 2 and a[0].get("k") == "sgpr" and a[0].get("n") == 2:
+                half = r - a[0]["r"]
+                if a[1].get("k") == "imm":
+                    return (a[1]["v"] & 0xFFFFFFFFFFFFFFFF) >> (32 * half) & 0xFFFFFFFF
+                if a[1].get("k") == "sgpr" and a[1].get("n") == 2:
+                    return self.literal_sgpr(n, j, a[1]["r"] + half)
+                return None
+            if not (a and a[0].get("k") == "sgpr" and a[0].get("n", 1) == 1):
+                return None
+            x = self.operand_literal(n, j, a[1]) if len(a) > 1 else None
+            y = self.operand_literal(n, j, a[2]) if len(a) > 2 else None
+            if op == "s_mov_b32" and len(a) == 2:
+                return x
+            if op == "s_movk_i32" and len(a) == 2 and a[1].get("k") == "imm":
+                v = a[1]["v"] & 0xFFFF
+                return (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            if op == "s_not_b32" and x is not None:
+                return ~x & 0xFFFFFFFF
+            if x is None or y is None or len(a) != 3:
+                return None
+            if op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
+                lo = x >> 16 if op == "s_pack_hh_b32_b16" else x & 0xFFFF
+                hi = (y & 0xFFFF) << 16 if op == "s_pack_ll_b32_b16" else y & 0xFFFF0000
+                return lo | hi
+            if op == "s_bfm_b32":
+                return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
+            folds = {"s_and_b32": x & y, "s_lshl_b32": x << (y & 31), "s_lshr_b32": x >> (y & 31), "s_mul_i32": x * y}
+            return folds[op] & 0xFFFFFFFF if op in folds else None
+        return None
+
+    def add_tid_lane(self, n, i, a, mods):
+        """LANE when a MUBUF/MTBUF access (vdata, vaddr, V#, ...) has no idxen and its V# word3 is a literal with
+        ADD_TID_ENABLE (bit 23) set: the effective index is then the wave lane (idxen ignores the bit), so the
+        result or the address is the lane id. A run-time V# cannot be judged here: tiers A and B assume the bit is
+        0 there (docs/design.md, SHADER-10)."""
+        if "idxen" in mods or len(a) < 3:
+            return 0
+        rsrc = a[2]
+        if rsrc.get("k") == "sgpr" and rsrc.get("n") == 4:
+            w3 = rsrc["r"] + 3
+        elif rsrc.get("k") == "slist" and len(rsrc["r"]) == 4 and isinstance(rsrc["r"][3], int):
+            w3 = rsrc["r"][3]
+        else:
+            return 0
+        lit = self.literal_sgpr(n, i, w3)
+        return LANE if lit is not None and lit >> 23 & 1 else 0
+
     def transfer(self, n, i, ins, st, ev):
         op, a = base_op(ins["op"]), ins["args"]
         mods = ins.get("mods") or []
@@ -371,16 +558,25 @@ class Analysis:
                 t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             return t
 
-        def put(a_, t, tag=None, uniform=False):
+        def put(a_, t, tag=None, uniform=False, uniform_active=False):
             for r in _regs(a_):
                 if r == "exec":
                     continue
                 T[r] = t
                 st["g"].pop(r, None)
+                # SHADER-820: a vote's SCC names the mask register it tested (its first SGPR for a pair). A new
+                # value in that register (v_cmp into the pair or VCC, s_mov_b64, s_cselect_b64: none of them
+                # writes SCC) leaves SCC a vote on the old mask, while a run side narrows EXEC to the new one, so
+                # the tag goes. Ops that vote on their own destination set the new tag after this put().
+                vote = st["g"].get("scc")
+                if vote and vote[0] == "vote" and r != "scc" and (
+                        r == vote[1] or (isinstance(vote[1], tuple) and r == (vote[1][0], vote[1][1] + 1))):
+                    del st["g"]["scc"]
                 if tag is not None:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
                     st["u"] = st["u"] | {r[1]} if uniform else st["u"] - {r[1]}
+                    st["ua"] = st["ua"] | {r[1]} if (uniform or uniform_active) else st["ua"] - {r[1]}
                     for k in [k for k in st["l"] if k[0] == r[1]]:
                         del st["l"][k]
                     # a waterfall scalar / mask names the VGPR it was read from: once that is rewritten the
@@ -413,10 +609,16 @@ class Analysis:
 
         # --- sinks
         if op.startswith(SINKS) and not op.startswith(("buffer_atomic",)):
-            # buffer_store vdata, vaddr, s[V#], soffset: operand 0 is the data, the rest address and descriptor;
+            # buffer_store/tbuffer_store/image_store: operand 0 is data, the rest address and descriptor;
+            # global_store/flat_store/scratch_store: operand 0 is vaddr, operand 1 is vdata, the rest saddr;
+            # ds_write/ds_store: operand 0 is vaddr, the rest is vdata;
             # exp target, v, v, v, v: the first operand is the target (no taint), the rest is data
             addr, data = [], list(srcs)
-            if op != "exp" and srcs:
+            if op.startswith(("global_store", "flat_store", "scratch_store")) and len(srcs) >= 2:
+                addr, data = [srcs[0]] + list(srcs[2:]), [srcs[1]]
+            elif op.startswith(("ds_write", "ds_store")) and len(srcs) >= 2:
+                addr, data = [srcs[0]], list(srcs[1:])
+            elif op != "exp" and srcs:
                 data, addr = [srcs[0]], list(srcs[1:])
             if self.stage == "gs" and op.startswith(("ds_write", "ds_store")):
                 # ds_write vaddr, vdata...: in a legacy GS the write is an output slot from its offset alone
@@ -428,6 +630,8 @@ class Analysis:
             at = 0
             for x in addr:
                 at |= self.rd(st, ins, x)
+            if op.startswith(("buffer_store", "tbuffer_store")):
+                at |= self.add_tid_lane(n, i, a, mods)
             bits_violation(dt)
             bits_violation(at, BASE | RNK)
             if at & RNK and at & BASE:
@@ -446,14 +650,33 @@ class Analysis:
             return
         if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
                           "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor")):
-            data_t = self.rd(st, ins, a[0]) if a else 0
+            if op.startswith(("global_atomic", "flat_atomic")):
+                if "glc" in mods:
+                    data_op = a[2] if len(a) > 2 else None
+                    addr_ops = ([a[1]] if len(a) > 1 else []) + list(a[3:])
+                else:
+                    data_op = a[1] if len(a) > 1 else None
+                    addr_ops = ([a[0]] if a else []) + list(a[2:])
+            elif op.startswith("ds_"):
+                if "_rtn" in op:
+                    data_op = a[2] if len(a) > 2 else None
+                    addr_ops = [a[1]] if len(a) > 1 else []
+                else:
+                    data_op = a[1] if len(a) > 1 else None
+                    addr_ops = [a[0]] if a else []
+            else:
+                data_op = a[0] if a else None
+                addr_ops = list(a[1:])
+            data_t = self.rd(st, ins, data_op) if data_op is not None else 0
             addr_t = 0
-            for x in a[1:]:
+            for x in addr_ops:
                 addr_t |= self.rd(st, ins, x)
+            if op.startswith("buffer_atomic"):
+                addr_t |= self.add_tid_lane(n, i, a, mods)
             elected = bool(st["xg"] and st["xg"][0] == "elect")
             bits_violation(addr_t, ELECT if elected else 0)
             if data_t & CNT:
-                dreg = _regs(a[0])[0] if a and _regs(a[0]) else None
+                dreg = _regs(data_op)[0] if data_op is not None and _regs(data_op) else None
                 if not (elected and (op.endswith("add") or op.endswith("add_u32") or op.endswith("_add"))
                         and self.cnt_token(st, dreg) == st["xg"][1]):
                     violation("lane-count")
@@ -484,6 +707,8 @@ class Analysis:
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
         t_src |= md
+        if op.startswith(("buffer_load", "tbuffer_load")):
+            t_src |= self.add_tid_lane(n, i, a, mods)
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):
@@ -551,6 +776,11 @@ class Analysis:
             if vr is not None and vr in st["u"]:
                 idiom("readfirstlane-uniform")
                 put(a[0], tv)
+            elif vr is not None and vr in st["ua"]:
+                # Uniform over active lanes only: if a half has EXEC == 0 here, v_readfirstlane returns lane 0's
+                # stale value, so this scalar is only exact while EXEC remains a subset of st["x"].
+                idiom("readfirstlane-uniform")
+                put(a[0], tv | ACT_RFL, ("act_rfl", st["x"]))
             elif tv & ELECT and st["g"].get(_regs(a[1])[0], ("",))[0] == "elect" \
                     and st["g"][_regs(a[1])[0]][1] == st["x"]:
                 idiom("aggregated-atomic")
@@ -564,14 +794,23 @@ class Analysis:
         if op == "v_readlane_b32" and len(a) == 3:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             tl = self.rd(st, ins, a[2])
-            if vr is not None and vr in st["u"] and not tl:
+            if vr is not None and vr in st["u"]:
+                # Every lane holds the same value in v[vr], so the selected lane index (even if derived from
+                # first-lane, lane-count, or lane-id) cannot change the result across 32-lane halves.
                 idiom("readlane-uniform")
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))
                 put(a[0], self.rd(st, ins, a[1]))
-            elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] and a[2]["v"] & 63 < 32:
-                put(a[0], st["l"][(vr, a[2]["v"] & 63)])
+            elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] \
+                    and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
+                lane = a[2]["v"] & 63
+                spill_t = st["l"][(vr, lane)]
+                if (id(ins), ("spill", vr, lane)) in self.stale:
+                    spill_t |= CTRL
+                put(a[0], spill_t)
                 idiom("lane-spill")
+                if ev is not None and vr in self.pure_spill_vgprs:
+                    ev["scalar_spills"].add((vr, lane))
             else:
                 put(a[0], X | self.rd(st, ins, a[1]) | tl)
             return
@@ -580,8 +819,12 @@ class Analysis:
             tv, tl = self.rd(st, ins, a[1]), self.rd(st, ins, a[2])
             T[("v", vr)] = T.get(("v", vr), 0) | X
             st["u"] = st["u"] - {vr}
-            if a[2].get("k") == "imm" and (a[2]["v"] & 63) < 32 and not tl:
-                st["l"][(vr, a[2]["v"] & 63)] = tv
+            st["ua"] = st["ua"] - {vr}
+            if a[2].get("k") == "imm" and not tl and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
+                lane = a[2]["v"] & 63
+                st["l"][(vr, lane)] = tv
+                if ev is not None and vr in self.pure_spill_vgprs:
+                    ev["scalar_spills"].add((vr, lane))
             else:
                 violation("cross-lane")
             return
@@ -606,6 +849,8 @@ class Analysis:
         if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
             d = dests[0] if dests else {"k": "special", "t": "vcc"}
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
+            if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
+                tag = UVOTE
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -648,8 +893,13 @@ class Analysis:
                 r = _regs(srcs[0])
                 if srcs[0].get("k") == "special" and srcs[0].get("t") == "exec":
                     tag = ("mask", st["x"])
-                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
+                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
                     tag = st["g"][r[0]]
+            elif op == "s_and_b64" and not t_src and all(
+                    (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
+                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+                tag = UVOTE
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -665,8 +915,10 @@ class Analysis:
                 g1 = st["g"].get(r1[0]) if r1 else None
                 u0 = bool(r0 and isinstance(r0[0], tuple) and r0[0][0] == "v" and r0[0][1] in st["u"])
                 u1 = bool(r1 and isinstance(r1[0], tuple) and r1[0][0] == "v" and r1[0][1] in st["u"])
-                put(a[0], t1, g1, uniform=u1)
-                put(a[1], t0, g0, uniform=u0)
+                ua0 = bool(r0 and isinstance(r0[0], tuple) and r0[0][0] == "v" and r0[0][1] in st["ua"])
+                ua1 = bool(r1 and isinstance(r1[0], tuple) and r1[0][0] == "v" and r1[0][1] in st["ua"])
+                put(a[0], t1, g1, uniform=u1, uniform_active=ua1)
+                put(a[1], t0, g0, uniform=u0, uniform_active=ua0)
             else:
                 tb = t0 | t1 | (ELECT if st["xg"] and st["xg"][0] == "elect" else 0)
                 put(a[0], tb, uniform=False)
@@ -717,6 +969,7 @@ class Analysis:
             if st["xg"] and st["xg"][0] == "elect":
                 wt |= ELECT
             st["u"] = frozenset(u for u in st["u"] if u < dst_base)
+            st["ua"] = frozenset(u for u in st["ua"] if u < dst_base)
             for k in [k for k in st["l"] if k[0] >= dst_base]:
                 del st["l"][k]
             for k, v in list(st["g"].items()):
@@ -732,14 +985,60 @@ class Analysis:
             return
 
         # --- everything else: results depend on the sources
+        def scaled_cnt_token():
+            """Linear scaling of a lane count by a clean uniform 32-bit stride preserves wave-aggregated atomic
+            partition invariance: (c_lo + c_hi) * K == c_lo * K + c_hi * K (mod 2^32).
+            Shift ops require the count to be the shifted value operand (never the shift distance), and
+            24-bit truncating multiplies (v_mul_u32_u24) are excluded because mod-2^24 truncation is nonlinear."""
+            if op in ("s_lshl_b32", "v_lshlrev_b32"):
+                if len(srcs) != 2:
+                    return None
+                val_op, sh_op = (srcs[0], srcs[1]) if op == "s_lshl_b32" else (srcs[1], srcs[0])
+                vt = self.rd(st, ins, val_op)
+                st_sh = self.rd(st, ins, sh_op)
+                if not (vt & CNT) or (vt & ~(CNT | ELECT)):
+                    return None
+                if st_sh != 0 or self.is_mask(ins, sh_op) or (
+                        sh_op.get("k") == "vgpr" and not all(r[1] in st["ua"] for r in _regs(sh_op))):
+                    return None
+                r = _regs(val_op)
+                return self.cnt_token(st, r[0]) if r else None
+            if op in ("s_mul_i32", "s_mulk_i32", "v_mul_lo_u32"):
+                cnt_toks = []
+                for x in srcs:
+                    xt = self.rd(st, ins, x)
+                    if xt & CNT:
+                        r = _regs(x)
+                        ct = self.cnt_token(st, r[0]) if r else None
+                        if ct is None or (xt & ~(CNT | ELECT)):
+                            return None
+                        cnt_toks.append(ct)
+                    elif xt != 0 or self.is_mask(ins, x) or (
+                            x.get("k") == "vgpr" and not all(r[1] in st["ua"] for r in _regs(x))):
+                        return None
+                if len(cnt_toks) == 1:
+                    return cnt_toks[0]
+            return None
+
         if op in ("v_cndmask_b32", "v_cndmask_b16") or op.startswith("v_"):
             tj = t_src
             uniform = False
+            uniform_active = False
             if op.startswith("v_") and not op.startswith(("v_interp", "v_mbcnt", "v_readlane", "v_writelane", "v_permlane",
                                                           "v_cndmask")) and dests:
                 uniform = st["f"] and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["u"] for r in _regs(x))) for x in srcs) and not uses
+                uniform_active = not (st["xg"] and st["xg"][0] == "elect") and all(
+                    x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
+                    (x.get("k") == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))) for x in srcs) and not uses
+                # a write of part of the VGPR (SDWA byte/word with UNUSED_PRESERVE, a 16-bit result) keeps the rest
+                # of it: uniform only if the whole register already was
+                if partial_write(ins, op):
+                    if uniform:
+                        uniform = all(r[1] in st["u"] for d in dests for r in _regs(d) if isinstance(r, tuple))
+                    if uniform_active:
+                        uniform_active = all(r[1] in st["ua"] for d in dests for r in _regs(d) if isinstance(r, tuple))
             # a waterfall scalar used by a lane whose v equals it is that lane's own value
             if tj & WFS:
                 ok = st["xg"] and st["xg"][0] == "wf"
@@ -750,10 +1049,25 @@ class Analysis:
                         if T.get(r, 0) & WFS and not (ok and g and g[0] == "wfs" and g[1] == st["xg"][1]):
                             good = False
                 tj = tj & ~WFS if good else tj | X
+            # an active-EXEC-only v_readfirstlane scalar is exact only on lanes active within its EXEC mask
+            if tj & ACT_RFL:
+                good = True
+                for x in srcs:
+                    for r in _regs(x):
+                        g = st["g"].get(r)
+                        if T.get(r, 0) & ACT_RFL and not (g and g[0] == "act_rfl" and self.ancestor(g[1], st["x"])):
+                            good = False
+                tj = tj & ~ACT_RFL if good else tj | X
+            if tj & X:
+                uniform = False
+                uniform_active = False
             tag = None
             ctok = None
             if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
                 ctok = self.cnt_token(st, _regs(srcs[0])[0])
+                tag = ("cnt", ctok) if ctok is not None else None
+            elif tj & CNT:
+                ctok = scaled_cnt_token()
                 tag = ("cnt", ctok) if ctok is not None else None
             if tag is None and tj == LANE and len(dests) == 1:
                 k = self.lmod_result(st, ins, op, a)
@@ -763,19 +1077,36 @@ class Analysis:
                 tj |= ELECT
                 tag = ("elect", st["xg"][1], ctok)
             for d in dests:
-                put(d, tj, tag, uniform=uniform and d.get("k") == "vgpr")
+                put(d, tj, tag, uniform=uniform and d.get("k") == "vgpr",
+                    uniform_active=uniform_active and d.get("k") == "vgpr")
             return
         # scalar ALU, loads, anything unnamed
         tag = None
-        if t_src & WFS:
+        if t_src & WFS and t_src & ACT_RFL:
+            t_src |= X
+        elif t_src & WFS:
             gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS}
             if len(gs) == 1 and None not in gs:
                 tag = next(iter(gs))
             else:
                 t_src |= X
+        elif t_src & ACT_RFL:
+            gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & ACT_RFL}
+            if len(gs) == 1 and None not in gs:
+                g0 = next(iter(gs))
+                if g0[0] == "act_rfl" and self.ancestor(g0[1], st["x"]):
+                    tag = g0
+                else:
+                    t_src |= X
+            else:
+                t_src |= X
         elif op.startswith(("s_mov", "s_load", "s_buffer_load")) and len(srcs) == 1 and _regs(srcs[0]) and \
                 _regs(srcs[0])[0] in st["g"] and st["g"][_regs(srcs[0])[0]][0] in ("mask", "elect", "wfmask", "cnt"):
             tag = st["g"][_regs(srcs[0])[0]]
+        elif t_src & CNT:
+            ctok = scaled_cnt_token()
+            if ctok is not None:
+                tag = ("cnt", ctok)
         for d in dests:
             put(d, t_src, tag)
         if "scc" in defs:
@@ -791,6 +1122,24 @@ class Analysis:
         if g and g[0] == "elect" and len(g) > 2:
             return g[2]
         return None
+
+    def uniform_cmp(self, st, ins, srcs, uses, tj):
+        """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
+        every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
+        and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
+        if tj or uses or not st["f"] or not srcs:
+            return False
+        for x in srcs:
+            k = x.get("k")
+            if k in ("imm", "fimm"):
+                continue
+            if self.rd(st, ins, x) or self.is_mask(ins, x):
+                return False
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+                continue
+            return False
+        return True
 
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
@@ -848,6 +1197,7 @@ class Analysis:
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
+                st["ua"] = st["u"]
                 if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
                     T["scc"] = X
                     st["g"]["scc"] = ("vote", "exec")
@@ -862,6 +1212,7 @@ class Analysis:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
+                st["ua"] = st["u"]
                 if mt & ~0:
                     for b, name in NAMES.items():
                         if mt & b and not (b & ELECT):
@@ -874,6 +1225,7 @@ class Analysis:
         st["x"] = site
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
+        st["ua"] = st["u"]
 
     def ancestor(self, anc, tok):
         seen = set()
@@ -901,6 +1253,8 @@ class Analysis:
                         break
         self.tok[site] = (old if narrowing else None, xg, st["f"] and False)
         st["x"], st["xg"], st["f"] = site, xg, False
+        if not narrowing:
+            st["ua"] = st["u"]
 
     def branch(self, n, ins, op, st, ev):
         T = st["t"]
@@ -915,14 +1269,14 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
         if t & ~ELECT:
             self.bad_branch(ev, ins, op, t)
             return
-        self.vote(n, ins, op, reg, op.endswith("nz"), ev)
+        self.vote(n, ins, op, reg, op.endswith("nz"), ev, st)
 
     def bad_branch(self, ev, ins, op, t):
         if ev is not None:
@@ -932,10 +1286,20 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev):
+    def vote(self, n, ins, op, reg, on_taken, ev, st):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
-        to that mask, so lanes that voted no are inert there."""
+        to that mask, so lanes that voted no are inert there.
+
+        A VCC that is a wave-uniform compare (UVOTE: every launch lane or none) is no lane vote: each half votes as
+        the wave does, so either side may have code of its own and scalars it defines are not stale. EXEC must have
+        been the launch mask at the compare: under a narrowed EXEC a half with no active lane votes no while the
+        wave votes yes."""
+        # st only for s_cbranch_vccz/vccnz: an SCC vote was taken on the mask as it was then, and VCC may since hold
+        # another value (a later v_cmp writes no SCC)
+        if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
+                and (id(ins), "vcc") not in self.stale:
+            return
         self.voted[n] = reg
         if n + 1 > self.n:
             return
@@ -958,8 +1322,167 @@ class Analysis:
         # that side must be no code of its own: the join, which the run side reaches again.
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
+        # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
+        # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
+        # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
+        # Any lane mask would do; the vote must be the mask's own "not empty" (checked from the SCC writer), not a
+        # stale or other SCC.
+        # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
+        # before the vote: one that did would keep the pixels of the empty half alive in the wave.
+        kregs = self.kill_vote(n, op, reg)
+        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
+                and self.confined(run, kregs) and not self.vm_export_before(n):
+            ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+
+    def kill_vote(self, n, op, reg):
+        """Registers of the mask whose emptiness the branch ending block `n` tests (SCC or VCC = mask != 0), or None
+        when that is not plain: the last SCC writer must set SCC = (its 64-bit mask destination != 0), and nothing
+        after it in the block may write that mask."""
+        if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+            return ("vcc",) if reg == "vcc" else None
+        body = self.blocks[n][:-1]
+        for k in range(len(body) - 1, -1, -1):
+            ins = body[k]
+            o, a = base_op(ins["op"]), ins["args"]
+            dests, _, defs, _ = operands(ins)
+            if "scc" not in defs and not o.startswith(("s_cmp", "s_bitcmp")):
+                continue
+            if o in ZERO_SCC and len(a) >= 2 and _mask64(a[0]):
+                m = tuple(_regs(a[0]))
+            elif o == "s_cmp_lg_u64" and len(a) == 2 and _mask64(a[0]) and a[1].get("k") == "imm" and a[1]["v"] == 0:
+                m = tuple(_regs(a[0]))
+            else:
+                return None
+            if m[0] != reg or m == ("exec",):
+                return None
+            for later in body[k + 1:]:
+                d, _, df, _ = operands(later)
+                if set(m) & ({r for x in d for r in _regs(x)} | set(df)):
+                    return None
+            return m
+        return None
+
+    def vm_export_before(self, n):
+        """Whether an `exp ... vm` is in a block from which block `n` can be reached (`n` itself included)."""
+        pred = {}
+        for b, ss in enumerate(self.succ):
+            for s_ in ss:
+                pred.setdefault(s_, []).append(b)
+        seen, work = set(), [n]
+        while work:
+            b = work.pop()
+            if b in seen:
+                continue
+            seen.add(b)
+            if any(base_op(i["op"]) == "exp" and "vm" in (i.get("mods") or []) for i in self.blocks[b]):
+                return True
+            work.extend(pred.get(b, []))
+        return False
+
+    def inert_exit(self, blk, m):
+        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), then may export
+        with that EXEC, and ends: nothing else, no other successor."""
+        seen = set()
+        narrowed = False
+        while blk not in seen:
+            seen.add(blk)
+            for ins in self.blocks[blk]:
+                op, a = base_op(ins["op"]), ins["args"]
+                if op in ("s_nop", "s_waitcnt", "s_branch"):
+                    continue
+                if op == "s_endpgm":
+                    return narrowed
+                if op == "exp" and narrowed:
+                    continue
+                if a and _regs(a[0]) == ["exec"] and not _half(a[0]) and (
+                        (op == "s_mov_b64" and len(a) == 2 and (tuple(_regs(a[1])) == m or _zero(a[1]))) or
+                        (op == "s_and_b64" and len(a) == 3 and any(tuple(_regs(x)) == m or _zero(x) for x in a[1:]))):
+                    narrowed = True
+                    continue
+                return False
+            if len(self.succ[blk]) != 1:
+                return False
+            blk = self.succ[blk][0]
+        return False
+
+    def confined(self, run, m):
+        """Whether, on every path from block `run` (loops included), EXEC is narrowed into the whole quads of mask
+        `m` before anything but mask arithmetic runs, and stays inside them: then a lane of a half whose `m` is empty
+        is off for the rest of the wave. A must-dataflow over the blocks `run` reaches: (EXEC inside, set of 64-bit
+        registers that hold a subset); a write to EXEC keeps it inside only when it is provably a subset (a narrowing,
+        or a copy / union of registers known to be inside)."""
+        region, work = set(), [run]
+        while work:
+            b = work.pop()
+            if b not in region:
+                region.add(b)
+                work.extend(self.succ[b])
+        entry = {run: (False, frozenset({m}))}
+        work = [run]
+        while work:
+            b = work.pop()
+            inside, sub = entry[b]
+            for ins in self.blocks[b]:
+                if not inside and base_op(ins["op"]) not in OFF_OK:
+                    return False
+                inside, sub = self.confine_step(ins, inside, sub)
+            for s in self.succ[b]:
+                new = (inside, sub) if s not in entry else (entry[s][0] and inside, entry[s][1] & sub)
+                if new != entry.get(s):
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    @staticmethod
+    def confine_step(ins, inside, sub):
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, srcs, defs, _ = operands(ins)
+
+        def ok(x):
+            return _zero(x) or (inside and _regs(x) == ["exec"] and not _half(x)) or tuple(_regs(x)) in sub
+
+        def combine(o, xs):
+            if o in ("s_mov_b64", "s_wqm_b64") and len(xs) == 1:
+                return ok(xs[0])
+            if o == "s_and_b64" and len(xs) == 2:
+                return ok(xs[0]) or ok(xs[1])
+            if o == "s_andn2_b64" and len(xs) == 2:
+                return ok(xs[0])
+            if o in ("s_or_b64", "s_xor_b64") and len(xs) == 2:
+                return ok(xs[0]) and ok(xs[1])
+            return False
+
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        new_sub = {k for k in sub if not set(k) & written}
+        old_inside = inside
+        if "exec" in written:
+            if op.startswith("v_cmpx"):
+                pass                                            # EXEC &= compare: a narrowing
+            elif op.startswith(SAVEEXEC) and len(a) == 2 and not _half(a[1]):
+                x = a[1]
+                if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")):
+                    inside = old_inside or ok(x)
+                elif op.startswith(("s_andn1_saveexec_b64", "s_andn1_wrexec_b64")):
+                    inside = old_inside
+                elif op.startswith(("s_andn2_saveexec_b64", "s_andn2_wrexec_b64")):
+                    inside = ok(x)
+                elif op.startswith(("s_or_saveexec_b64", "s_xor_saveexec_b64")):
+                    inside = old_inside and ok(x)
+                else:
+                    inside = False
+                if _mask64(a[0]):
+                    keep = inside if "_wrexec_" in op else old_inside
+                    if keep:
+                        new_sub.add(tuple(_regs(a[0])))
+            elif dests and _regs(dests[0]) == ["exec"] and not _half(dests[0]):
+                inside = combine(op, srcs)
+            else:
+                inside = False
+        elif dests and _mask64(dests[0]) and combine(op, srcs):
+            new_sub.add(tuple(_regs(dests[0])))
+        return inside, frozenset(new_sub)
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""
@@ -1014,7 +1537,7 @@ class Analysis:
                 if entry[s] is None or new != entry[s]:
                     entry[s] = new
                     work.append(s)
-        ev = {"viol": [], "idioms": set(), "uniform_readlane": set()}
+        ev = {"viol": [], "idioms": set(), "uniform_readlane": set(), "scalar_spills": set()}
         self.voted = {}
         for n in range(self.n):
             if entry[n] is not None:
@@ -1084,6 +1607,10 @@ class Analysis:
                 regs += [r for r in d2 if r not in ("exec",)]
                 if any(_half(d) and d["t"].startswith("vcc") for d in dests):
                     regs.append("vcc")
+                if base_op(ins["op"]) == "v_writelane_b32" and len(ins["args"]) == 3 \
+                        and ins["args"][0].get("k") == "vgpr" and ins["args"][0]["r"] in self.pure_spill_vgprs \
+                        and ins["args"][2].get("k") == "imm":
+                    regs.append(("spill", ins["args"][0]["r"], ins["args"][2]["v"] & 63))
                 defs_of[(b, i)] = regs
 
         def sregs(x):
@@ -1127,6 +1654,10 @@ class Analysis:
                 read = {r for x in srcs for r in sregs(x)} | {r for r in uses if r != "exec"}
                 if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
+                if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
+                        and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \
+                        and ins["args"][2].get("k") == "imm":
+                    read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
@@ -1157,7 +1688,7 @@ def analyse(blocks, succ, masks, stage):
         pass
     tier = "C" if reasons else ("B" if idioms else "A")
     return {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
-            "sites": ev["viol"][:8]}
+            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
 
 
 # ---- census over a shader index ----

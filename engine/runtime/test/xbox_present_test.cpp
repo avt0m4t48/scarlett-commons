@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
+#include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xbox_present.h"
@@ -294,12 +295,18 @@ int main() {
             for (const auto& e : available) loader_has = loader_has || !std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace");
             auto standalone_presenter = rt::d3d12::create_window_presenter(standalone.p, window);
             if (standalone_presenter) {
-                EXPECT(rt::d3d12::device_has_swapchain_colorspace(standalone.p) == loader_has);
+                const bool colorspace_enabled = rt::d3d12::device_has_swapchain_colorspace(standalone.p);
+                EXPECT(colorspace_enabled == loader_has);
+                // The presenter owns the remaining reference to the device and its Vulkan instance.
+                standalone.reset();
                 EXPECT(standalone_presenter->enable_capture());
                 EXPECT(SUCCEEDED(standalone_presenter->present_blank(1)));
+                Frame frame;
+                EXPECT(standalone_presenter->read_back(frame.bytes, &frame.extent, &frame.format));
+                EXPECT(!frame.bytes.empty());
                 std::printf("standalone device (real instance path): VK_EXT_swapchain_colorspace %s on the instance (loader has it: %s)\n",
-                            rt::d3d12::device_has_swapchain_colorspace(standalone.p) ? "enabled" : "not enabled",
-                            loader_has ? "yes" : "no");
+                            colorspace_enabled ? "enabled" : "not enabled", loader_has ? "yes" : "no");
+                std::printf("standalone presenter: frame captured after releasing the caller's device reference\n");
             } else {
                 std::printf("standalone device: no window presenter (skipped the instance-extension check)\n");
             }
@@ -410,7 +417,8 @@ int main() {
         UINT want_w = width, want_h = height;  // the client size the frames are expected at (the resize case changes it)
         const auto grab = [&](Frame& frame) -> bool {
             return xbox.presenter().read_back(frame.bytes, &frame.extent, &frame.format) &&
-                   (want_w == 0 || (frame.extent.width == want_w && frame.extent.height == want_h));
+                   xbox_present_readback_size_matches(frame.bytes.size(), frame.extent.width, frame.extent.height,
+                                                     want_w, want_h);
         };
 
         const FLOAT blue_ish[4] = {0.2f, 0.6f, 0.9f, 1.0f};  // 51, 153, 230
@@ -1249,6 +1257,14 @@ int main() {
             EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
             std::printf("no tearing mode (LEONIDA_PRESENT_NO_TEAR): late frame waits for the vblank: ok\n");
         }
+        // The device a title holds is the Xbox-ABI proxy, not `inner`: the presenter comes from it all the same
+        // (D3D-414: it used to be null, with nothing in the log).
+        {
+            auto from_proxy = rt::d3d12::create_window_presenter(device.p, window);
+            EXPECT(from_proxy && from_proxy->enable_capture());
+            EXPECT(SUCCEEDED(from_proxy->present_blank(1)));
+            std::printf("presenter from the Xbox device proxy: created, a blank frame presented: ok\n");
+        }
         // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
         // the colour that was presented, and the loop takes about 30 vblanks.
         auto presenter2 = rt::d3d12::create_window_presenter(inner, window);
@@ -1263,21 +1279,63 @@ int main() {
         constexpr int frames = 30;
         const auto start = std::chrono::steady_clock::now();
         std::uint64_t last = 0;
-        for (int i = 0; i < frames; ++i) {
+        // One real-time frame: wait for the origin, present colour `c`. True with `shown` false when the present was
+        // skipped because the window is minimised (PresentX still S_OK, nothing on screen, nothing to read back).
+        const auto real_frame = [&](int c, bool& shown) -> bool {
             pump();
             std::uint64_t t = 0;
-            EXPECT(real.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 1000, 0, &t) == S_OK);
-            EXPECT(t == last + 1);
+            if (real.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 1000, 0, &t) != S_OK || t != last + 1) {
+                std::fprintf(stderr, "real time: token %llu after %llu\n", static_cast<unsigned long long>(t),
+                             static_cast<unsigned long long>(last));
+                return false;
+            }
             last = t;
-            auto p = plane_of(colours[i % 3], t);
-            EXPECT(real.PresentX(1, &p, nullptr) == S_OK);
-            EXPECT(real.presenter().read_back(frame.bytes, &frame.extent, &frame.format));
-            EXPECT(close_to(frame.at(width / 2, height / 2), expect_rgb[i % 3], 0));
+            auto p = plane_of(colours[c], t);
+            if (real.PresentX(1, &p, nullptr) != S_OK) return false;
+            shown = real.presenter().read_back(frame.bytes, &frame.extent, &frame.format);
+            if (!shown) return IsIconic(window) != FALSE;  // skipped only while minimised
+            const Px got = frame.at(width / 2, height / 2);
+            if (close_to(got, expect_rgb[c], 0)) return true;
+            std::fprintf(stderr, "real time: centre %d,%d,%d, presented %d,%d,%d\n", got.r, got.g, got.b, expect_rgb[c].r,
+                         expect_rgb[c].g, expect_rgb[c].b);
+            return false;
+        };
+        // Someone at the desktop can minimise the window during the loop (Win+D in the middle of a CTest run): those
+        // presents are skipped, and the window is restored so the rest of the loop is seen again.
+        int unseen = 0;
+        for (int i = 0; i < frames; ++i) {
+            bool shown = false;
+            EXPECT(real_frame(i % 3, shown));
+            if (!shown) {
+                ++unseen;
+                ShowWindow(window, SW_RESTORE);
+            }
         }
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        std::printf("real time: %d frames at 60 Hz in %lld ms (ideal %d)\n", frames, static_cast<long long>(ms),
-                    frames * int(period) / 1000);
+        std::printf("real time: %d frames at 60 Hz in %lld ms (ideal %d), %d skipped while minimised\n", frames,
+                    static_cast<long long>(ms), frames * int(period) / 1000, unseen);
         EXPECT(ms >= (frames - 1) * int(period) / 1000 * 9 / 10 && ms < 5000);
+        EXPECT(unseen < frames);
+
+        // Minimised on purpose: the surface is 0x0 (VK_KHR_win32_surface), so PresentX succeeds without showing the
+        // frame, and read_back must say so rather than hand out the frame before it (TEST-378: the real-time loop
+        // above once compared that older frame). Each colour differs from the one shown last, so a stale frame fails.
+        // Restored, the next frame is shown and read back again.
+        {
+            ShowWindow(window, SW_MINIMIZE);
+            int skipped_presents = 0;
+            for (int i = 0; i < 3; ++i) {  // the first present can still reach the old swapchain (then out of date)
+                bool shown = true;
+                EXPECT(real_frame(i, shown));
+                if (!shown) ++skipped_presents;
+            }
+            EXPECT(skipped_presents > 0);
+            ShowWindow(window, SW_RESTORE);
+            bool shown = false;
+            for (int i = 0; i < 3 && !shown; ++i) EXPECT(real_frame((i + 1) % 3, shown));  // stale, then recreated
+            EXPECT(shown);
+            std::printf("minimised: %d of 3 presents skipped and not read back; restored: shown again\n", skipped_presents);
+        }
         EXPECT(real.PresentX(0, nullptr, nullptr) == S_OK);  // the shutdown blank
     }
     DestroyWindow(window);

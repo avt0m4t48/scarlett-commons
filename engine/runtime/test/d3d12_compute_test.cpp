@@ -9,7 +9,9 @@
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/cached_pso.h"
@@ -203,9 +205,11 @@ std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STA
 }
 
 // The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
-// Empty when the host has no D3D12 device or no compiler (Wine), which the caller reports as a skip.
+// Empty when the host has no D3D12 device or no compiler, or is Wine's, which the caller reports as a skip: vkd3d has
+// both, but its GetCachedBlob is a stub, so every host answered nothing and the comparison failed on each run.
 std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
                                                         const std::vector<std::uint8_t>& other_root_blob) {
+    if (hostwine::host_is_wine()) return {};
     using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
                                        ID3DBlob**, ID3DBlob**);
     using CreateDeviceFn = decltype(&::D3D12CreateDevice);
@@ -268,10 +272,9 @@ int main() {
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);  // filler, s_endpgm-like words
     const auto container = shader_container(fssm);
     EXPECT(leonida::fssm_program(container) == fssm);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_compute_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
@@ -307,7 +310,8 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -387,7 +391,9 @@ int main() {
                                                    E_INVALIDARG, E_INVALIDARG, S_OK};
             EXPECT(layer == expected);
             const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
-            if (hosts.empty()) std::printf("SKIP: no host D3D12 device or compiler for the CachedPSO comparison\n");
+            if (hosts.empty())
+                std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
+                            "comparison\n");
             for (const auto& host : hosts) EXPECT(host == layer);
             if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
 
@@ -436,6 +442,44 @@ int main() {
             limited_desc.pRootSignature = limited_root.p;
             Ref<ID3D12PipelineState> refused;
             EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        }
+
+        // The GPU address arena is no larger than the device's maxBufferSize and maxMemoryAllocationSize
+        // (src/arena_size.h), whatever LEONIDA_ARENA_MB asks for: with LEONIDA_ARENA_MB=3000 on a GPU that reports
+        // 2 GiB (RX 6800), a run under LEONIDA_VK_VALIDATION=1 has no vkAllocateMemory error. A device that reports
+        // a 32 MiB maxMemoryAllocationSize (simulated) gets at most 32 MiB from the default 256, and a buffer past
+        // that is refused.
+        {
+            VkPhysicalDeviceMaintenance4Properties m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+            VkPhysicalDeviceMaintenance3Properties m3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, &m4};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m3};
+            d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+            const std::uint64_t arena = rt::d3d12::device_arena_size(device.p);
+            EXPECT(arena > 0 && arena <= m4.maxBufferSize && arena <= m3.maxMemoryAllocationSize);
+
+            constexpr std::uint64_t capped_limit = 32ull << 20;
+            rt::d3d12::VulkanDeviceInfo capped_info = info;
+            capped_info.max_memory_allocation_size = capped_limit;
+            Ref<ID3D12Device> capped;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(capped_info, IID_PPV_ARGS(&capped.p))));
+            const std::uint64_t capped_arena = rt::d3d12::device_arena_size(capped.p);
+            EXPECT(capped_arena > 0 && capped_arena <= capped_limit);
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto fits = buffer_desc(1u << 20, D3D12_RESOURCE_FLAG_NONE);
+            const auto too_large = buffer_desc(capped_limit + (1u << 20), D3D12_RESOURCE_FLAG_NONE);
+            Ref<ID3D12Resource> inside, past;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &fits,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&inside.p))));
+            EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
+            std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "
+                        "%llu MiB with a simulated 32 MiB maxMemoryAllocationSize\n",
+                        static_cast<unsigned long long>(arena >> 20),
+                        static_cast<unsigned long long>(m4.maxBufferSize >> 20),
+                        static_cast<unsigned long long>(m3.maxMemoryAllocationSize >> 20),
+                        static_cast<unsigned long long>(capped_arena >> 20));
         }
 
         // Buffers in the arena, an upload buffer outside it, a readback buffer for the results.
@@ -501,7 +545,7 @@ int main() {
         list->SetComputeRootUnorderedAccessView(0, va_a);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        // Two dispatches: the second changes s0 and the UAV; each must keep what it was recorded with.
+        // Two dispatches: the second changes s4 and the UAV; each must keep what it was recorded with.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);
@@ -889,7 +933,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {

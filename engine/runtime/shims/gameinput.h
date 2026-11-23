@@ -1,11 +1,24 @@
 // GameInput shim on SDL3: runtime-side controls and test seams. The GameInput API itself is reached the way a title
 // reaches it, through GameInputCreate in the shim registry (gameinput.dll / xgameruntime.dll). See docs/gameinput.md.
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include "../src/active_input.h"  // leonida::InputFamily (and std::optional) for Config::prompts and active_input()
+
 namespace rt::gameinput {
+
+// Takes a reference on a reference-counted object only while it is alive, that is while its count isn't 0. A thread
+// that finds the object in a shared list (the poll thread and a device's force-feedback effects) then can't revive one
+// whose last Release has already run and whose destructor is waiting for the lock to unlink it. False: leave it be.
+template <class Count>
+bool add_ref_if_live(std::atomic<Count>& refs) {
+    Count n = refs.load();
+    while (n != 0 && !refs.compare_exchange_weak(n, n + 1)) {}
+    return n != 0;
+}
 
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
 enum class DsTriggerMode { Off, Rumble, Resistance };
@@ -15,6 +28,10 @@ enum class DsTriggerMode { Off, Rumble, Resistance };
 enum class KeyboardPadMode { Off, Focused, Always };
 
 struct Config {
+    // LEONIDA_PROMPTS=auto|xbox|playstation|ps5|ps4|ps3|nintendo|keyboard: a family that active_input() reports
+    // whatever is in use; unset or auto follows the devices.
+    std::optional<leonida::InputFamily> prompts;
+    uint32_t prompts_switch_ms = 300;  // LEONIDA_PROMPTS_SWITCH_MS, 0..2000: shortest time between two changes
     DsTriggerMode ds_triggers = DsTriggerMode::Rumble;  // LEONIDA_DS_TRIGGERS=off|rumble|resistance
     float ds_trigger_gain = 1.0f;                       // LEONIDA_DS_TRIGGER_GAIN, 0..4, scales the effect strength
     float mouse_sensitivity = 1.0f;                     // LEONIDA_MOUSE_SENSITIVITY, 0.1..10, scales mouse movement
@@ -39,6 +56,17 @@ void poll();
 
 // Number of gamepads currently open by the backend (tests, gameinput_probe).
 int connected_count();
+
+// The kind of device the player used last (src/active_input.h has the rules), or the one LEONIDA_PROMPTS forces.
+// The title is told every pad is an Xbox One pad; this is for the runtime's own use, such as button prompt glyphs.
+// Safe from any thread. `generation` goes up by one with each change of `family`, so a reader can check it every
+// frame and act only when it moved. Xbox, generation 0, until the first deliberate input.
+struct ActiveInput {
+    leonida::InputFamily family = leonida::InputFamily::Xbox;
+    uint64_t generation = 0;
+    bool forced = false;  // LEONIDA_PROMPTS set the family
+};
+ActiveInput active_input();
 
 // The SDL haptic calls the shim makes, one entry per call, so a test can stand in for them: SDL's virtual joysticks
 // report no haptics, and a pad that does is the only other way to reach this path. `joystick` is the SDL_Joystick the
@@ -69,6 +97,12 @@ struct OutputState {
     bool trigger_rumble = false;          // the pad takes SDL_RumbleGamepadTriggers
     bool force_feedback = false;          // SDL opened the pad as a haptic device
     uint32_t haptic_motors = 0;           // haptic motors the pad reports (0 or 2)
+    // The last force-feedback effect the shim asked SDL for: SDL_CreateHapticEffect's id (-1 when SDL refused),
+    // whether SDL_RunHapticEffect then returned true, and SDL's error text when a call failed. `force_feedback` only
+    // says a haptic device was opened; an effect SDL creates but will not run, or refuses outright, shows up here.
+    int effect_id = -1;
+    bool effect_ran = false;
+    char effect_error[128] = {};
 };
 bool output_state(int i, OutputState* out);
 

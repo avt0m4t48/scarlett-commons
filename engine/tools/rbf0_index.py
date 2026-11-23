@@ -76,7 +76,7 @@ def parse_rbf0(data, string_limit=None):
     p = 8 if wide else 4
     scalar = 8 if wide else 4
     descs = []
-    stack = []                 # [attribute_count, attributes_seen]
+    stack = []                 # [attribute_count, attributes_seen, content_started]
     strings = []
     ints = []
     floats = []
@@ -107,8 +107,8 @@ def parse_rbf0(data, string_limit=None):
                     raise RbfError("close tag is not FF FF", at)
                 if not stack:
                     raise RbfError("close without an open element", at)
-                attrs, seen = stack.pop()
-                if seen < attrs:
+                attrs, seen, content_started = stack.pop()
+                if not content_started and seen < attrs:
                     attr_mismatches += 1
                 if not stack:
                     root_end = p
@@ -119,8 +119,10 @@ def parse_rbf0(data, string_limit=None):
                     raise RbfError("text tag is not FD FF", at)
                 n = struct.unpack("<I", take(4, "text length"))[0]
                 raw = take(n, "text")
-                if stack and stack[-1][1] < stack[-1][0]:
-                    attr_mismatches += 1
+                if stack and not stack[-1][2]:
+                    if stack[-1][1] < stack[-1][0]:
+                        attr_mismatches += 1
+                    stack[-1][2] = True
                 text = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
                 if string_limit is None or len(strings) < string_limit:
                     strings.append(text)
@@ -139,9 +141,11 @@ def parse_rbf0(data, string_limit=None):
                 word0, word1, attrs = struct.unpack("<HHH", raw)
                 if word0 or word1:
                     raise RbfError(f"element header word is not zero ({word0}, {word1})", at)
-                if stack and stack[-1][1] < stack[-1][0]:
-                    attr_mismatches += 1
-                stack.append([attrs, 0])
+                if stack and not stack[-1][2]:
+                    if stack[-1][1] < stack[-1][0]:
+                        attr_mismatches += 1
+                    stack[-1][2] = True
+                stack.append([attrs, 0, False])
                 elements += 1
                 max_depth = max(max_depth, len(stack))
                 if not root:
@@ -415,15 +419,19 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
     return rows, records, summary
 
 
+def carved_streams(path):
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not name.lower().endswith((".json", ".csv")) and os.path.isfile(full):
+            yield name, full
+
+
 def scan_dir(path, string_limit=16):
     """Index already-carved files. Sorting by a leading hexadecimal file name keeps archive order."""
     entries = []
     unnamed = []
-    for name in sorted(os.listdir(path)):
-        full = os.path.join(path, name)
-        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
-            continue
+    for name, full in carved_streams(path):
         with open(full, "rb") as f:
             data = f.read()
         match = re.match(r"([0-9a-fA-F]{6,})", name)
@@ -528,6 +536,10 @@ def main():
     limit = None if a.all_strings else a.strings
     try:
         if os.path.isdir(a.source):
+            manifest = os.path.join(a.source, "index.json")
+            if same_output_path(manifest, a.out) or (os.path.isfile(a.out) and any(
+                    same_output_path(path, a.out) for _, path in carved_streams(a.source))):
+                ap.error(f"output would overwrite a carve input: {a.out}")
             rows, records, summary = scan_dir(a.source, string_limit=limit)
         else:
             def progress(n, pos, end):

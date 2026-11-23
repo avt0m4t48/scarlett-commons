@@ -427,6 +427,8 @@ class SmemBodyEvaluator:
             pc += 1
 
     def _value(self, name):
+        if name == "%heap_base":          # built once in the entry block, outside the body run here
+            return self.heap_base
         if name == "%c64_32":
             return 32
         if name in self.ids:
@@ -452,10 +454,6 @@ class SmemBodyEvaluator:
             if kind != "psb":
                 raise AssertionError(f"PSB access chain on {kind}")
             value = ("mem", (address + 4 * self._value(args[1])) & MASK64)
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
-            value = self.heap_base & MASK32
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
-            value = (self.heap_base >> 32) & MASK32
         elif op == "OpLoad" and ty == "%uint":
             kind, where = self._value(args[0])
             if kind == "sgpr":
@@ -490,7 +488,7 @@ class SmemBodyEvaluator:
             value = self._value(args[0]) == self._value(args[1])
         elif op == "OpUGreaterThanEqual" and ty == "%bool":
             value = self._value(args[0]) >= self._value(args[1])
-        elif op == "OpSelect" and ty == "%ulong":
+        elif op == "OpSelect" and ty in ("%ulong", "%uint"):
             cond = self._value(args[0])
             if not isinstance(cond, bool):
                 raise AssertionError("OpSelect on a non-bool")
@@ -653,8 +651,8 @@ class SmemHardwareRuleTests(unittest.TestCase):
       s_load*:        IMM is sign-extended from 21 bits, the sum is 64-bit, no bound
 
     Each case is a row of that measurement (the row names of the oracle's model are in the comments; the rule is in
-    docs/design.md, Scalar/buffer memory). Every case checks the value in the destination SGPRs and the exact list
-    of dword addresses read: an out-of-range dword must not be read at all. In `want`, an int X is the data at
+    docs/design.md, Scalar/buffer memory). Every case checks the value in the destination SGPRs and the set of
+    dword addresses read: an out-of-range dword must not be read at all. In `want`, an int X is the data at
     region offset X and None is 0. The lines are hand-written; the evaluator runs the code Gen.scalar_load emits.
     """
 
@@ -683,7 +681,10 @@ class SmemHardwareRuleTests(unittest.TestCase):
         values = [0 if w is None else mem.data(w) for w in want]
         self.assertEqual([f"{ev.sgpr.get(12 + i, 0):#010x}" for i in range(len(want))],
                          [f"{v:#010x}" for v in values], line)
-        self.assertEqual([hex(r) for r in got_reads], [hex(r) for r in reads], line)
+        # The addresses read, as a set: an out-of-range dword re-reads the load's first dword (in range whenever any
+        # dword is) instead of taking a branch of its own, so a dword may be read twice; what must hold is that
+        # nothing outside the bound is read at all.
+        self.assertEqual(sorted({hex(r) for r in got_reads}), sorted({hex(r) for r in reads}), line)
 
     # s_buffer_load_dword, stride 0
     def test_bound_counts_the_whole_dword(self):
@@ -772,6 +773,43 @@ class SmemHardwareRuleTests(unittest.TestCase):
         for soff in (0xFFFFFFFC, 0x80000000, 0x7FFFFFFC):
             self.both("s_buffer_load_dword s12, s[24:27], s40", soff, [None], [], extra={"nr": 0x100})
         self.both("s_buffer_load_dword s12, s[24:27], s40", 8, [8], [8], extra={"nr": 0x100})
+
+    # Measured on gfx1036 (RDNA2, Ryzen 9 9950X3D iGPU, AMD Windows driver 32.0.21045.16010) through tools/hw_oracle,
+    # wave32 = wave64, every read inside a seeded region so only the bound decides: the edges docs/design.md listed
+    # as not measured.
+    def test_x16_is_bounded_per_dword(self):
+        # x16 at 0, NR 0x14 -> d0..d4 data, d5..d15 0; NR 0x40 -> all 16 data
+        line = "s_buffer_load_dwordx16 s[40:55], s[24:27], 0x0"
+        self.check_wide(line, {"nr": 0x14}, [4 * i if i < 5 else None for i in range(16)])
+        self.check_wide(line, {"nr": 0x40}, [4 * i for i in range(16)])
+        # x16 with imm 8 or soffset 8, NR 0x20 -> d0..d5 data (bytes 8..0x1f), d6..d15 0
+        self.check_wide("s_buffer_load_dwordx16 s[40:55], s[24:27], 0x8", {"nr": 0x20},
+                        [8 + 4 * i if i < 6 else None for i in range(16)])
+        self.check_wide("s_buffer_load_dwordx16 s[40:55], s[24:27], s20", {"nr": 0x20, 20: 8},
+                        [8 + 4 * i if i < 6 else None for i in range(16)])
+
+    def test_num_records_times_stride_does_not_wrap_at_4gib(self):
+        # stride 0x1000 x NR 0x100000 and 0x2000 x 0x80000 = 2^32, stride 8 x NR 0x20000001 = 2^32 + 8: all four
+        # dwords are data. A 32-bit product (0, 0, 8) would give 0 for every dword, or for d2 and d3.
+        for stride, nr in ((0x1000, 0x100000), (0x2000, 0x80000), (8, 0x20000001)):
+            self.check("s_buffer_load_dwordx4 s[12:15], s[24:27], 0x0", {"nr": nr, "stride": stride},
+                       [0x0, 0x4, 0x8, 0xC], [0x0, 0x4, 0x8, 0xC])
+        # control from the same run: stride 8 x NR 1 = 8 bytes -> d0, d1 data, d2, d3 0
+        self.check("s_buffer_load_dwordx4 s[12:15], s[24:27], 0x0", {"nr": 1, "stride": 8},
+                   [0x0, 0x4, None, None], [0x0, 0x4])
+
+    def test_num_records_at_or_above_2_31_is_unsigned(self):
+        for nr in (0x80000000, 0xFFFFFFFF):
+            self.check("s_buffer_load_dwordx4 s[12:15], s[24:27], 0x0", {"nr": nr},
+                       [0x0, 0x4, 0x8, 0xC], [0x0, 0x4, 0x8, 0xC])
+
+    def check_wide(self, line, sgpr, want):
+        """check() for a destination starting at s40 (a 16-dword load does not fit below the V# in s[24:27])."""
+        ev, got_reads, mem = self.run_line(line, sgpr)
+        values = [0 if w is None else mem.data(w) for w in want]
+        self.assertEqual([f"{ev.sgpr.get(40 + i, 0):#010x}" for i in range(len(want))],
+                         [f"{v:#010x}" for v in values], line)
+        self.assertEqual(sorted({hex(r) for r in got_reads}), sorted({hex(w) for w in want if w is not None}), line)
 
     # s_load: 64-bit pointer, no bound
     def test_s_load_truncates_pointer_and_offsets(self):

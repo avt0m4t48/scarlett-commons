@@ -270,7 +270,8 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
             continue
         try:
             tag, _, value = reader.read(doc["data"])
-        except ET.ParseError as e:
+        except (ET.ParseError, LookupError, ValueError) as e:
+            # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
             continue
         read += 1
@@ -321,6 +322,11 @@ def main(argv=None):
           f"{s['registered']['roots']} roots, {s['registered']['types']} types")
     if a.out:
         print(f"wrote {s['documents']} JSON files to {a.out} (game data: keep them local)")
+    if not s["documents"] and s["not_well_formed"]:
+        # Nothing parsed. A corpus with some truncated tails still reads the rest and stays 0; a run that read
+        # nothing at all cannot tell "no documents here" from "every document was broken", so the exit code says it.
+        print(f"ERROR: no document could be read; {s['not_well_formed']} not well-formed", file=sys.stderr)
+        return 1
     return 0
 
 

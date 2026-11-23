@@ -232,6 +232,39 @@ class TestResourceKindDictionary(unittest.TestCase):
         self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
 
 
+class TestResourceKindDictionaryChild(unittest.TestCase):
+    """The dictionary signature follows the pinned rpf9-explorer's DrawableDictionaryCheckBytes.
+
+    When the child-pointer array named by +48 is inside the supplied prefix, its first entry must also
+    be a system pointer. Every byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def dictionary(child_at=0x80, first_child=0x50000000 + 0x300):
+        b = bytearray(192)
+        struct.pack_into("<Q", b, 0, 0)
+        struct.pack_into("<Q", b, 8, 0x50000000 + 0x180)
+        struct.pack_into("<Q", b, 32, 0x50000000 + 0x200)
+        struct.pack_into("<Q", b, 48, 0x50000000 + child_at)
+        for at in (40, 42, 56, 58):
+            struct.pack_into("<H", b, at, 2)
+        if child_at <= len(b) - 8:
+            struct.pack_into("<Q", b, child_at, first_child)
+        return bytes(b)
+
+    def test_null_first_child_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(first_child=0)))
+
+    def test_non_system_first_child_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(first_child=0x12345678)))
+
+    def test_system_first_child_is_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
+
+    def test_child_array_beyond_prefix_is_still_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary(child_at=0x100)), "dictionary")
+
+
 class TestValidate(unittest.TestCase):
     def test_weighted_8bit_clean(self):
         _s, gfx, mesh = weighted_mesh("weighted-8inf-8bit", vertices=16, bones=6)
@@ -489,7 +522,7 @@ class TestCli(unittest.TestCase):
             path, data = self._archive(tmp)
             other = os.path.join(tmp, ".", "synthetic.rpf")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", other],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -501,7 +534,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -512,7 +545,7 @@ class TestCli(unittest.TestCase):
             path, _ = self._archive(tmp)
             out = os.path.join(tmp, "reports", "sub", "out.json")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 report = json.load(fh)
@@ -527,7 +560,7 @@ class TestCli(unittest.TestCase):
                 fh.write("a file, not a folder")
             out = os.path.join(blocker, "out.json")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -539,7 +572,7 @@ class TestCli(unittest.TestCase):
             for sample in ("0", "-1"):
                 with self.subTest(sample=sample):
                     r = subprocess.run([sys.executable, "-I", TOOL, path, "--sample", sample],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True, errors="replace")
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn("--sample must be at least 1", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
@@ -561,13 +594,13 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
             r = subprocess.run([sys.executable, "-I", TOOL, missing],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("not a file", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
             r2 = subprocess.run([sys.executable, "-I", TOOL, tmp],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, errors="replace")
             self.assertEqual(r2.returncode, 2, r2.stderr)
             self.assertIn("not a file", r2.stderr)
             self.assertNotIn("Traceback", r2.stderr)

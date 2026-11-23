@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +39,28 @@ class ArgumentTypes(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
                 rdna2spirv._shard_arg(text)
 
+    def test_max_structured_depth(self):
+        self.assertEqual(rdna2spirv._depth_arg("0"), 0)
+        self.assertEqual(rdna2spirv._depth_arg("64"), 64)
+        for text in ("-1", "x", "", "1.5"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                rdna2spirv._depth_arg(text)
+
+    def test_max_structured_depth_sets_the_bound(self):
+        # SHADER-427: the option replaces MAX_STRUCTURED_DEPTH for the run; without it the default is 64, written out
+        # here rather than read from the module so that changing the default fails this test.
+        self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, 64)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(rdna2spirv, "MAX_STRUCTURED_DEPTH", rdna2spirv.MAX_STRUCTURED_DEPTH):
+            for extra, expected in (([], 64), (["--max-structured-depth", "0"], 0),
+                                    (["--max-structured-depth", "40"], 40)):
+                with self.subTest(extra=extra), \
+                        mock.patch.object(sys, "argv", [TOOL, tmp, "--out", os.path.join(tmp, "o")] + extra), \
+                        redirect_stdout(io.StringIO()):
+                    rdna2spirv.MAX_STRUCTURED_DEPTH = 64
+                    rdna2spirv.main()
+                    self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, expected)
+
 
 class SourceDiscovery(unittest.TestCase):
     """The src argument is a .s file or a folder of .s files; other names are not inputs."""
@@ -47,9 +69,9 @@ class SourceDiscovery(unittest.TestCase):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
-                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                self.assertEqual(Path(kwargs.get("cwd", ""), cmd[-1]).read_bytes(), b"new module")
             else:
                 self.fail(f"unexpected tool: {tool}")
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -66,7 +88,7 @@ class SourceDiscovery(unittest.TestCase):
             out = os.path.join(tmp, "spirv")
             # The .s suffix matters: without isfile() a missing shader path would be trusted as a file.
             p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "absent.s"), "--out", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn("not a .s file or a folder of .s files", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
@@ -78,7 +100,7 @@ class SourceDiscovery(unittest.TestCase):
             src = os.path.join(tmp, "shader.s")
             os.mkdir(src)
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertIn("0 shaders:", p.stdout)
@@ -146,7 +168,7 @@ class SourceDiscovery(unittest.TestCase):
             src = os.path.join(tmp, "notes.txt")
             Path(src).write_text("not a shader", encoding="utf-8")
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
 
@@ -166,7 +188,7 @@ class CommandLine(unittest.TestCase):
                 out = os.path.join(tmp, "spirv")
                 with self.subTest(args=args):
                     p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out, *args],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True, errors="replace")
                     self.assertEqual(p.returncode, 2)
                     self.assertIn(message, p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
@@ -184,7 +206,7 @@ class OutputFolderValidation(unittest.TestCase):
 
     def run_tool(self, out, *extra, timeout=None):
         return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", os.fspath(out), *extra],
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def assert_usage_error(self, p, message):
         self.assertEqual(p.returncode, 2, p.stderr)
@@ -248,6 +270,54 @@ class OutputFolderValidation(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "keep")
 
 
+class OutputInsideInput(unittest.TestCase):
+    """--out equal to the input folder, or inside it, is refused before anything is written (BUILD-1044)."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = self.tmp / "disasm"
+        self.src.mkdir()
+        (self.src / "ps_x.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        (self.tmp / "ps_x.dxbc").write_bytes(b"DXBC" + bytes(28))
+
+    def run_tool(self, out):
+        return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", os.fspath(out)],
+                              capture_output=True, text=True, timeout=120)
+
+    def assert_refused(self, out):
+        p = self.run_tool(out)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertTrue(p.stderr.startswith("ERROR: --out "), p.stderr)
+        self.assertIn("separate output folder", p.stderr)
+        self.assertFalse((self.src / "ps_x.spvasm").exists())
+        self.assertFalse((self.src / "ps_x.spv").exists())
+        self.assertFalse((self.src / "index.json").exists())
+
+    def test_out_equal_to_the_input_folder_is_refused(self):
+        self.assert_refused(self.src)
+
+    def test_out_inside_the_input_folder_is_refused(self):
+        out = self.src / "spirv"
+        self.assert_refused(out)
+        self.assertFalse(out.exists())      # refused before mkdir, not left as an empty folder
+
+    def test_a_distinct_out_folder_still_translates(self):
+        out = self.tmp / "spirv"
+
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool):
+            self.assertIsNone(rdna2spirv.main())
+        self.assertTrue((out / "ps_x.spv").is_file())
+        self.assertTrue((out / "index.json").is_file())
+
+
 class ValidatedOutput(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -264,9 +334,9 @@ class ValidatedOutput(unittest.TestCase):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
-                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                self.assertEqual(Path(kwargs.get("cwd", ""), cmd[-1]).read_bytes(), b"new module")
                 if reject_at is None:
                     self.assertFalse(self.module.exists(), "the binary was published before validation")
             else:
@@ -282,6 +352,44 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_existing_single_s_file_still_translates(self):
         self.assertIn("1 pass spirv-val", self.translate())
+
+    def test_missing_assembler_is_one_setup_error(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run",
+                                  side_effect=FileNotFoundError(2, "No such file or directory", "spirv-as")), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = rdna2spirv.main()
+        message = err.getvalue()
+        self.assertEqual(code, 2, message)
+        self.assertIn("spirv-as", message)
+        self.assertIn("SPIRV-Tools", message)
+        self.assertNotIn("Traceback", message)
+        self.assertEqual(len(message.strip().splitlines()), 1, message)
+        self.assertFalse(self.module.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_missing_validator_does_not_publish_the_module(self):
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise FileNotFoundError(2, "No such file or directory", "spirv-val")
+
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = rdna2spirv.main()
+        message = err.getvalue()
+        self.assertEqual(code, 2, message)
+        self.assertIn("spirv-val", message)
+        self.assertIn("SPIRV-Tools", message)
+        self.assertNotIn("Traceback", message)
+        self.assertEqual(len(message.strip().splitlines()), 1, message)
+        self.assertFalse(self.module.exists())
+        self.assertFalse(self.index.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
 
     def test_validator_rejection_does_not_publish_binary(self):
         self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
@@ -353,7 +461,7 @@ class EmptyShader(unittest.TestCase):
             with open(os.path.join(tmp, "ps_empty.dxbc"), "wb") as f:
                 f.write(b"DXBC" + bytes(28))
             out = os.path.join(tmp, "spirv")
-            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True)
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)

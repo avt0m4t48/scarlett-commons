@@ -12,8 +12,10 @@ const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
 const worldSource = html.slice(worldBegin, worldEnd);
 
-function loadWorld(fetch, search = '') {
-    return vm.runInNewContext(worldSource + '\nloadWorld()', { fetch, location: { search }, URLSearchParams });
+function loadWorld(fetch, search = '', timers = { setTimeout, clearTimeout }) {
+    return vm.runInNewContext(worldSource + '\nloadWorld()', {
+        fetch, location: { search }, URLSearchParams, AbortController, ...timers,
+    });
 }
 
 function manifestResponse(manifest) {
@@ -65,13 +67,64 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
 test('test mode, a missing manifest, and an unreadable manifest have distinct messages', async () => {
     const explicit = await loadWorld(async () => assert.fail('test mode must not fetch'), '?test');
     const missing = await loadWorld(async () => ({ ok: false, status: 404 }));
+    const unavailable = await loadWorld(async () => ({ ok: false, status: 503 }));
     const invalid = await loadWorld(async () => ({ ok: true, json: async () => { throw new SyntaxError(); } }));
     const unreachable = await loadWorld(async () => { throw new TypeError(); });
-    for (const world of [explicit, missing, invalid, unreachable]) assert.equal(world.test, true);
+    for (const world of [explicit, missing, unavailable, invalid, unreachable]) assert.equal(world.test, true);
     assert.match(explicit.reason, /requested/);
     assert.match(missing.reason, /not found/);
+    assert.match(unavailable.reason, /HTTP 503/);
     assert.match(invalid.reason, /valid JSON/);
     assert.match(unreachable.reason, /could not be loaded/);
+});
+
+test('a stalled world manifest falls back to generated terrain at the startup deadline', async t => {
+    for (const phase of ['headers', 'body']) {
+        await t.test(phase, async () => {
+            let expire, signal, readingBody = false, deadlineCleared = false;
+            const timers = {
+                setTimeout(callback, delay) { assert.equal(delay, 10_000); expire = callback; return 1; },
+                clearTimeout(id) { assert.equal(id, 1); deadlineCleared = true; },
+            };
+            const loading = loadWorld((_url, options) => {
+                signal = options.signal;
+                const stall = () => new Promise((_, reject) => {
+                    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+                });
+                if (phase === 'headers') return stall();
+                return Promise.resolve({ ok: true, json() { readingBody = true; return stall(); } });
+            }, '', timers);
+            await new Promise(setImmediate);
+            assert.equal(readingBody, phase === 'body');
+            assert.equal(typeof expire, 'function');
+            assert.equal(signal.aborted, false);
+            assert.equal(deadlineCleared, false);
+            expire();
+            assert.equal(signal.aborted, true);
+            const world = await loading;
+            assert.equal(world.test, true);
+            assert.ok(world.chunks.length > 0);
+            assert.match(world.reason, /world\/world\.json.*timed out/);
+            assert.equal(deadlineCleared, true);
+        });
+    }
+});
+
+test('manifest success clears the deadline and explicit test mode never schedules it', async () => {
+    const scheduled = [], cleared = [];
+    const timers = {
+        setTimeout(callback) { scheduled.push(callback); return scheduled.length; },
+        clearTimeout(id) { cleared.push(id); },
+    };
+    const world = await loadWorld(manifestResponse({ spawn: [1, 2, 3], chunks: [] }), '', timers);
+    assert.equal(world.test, false);
+    assert.equal(scheduled.length, 1);
+    assert.deepEqual(cleared, [1]);
+
+    const explicit = await loadWorld(() => assert.fail('test mode must not fetch'), '?test', timers);
+    assert.equal(explicit.test, true);
+    assert.equal(scheduled.length, 1);
+    assert.deepEqual(cleared, [1]);
 });
 
 test('generated terrain shares vertex normals at both kinds of chunk border', () => {
@@ -155,6 +208,7 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
 async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
     const helpMessages = [];
+    const actions = [];
     const canvas = {
         addEventListener: (type, handler) => canvasEvents.set(type, handler),
         requestPointerLock,
@@ -171,17 +225,25 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         renderer: { domElement: canvas }, document,
         addEventListener: (type, handler) => windowEvents.set(type, handler),
         loadWorld: async () => ({}),
+        wire: false,
+        applyWire: () => actions.push('wireframe'),
+        camera: { position: { toArray: () => [1, 2, 3] } },
+        formatCamHash: () => '#cam=1,2,3,0,0',
+        history: { replaceState: (_state, _title, hash) => actions.push(hash) },
+        location: { href: 'http://localhost/#cam=1,2,3,0,0' },
+        navigator: { clipboard: { writeText: async url => actions.push(url) } },
     });
     return {
         ...state,
         helpMessages,
+        actions,
         fallback: () => start.onclick(),
         lockError: () => documentEvents.get('pointerlockerror')?.(),
         lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
         down: button => canvasEvents.get('mousedown')({ button }),
         up: button => windowEvents.get('mouseup')({ button }),
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
-        key: code => windowEvents.get('keydown')({ code }),
+        key: (code, modifiers) => windowEvents.get('keydown')({ code, ...modifiers }),
         blur: () => windowEvents.get('blur')(),
     };
 }
@@ -255,6 +317,24 @@ test('pointer lock turns the camera without a pressed mouse button', async () =>
     assert.ok(cam.yaw() < 0);
 });
 
+test('browser shortcuts leave viewer actions alone and Ctrl movement remains available', async () => {
+    const cam = await freecamFixture();
+    for (const modifier of ['ctrlKey', 'metaKey', 'altKey']) {
+        cam.key('KeyF', { [modifier]: true });
+        cam.key('KeyP', { [modifier]: true });
+    }
+    assert.deepEqual(cam.actions, []);
+
+    cam.key('ControlLeft', { ctrlKey: true });
+    cam.key('KeyW', { ctrlKey: true });
+    assert.equal(cam.keys.has('ControlLeft'), true);
+    assert.equal(cam.keys.has('KeyW'), true);
+
+    cam.key('KeyF');
+    cam.key('KeyP');
+    assert.deepEqual(cam.actions, ['wireframe', '#cam=1,2,3,0,0', 'http://localhost/#cam=1,2,3,0,0']);
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
@@ -273,6 +353,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
         document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
         devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        AbortController, setTimeout, clearTimeout,
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks }), GLTFLoader: class {},
     });
     const pressG = (repeat = false) => handlers.get('keydown')({ code: 'KeyG', repeat });
@@ -293,6 +374,62 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
+test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+    class Vector3 {
+        constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+        set(x, y, z) { return Object.assign(this, { x, y, z }); }
+        fromArray([x, y, z]) { return this.set(x, y, z); }
+        add(v) { return this.set(this.x + v.x, this.y + v.y, this.z + v.z); }
+        sub(v) { return this.set(this.x - v.x, this.y - v.y, this.z - v.z); }
+        addScaledVector(v, s) { return this.set(this.x + v.x * s, this.y + v.y * s, this.z + v.z * s); }
+        crossVectors(a, b) { return this.set(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+        lengthSq() { return this.x * this.x + this.y * this.y + this.z * this.z; }
+        normalize() { const n = Math.sqrt(this.lengthSq()) || 1; return this.set(this.x / n, this.y / n, this.z / n); }
+    }
+    const handlers = new Map();
+    let frame;
+    const camera = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn camera; })()`, {
+        THREE: {
+            WebGLRenderer: class {
+                domElement = { addEventListener() {} };
+                info = { render: { calls: 0, triangles: 0 } };
+                setPixelRatio() {} setSize() {} render() {}
+                setAnimationLoop(callback) { frame = callback; }
+            },
+            Scene: class { add() {} },
+            PerspectiveCamera: class {
+                position = new Vector3();
+                quaternion = { setFromEuler() {} };
+                getWorldDirection(v) { return v.set(0, 0, -1); }
+            },
+            DirectionalLight: class { position = { set() {} }; },
+            Clock: class { getDelta() { return 0.1; } },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
+            Group: class { add() {} },
+            Vector3,
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        performance: { now: () => 0 },
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+    });
+    // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
+    const climb = (...modifiers) => {
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keydown')({ code });
+        const before = camera.position.y;
+        frame();
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keyup')({ code });
+        return camera.position.y - before;
+    };
+    const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} is not ${expected}`);
+    close(climb(), 4);
+    close(climb('ShiftLeft'), 20);
+    close(climb('ShiftRight'), 20);
+    close(climb('ControlLeft'), 0.8);
+    close(climb('ControlRight'), 0.8);
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
@@ -300,10 +437,17 @@ const source = html.slice(begin, end);
 const settle = () => new Promise(setImmediate);
 function fixture(count = 1) {
     const requests = [], added = [], disposed = [];
-    let now = 0;
+    const timers = new Map();
+    let now = 0, nextTimer = 0;
     class Group { add() {} }
     const context = vm.createContext({
         performance: { now: () => now },
+        setTimeout(callback, delay) {
+            const id = ++nextTimer;
+            timers.set(id, { at: now + delay, callback });
+            return id;
+        },
+        clearTimeout: id => timers.delete(id),
         THREE: { MeshStandardMaterial: class {}, Group, DoubleSide: 2,
             LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' } },
         AbortController,
@@ -335,6 +479,15 @@ function fixture(count = 1) {
     const object = () => ({ traverse(fn) { fn({ geometry: { dispose() { disposed.push(this); } } }); } });
     return { context, requests, added, disposed, state: context.state, object,
         frame(time = now) { now = time; context.state.stream(); },
+        async advanceTimers(time) {
+            now = time;
+            for (const [id, { at, callback }] of timers) {
+                if (at > now) continue;
+                timers.delete(id);
+                callback();
+            }
+            await settle();
+        },
         async fail(index, time = now) {
             now = time; requests[index].reject(new Error('synthetic load failure')); await settle();
         },
@@ -382,6 +535,60 @@ test('a transient failure retries only after backoff, then loads the chunk', asy
     assert.deepEqual(f.added, [obj]);
     f.frame(100000);
     assert.equal(f.requests.length, 2);
+});
+
+test('stalled chunk headers and bodies release their slots at the download deadline', async () => {
+    const f = fixture(5);
+    f.frame();
+    await f.advanceTimers(20000);
+    f.requests[0].headers(); // Receiving headers does not restart the deadline.
+    await settle();
+    assert(f.requests[0].completeBody);
+    await f.advanceTimers(29999);
+    assert.equal(f.state.inflight, 4);
+    assert.equal(f.state.failed, 0);
+
+    await f.advanceTimers(30000);
+    assert(f.requests.every(request => request.signal.aborted));
+    assert.equal(f.requests[0].parse, undefined);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 4);
+    f.frame();
+    assert.deepEqual(f.requests.slice(4).map(request => request.url), ['4.glb']);
+    f.frame(30999);
+    assert.equal(f.requests.length, 5);
+    f.frame(31000);
+    assert.deepEqual(f.requests.slice(5).map(request => request.url), ['0.glb', '1.glb', '2.glb']);
+});
+
+test('repeated download timeouts use the existing attempt budget', async () => {
+    const f = fixture();
+    f.frame();
+    await f.advanceTimers(30000);
+    f.frame(31000);
+    await f.advanceTimers(61000);
+    f.frame(62999);
+    assert.equal(f.requests.length, 2);
+    f.frame(63000);
+    await f.advanceTimers(93000);
+    f.frame(100000);
+    assert.equal(f.state.failed, 3);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.requests.length, 3);
+});
+
+test('a completed download clears its deadline before GLB parsing finishes', async () => {
+    const f = fixture();
+    f.frame();
+    await f.receive(0);
+    await f.advanceTimers(30000);
+    assert.equal(f.requests[0].signal.aborted, false);
+    assert.equal(f.state.inflight, 1);
+    const obj = f.object();
+    await f.finish(0, obj);
+    assert.deepEqual(f.added, [obj]);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 0);
 });
 
 test('permanent failure stops after three attempts with increasing delays', async () => {
@@ -523,6 +730,28 @@ test('stale and evicted chunks close each shared bitmap once', async t => {
     assert.equal(live.bitmap.close.mock.callCount(), 1);
     assert.equal(otherClose.mock.callCount(), 0);
     for (const tex of [...stale.textures, ...live.textures]) assert.equal(tex.dispose.mock.callCount(), 1);
+});
+
+test('eviction disposes each skeleton shared by skinned meshes once', async t => {
+    const f = fixture();
+    const shared = { dispose: t.mock.fn() };
+    const separate = { dispose: t.mock.fn() };
+    const nodes = [
+        { isSkinnedMesh: true, skeleton: shared },
+        { isSkinnedMesh: true, skeleton: shared },
+        { isSkinnedMesh: true, skeleton: separate },
+        { isSkinnedMesh: true },
+    ];
+    f.frame();
+    await f.succeed(0, { traverse(fn) { nodes.forEach(fn); } });
+    assert.equal(shared.dispose.mock.callCount(), 0);
+    assert.equal(separate.dispose.mock.callCount(), 0);
+
+    f.context.camera.position.x = 10000;
+    f.frame();
+    assert.equal(f.state.live.has('chunk_0'), false);
+    assert.equal(shared.dispose.mock.callCount(), 1);
+    assert.equal(separate.dispose.mock.callCount(), 1);
 });
 
 test('stale parses retain their slot, then dispose success or ignore failure', async () => {

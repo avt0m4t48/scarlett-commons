@@ -5,12 +5,14 @@ llvm-mc).
 """
 import os
 import random
+import subprocess
 import sys
 import tempfile
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "cf_diff.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import cf_diff  # noqa: E402
@@ -43,6 +45,24 @@ def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert "--programs must be at least 1" in captured.err
     assert captured.out == ""
+
+
+def test_a_run_where_every_program_was_skipped_is_not_a_success(capsys, monkeypatch):
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: ("skip", "unsupported form"))
+    assert cf_diff.main(["--programs", "2", "--seed", "1"]) == 2
+    assert "no program ran: every one was skipped" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("statuses, code", [
+    (["skip", "skip"], 2),            # nothing was compared
+    (["skip", "mismatch"], 1),        # a mismatch outranks "nothing else ran"
+    (["match", "skip"], 0),           # one wave compared and matched
+])
+def test_a_single_program_run_exits_like_the_suite(statuses, code, capsys, monkeypatch):
+    results = iter(statuses)
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: (next(results), "detail"))
+    assert cf_diff.main(["--program", "3", "--seed", "1", "--wave", "both"]) == code
+    assert ("no program ran: every one was skipped" in capsys.readouterr().out) == (code == 2)
 
 
 def test_generation_is_deterministic():
@@ -119,6 +139,13 @@ def test_minimize_keeps_the_mismatch(monkeypatch):
 
 def test_self_test_passes():
     assert cf_diff.self_test() is True
+
+
+def test_no_arguments_prints_usage():
+    proc = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 2
+    assert "usage:" in proc.stderr
+    assert "Traceback" not in proc.stderr
 
 
 def test_generator_covers_every_shape():

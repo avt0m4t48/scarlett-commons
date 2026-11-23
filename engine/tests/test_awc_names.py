@@ -170,6 +170,32 @@ class TestRules(unittest.TestCase):
         self.assertEqual(stats["family_min_size"], 2)
         self.assertEqual(stats["control_dialogue"] + stats["control_family"], 0)
 
+    def test_rejected_dialogue_hit_does_not_shadow_accepted_family_member(self):
+        d = A.Dictionary(["zz_fooau_abcd_01"])
+        bases = ["zz_fooau_abcd"]
+        # Including SALT + zz_fooau_abcd_01 makes the salted control reject the dialogue rule;
+        # zz_fooau_abcd_01 must still be named via its 3-member family alongside _02 and _03.
+        index = self.index({
+            "b0": [
+                "zz_fooau_abcd_01",
+                "zz_fooau_abcd_02",
+                "zz_fooau_abcd_03",
+                A.SALT + "zz_fooau_abcd_01",
+            ]
+        })
+        real, stats = A.name_source(d, bases, index)
+        self.assertFalse(stats["dialogue_rule"])
+        self.assertEqual(stats["family_min_size"], 2)
+        self.assertEqual(stats["named"], 3)
+        self.assertEqual(
+            sorted(real.values()),
+            [
+                ("zz_fooau_abcd_01", "family", 3),
+                ("zz_fooau_abcd_02", "family", 3),
+                ("zz_fooau_abcd_03", "family", 3),
+            ],
+        )
+
 
 class TestConversations(unittest.TestCase):
     def test_waves_per_label(self):
@@ -258,7 +284,10 @@ class TestCli(unittest.TestCase):
                         out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
                     elif alias == "hardlink":
                         out = os.path.join(tmp, "names.csv")
-                        os.link(target, out)
+                        try:
+                            os.link(target, out)
+                        except (OSError, NotImplementedError) as e:
+                            self.skipTest(f"hard links unavailable: {e}")
                     else:
                         out = target
                     err = io.StringIO()
@@ -298,9 +327,45 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])
 
+    def test_malformed_banks_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for doc in ([1], [["Path"]]):
+                banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main(["--words", words, banks]), 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertIn("awc_names: error:", err.getvalue())
+
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+
+    def test_min_token_below_one_is_rejected(self):
+        # --min-token counts the dictionary words a token must appear in. 0 or a negative used to pass
+        # type=int and silently disable the common-token filter (every token passes tokens[t] >= min_token).
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "b.awc"), make_bank(["abc_01", "abc_02", "abc_03"]))
+            words = write(os.path.join(tmp, "w.txt"), "abc_01\nabc_02\nabc_03\n")
+            for bad in ("0", "-1", "-5"):
+                with self.subTest(min_token=bad):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([bank, "--words", words, "--min-token", bad])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("at least 1", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--min-token", "x"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("Traceback", err.getvalue())
+            # 1 is the smallest meaningful value and still runs.
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([bank, "--words", words, "--min-token", "1"]), 0)
 
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_words_input_reports_rc_2_without_traceback(self):
@@ -334,6 +399,27 @@ class TestCli(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("cannot read", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_scalar_json_words_report_rc_2_without_traceback(self):
+        # A JSON scalar is neither a hashdict object nor a word list: one error line, exit 2. A string
+        # must not be read as one word per character.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "o.csv")
+            for doc in ("42", "null", "true", '"abc"'):
+                with self.subTest(doc=doc):
+                    words = write(os.path.join(tmp, "words.json"), doc)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        rc = A.main([tmp, "--words", words, "--out", out])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertIn("awc_names: error: cannot read", err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_json_word_list_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
+            self.assertEqual(A.read_words(path), ["a_word", "2"])
 
 
 if __name__ == "__main__":

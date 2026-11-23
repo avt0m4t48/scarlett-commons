@@ -27,8 +27,8 @@ Meshlet group (first u32 has bit 31 set):
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
                      12-bit steps around 2047, (field - 2047) * step (measured on `42 40` geometry; the default
-                     0x007FF7FF / 0x7FF is the origin). The step is 1/16 m, or 1/8 m when w2 bit 28 is set (large
-                     meshlets out to +-256 m; the other w2 bits 24-31 are 0). w3 bits 14-30 are the normal cone: axis
+                     0x007FF7FF / 0x7FF is the origin). The step is 2^e / 16 m with e = w2 bits 28-31 (0 to 4
+                     seen; larger meshlets further out), and w2 bits 24-27 are 0. w3 bits 14-30 are the normal cone: axis
                      octahedral u = bits 14-19, v = bits 20-25 (x / 31.5 - 1), sin(half-angle) = (31 - bits 26-30)
                      / 31; all zero = no cone.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
@@ -39,7 +39,7 @@ Meshlet group (first u32 has bit 31 set):
     +0x5C         u32, 0x200 (as in the `63 30` block)
     +0x60         f32 x3 bias        +0x6C  u32 axis order, 0, 1 or 2
     +0x70         f32 x3 scale       +0x7C  f32 UV scale for type-8 slots (4.0f in every block measured)
-    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x26, 0x27 and
+    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x25, 0x26, 0x27 and
     0x28 = 4 bytes, and 0x63 in the `63 30` block = 12 bytes. The vertex count is the span
     from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
     Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
@@ -84,9 +84,10 @@ SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
 OTHER_HEADER_SIZE = 0x80
 # A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
-# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
+# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8. Skinned blocks also use type 5 for joint indices.
 SLOT_TYPES = {1: "octahedral normal, 10 + 10 bits unorm", 2: "2 x f32 or a packed position", 3: "3 x f32",
-              6: "RGBA8", 7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
+              5: "joint indices in skin slots", 6: "RGBA8",
+              7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
               8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
 
 
@@ -233,8 +234,8 @@ def face_agreement(positions, triangles):
 
 
 def centre_step(w2):
-    """Metres per step of a meshlet record's centre fields: 1/16, or 1/8 when w2 bit 28 is set."""
-    return 0.125 if (w2 >> 28) & 1 else 0.0625
+    """Metres per step of a meshlet record's centre fields: 2^e / 16 with the exponent e in w2 bits 28-31."""
+    return 2.0 ** ((w2 >> 28) & 15) / 16
 
 
 def meshlet_centre(w2, w3):
@@ -316,7 +317,7 @@ def centre_agreement(data, group, positions):
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
         stored, size = meshlet_centre(w2, w3), centre_step(w2)
-        out["coarse_steps"] += size > 0.0625
+        out["coarse_steps"] += (w2 >> 28) != 0
         for i in range(3):
             step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) / size)
             out["axes_exact"] += step == 0
@@ -419,6 +420,25 @@ def normal_agreement(positions, normals, triangles):
     return out
 
 
+def centre_distance(data, group, positions):
+    """Sum over a group's meshlets of the distance (per axis, in metres) between the stored centre and the centre of
+    the meshlet's vertex box, with these positions. The `42 40` block a group was built against gives the smallest
+    sum; a vertex reference past the block, or a sum that is not finite (NaN or infinite positions), gives None."""
+    at, k = group["offset"], group["meshlets"]
+    rec_at = at + 12
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, rec_at + 16 * k + 4 * group["triangles"])
+    total = 0.0
+    for m in range(k):
+        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
+        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
+        if len(pts) != vc:
+            return None
+        stored = meshlet_centre(w2, w3)
+        total += sum(abs((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) for i in range(3))
+    return total if math.isfinite(total) else None
+
+
 def block4240_checks(data, block):
     """Count-only plausibility checks for one `42 40` block's decoded positions. Every position is bias + scale * q
     with q between 0 and 2^24 - 1 (2^16 - 1 for the third field), so when the header's box is finite and inside
@@ -430,10 +450,33 @@ def block4240_checks(data, block):
         ends = [(b, b + s * q) for b, s, q in zip(bias, scale, (0xFFFFFF, 0xFFFFFF, 0xFFFF))]
         if all(math.isfinite(e) for pair in ends for e in pair) and all(abs(e) <= 300 for pair in ends for e in pair):
             return {"positions_4240": n, "positions_4240_finite": n, "positions_4240_within_300m": n}
-    pos = positions_4240(data, block)
-    finite = [p for p in pos if all(math.isfinite(c) for c in p)]
-    return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
-            "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+
+    slots = {i: (tag, off) for i, tag, off in block["slots"]}
+    if slots.get(0, (None,))[0] != 0x42:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not a packed position (tag 0x42)")
+    axis = _u32(data, at + 0x6C)
+    if axis > 2:
+        raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
+
+    b0, b1, b2 = bias
+    s0, s1, s2 = scale
+    total = 0
+    finite_count = 0
+    within_300m_count = 0
+
+    slot0_off = slots[0][1]
+    for (q,) in struct.iter_unpack("<Q", memoryview(data)[at + slot0_off:at + slot0_off + 8 * n]):
+        total += 1
+        a = b0 + s0 * ((q >> 8) & 0xFFFFFF)
+        b = b1 + s1 * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
+        c = b2 + s2 * (q >> 48)
+        if math.isfinite(a) and math.isfinite(b) and math.isfinite(c):
+            finite_count += 1
+            if abs(a) <= 300 and abs(b) <= 300 and abs(c) <= 300:
+                within_300m_count += 1
+
+    return {"positions_4240": total, "positions_4240_finite": finite_count,
+            "positions_4240_within_300m": within_300m_count}
 
 
 def parse_group(data, at):
@@ -584,9 +627,11 @@ def block_checks(data, block):
 
 def summarise_page(data, name, faces=False, centres=False, normals=False, cones=False):
     """Counts for one page. faces=True also runs face_agreement, centres=True centre_agreement, normals=True
-    normal_agreement and cones=True cone_agreement on every group
-    whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
-    it)."""
+    normal_agreement and cones=True cone_agreement on every group whose vertex span matches a `42 40` block in the
+    page. With one such block, that block. With several, nothing
+    in the page orders them (a group of `Q0 Q1 G0 G1` belongs to Q0 in some pages and to Q1 in others), so the
+    block whose vertex boxes are closest to the group's stored centres (`centre_distance`); ties, and groups no
+    block fits, keep the nearest block before the group, else the first after it."""
     try:
         chunks = parse_page(data)
     except PageError as exc:
@@ -615,6 +660,19 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
                     continue
                 before = [b for b in same if b["offset"] < g["offset"]]
                 b = before[-1] if before else same[0]
+                if len(same) > 1:
+                    checks["groups_4240_several_blocks"] = checks.get("groups_4240_several_blocks", 0) + 1
+                    scored = []
+                    for c in same:
+                        if c["offset"] not in decoded:
+                            decoded[c["offset"]] = positions_4240(data, c)
+                        cost = centre_distance(data, g, decoded[c["offset"]])
+                        if cost is not None:
+                            scored.append((cost, c is not b, c["offset"], c))
+                    best = min(scored, key=lambda x: x[:3])[3] if scored else b
+                    if best is not b:
+                        b = best
+                        checks["groups_4240_block_by_centres"] = checks.get("groups_4240_block_by_centres", 0) + 1
                 if b["offset"] not in decoded:
                     decoded[b["offset"]] = positions_4240(data, b)
                 if faces:
@@ -635,6 +693,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
+    counts_4240 = {b["vertices"] for b in others}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
             "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
@@ -653,8 +712,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
             "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
             "blocks_4240_flags": sorted({b["flags"] for b in others}),
             "blocks_4240_axes": sorted({b["axis"] for b in others}),
-            "groups_matching_4240_block_here": sum(1 for g in groups
-                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups if g["vertex_span"] in counts_4240),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}
@@ -697,7 +755,7 @@ def iter_archive(path):
             m.close()
 
 
-def iter_inputs(paths):
+def iter_inputs(paths, existing_report=None):
     for path in paths:
         if os.path.isdir(path):
             for root, _, files in os.walk(path):
@@ -708,6 +766,8 @@ def iter_inputs(paths):
                         if len(head) == 4 and (head in (b"\x63\x30\x00\x00", b"\x42\x40\x00\x00") or head[3] & 0x80):
                             data = head + fh.read()
                             if is_mesh_page(data):
+                                if existing_report and same_output_path(existing_report, full):
+                                    raise PageError(f"--json would overwrite the input {full}")
                                 yield os.path.relpath(full, path), data
         elif path.lower().endswith(".rpf"):
             yield from iter_archive(path)
@@ -763,8 +823,8 @@ def _resource_pointer(system, at, base, segment, size):
     return address
 
 
-def drawable_geometries(system, drawable):
-    """Read the primary LOD geometry list at a caller-identified drawable."""
+def drawable_geometries(system, drawable, lod_index=0):
+    """Read one LOD geometry list at a caller-identified drawable."""
     def pointer(at, size):
         return _resource_pointer(system, at, 0x50000000, system, size)
 
@@ -776,7 +836,9 @@ def drawable_geometries(system, drawable):
 
     if not 0 <= drawable <= len(system) - 176:
         raise PageError("drawable outside the system segment")
-    lod = pointer(drawable + 80, 16)
+    if lod_index not in range(4):
+        raise PageError("drawable LOD index must be between 0 and 3")
+    lod = pointer(drawable + 80 + 8 * lod_index, 16)
     models = count(lod + 8)
     table = pointer(lod, 8 * models)
     for i in range(models):
@@ -841,11 +903,13 @@ def is_scanned_input(path, input_path):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
     if same_output_path(path, input_path):
         return True
-    if not os.path.isdir(input_path) or not os.path.isfile(path):
+    if not os.path.isdir(input_path):
         return False
-    manifest = os.path.join(input_path, "index.json")
-    if os.path.isfile(manifest) and same_output_path(path, manifest):
+    # Reserved even before the carve writes it: other tools read <input>/index.json as the carve manifest.
+    if same_output_path(path, os.path.join(input_path, "index.json")):
         return True
+    if not os.path.isfile(path):
+        return False
     root = os.path.normcase(os.path.abspath(input_path))
     target = os.path.normcase(os.path.abspath(path))
     if os.path.dirname(target) != root and not target.startswith(root + os.sep):
@@ -873,8 +937,11 @@ def main(argv=None):
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
                         help="known geometry record offset in the system segment (repeatable)")
     select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
-                        help="walk primary LOD geometry records from this system-segment drawable")
+                        help="walk geometry records from this system-segment drawable")
+    ap.add_argument("--lod", type=int, choices=range(4), help="drawable LOD index (default: 0)")
     args = ap.parse_args(argv)
+    if args.lod is not None and args.drawable_offset is None:
+        ap.error("--lod requires --drawable-offset")
     if args.json:
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
@@ -895,7 +962,7 @@ def main(argv=None):
             with open(args.inputs[0], "rb") as source:
                 graphics = source.read()
             rows = []
-            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset)
+            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset, args.lod or 0)
             try:
                 for offset in offsets:
                     try:
@@ -922,8 +989,13 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
-             for name, data in iter_inputs(args.inputs)]
+    existing_report = args.json if args.json and os.path.isfile(args.json) else None
+    try:
+        pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
+                 for name, data in iter_inputs(args.inputs, existing_report)]
+    except PageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     total = totals(pages)
     if not args.quiet:
         for p in pages:

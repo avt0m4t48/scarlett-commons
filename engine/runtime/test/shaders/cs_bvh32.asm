@@ -2,18 +2,21 @@
 ; is 11 dwords: node, ray extent (t max), origin xyz, direction xyz, inverse direction xyz. The 64-bit form has the
 ; node's high dword after the low one, so read with that layout every operand here would be one register off.
 ; Same scene and ray as cs_bvh.asm: vk_compute_test writes an AMD-format BVH into the heap (box32 root at 0x100 ->
-; triangle z=10 node 0x40, triangle z=5 node 0x48, a box the ray misses, a NaN box). Ray origin (0.25, 0.25, 0),
-; direction +z, t max 100. Run: vk_compute_test cs_bvh32.spv 1 bvh
-; Expected, from the "Ray tracing" row of docs/design.md (one traversal step, RADV's software box and triangle tests):
+; triangle z=10 node 0x40, triangle z=5 node 0x48, a box the ray misses, a box with a NaN min.x). Ray origin
+; (0.25, 0.25, 0), direction +z, t max 100. Run: vk_compute_test cs_bvh32.spv 1 bvh
+; Expected, from the "Ray tracing" row of docs/design.md (one traversal step; the box test as measured on RDNA2,
+; SHADER-650, and RADV's software triangle test):
 ;   box node 0x25 (address 0x100 >> 3 | type 5): along +z the ray enters a box that contains its x and y at the
 ;   box's near z, so child 0x40 (z = 10) at 10 and child 0x48 (z = 5) at 5. The third box lies at x in [5, 6], which
-;   the ray never reaches, and the fourth has a NaN corner: both give 0xffffffff. box_sort_enable (descriptor bit 63,
-;   set in s5) orders the children by entry distance: out[0..3] = 0x48 0x40 0xffffffff 0xffffffff.
+;   the ray never reaches: 0xffffffff. The fourth (0x68) has min.x = NaN; the hardware skips a NaN plane, so the box
+;   is x <= 1, y and z in [0, 1], which the ray is in at t = 0. box_sort_enable (descriptor bit 63, set in s5) orders
+;   the children by entry distance clamped to 0: out[0..3] = 0x68 0x48 0x40 0xffffffff (native gfx1030 gives the same).
 ;   triangle node 0x40 (address 0x200, vertices (0,0,10) (1,0,10) (0,1,10)): the ray runs along z, so the vertices
 ;   relative to the origin project onto xy unsheared: A = (-0.25, -0.25), B = (0.75, -0.25), C = (-0.25, 0.75). The
 ;   edge functions are u = Cx By - Cy Bx = -0.5, v = Ax Cy - Ay Cx = -0.25 and w = Bx Ay - By Ax = -0.25, all of one
-;   sign (a hit); det = u + v + w = -1 and t = 10 (u + v + w) = -10. The result is (t / |det|, sign(det), v / |det|,
-;   w / |det|) = (-10, -1, -0.25, -0.25): out[4..7] = 0xc1200000 0xbf800000 0xbe800000 0xbe800000. The shader's
+;   sign (a hit); det = u + v + w = -1 and T = 10 (u + v + w) = -10. The result, as RDNA2 returns it, is
+;   k (T, det, v, w) with k = |d.z|^3 = 1, so (-10, -1, -0.25, -0.25): out[4..7] = 0xc1200000 0xbf800000 0xbe800000
+;   0xbe800000 (the same words natively on gfx1030, tests/semantic/test_image_bvh_tri_hw.py's cs_bvh row). The shader's
 ;   division by the second word gives t = 10 and the barycentrics 0.25, 0.25.
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v2, 0x25

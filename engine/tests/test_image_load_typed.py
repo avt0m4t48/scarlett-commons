@@ -124,6 +124,8 @@ class Module:
             return self.value(words[self.value(p[2], word1, index)], word1, index)
         if op == "OpGroupNonUniformBroadcastFirst":   # desc_lookup makes the descriptor word uniform: one invocation
             return self.value(a[2], word1, index)      # here, so the value itself (a[1] is the Subgroup scope)
+        if op == "OpGroupNonUniformShuffle":          # the same for a wave32 pixel shader's half (SHADER-731, #4225)
+            return self.value(a[2], word1, index)
         u = [self.value(y, word1, index) for y in a[1:]]
         if op == "OpBitcast":
             return u[0]
@@ -336,6 +338,56 @@ class LodQueryCoordinates(unittest.TestCase):
 
 
 class TypedGatherShaders(unittest.TestCase):
+    def test_a16_offset_gathers_preserve_offset_and_unpack_uv_lod(self) -> None:
+        fixture = Path(ROOT) / "tests/semantic/fixtures/gather_offset_a16.asm"
+        lines = [line for line in fixture.read_text(encoding="ascii").splitlines()
+                 if line and not line.startswith(";")]
+        end = lines.index("s_waitcnt vmcnt(0)")
+        for explicit in (True, False):
+            with self.subTest(explicit_lod=explicit):
+                body = lines[:end]
+                if not explicit:
+                    body[-1] = body[-1].replace("gather4_l_o", "gather4_lz_o").replace("v[4:6]", "v[4:5]")
+                m = Module(translate(body))
+
+                def source_register(value: str) -> int:
+                    op, load = m.defs[value]
+                    self.assertEqual(op, "OpLoad")
+                    op, ptr = m.defs[load[1]]
+                    self.assertEqual((op, ptr[1]), ("OpAccessChain", "%vgpr"))
+                    return m.value(ptr[2], 0, 0)
+
+                fields = [(source_register(a[1]), m.value(a[2], 0, 0), m.value(a[3], 0, 0))
+                          for _, op, a in m.order if op == "OpBitFieldSExtract"]
+                self.assertEqual(fields, [(4, 0, 6), (4, 8, 6)])
+
+                def source_half(value: str) -> tuple[int, int]:
+                    while m.defs[value][0] == "OpBitcast":
+                        value = m.defs[value][1][1]
+                    extract_op, (_, pair, half) = m.defs[value]
+                    self.assertEqual(extract_op, "OpCompositeExtract")
+                    op, unpack = m.defs[pair]
+                    self.assertEqual((op, unpack[2]), ("OpExtInst", "UnpackHalf2x16"))
+                    return source_register(unpack[3]), int(half)
+
+                if explicit:
+                    uv, = [a[1] for _, op, a in m.order if op == "OpFMul" and a[0] == "%v2float"]
+                    lod, = [a[3] for _, op, a in m.order if op == "OpExtInst" and a[2] == "FClamp"]
+                    self.assertEqual(source_half(lod), (6, 0))
+                else:
+                    uv, = {a[2] for _, op, a in m.order if op == "OpImageGather"}
+                op, coord = m.defs[uv]
+                self.assertEqual(op, "OpCompositeConstruct")
+                self.assertEqual([source_half(c) for c in coord[1:]], [(5, 0), (5, 1)])
+
+    def test_a16_offset_gathers_with_status_stay_unsupported(self) -> None:
+        for op in ("image_gather4_l_o", "image_gather4_lz_o"):
+            addr = "v[4:6]" if op == "image_gather4_l_o" else "v[4:5]"
+            for status in ("tfe", "lwe"):
+                with self.subTest(op=op, status=status), self.assertRaises(rdna2spirv.Unsupported):
+                    dest = "v[10:14]" if status == "tfe" else "v[10:13]"
+                    translate([f"{op} {dest}, {addr}, s[0:7], s[8:11] dmask:0x2 dim:SQ_RSRC_IMG_2D a16 {status}"])
+
     def test_2d_lod_samples_use_matching_typed_views(self):
         instructions = (("image_sample_lz", "v[4:5]"), ("image_sample_l", "v[4:6]"))
         destinations = (("v[0:3]", ""), ("v[0:1]", " d16"))
@@ -447,12 +499,14 @@ class TypedGatherShaders(unittest.TestCase):
 
 
 class StoreAndLoad(unittest.TestCase):
-    def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
+    def test_a_shader_that_also_stores_needs_write_without_format_and_both_indexing_capabilities(self):
         m = Module(translate(["v_mov_b32 v4, 1", "v_mov_b32 v5, 2",
                               "image_store v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "s_waitcnt vmcnt(0)"]))
         self.assertIn("StorageImageWriteWithoutFormat", m.caps)
+        self.assertIn("StorageImageArrayDynamicIndexing", m.caps)
+        self.assertIn("SampledImageArrayDynamicIndexing", m.caps)
         self.assertNotIn("StorageImageReadWithoutFormat", m.caps)
         self.assertNotIn("OpImageRead", m.text)
         self.assertEqual(set(m.binding.values()), {0, 1, 2, 8, 9, 10})
@@ -509,13 +563,13 @@ class VolumeGradientSamples(unittest.TestCase):
                 self.assertEqual(len(clamp), int("_cl " in line))
 
                 def source(value: str) -> tuple[int, int | None]:
-                    op, (_, word) = module.defs[value]
-                    self.assertEqual(op, "OpBitcast")
-                    op, args = module.defs[word]
+                    # Through the bitcasts between a VGPR word and a float (a round trip is the original id).
+                    op, args = module.defs[value]
+                    while op == "OpBitcast":
+                        op, args = module.defs[args[1]]
                     half = None
-                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
-                        extract, (_, unpacked, selector) = module.defs[args[1]]
-                        self.assertEqual(extract, "OpCompositeExtract")
+                    if op == "OpCompositeExtract":  # f16 coord converted to f32
+                        _, unpacked, selector = args
                         unpack, (_, _, name, packed) = module.defs[unpacked]
                         self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
                         half = int(selector)

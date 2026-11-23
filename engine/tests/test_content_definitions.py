@@ -117,19 +117,41 @@ class ContentTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 list(carve_documents(directory))
 
+    def test_cli_counts_unrelated_standalone_xml_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [os.path.join(directory, name) for name in ("setup.xml", "other.xml", "broken.xml")]
+            for path, payload in zip(paths, (SETUP, b"<Other/>", b"<Other>")):
+                with open(path, "wb") as f:
+                    f.write(payload)
+            cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "content_definitions.py")]
+            for inputs, expected in ((paths[:2], 0), (paths, 1)):
+                with self.subTest(inputs=len(inputs)):
+                    result = subprocess.run(cmd + inputs, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    counts = json.loads(result.stdout)
+                    self.assertEqual((counts["setups"], counts["other_xml"], counts["failed_inputs"]),
+                                     (1, 1, expected))
+
     def test_cli_reports_counts_only_and_failure_status(self):
         with tempfile.TemporaryDirectory() as directory:
             self.make_carve(directory, [CHANGE, CONTENT, SETUP])
             cmd = [sys.executable, '-I', os.path.join(ROOT, 'tools', 'content_definitions.py'), directory]
-            for extra, failed in (([], 0), ([os.path.join(directory, 'private.xml')], 1)):
-                result = subprocess.run(cmd + extra, capture_output=True, text=True)
-                self.assertEqual(result.returncode, failed, result.stderr)
-                self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
-                                 setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
-                                 other_xml=0, failed_inputs=failed))
-                self.assertEqual(result.stderr, '')
-                self.assertNotIn('fixture', result.stdout)
-                self.assertNotIn(directory, result.stdout)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
+                             setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
+                             other_xml=0, failed_inputs=0))
+            self.assertEqual(result.stderr, '')
+            self.assertNotIn('fixture', result.stdout)
+            self.assertNotIn(directory, result.stdout)
+
+            missing = os.path.join(directory, 'private.xml')
+            result = subprocess.run(cmd + [missing], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
+                             setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
+                             other_xml=0, failed_inputs=1))
+            self.assertEqual(result.stderr.strip().splitlines(), [f'ERROR: {missing}: does not exist'])
 
 
 if __name__ == '__main__':

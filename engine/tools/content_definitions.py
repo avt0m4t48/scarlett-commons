@@ -24,6 +24,10 @@ class ContentError(ValueError):
     """Invalid content XML; messages never include input values or paths."""
 
 
+class _OtherRoot(ContentError):
+    """Well-formed XML outside the supported content schemas."""
+
+
 @dataclass(frozen=True)
 class Record:
     tag: str
@@ -134,7 +138,7 @@ def parse_content(chunks, *, max_bytes: int = 64 << 20) -> ContentDocument:
     except (ET.ParseError, LookupError, ValueError):
         raise ContentError("malformed or unsupported XML") from None
     if element.tag not in ROOTS:
-        raise ContentError("unsupported content root")
+        raise _OtherRoot("unsupported content root")
 
     def record(el):
         return Record(el.tag, tuple(el.attrib.items()), el.text or "", el.tail or "",
@@ -204,18 +208,29 @@ def main() -> int:
         counts["included_sets"] += len(doc.included_sets)
         counts["groups"] += len(doc.change_set_groups)
 
+    status = 0
     for path in args.inputs:
+        if not os.path.exists(path):
+            print(f"ERROR: {path}: does not exist", file=sys.stderr)
+            counts["failed_inputs"] += 1
+            status = 2
+            continue
         try:
             if os.path.isdir(path):
                 for _, _, doc in carve_documents(path):
                     add(doc)
             else:
                 with open(path, "rb") as stream:
-                    add(parse_content(file_chunks(stream)))
+                    try:
+                        doc = parse_content(file_chunks(stream))
+                    except _OtherRoot:
+                        doc = None
+                    add(doc)
         except (OSError, ContentError, ValueError, KeyError, TypeError):
             counts["failed_inputs"] += 1
+            status = max(status, 1)
     print(json.dumps(counts, sort_keys=True))
-    return int(bool(counts["failed_inputs"]))
+    return status
 
 
 if __name__ == "__main__":

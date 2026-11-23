@@ -64,6 +64,48 @@ def make_resource(strings, pad=0):
     return bytes(head + desc + bytes(pad) + index + hashes + blob)
 
 
+def make_chunked_resource(chunks, between=(), gap=b"GAP-BETWEEN-CHUNKS\0"):
+    """A string table whose blob is split into chunks, as tables with more than 1 MiB of text are.
+
+    ``chunks`` is a list of {label: text}, one per chunk. The descriptor lists one tag-0x10 entry per chunk, with the
+    ``between`` (tag, bytes) entries after the first one. ``gap`` sits between the chunks so they are not contiguous.
+    An index entry's second word is ``offset << 20 | 4 | chunk``. Bytes that are not an entry end the descriptor.
+    """
+    labels, refs, blobs = [], [], []
+    for k, strings in enumerate(chunks):
+        blob = bytearray()
+        for label, text in strings.items():
+            labels.append(label)
+            refs.append(len(blob) << 20 | 4 | k)
+            blob += text.encode("utf-8") + b"\0"
+        blobs.append(bytes(blob))
+    head = bytearray(0x10) + b"0DRP" + bytes(0x0C)
+    desc_at = len(head)
+    desc_len = 0x28 + 16 * (len(chunks) + len(between)) + 16
+    index_at = desc_at + desc_len
+    hash_at = index_at + 16 * len(labels)
+    blob_at, at = [], hash_at + 16 * len(labels)
+    for blob in blobs:
+        blob_at.append(at)
+        at += len(blob) + len(gap)
+    entries = [(0x10, len(blobs[0]), blob_at[0])] + [(tag, size, 0) for tag, size in between]
+    entries += [(0x10, len(blob), off) for blob, off in zip(blobs[1:], blob_at[1:])]
+    desc = (ptr(index_at) + struct.pack("<II", 0, 0x10) + ptr(0) + b"\x01\x01\x00\x00"
+            + struct.pack("<I", 16 * len(labels)) + ptr(hash_at))
+    desc += b"".join(struct.pack("<II", tag, size) + ptr(off) for tag, size, off in entries)
+    desc += struct.pack("<IIII", 0x10, 0x10, 0x10, 0x10)      # not an entry: its pointer word is not 0x5xxxxxxx
+    assert len(desc) == desc_len
+    index = b"".join(struct.pack("<QQ", 0, ref) for ref in refs)
+    hashes = bytearray()
+    for i, label in enumerate(labels):
+        entry = bytearray(16)
+        struct.pack_into("<II", entry, 0, T.joaat(label), 0)
+        entry[8] = 1
+        entry[11:14] = i.to_bytes(3, "little")
+        hashes += entry
+    return bytes(head + desc + index + hashes + b"".join(blob + gap for blob in blobs))
+
+
 def write(path, data):
     with open(path, "wb") as fh:
         fh.write(data)
@@ -89,6 +131,28 @@ class TestTables(unittest.TestCase):
         at = res.index(b"\x01\x01\x00\x00") + 4
         struct.pack_into("<I", res, at, len(res) * 2)      # hash table larger than the resource
         self.assertEqual(list(T.string_tables(bytes(res))), [])
+
+    def test_blob_chunks_named_by_the_index_entry(self):
+        chunks = [{"ZZ_FIRST": "first chunk text"}, {"ZZ_SECOND": "second chunk"}, {"ZZ_THIRD": "third", "ZZ_LAST": "x"}]
+        tables = list(T.string_tables(make_chunked_resource(chunks)))
+        self.assertEqual(tables, [{T.joaat(k): v for c in chunks for k, v in c.items()}])
+
+    def test_other_descriptor_entries_between_chunks_are_skipped(self):
+        chunks = [{"ZZ_FIRST": "first chunk text"}, {"ZZ_SECOND": "second chunk"}]
+        res = make_chunked_resource(chunks, between=[(0x956A9DF5, 0x20), (0x10075946, 0x40)])
+        self.assertEqual(list(T.string_tables(res)), [{T.joaat(k): v for c in chunks for k, v in c.items()}])
+
+    def test_one_chunk_reads_as_before(self):
+        res = make_chunked_resource([EN])
+        self.assertEqual(list(T.string_tables(res)), [{T.joaat(k): v for k, v in EN.items()}])
+        first_blob_entry = 0x20 + 0x28
+        self.assertEqual(len(T.blob_chunks(res, first_blob_entry)), 1)   # the bytes after the entry end the run
+
+    def test_index_entry_naming_a_missing_chunk_is_skipped(self):
+        res = bytearray(make_chunked_resource([{"ZZ_FIRST": "first"}, {"ZZ_SECOND": "second"}]))
+        index_at = struct.unpack_from("<I", res, 0x20)[0] & 0x0FFFFFFF
+        struct.pack_into("<Q", res, index_at + 16 + 8, 4 | 3)  # second string: chunk 3 of 2
+        self.assertEqual(list(T.string_tables(bytes(res))), [{T.joaat("ZZ_FIRST"): "first"}])
 
     def test_language(self):
         self.assertEqual(T.language(EN.values()), "en")
@@ -288,6 +352,18 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_report_cannot_replace_the_carve_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carve")
+            os.mkdir(source)
+            index = write(os.path.join(source, "index.json"), b'{"files": []}')
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([source, "--tables", index])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b'{"files": []}')
+
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
@@ -302,8 +378,13 @@ class TestCli(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(T.main(["/nonexistent"]), 2)
+        # "/nonexistent" is a drive-root path on Windows (C:\nonexistent), which really exists on some hosts.
+        # Use a path inside a fresh temp directory so the input is guaranteed to be missing on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing-input")
+            self.assertFalse(os.path.exists(missing))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([missing]), 2)
 
     def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,21 +1,28 @@
-"""First light: draw one real game model with its own translated vertex and pixel shaders.
+"""First light: draw an exported game model with a selected pair of translated game shaders.
 
 This assembles the smallest end-to-end path from the user's package to a Vulkan image: carve the game's
 `shaders.rpf`, translate one real VS/PS pair with the repository's translator, convert one exported model to the
 mesh the GPU harness reads, and run it on the device. Nothing is written outside `--work`, and no game data is
 committed: the tool is the recipe, the user's copy is the input.
 
-The default pair is a vertex shader that forwards POSITION and TEXCOORD to clip space and a pixel shader that
+Without a DDS texture, the vertex shader forwards clip-space POSITION and TEXCOORD. The default pixel shader
 writes the interpolated TEXCOORD, so the first image is the model's own UV map. Both are ordinary game shaders;
 `--vs` and `--ps` take other names from the carve index.
 
 Usage:
     python -I first_light.py --game "<package>" --obj <model.obj> --work <dir> [--out <dir>] [--run]
+    python -I first_light.py --game "<package>" --obj <model.obj> --work <dir> --camera [--yaw 30 --pitch 25] --run
     python -I first_light.py --game "<package>" --work <dir> --list          # show VS/PS candidates
 
 The mesh file the harness reads is: u32 vertex_count, u32 index_count, vertex_count x (x,y,z,u,v) f32, then
-index_count u32 indices. The draw is orthographic: the model is centred and scaled to NDC on X/Y and flattened to
-z = 0.5, because the chosen VS does not apply a matrix (see docs/first_light.md).
+index_count u32 indices. By default the draw is orthographic: the model is centred and scaled to NDC on X/Y and
+flattened to z = 0.5, because the chosen VS does not apply a matrix (see docs/first_light.md).
+
+`--camera` draws in perspective instead, with a game VS that reads a world matrix and a view-projection matrix
+from two constant buffers (CAMERA_VS). The mesh keeps the model's own coordinates; the tool builds a camera, writes
+the matrices, the two V#s and the descriptor table into the harness heap (VKH_HEAP, VKH_SGPRS) and predicts the
+image with the same matrices, interpolating UV perspective-correctly as the rasterizer does. Its output goes to
+<work>/first_light/camera, so the orthographic folder that d3d12_first_light_test reads is left alone.
 
 The model is an OBJ from `rpf9dump models` (tools/rpf9dump). Building that tool and exporting an archive is the
 only step outside this script:
@@ -32,6 +39,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import struct
@@ -52,12 +60,71 @@ DEFAULT_SSHARP = [0x92, 0xC00000, 0x14500000, 0]
 MESH_HEADER = struct.Struct("<II")
 TEX_HEADER = struct.Struct("<II")
 
+# --camera (TEST-523). CAMERA_VS forwards TEXCOORD like DEFAULT_VS but builds clip space from two constant buffers;
+# its scalar loads give the layout. The descriptor table's 32-bit address is in s9 (high half 0). The V# at table +
+# 0x20 holds the world rows (X, Y, Z and translation, one float4 each at 0x00..0x30; the VS reads xyz of each), and
+# the V# at table + 0x60 the four view-projection rows at 0x160..0x19f. Both multiply a row vector:
+# world = [x y z 1] W, clip = [world 1] VP. On 1.0.2.1, all 9 translated VS modules with exactly POSITION and
+# TEXCOORD inputs and a computed clip w read 16 dwords at 0x160 of a constant buffer, as do 1,266 of all 2,236 VS
+# modules (docs/first_light.md section 7).
+CAMERA_VS = "VS_TransformVT_e6ebb353_Wrapped"
+CAMERA_TABLE_SGPR = 9
+CAMERA_WORLD_VSHARP = 0x20
+CAMERA_VIEW_VSHARP = 0x60
+CAMERA_VIEWPROJ = 0x160
+TABLE_VA, WORLD_VA, VIEW_VA = 0x100, 0x1000, 0x2000  # Xbox VAs inside vk_harness's 64 KiB VKH_HEAP
+
 
 def run(argv, **kwargs):
     """Run a repository tool with this interpreter; fail loud with its command in the message."""
     cmd = [sys.executable, "-I"] + argv
     print("+ " + " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, check=True, **kwargs)
+
+
+def reset_run_folders(work: str) -> str:
+    """Remove <work>/first_light/dxbc and spirv as an earlier run left them; return a new, empty dxbc.
+
+    The unpacker, the disassembler and the translator each take every file in the folder they are given, and the
+    translator merges into an index.json it finds, so a container staged by an earlier run would be translated
+    again beside this run's pair. Both folders hold only copies from <work>/shaders and files derived from them,
+    so they are removed whole; first_light/out, another --out and <work>/shaders are not touched. A folder that
+    is a symlink or a junction, or is reached through one at first_light, is refused: nothing outside the work
+    folder is removed. shutil.rmtree unlinks a link inside a folder without entering it.
+    """
+    base = os.path.join(work, "first_light")
+    real_base = os.path.join(os.path.realpath(work), "first_light")
+    # first_light itself is checked first: when it is a link to a folder with no dxbc or spirv in it, there is
+    # nothing stale to judge below, and the new dxbc would be created on the far side of the link.
+    if os.path.lexists(base) and (
+        not os.path.isdir(base) or os.path.normcase(os.path.realpath(base)) != os.path.normcase(real_base)
+    ):
+        raise SystemExit(
+            f"{base} is a symlink, a junction or a file: each run removes and creates folders under it and does "
+            "not follow a link to do it; remove it and run again"
+        )
+    stale = [os.path.join(base, name) for name in ("dxbc", "spirv") if os.path.lexists(os.path.join(base, name))]
+    for folder in stale:  # both are checked before either is removed
+        real = os.path.join(real_base, os.path.basename(folder))
+        if not os.path.isdir(folder) or os.path.normcase(os.path.realpath(folder)) != os.path.normcase(real):
+            raise SystemExit(
+                f"{folder} is a symlink, a junction or a file, or first_light above it is a link: each run "
+                "removes this folder and does not follow a link to do it; remove it and run again"
+            )
+    for folder in stale:
+        try:
+            shutil.rmtree(folder)
+        except OSError as e:
+            raise SystemExit(
+                f"cannot remove {e.filename or folder} left by an earlier run ({e.strerror or e}); "
+                f"close what holds it or delete {folder}, then run again"
+            ) from e
+    dxbc = os.path.join(base, "dxbc")
+    try:
+        os.makedirs(dxbc)
+    except OSError as e:
+        raise SystemExit(f"cannot create {dxbc}: {e.strerror or e}") from e
+    return dxbc
 
 
 def carve_index(work: str) -> str:
@@ -93,8 +160,7 @@ def choose(index_path: str, vs: str, ps: str) -> list[dict]:
 def translate(work: str, picked: list[dict]) -> dict:
     """Translate just the two chosen containers, in the layout rdna2spirv.py reads."""
     base = os.path.join(work, "first_light")
-    dxbc = os.path.join(base, "dxbc")
-    os.makedirs(dxbc, exist_ok=True)
+    dxbc = reset_run_folders(work)
     index = []
     for entry in picked:
         shutil.copy(
@@ -180,9 +246,16 @@ def read_obj(
                 if len(p) < 3:
                     raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
                 try:
-                    uvs.append(tuple(float(x) for x in p[1:3]))
+                    u, v = map(float, p[1:3])
                 except ValueError:
                     raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
+                if not (math.isfinite(u) and math.isfinite(v)):
+                    raise SystemExit(f"{path}: non-finite texture coordinates: {line.strip()!r}")
+                try:
+                    struct.pack("<2f", u, v)  # Validate the mesh encoding before opening the output.
+                except OverflowError:
+                    raise SystemExit(f"{path}: texture coordinates exceed the binary32 range: {line.strip()!r}") from None
+                uvs.append((u, v))
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:
@@ -238,6 +311,106 @@ def fit(vertices, width: int, height: int, fit_xy: bool, flatten_z: bool):
         nz = 0.5 if flatten_z else (z - cz) * scale + 0.5
         out.append((nx, ny, nz, u, v))
     return out
+
+
+def f32(x: float) -> float:
+    """x rounded to float32, so the predicted image uses the matrices the GPU reads."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _sub(a, b):
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    n = math.sqrt(_dot(a, a))
+    return tuple(x / n for x in a)
+
+
+def row_times(v, m):
+    """The row vector v times the 4x4 matrix m (a list of rows), as CAMERA_VS multiplies."""
+    return tuple(sum(v[i] * m[i][j] for i in range(4)) for j in range(4))
+
+
+def camera_matrices(vertices, width: int, height: int, yaw: float, pitch: float, fov: float, distance: float = 3.0):
+    """The world rows and view-projection rows (row-vector 4x4, float32) for --camera.
+
+    World centres the model's bounding box and scales its bounding sphere to radius 1. The camera looks at the
+    centre from `distance` radii, `yaw` degrees around the up axis (Z, the game's) from -Y and `pitch` degrees above
+    the XY plane, with a vertical field of view of `fov` degrees. The projection is Vulkan's: x right, y down the
+    image like the harness's viewport, depth 0..1 between a near and far plane just outside the sphere, so depth
+    clips no vertex.
+    """
+    cx, cy, cz = ((min(v[i] for v in vertices) + max(v[i] for v in vertices)) / 2 for i in range(3))
+    radius = max(math.dist(v[:3], (cx, cy, cz)) for v in vertices) or 1.0
+    s = 1.0 / radius
+    world = [[s, 0.0, 0.0, 0.0], [0.0, s, 0.0, 0.0], [0.0, 0.0, s, 0.0], [-cx * s, -cy * s, -cz * s, 1.0]]
+    ya, pa = math.radians(yaw), math.radians(pitch)
+    eye = (distance * math.cos(pa) * math.sin(ya), -distance * math.cos(pa) * math.cos(ya), distance * math.sin(pa))
+    forward = _unit(_sub((0.0, 0.0, 0.0), eye))
+    right = _unit(_cross(forward, (0.0, 0.0, 1.0)))
+    up = _cross(right, forward)
+    view = [[right[i], up[i], forward[i], 0.0] for i in range(3)]
+    view.append([-_dot(eye, right), -_dot(eye, up), -_dot(eye, forward), 1.0])
+    near, far = distance - 1.25, distance + 1.25
+    sy = 1.0 / math.tan(math.radians(fov) / 2)
+    sx = sy * height / width
+    a, b = far / (far - near), -near * far / (far - near)
+    proj = [[sx, 0.0, 0.0, 0.0], [0.0, -sy, 0.0, 0.0], [0.0, 0.0, a, 1.0], [0.0, 0.0, b, 0.0]]
+    viewproj = [row_times(row, proj) for row in view]
+    return [[f32(x) for x in row] for row in world], [[f32(x) for x in row] for row in viewproj]
+
+
+def project(vertices, world, viewproj):
+    """(x/w, y/w, z/w, u, v, w) per vertex: what CAMERA_VS computes, divided into the harness's NDC.
+
+    The trailing w makes uv_at interpolate perspective-correctly. A vertex the draw would clip (w <= 0, or depth
+    outside 0..1) is an error: the prediction does not model clipping.
+    """
+    out = []
+    for x, y, z, u, v in vertices:
+        wx, wy, wz, _ = row_times((x, y, z, 1.0), world)
+        cx, cy, cz, cw = row_times((wx, wy, wz, 1.0), viewproj)
+        if cw <= 0 or not 0.0 <= cz / cw <= 1.0:
+            raise SystemExit(f"vertex {(x, y, z)} is clipped by the camera (clip {cx, cy, cz, cw})")
+        out.append((cx / cw, cy / cw, cz / cw, u, v, cw))
+    return out
+
+
+def vsharp(base: int, size: int) -> list[int]:
+    """A raw buffer V#: 32-bit base address (the heap is below 4 GiB), stride 0, size in bytes, word 3 zero."""
+    return [base, 0, size, 0]
+
+
+def camera_constants(world, viewproj) -> tuple[str, str]:
+    """VKH_SGPRS and VKH_HEAP for CAMERA_VS: the table address in s9, the two V#s in the table, the two matrices."""
+    sgprs = [0] * (CAMERA_TABLE_SGPR + 1)
+    sgprs[CAMERA_TABLE_SGPR] = TABLE_VA
+    heap = {}
+
+    def put(addr, words):
+        for i, word in enumerate(words):
+            heap[addr + 4 * i] = word
+
+    def f32_words(m):
+        return [struct.unpack("<I", struct.pack("<f", x))[0] for row in m for x in row]
+
+    put(TABLE_VA + CAMERA_WORLD_VSHARP, vsharp(WORLD_VA, 0x40))
+    put(TABLE_VA + CAMERA_VIEW_VSHARP, vsharp(VIEW_VA, CAMERA_VIEWPROJ + 0x40))
+    put(WORLD_VA, f32_words(world))
+    put(VIEW_VA + CAMERA_VIEWPROJ, f32_words(viewproj))
+    return (
+        ",".join(str(w) for w in sgprs),
+        ",".join(f"{addr:#x}={word:#x}" for addr, word in sorted(heap.items())),
+    )
 
 
 def write_mesh(path: str, vertices, indices) -> None:
@@ -302,10 +475,21 @@ def sample_rgba_bilinear(
 
 
 def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> dict:
-    """Build the environment variables for vk_harness from a first_light manifest."""
+    """The environment vk_harness draws a first_light manifest with: the mesh and its layout, plus the constants of a
+    --camera draw (VKH_SGPRS and VKH_HEAP) or of a --dds draw (the texture, T#, S# and its pointer SGPR).
+
+    tests/test_first_light.py uses it too. VKH_SGPRS and VKH_HEAP from the caller are dropped first, so a stale value
+    cannot change an orthographic draw.
+    """
     env = dict(os.environ if base_env is None else base_env)
     env["VKH_DRAW_MESH"] = os.path.join(out_dir, manifest["files"]["mesh"])
     env["VKH_VERTEX_LAYOUT"] = "0:3f,1:2f"
+    env.pop("VKH_SGPRS", None)
+    env.pop("VKH_HEAP", None)
+    camera = manifest.get("camera")
+    if camera:
+        env["VKH_SGPRS"] = camera["sgprs"]
+        env["VKH_HEAP"] = camera["heap"]
     tex = manifest.get("texture")
     if tex:
         tex_file = manifest["files"]["texture"]
@@ -343,13 +527,26 @@ def barycentric(px, py, ax, ay, bx, by, cx, cy):
 
 
 def uv_at(vertices, indices, px: int, py: int, width: int, height: int):
-    """The UV the last triangle covering this pixel centre writes (no depth test: the last primitive wins)."""
+    """The UV the last triangle covering this pixel centre writes (no depth test: the last primitive wins).
+
+    Vertices from project() carry clip w as a sixth item; their UV is interpolated perspective-correctly (each
+    screen-space weight divided by its vertex's w, renormalized), as the rasterizer does for a perspective varying.
+    """
     x, y = pixel_ndc(px, py, width, height)
     found = None
     for i in range(0, len(indices), 3):
         a, b, c = (vertices[indices[i + k]] for k in range(3))
         weights = barycentric(x, y, a[0], a[1], b[0], b[1], c[0], c[1])
+        if weights and len(a) > 5:
+            q = (weights[0] / a[5], weights[1] / b[5], weights[2] / c[5])
+            weights = tuple(w / sum(q) for w in q)
         if weights:
+            if not (0 <= a[2] <= 1 and 0 <= b[2] <= 1 and 0 <= c[2] <= 1):
+                # The passthrough VS has w=1. Use the float32 depths written to mesh.bin.
+                za, zb, zc = struct.unpack("<3f", struct.pack("<3f", a[2], b[2], c[2]))
+                z = za + weights[1] * (zb - za) + weights[2] * (zc - za)
+                if not 0 <= z <= 1:
+                    continue
             found = (
                 weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                 weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
@@ -407,6 +604,70 @@ def find_harness(explicit: str | None) -> str:
 
 
 CLEAR = -1.0
+FALLBACK_RGBA = (1.0, 0.0, 1.0, 1.0)
+
+
+def _close(got: float, want: float, tol: float) -> bool:
+    return math.isfinite(got) and abs(got - want) <= tol
+
+
+def _distinguishable_from_fallback(rgba: list[float] | tuple[float, ...], tol: float) -> bool:
+    return any(abs(c - m) > tol for c, m in zip(rgba, FALLBACK_RGBA))
+
+
+def rgba_probes_for_mesh(
+    vertices,
+    indices,
+    width: int,
+    height: int,
+    tw: int,
+    th: int,
+    rgba: bytes,
+    uv_probe_list: list[dict] | None = None,
+    tol: float = 0.02,
+    limit: int = 4,
+) -> list[dict]:
+    """Select covered RGBA probes for textured verification.
+
+    Starts from ``uv_probe_list`` when available; if that is empty (e.g. an off-centre mesh with
+    default (0, 0) UVs), scans covered pixels so textured draws always have at least one covered
+    RGBA probe. Prefers samples whose expected colour differs from the harness's magenta fallback.
+    """
+    candidates = list(uv_probe_list) if uv_probe_list else []
+    if not candidates and vertices:
+        step = max(1, min(width, height) // 16)
+        for py in range(step // 2, height, step):
+            for px in range(step // 2, width, step):
+                uv = uv_at(vertices, indices, px, py, width, height)
+                if uv is not None:
+                    candidates.append(
+                        {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                    )
+        if not candidates:
+            for py in range(height):
+                for px in range(width):
+                    uv = uv_at(vertices, indices, px, py, width, height)
+                    if uv is not None:
+                        candidates.append(
+                            {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                        )
+                        if len(candidates) >= limit * 4:
+                            break
+                if len(candidates) >= limit * 4:
+                    break
+    sampled = [
+        {
+            "pixel": p["pixel"],
+            "uv": p["uv"],
+            "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
+        }
+        for p in candidates
+    ]
+    distinct = [p for p in sampled if _distinguishable_from_fallback(p["rgba"], tol)]
+    pool = distinct if distinct else sampled
+    if len(pool) > limit:
+        pool = [pool[int(i * len(pool) / limit)] for i in range(limit)]
+    return pool
 
 
 def check_image(data: bytes, manifest: dict) -> dict:
@@ -414,13 +675,43 @@ def check_image(data: bytes, manifest: dict) -> dict:
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
+    def check_rgba_shape(values: object, field: str) -> None:
+        if not isinstance(values, (list, tuple)) or len(values) != 4:
+            raise AssertionError(f"{field} must contain exactly four RGBA values")
+
     width, height = manifest["width"], manifest["height"]
+
+    def pixel_offset(point, field: str) -> int:
+        if (
+            not isinstance(point, (list, tuple)) or len(point) != 2
+            or any(type(coord) is not int for coord in point)
+            or not (0 <= point[0] < width and 0 <= point[1] < height)
+        ):
+            raise AssertionError(f"invalid {field} coordinates {point!r} for {width}x{height} image")
+        x, y = point
+        return (y * width + x) * 4
+
     if len(data) != width * height * 16:
         raise AssertionError(
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    clear_val = manifest.get("clear", CLEAR)
+    textured = (
+        manifest.get("texture") is not None
+        or manifest.get("centre_rgba") is not None
+        or manifest.get("rgba_probes") is not None
+    )
+    if textured:
+        # UNORM texels can have any alpha in [0, 1] (including 0.0), so distinguish covered fragments
+        # from the harness clear sentinel (-1.0) instead of testing alpha > 0.5.
+        covered = sum(
+            1
+            for i in range(0, len(pixels), 4)
+            if not all(_close(pixels[i + c], clear_val, 1e-5) for c in range(4))
+        )
+    else:
+        covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
@@ -432,50 +723,69 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
         )
     if (clear := manifest.get("clear_pixel")) is not None:
-        i = (clear[1] * width + clear[0]) * 4
-        want = manifest.get("clear", CLEAR)
-        if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
+        i = pixel_offset(clear, "clear_pixel")
+        if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):
             raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
+                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {clear_val}"
             )
-    if (rgba := manifest.get("centre_rgba")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+    if textured:
         tol = manifest.get("rgba_tolerance", 0.02)
+        expected_rgbas = []
+        if (rgba := manifest.get("centre_rgba")) is not None:
+            expected_rgbas.append(rgba)
+        for probe in manifest.get("rgba_probes") or []:
+            expected_rgbas.append(probe["rgba"])
+        if not expected_rgbas:
+            raise AssertionError(
+                "textured manifest has no covered RGBA samples (centre_rgba or rgba_probes)"
+            )
+        if not any(_distinguishable_from_fallback(r, tol) for r in expected_rgbas):
+            raise AssertionError(
+                f"textured manifest has no expected colour distinguishable from fallback {FALLBACK_RGBA} (tol {tol})"
+            )
+    centre = manifest.get("centre_pixel")
+    if centre is None or centre == []:
+        centre = [width // 2, height // 2]
+    if (rgba := manifest.get("centre_rgba")) is not None:
+        i = pixel_offset(centre, "centre_pixel")
+        tol = manifest.get("rgba_tolerance", 0.02)
+        check_rgba_shape(rgba, "centre_rgba")
         for c, want in enumerate(rgba):
-            if abs(pixels[i + c] - want) > tol:
+            if not _close(pixels[i + c], want, tol):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
                 )
     elif (uv := manifest.get("centre_uv")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+        i = pixel_offset(centre, "centre_pixel")
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
-            if abs(pixels[i + c] - want) > 2e-3:
+            if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
     if (rgba_probes := manifest.get("rgba_probes")) is not None:
         tol = manifest.get("rgba_tolerance", 0.02)
         for probe in rgba_probes:
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
+            i = pixel_offset(probe.get("pixel"), "rgba_probes pixel")
             want_rgba = probe["rgba"]
+            check_rgba_shape(want_rgba, "rgba_probes[].rgba")
             for c, want in enumerate(want_rgba):
-                if abs(pixels[i + c] - want) > tol:
+                if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
-    else:
-        for probe in manifest.get("uv_probes", []):
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
-            u, v = probe["uv"]
-            for c, want in enumerate((u, v, 0.0, 1.0)):
-                if abs(pixels[i + c] - want) > 2e-3:
-                    raise AssertionError(
-                        f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
-                    )
+    uv_probes = manifest.get("uv_probes")
+    if uv_probes is None:
+        uv_probes = []
+    for probe in uv_probes:
+        i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
+        if rgba_probes is not None:
+            continue
+        u, v = probe["uv"]
+        for c, want in enumerate((u, v, 0.0, 1.0)):
+            if not _close(pixels[i + c], want, 2e-3):
+                raise AssertionError(
+                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                )
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
 
@@ -493,12 +803,12 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
+    if manifest.get("vertex_count") == 0 or manifest.get("index_count") == 0:
+        raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
-    if os.path.exists(raw):
-        os.unlink(
-            raw
-        )  # a harness that exits 0 without writing must not pass on a stale file
+    ppm = os.path.join(out_dir, "image.ppm")
+    manifest_path = os.path.join(out_dir, "manifest.json")
     env = harness_env(manifest, out_dir)
     cmd = [
         harness,
@@ -508,6 +818,14 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         str(manifest["width"]),
         str(manifest["height"]),
     ]
+    # A new draw must not reuse an old readback or leave an old success report on failure.
+    for path in (raw, ppm):
+        if os.path.exists(path):
+            os.unlink(path)
+    if "result" in manifest:
+        del manifest["result"]
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f, indent=1)
     subprocess.run(cmd, check=True, env=env)
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
@@ -517,7 +835,6 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         result = check_image(data, manifest)
     except AssertionError as e:
         raise SystemExit(str(e)) from e
-    ppm = os.path.join(out_dir, "image.ppm")
     write_ppm(ppm, result["pixels"], manifest["width"], manifest["height"])
     print(
         f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
@@ -529,7 +846,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     return result
 
@@ -577,7 +894,7 @@ def load_json(
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Draw one real game model with its own translated VS/PS."
+        description="Draw an exported model with translated game shaders. Display its UVs or supply a texture with --dds."
     )
     ap.add_argument("--game", help="the package folder")
     ap.add_argument("--obj", help="an OBJ exported by rpf9dump models")
@@ -588,7 +905,8 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--out", help="output folder (default <work>/first_light/out)")
     ap.add_argument(
-        "--vs", default=DEFAULT_VS, help="vertex shader name in the carve index"
+        "--vs",
+        help=f"vertex shader name in the carve index (default {DEFAULT_VS}, or {CAMERA_VS} with --camera)",
     )
     ap.add_argument(
         "--ps", default=None, help="pixel shader name in the carve index (default untextured, or PS_Copy with --dds)"
@@ -599,13 +917,28 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--height", type=int, default=128)
-    ap.add_argument("--min-coverage", type=float, default=0.5)
+    ap.add_argument(
+        "--min-coverage",
+        type=float,
+        help="the oracle's lowest covered fraction (default 0.5, or 0.2 with --camera: a model in perspective "
+        "fills less of the image)",
+    )
     ap.add_argument(
         "--no-fit",
         action="store_true",
         help="keep the model's coordinates (must already be in NDC)",
     )
     ap.add_argument("--keep-z", action="store_true", help="do not flatten z to 0.5")
+    ap.add_argument(
+        "--camera",
+        action="store_true",
+        help="draw in perspective with CAMERA_VS and a camera's world/view-projection constants",
+    )
+    ap.add_argument("--yaw", type=float, default=30.0, help="--camera: degrees around Z from -Y (default 30)")
+    ap.add_argument(
+        "--pitch", type=float, default=25.0, help="--camera: degrees above the XY plane, -80..80 (default 25)"
+    )
+    ap.add_argument("--fov", type=float, default=50.0, help="--camera: vertical field of view, degrees (default 50)")
     ap.add_argument(
         "--harness",
         help="vk_harness binary (default LEONIDA_VK_HARNESS or runtime/build/linux)",
@@ -624,11 +957,23 @@ def main(argv=None) -> int:
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.camera:
+        if a.vs not in (None, CAMERA_VS):
+            ap.error(f"--camera writes the constant layout of {CAMERA_VS} only")
+        if a.no_fit or a.keep_z:
+            ap.error("--camera keeps the model's coordinates; --no-fit and --keep-z do not apply")
+        if not -80.0 <= a.pitch <= 80.0 or not 1.0 <= a.fov <= 150.0:
+            ap.error("--pitch must be within -80..80 and --fov within 1..150 degrees")
+        if a.dds:
+            ap.error("--camera and --dds both put a pointer in s9 and data at heap VA 0x100; draw the camera untextured")
+    a.vs = a.vs or (CAMERA_VS if a.camera else DEFAULT_VS)
+    if a.min_coverage is None:
+        a.min_coverage = 0.2 if a.camera else 0.5
     work = os.path.abspath(os.path.expanduser(a.work))
     out_dir = (
         os.path.abspath(os.path.expanduser(a.out))
         if a.out
-        else os.path.join(work, "first_light", "out")
+        else os.path.join(work, "first_light", "camera" if a.camera else "out")
     )
 
     if a.list:
@@ -678,10 +1023,32 @@ def main(argv=None) -> int:
     if a.obj:
         with open(a.obj, "rb") as f:
             obj_sha256 = hashlib.sha256(f.read()).hexdigest()
-    if vertices:
+    camera = None
+    if vertices and a.camera:
+        # The mesh keeps the model's coordinates (CAMERA_VS applies the matrices); the prediction below works on
+        # the same vertices projected on the CPU.
+        write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
+        world, viewproj = camera_matrices(vertices, a.width, a.height, a.yaw, a.pitch, a.fov)
+        sgprs, heap = camera_constants(world, viewproj)
+        camera = {
+            "yaw": a.yaw,
+            "pitch": a.pitch,
+            "fov": a.fov,
+            "world": world,
+            "viewproj": viewproj,
+            "sgprs": sgprs,
+            "heap": heap,
+        }
+        vertices = project(vertices, world, viewproj)
+    elif vertices:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
         write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
+    else:  # a run without a model must not draw the mesh an earlier run left in the folder
+        try:
+            os.unlink(os.path.join(out_dir, "mesh.bin"))
+        except FileNotFoundError:
+            pass
     centre_pixel = [a.width // 2, a.height // 2]
     centre_uv = (
         uv_at(vertices, indices, centre_pixel[0], centre_pixel[1], a.width, a.height)
@@ -715,6 +1082,7 @@ def main(argv=None) -> int:
         "clear_pixel": clear,
         "uv_probes": probes,
         "clear": -1.0,
+        "camera": camera,
         "files": {
             "vs": "vs.spv",
             "ps": "ps.spv",
@@ -752,15 +1120,19 @@ def main(argv=None) -> int:
             manifest["centre_rgba"] = sample_rgba_bilinear(
                 tw, th, rgba, centre_uv[0], centre_uv[1]
             )
-        if probes:
-            manifest["rgba_probes"] = [
-                {
-                    "pixel": p["pixel"],
-                    "uv": p["uv"],
-                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
-                }
-                for p in probes
-            ]
+        tex_probes = rgba_probes_for_mesh(
+            vertices,
+            indices,
+            a.width,
+            a.height,
+            tw,
+            th,
+            rgba,
+            uv_probe_list=probes,
+            tol=manifest["rgba_tolerance"],
+        )
+        if tex_probes:
+            manifest["rgba_probes"] = tex_probes
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
@@ -771,6 +1143,7 @@ def main(argv=None) -> int:
             f"run: {env_str} "
             f"<vk_harness> {os.path.join(out_dir, 'vs.spv')} {os.path.join(out_dir, 'ps.spv')} "
             f"{os.path.join(out_dir, 'image.raw')} {a.width} {a.height}"
+            + (" (with VKH_SGPRS and VKH_HEAP from manifest.json's camera)" if camera else "")
         )
         return 0
     run_draw(a, manifest, out_dir)

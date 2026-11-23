@@ -6,6 +6,7 @@
 //      A failed capture fence wait also leaves the caller's outputs untouched.
 //   3. Concurrent present() + VulkanQueue::execute() + add_resource()/remove_resource() follows VulkanContext's
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
+//   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -16,12 +17,12 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 
+#include "vk_presenter_capture_colour.h"
 #include "vk_test_device.h"
 #include "../src/vulkan_present.h"
 
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +59,8 @@ PFN_vkQueuePresentKHR real_present = nullptr;
 PFN_vkWaitForFences real_wait = nullptr;
 PFN_vkCmdPipelineBarrier real_barrier = nullptr;
 PFN_vkCmdCopyImageToBuffer real_copy_i2b = nullptr;
+PFN_vkDestroySwapchainKHR real_destroy_swapchain = nullptr;
+PFN_vkDeviceWaitIdle real_device_wait_idle = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
@@ -66,9 +69,36 @@ std::atomic<bool> observe_capture{false};
 std::atomic<bool> saw_capture_waw{false};
 std::atomic<std::uint32_t> capture_copies{0};
 std::atomic<std::uint32_t> capture_waw_barriers{0};
+std::atomic<bool> check_swapchain_destroy{false};
+std::atomic<bool> destroy_entered{false};
+std::atomic<bool> submit_entered{false};
+std::atomic<bool> overlap_detected{false};
+std::atomic<bool> unexpected_submit_error{false};
+std::mutex destroy_mutex;
+std::condition_variable destroy_cv;
+bool allow_destroy_finish = false;
+
+// Synthetic WSI layer: a destroy hook initiates vkDeviceWaitIdle, as a capture layer may do internally.
+// Holding the hook behind a condition variable makes the concurrency window deterministic rather than dependent
+// on the installed capture software or validation logging overhead. Only the test hook waits on this condition.
+VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice device, VkSwapchainKHR swapchain,
+                                              const VkAllocationCallbacks* alloc) {
+    if (check_swapchain_destroy.load(std::memory_order_relaxed)) {
+        destroy_entered.store(true, std::memory_order_release);
+        destroy_cv.notify_all();
+        {
+            std::unique_lock lock(destroy_mutex);
+            destroy_cv.wait(lock, [] { return allow_destroy_finish; });
+        }
+        overlap_detected.store(submit_entered.load(std::memory_order_acquire), std::memory_order_release);
+        if (real_device_wait_idle(device) != VK_SUCCESS) unexpected_submit_error.store(true);
+    }
+    real_destroy_swapchain(device, swapchain, alloc);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
                                             VkFence fence) {
+    submit_entered.store(true, std::memory_order_release);
     const VkResult armed = fail_next_submit.exchange(VK_SUCCESS);
     if (armed != VK_SUCCESS) return armed;
     return real_submit(queue, count, submits, fence);
@@ -124,6 +154,7 @@ VKAPI_ATTR void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cb, VkImage 
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
+    if (n == "vkDestroySwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(destroy_swapchain);
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
     if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
     if (n == "vkWaitForFences") return reinterpret_cast<PFN_vkVoidFunction>(wait_for_fences);
@@ -140,6 +171,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
 void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
     real_get_instance = instance_proc;
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+    real_destroy_swapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(real_get_device(device, "vkDestroySwapchainKHR"));
+    real_device_wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(real_get_device(device, "vkDeviceWaitIdle"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
     real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
     real_wait = reinterpret_cast<PFN_vkWaitForFences>(real_get_device(device, "vkWaitForFences"));
@@ -304,18 +337,102 @@ int main() {
         EXPECT(driver::capture_waw_barriers.load() == 4);
 
         EXPECT(presenter.read_back(pixels, &ext, &fmt));
-        EXPECT(pixels.size() == std::size_t(ext.width) * ext.height * 4);
-        const std::size_t mid2 = (std::size_t(ext.height / 2) * ext.width + ext.width / 2) * 4;
         const bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
-        const int r = bgra ? pixels[mid2 + 2] : pixels[mid2 + 0];
-        const int g = pixels[mid2 + 1];
-        const int b = bgra ? pixels[mid2 + 0] : pixels[mid2 + 2];
-        EXPECT(std::abs(r - 51) <= 2 && std::abs(g - 153) <= 2 && std::abs(b - 230) <= 2);
-        std::printf("presenter sync: capture-buffer WAW barriers (4/4) and read_back (%d,%d,%d) ok\n", r, g, b);
+        EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
+        std::printf("presenter sync: capture-buffer WAW barriers (4/4) and full-frame read_back ok\n");
+
+        // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
+        //     no submitted Signal, so the queue holds it; the presents are queued behind it instead of blitting the
+        //     back buffers as they were. Three presents queue up and keep their order: a blit, a blank one (reads
+        //     nothing) and a composed one (present_planes), whose frame is the last one shown, so a reordering
+        //     would end on the black frame.
+        {
+            VulkanFence gate(context, 0);
+            EXPECT(gate.semaphore() != VK_NULL_HANDLE);
+            const VkImage plane_img = d.image(VK_FORMAT_R8G8B8A8_UNORM, 32, 32, 1,
+                                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            EXPECT(plane_img != VK_NULL_HANDLE);
+            ResourceBinding plane_rb = side_rb;
+            plane_rb.image = plane_img;
+            plane_rb.sampled = true;
+            context.add_resource(2, plane_rb, VK_IMAGE_LAYOUT_UNDEFINED);
+            CommandList red;
+            EXPECT(red.transition({1, 0, d3d12_state::common, d3d12_state::render_target}));
+            EXPECT(red.clear_render_target({1, 0, 0, 1}, {0.9f, 0.1f, 0.2f, 1.0f}));
+            EXPECT(red.transition({1, 0, d3d12_state::render_target, d3d12_state::common}));
+            EXPECT(red.transition({2, 0, d3d12_state::common, d3d12_state::render_target}));
+            EXPECT(red.clear_render_target({2, 0, 0, 1}, {0.2f, 0.8f, 0.4f, 1.0f}));
+            EXPECT(red.transition({2, 0, d3d12_state::render_target, d3d12_state::pixel_shader_resource}));
+            EXPECT(red.close());
+            const CommandList* ptr = &red;
+            queue.wait(gate.semaphore(), 1);
+            EXPECT(queue.execute({&ptr, 1}) == ReplayResult::success);   // held
+            const auto center = [&](int& cr, int& cg, int& cb) {
+                std::vector<std::uint8_t> shot;
+                VkExtent2D e{};
+                VkFormat f{};
+                if (!presenter.read_back(shot, &e, &f)) return false;
+                const std::size_t at = (std::size_t(e.height / 2) * e.width + e.width / 2) * 4;
+                const bool bgr = (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB);
+                cr = bgr ? shot[at + 2] : shot[at + 0];
+                cg = shot[at + 1];
+                cb = bgr ? shot[at + 0] : shot[at + 2];
+                return true;
+            };
+            const std::uint64_t shown = presenter.presented();
+            PresentPlanes planes;
+            planes.count = 1;
+            planes.plane[0].source = 2;
+            int cr = 0, cg = 0, cb = 0;
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);            // queued: returns at once
+            EXPECT(presenter.present_blank(true) == VK_SUCCESS);         // queued behind the one before it
+            EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);
+            EXPECT(presenter.presented() == shown && !presenter.last_present_tore());
+            EXPECT(center(cr, cg, cb) && std::abs(cr - 51) <= 2 && std::abs(cg - 153) <= 2 && std::abs(cb - 230) <= 2);
+            EXPECT(gate.signal(1));   // releases the render, then the presents, in order, on this thread
+            EXPECT(queue.idle());
+            EXPECT(presenter.presented() == shown + 3 && presenter.composed_presents() >= 1);
+            // The composed frame (0.2, 0.8, 0.4 in the plane) is the last one shown; a blank last would be black.
+            EXPECT(center(cr, cg, cb) && std::abs(cr - 51) <= 12 && std::abs(cg - 204) <= 12 && std::abs(cb - 102) <= 12);
+            // The blit alone, with nothing held, is the plain path again and shows the red the render drew.
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);
+            EXPECT(center(cr, cg, cb) && std::abs(cr - 230) <= 2 && std::abs(cg - 26) <= 2 && std::abs(cb - 51) <= 2);
+            std::printf("presenter sync: three Presents queued behind held work ran in order (%d,%d,%d)\n", cr, cg, cb);
+            context.remove_resource(2);
+        }
+
+        // 2c. A queue destroyed with held work lets the Presents queued behind it run (the work is dropped).
+        {
+            VulkanFence never(context, 0);
+            EXPECT(never.semaphore() != VK_NULL_HANDLE);
+            CommandList noop;
+            EXPECT(noop.transition({1, 0, d3d12_state::common, d3d12_state::render_target}));
+            EXPECT(noop.clear_render_target({1, 0, 0, 1}, {0.0f, 0.0f, 0.0f, 1.0f}));  // never replayed
+            EXPECT(noop.transition({1, 0, d3d12_state::render_target, d3d12_state::common}));
+            EXPECT(noop.close());
+            const CommandList* ptr = &noop;
+            const std::uint64_t shown = presenter.presented();
+            {
+                VulkanQueue doomed(context, d.queue, d.family);
+                EXPECT(doomed.ok());
+                doomed.wait(never.semaphore(), 1);
+                EXPECT(doomed.execute({&ptr, 1}) == ReplayResult::success);   // held for good
+                EXPECT(presenter.present(1, true) == VK_SUCCESS);             // queued behind it
+                EXPECT(presenter.presented() == shown);
+            }
+            EXPECT(presenter.presented() == shown + 1);
+            std::printf("presenter sync: Present queued behind a destroyed queue's held work ran\n");
+        }
 
         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
         std::atomic<bool> stop{false};
         std::atomic<bool> worker_failed{false};
+        // The worker is paced: VulkanQueue::execute() has no back-pressure (it allocates a new command buffer whenever
+        // none has finished), so an unthrottled loop queues thousands of submissions on the shared VkQueue and
+        // present()'s frame fence is signalled only after all of them drain, while the worker keeps contending for
+        // submit_mutex_ and tracker_mutex_ at full CPU. A slow GPU (an iGPU, or several processes sharing one) then
+        // leaves present() stuck for tens of seconds. Draining every few rounds keeps the interleaving, not the backlog.
+        constexpr std::uint64_t drain_every = 8;
         std::thread worker([&] {
             std::uint64_t round = 0;
             while (!stop.load(std::memory_order_relaxed)) {
@@ -334,7 +451,10 @@ int main() {
                 }
                 (void)context.layout(base, 0);
                 for (ResourceId i = 0; i < 32; ++i) context.remove_resource(base + i);
-                ++round;
+                if (++round % drain_every == 0 && !worker_queue.idle()) {
+                    worker_failed.store(true);
+                    break;
+                }
             }
         });
 
@@ -350,6 +470,59 @@ int main() {
         EXPECT(!worker_failed.load());
         EXPECT(queue.idle() && worker_queue.idle());
         std::printf("presenter sync: concurrent present + queue.execute + tracker mutations ok\n");
+
+        // 4. Emulate a WSI capture layer that performs device-idle inside vkDestroySwapchainKHR.
+        // The presenter first enters the destroy hook; a second thread then attempts a real queue submission.
+        // Once the hook is released, that submission must not have entered the Vulkan driver while the hook ran.
+        driver::destroy_entered.store(false);
+        driver::submit_entered.store(false);
+        driver::overlap_detected.store(false);
+        driver::unexpected_submit_error.store(false);
+        {
+            std::lock_guard lock(driver::destroy_mutex);
+            driver::allow_destroy_finish = false;
+        }
+        driver::check_swapchain_destroy.store(true);
+        VkResult recreated = VK_ERROR_UNKNOWN;
+        std::thread destroy_thread([&] { recreated = presenter.present(1, true); });
+        bool entered = false;
+        {
+            std::unique_lock lock(driver::destroy_mutex);
+            entered = driver::destroy_cv.wait_for(lock, std::chrono::seconds(5),
+                                                  [] { return driver::destroy_entered.load(); });
+        }
+        std::atomic<bool> submit_started{false};
+        ReplayResult submit_result = ReplayResult::unsupported;
+        std::thread submit_thread;
+        if (entered) {
+            submit_thread = std::thread([&] {
+                submit_started.store(true);
+                CommandList list;
+                if (!list.clear_render_target({1, 0, 0, 1}, {0.3f, 0.2f, 0.1f, 1.0f}) || !list.close()) return;
+                const CommandList* ptr = &list;
+                submit_result = worker_queue.execute({&ptr, 1});
+            });
+            for (int attempt = 0; attempt < 100 && !submit_started.load(); ++attempt)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Give the competing thread time to reach the submit point if no mutex is protecting destruction.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        {
+            std::lock_guard lock(driver::destroy_mutex);
+            driver::allow_destroy_finish = true;
+        }
+        driver::destroy_cv.notify_all();
+        destroy_thread.join();
+        if (submit_thread.joinable()) submit_thread.join();
+        driver::check_swapchain_destroy.store(false);
+        EXPECT(entered);
+        EXPECT(recreated == VK_SUCCESS);
+        EXPECT(submit_started.load());
+        EXPECT(submit_result == ReplayResult::success);
+        EXPECT(!driver::overlap_detected.load());
+        EXPECT(!driver::unexpected_submit_error.load());
+        EXPECT(queue.idle() && worker_queue.idle());
+        std::printf("presenter sync: synthetic WSI device-idle during swapchain destruction serialized ok\n");
     }
 
     DestroyWindow(window);

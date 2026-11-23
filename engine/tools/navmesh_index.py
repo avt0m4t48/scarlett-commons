@@ -228,6 +228,9 @@ def _publish(dest, write, newline):
     except BaseException:
         if temp is not None:
             with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it deletable
+                # first, or Windows strands it beside the report when the replace fails.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
 
@@ -270,11 +273,13 @@ def offset(text):
 
 
 def is_scanned_input(path, input_path, pattern):
-    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    """True when a report path would replace the carve manifest or a scanned input."""
     if same_report_path(path, input_path):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    if same_report_path(path, os.path.join(input_path, "index.json")):
+        return True
     pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
@@ -314,8 +319,13 @@ def main() -> int:
     if a.csv and same_report_path(out_path, a.csv):
         ap.error("--out and --csv must refer to different files")
     for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and os.path.isdir(path):     # open() on a folder ends the run in a PermissionError traceback
+            ap.error(f"{flag} is a directory: {path}")
         if path and is_scanned_input(path, a.input, a.pattern):
             ap.error(f"{flag} would overwrite the input {path}")
+    if not os.path.exists(a.input):
+        print(f"ERROR: {a.input}: does not exist", file=sys.stderr)
+        return 2
     below_normal()
 
     if is_dir:

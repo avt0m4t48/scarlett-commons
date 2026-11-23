@@ -6,18 +6,21 @@
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
 // each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplug/replug, reading history,
-// and identification of two or three otherwise indistinguishable pads. No game data.
+// identification of two or three otherwise indistinguishable pads, and which kind of device was used last
+// (active_input, LEONIDA_PROMPTS). No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gameinput.h"
@@ -241,6 +244,20 @@ GameInputMotionState motion_state(IGameInput* input, IGameInputDevice* dev, bool
     return ms;
 }
 
+struct MotionReadings {
+    IGameInputDevice* gyro;
+    IGameInputDevice* plain;
+    int gyro_calls, plain_calls;
+};
+void CALLBACK on_motion_reading(GameInputCallbackToken, void* context, IGameInputReading* reading, bool) {
+    auto* seen = static_cast<MotionReadings*>(context);
+    IGameInputDevice* dev = nullptr;
+    if (reading) reading->GetDevice(&dev);
+    if (dev == seen->gyro) ++seen->gyro_calls;
+    if (dev == seen->plain) ++seen->plain_calls;
+    if (dev) dev->Release();
+}
+
 // ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
 
 using rt::gameinput::RawReportSize;
@@ -299,11 +316,16 @@ struct FakeRawHid {
     std::vector<std::vector<uint8_t>> writes, features_sent;
     std::vector<uint8_t> feature_reply;
     bool fail = false;
+    HANDLE in_open = nullptr, release_open = nullptr;
 };
 FakeRawHid g_raw;
 void* raw_open(const char*, uint16_t vendor, uint16_t product) {
     if (vendor != g_raw.vendor || product != g_raw.product) return nullptr;
     ++g_raw.opens;
+    if (g_raw.release_open) {
+        SetEvent(g_raw.in_open);
+        WaitForSingleObject(g_raw.release_open, 5000);
+    }
     return &g_raw;
 }
 void raw_close(void*) { ++g_raw.closes; }
@@ -343,6 +365,14 @@ std::vector<uint8_t> raw_bytes(IGameInputRawDeviceReport* r) {
     std::vector<uint8_t> v(r ? r->GetRawDataSize() : 0);
     if (r) r->GetRawData(v.size(), v.data());
     return v;
+}
+
+// RT-262: the poll thread takes a reference on a force-feedback effect only while it is alive.
+void test_add_ref_if_live() {
+    std::atomic<unsigned long> live{1}, dying{0};
+    check(rt::gameinput::add_ref_if_live(live) && live.load() == 2, "add_ref_if_live: a live count goes up by one");
+    check(!rt::gameinput::add_ref_if_live(dying) && dying.load() == 0,
+          "add_ref_if_live: a count of 0 stays 0, so an effect being destroyed isn't revived");
 }
 
 void test_raw_hid(IGameInput* input) {
@@ -456,6 +486,64 @@ void test_raw_hid(IGameInput* input) {
     rt::gameinput::set_hid_backend(nullptr);
 }
 
+void test_raw_report_during_reconnect(IGameInput* input) {
+    rt::gameinput::set_hid_backend(&kFakeRawHid);
+    Pad raw_pad;
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    rt::gameinput::poll();
+    g_raw.inputs.push_back({0x01, 0x44, 0x55, 0x66});
+    rt::gameinput::poll();
+    IGameInputReading* held = nullptr;
+    check(input->GetCurrentReading(GameInputKindRawDeviceReport, nullptr, &held) == S_OK && held,
+          "raw hid reconnect: a reading with a raw report to hold");
+    detach(raw_pad);
+    rt::gameinput::poll();
+    if (!held) {
+        rt::gameinput::set_hid_backend(nullptr);
+        return;
+    }
+
+    g_raw.in_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_raw.release_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE read_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    std::thread poller([] { rt::gameinput::poll(); });
+    const bool in_open = WaitForSingleObject(g_raw.in_open, 5000) == WAIT_OBJECT_0;
+    bool got = false;
+    void* report = nullptr;
+    std::thread reader([&] {
+        got = held->GetRawReport(&report);
+        SetEvent(read_done);
+    });
+    const bool waited = WaitForSingleObject(read_done, 200) == WAIT_TIMEOUT;
+    SetEvent(g_raw.release_open);
+    poller.join();
+    const bool finished = WaitForSingleObject(read_done, 5000) == WAIT_OBJECT_0;
+    reader.join();
+    check(in_open && waited, "raw hid reconnect: GetRawReport waits while open_raw rebuilds the report tables");
+    auto* rr = static_cast<IGameInputRawDeviceReport*>(report);
+    check(finished && got && rr && raw_bytes(rr) == std::vector<uint8_t>({0x44, 0x55, 0x66}),
+          "raw hid reconnect: then it gives the held reading's report");
+    if (rr) rr->Release();
+    IGameInputDevice* dev = nullptr;
+    held->GetDevice(&dev);
+    void* created = nullptr;
+    check(dev && (dev->GetDeviceStatus() & GameInputDeviceRawIoEnabled) &&
+              dev->CreateRawDeviceReport(2, GameInputRawOutputReport, &created) == S_OK && created,
+          "raw hid reconnect: and the reconnected pad has raw I/O again");
+    if (created) static_cast<IGameInputRawDeviceReport*>(created)->Release();
+    if (dev) dev->Release();
+    held->Release();
+
+    CloseHandle(read_done);
+    CloseHandle(g_raw.in_open);
+    CloseHandle(g_raw.release_open);
+    g_raw.in_open = g_raw.release_open = nullptr;
+    detach(raw_pad);
+    rt::gameinput::poll();
+    rt::gameinput::set_hid_backend(nullptr);
+}
+
 void test_motion(IGameInput* input) {
     const size_t events_before = g_device_events.size();  // other tests' events are still queued in the vector
     Pad gyro_pad, plain;
@@ -557,6 +645,19 @@ void test_motion(IGameInput* input) {
         next->Release();
     }
     if (first) first->Release();
+
+    MotionReadings seen{mdev, pdev, 0, 0};
+    GameInputCallbackToken motion_token = 0;
+    check(input->RegisterReadingCallback(nullptr, GameInputKindMotion, 0.0f, &seen, on_motion_reading, &motion_token) == S_OK,
+          "motion: RegisterReadingCallback(GameInputKindMotion)");
+    for (int i = 0; i < 4; ++i) {
+        SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        rt::gameinput::poll();
+    }
+    input->UnregisterCallback(motion_token, 0);
+    check(seen.gyro_calls > 0 && seen.plain_calls == 0,
+          "motion: a Motion reading callback fires for the gyro pad's readings, not for the plain pad's");
 
     detach(gyro_pad);
     detach(plain);
@@ -794,6 +895,156 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::set_cursor_source(nullptr);
 }
 
+// active_input(): which kind of device the player used last. Virtual pads with a DualSense, a DualShock 4 and an Xbox
+// pad's vendor and product id (SDL takes the gamepad type from them) plus the keyboard pad; first with no wait
+// between changes (LEONIDA_PROMPTS_SWITCH_MS=0), then with the default 300 ms window on the real clock, then a family
+// forced by LEONIDA_PROMPTS.
+void test_active_input() {
+    using leonida::InputFamily;
+    const auto family = [] { return rt::gameinput::active_input().family; };
+    const auto generation = [] { return rt::gameinput::active_input().generation; };
+
+    set_env("LEONIDA_PROMPTS", nullptr);
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", "0");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(!rt::gameinput::active_input().forced, "active input: not forced without LEONIDA_PROMPTS");
+
+    Pad ds, ds4, xbox;
+    attach(ds, "Leonida virtual DualSense", 0x054C, 0x0CE6, false);
+    attach(ds4, "Leonida virtual DualShock 4", 0x054C, 0x09CC, false);
+    attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_SOUTH, true);  // held while it connects
+    const uint64_t at_connect = generation();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 3, "active input: three pads open");
+    check(generation() == at_connect, "active input: connecting pads (one with a button held) changes nothing");
+
+    auto press = [](Pad& p, SDL_GamepadButton b) {
+        SDL_SetJoystickVirtualButton(p.js, b, true);
+        rt::gameinput::poll();
+        SDL_SetJoystickVirtualButton(p.js, b, false);
+        rt::gameinput::poll();
+    };
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_SOUTH, false);  // the held button, let go
+    rt::gameinput::poll();
+    check(generation() == at_connect, "active input: letting go of a button is not input");
+
+    // The tests before this one leave whichever pad they used last; an Xbox press makes the start known.
+    press(xbox, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Xbox, "active input: the Xbox pad in use");
+    const uint64_t g0 = generation();
+
+    press(ds, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 1, "active input: DualSense press");
+    press(ds4, SDL_GAMEPAD_BUTTON_EAST);
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 2, "active input: DualShock 4 press");
+
+    // Stick drift on the Xbox pad (0.18) is not input; the stick pushed over is.
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 6000);
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 2, "active input: stick drift changes nothing");
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 32767);
+    rt::gameinput::poll();
+    check(family() == InputFamily::Xbox && generation() == g0 + 3, "active input: Xbox stick pushed over");
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 0);
+    rt::gameinput::poll();
+
+    // Buttons GameInput's gamepad state leaves out count too: the DualSense touchpad.
+    press(ds, SDL_GAMEPAD_BUTTON_TOUCHPAD);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 4, "active input: DualSense touchpad click");
+    // A trigger pulled on the DualShock 4.
+    SDL_SetJoystickVirtualAxis(ds4.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 32767);
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 5, "active input: DualShock 4 trigger pull");
+    SDL_SetJoystickVirtualAxis(ds4.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+    rt::gameinput::poll();
+
+    // The keyboard pad: a key, and the mouse through the keyboard pad's right stick.
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
+    std::memset(g_keys, 0, sizeof g_keys);
+    g_cursor_x = g_cursor_y = 0;
+    set_env("LEONIDA_KEYBOARD_PAD", "always");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();  // attaches the keyboard pad
+    rt::gameinput::poll();  // opens it: its first sample is the baseline
+    check(rt::gameinput::connected_count() == 4 && generation() == g0 + 5,
+          "active input: the keyboard pad connecting changes nothing");
+    g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    g_keys[VK_RETURN] = false;
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && generation() == g0 + 6, "active input: Enter on the keyboard pad");
+    press(xbox, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Xbox && generation() == g0 + 7, "active input: back to the Xbox pad");
+    g_cursor_x += 1;  // a 1-count jitter stays well inside the stick radius
+    rt::gameinput::poll();
+    check(family() == InputFamily::Xbox, "active input: mouse jitter changes nothing");
+    g_cursor_x += 20;  // a real movement pushes the right stick past the radius
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && generation() == g0 + 8, "active input: mouse movement");
+    for (int i = 0; i < 80; ++i) rt::gameinput::poll();  // the stick falls back to rest
+
+    // The default window on the real clock: a second change within 300 ms of the last is ignored.
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().prompts_switch_ms == 300, "active input: 300 ms by default");
+    Sleep(350);
+    press(ds, SDL_GAMEPAD_BUTTON_NORTH);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 9, "active input: DualSense after the window");
+    press(xbox, SDL_GAMEPAD_BUTTON_WEST);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 9,
+          "active input: an Xbox press right after a change is ignored");
+    Sleep(350);
+    press(xbox, SDL_GAMEPAD_BUTTON_WEST);
+    check(family() == InputFamily::Xbox && generation() == g0 + 10,
+          "active input: the Xbox press once the window passed");
+
+    // LEONIDA_PROMPTS forces a family; tracking goes on underneath and takes over again when it is cleared.
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", "0");
+    set_env("LEONIDA_PROMPTS", "keyboard");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && rt::gameinput::active_input().forced && generation() == g0 + 11,
+          "active input: LEONIDA_PROMPTS=keyboard");
+    press(ds, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Keyboard && generation() == g0 + 11,
+          "active input: forced, a DualSense press shows nothing");
+    set_env("LEONIDA_PROMPTS", "PlayStation");  // case does not matter
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation5 && rt::gameinput::active_input().forced && generation() == g0 + 12,
+          "active input: LEONIDA_PROMPTS=PlayStation (any case) is PlayStation 5");
+    set_env("LEONIDA_PROMPTS", "ps4");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 13, "active input: LEONIDA_PROMPTS=ps4");
+    set_env("LEONIDA_PROMPTS", "nonsense");  // warns and follows the devices
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(!rt::gameinput::active_input().forced && family() == InputFamily::PlayStation5 && generation() == g0 + 14,
+          "active input: an unknown LEONIDA_PROMPTS follows the devices (the DualSense pressed while forced)");
+    set_env("LEONIDA_PROMPTS", "playstation");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation5 && rt::gameinput::active_input().forced && generation() == g0 + 14,
+          "active input: forcing the family already in use changes no generation");
+
+    // Clean up: everything off and unplugged.
+    set_env("LEONIDA_PROMPTS", nullptr);
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    detach(ds);
+    detach(ds4);
+    detach(xbox);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "active input: all pads closed at the end");
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
+}
+
 bool same_id(const AppLocalDeviceId& a, const AppLocalDeviceId& b) { return std::memcmp(&a, &b, sizeof a) == 0; }
 
 // The id the shim derives from SDL: the GUID, then two FNV-1a hashes of "s:" serial, "p:" path or nothing, with
@@ -998,6 +1249,7 @@ struct FakeHaptic {
                         SDL_HAPTIC_SAWTOOTHUP | SDL_HAPTIC_SAWTOOTHDOWN | SDL_HAPTIC_RAMP | SDL_HAPTIC_SPRING |
                         SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER | SDL_HAPTIC_INERTIA;
     int max_effects = 8;
+    int create_result = 1;  // what create returns; negative is SDL refusing the effect
     int opens = 0, closes = 0, creates = 0, updates = 0, runs = 0, stops = 0, destroys = 0;
     int gain_calls = 0, last_gain = -1;
     uint32_t last_iterations = 0;
@@ -1017,8 +1269,12 @@ int fake_max_effects(void* h) { return static_cast<FakeHaptic*>(h)->max_effects;
 int fake_create(void* h, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
     ++f->creates;
+    if (f->create_result < 0) {
+        SDL_SetError("fake: refused");
+        return -1;
+    }
     f->last = *static_cast<const SDL_HapticEffect*>(e);
-    return 1;
+    return f->create_result;
 }
 bool fake_update(void* h, int, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
@@ -1114,12 +1370,31 @@ void test_force_feedback(IGameInput* input) {
     const int runs0 = g_fake.runs;
     rt::gameinput::poll();
     check(g_fake.creates == 1 && g_fake.runs == runs0 + 1, "force feedback: the poll thread creates and runs the effect");
+    rt::gameinput::OutputState sent{};
+    check(rt::gameinput::output_state(0, &sent) && sent.effect_id == 1 && sent.effect_ran && !sent.effect_error[0],
+          "force feedback: the output state reports the effect SDL created and is running");
     check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
           "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
     check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
           "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
     rt::gameinput::poll();
     check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
+
+    // SDL refusing an effect is visible, not swallowed: the output state carries the failure and SDL's error.
+    g_fake.create_result = -1;
+    IGameInputForceFeedbackEffect* refused = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&refused)) == S_OK && refused,
+          "force feedback: GameInput accepts an effect SDL will refuse");
+    if (refused) {
+        rt::gameinput::poll();
+        rt::gameinput::OutputState refused_out{};
+        check(rt::gameinput::output_state(0, &refused_out) && refused_out.effect_id < 0 && !refused_out.effect_ran &&
+                  std::strstr(refused_out.effect_error, "fake: refused"),
+              "force feedback: SDL refusing the effect is recorded with its error");
+        refused->Release();
+        rt::gameinput::poll();  // the released effect leaves the device
+    }
+    g_fake.create_result = 1;
 
     params.data.constant.magnitude.linearX = -1.0f;
     check(effect->SetParams(&params), "force feedback: SetParams");
@@ -1208,6 +1483,28 @@ void test_force_feedback(IGameInput* input) {
     check(effect->Release() == 0, "force feedback: the effect is freed once the title releases it");
     rt::gameinput::poll();
     check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
+
+    // RT-262: the title releases effects while the poll thread applies them. The poll thread used to AddRef an effect
+    // whose count had already reached 0 (its destructor waiting for the lock), use it after it was freed, and free it
+    // a second time with its own Release.
+    {
+        std::atomic<bool> stop{false};
+        std::thread poller([&] {
+            while (!stop.load()) rt::gameinput::poll();
+        });
+        int created = 0;
+        for (int i = 0; i < 20000; ++i) {
+            IGameInputForceFeedbackEffect* e = nullptr;
+            if (dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&e)) == S_OK && e) {
+                ++created;
+                e->Release();
+            }
+        }
+        stop = true;
+        poller.join();
+        rt::gameinput::poll();
+        check(created == 20000, "force feedback: 20,000 effects created and released while the poll thread runs");
+    }
 
     detach(wheel);
     rt::gameinput::poll();
@@ -1319,6 +1616,7 @@ int main() {
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);
+    test_add_ref_if_live();
 
     auto create = reinterpret_cast<GameInputCreateFn>(rt::shims::find("gameinput.dll", "GameInputCreate"));
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");
@@ -1815,6 +2113,7 @@ int main() {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
 
+    test_active_input();
     test_twins(input);
     test_keyboard_pad(input);
     test_motion(input);
@@ -1822,6 +2121,7 @@ int main() {
     test_force_feedback(input);
     test_haptic_motors(input);
     test_raw_hid(input);
+    test_raw_report_during_reconnect(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

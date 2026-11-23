@@ -60,32 +60,19 @@ MUTATIONS = [
      'self.emit(f"{sub} = OpISub %int {self.as_int(self.cu(30))} {f}")',
      "test_ps_ops3"),
     ("v_pk_lshlrev_b16 reads low shift amount for both halves", TRANSLATOR,
-     'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")',
-     'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")',
+     'self.emit(f"{half} = OpShiftRightLogical %uint {sh_src} {self.cu(16)}")',
+     'self.emit(f"{half} = OpShiftRightLogical %uint {sh_src} {self.cu(0)}")',
      "test_ps_ops4"),
     ("v_sin/v_cos omits turns-to-radians 2*pi factor", TRANSLATOR,
      'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")',
      'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
-     '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
-     '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
-     '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
-     '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
-     '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
+     # since SHADER-340 v_mul_legacy_f32 flushes its inputs and product; the guard is the OpSelect on either zero
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpSelect %float {either} %f0 {m}")',
-     '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
-     '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
-     '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
-     '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
-     '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
+     '            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")',
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpCopyObject %float {m}")',
+     '            self.emit(f"{r} = OpCopyObject %float {self.flush_f32(m)}")',
      "test_ps_legacy_mul"),
 ]
 

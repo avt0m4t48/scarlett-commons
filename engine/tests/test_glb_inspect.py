@@ -15,6 +15,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "glb_inspect.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import glb_inspect  # noqa: E402
 
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
@@ -285,6 +287,23 @@ class GlbInspectTests(unittest.TestCase):
         duplicate = raw_glb([(JSON_CHUNK, payload), (JSON_CHUNK, payload)])
         self.assert_error(duplicate, "duplicate JSON chunk")
 
+    def test_parse_only_copies_the_json_payload(self):
+        metadata = json_bytes({"asset": {"version": "2.0"}, "buffers": [{"byteLength": 3}]})
+        json_end = glb_inspect.GLB_HEADER_SIZE + glb_inspect.CHUNK_HEADER_SIZE + len(metadata)
+
+        class MetadataOnlyBytes(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice) and (key.stop is None or key.stop > json_end):
+                    raise AssertionError("copied payload outside the JSON chunk")
+                return super().__getitem__(key)
+
+        data = MetadataOnlyBytes(raw_glb([
+            (JSON_CHUNK, metadata), (BIN_CHUNK, b"abc\x00"), (EXT_CHUNK, b"TEST"),
+        ]))
+        chunks = glb_inspect.parse_glb(data)["chunks"]
+        self.assertEqual(chunks[1]["padding"], 1)
+        self.assertEqual(chunks[2]["byte_length"], 4)
+
     def test_chunk_and_header_lengths_must_be_4_byte_aligned(self):
         payload = b'{"asset":{"version":"2.0"}}'
         self.assertEqual(len(payload) % 4, 3)
@@ -300,7 +319,7 @@ class GlbInspectTests(unittest.TestCase):
     def test_nul_padding_is_accepted_and_counted(self):
         payload = b'{"asset":{"version":"2.0"}}' + b"\x00"
         with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "nul.glb")
+            path = os.path.join(folder, "nul_padding.glb")
             out = os.path.join(folder, "report.json")
             with open(path, "wb") as handle:
                 handle.write(raw_glb([(JSON_CHUNK, payload)]))
@@ -555,6 +574,133 @@ class GlbInspectTests(unittest.TestCase):
             issues = report["animations"][0]["issues"]
             self.assertTrue(any("input accessor type is VEC3, expected SCALAR" in issue for issue in issues))
             self.assertTrue(any("path 'translation' expects VEC3 output, got VEC4" in issue for issue in issues))
+
+    def test_non_object_sampler_is_an_issue_not_a_crash(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["samplers"] = [7]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "sampler.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("issue: sampler[0] is not an object", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["issues"], ["sampler[0] is not an object"])
+            self.assertIsNone(animation["samplers"][0]["output_type"])
+
+    def test_oversized_integer_max_reports_no_duration_instead_of_crashing(self):
+        gltf = animated_gltf()
+        gltf["accessors"][2]["max"] = [10 ** 400]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "huge.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("duration=(missing)", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertIsNone(animation["duration"])
+            self.assertIsNone(animation["samplers"][0]["duration"])
+
+    def test_zero_keyframes_has_no_duration(self):
+        gltf = animated_gltf()
+        gltf["accessors"][2]["count"] = 0
+        gltf["accessors"][3]["count"] = 0
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "empty_keys.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("duration=(missing)", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertIsNone(animation["duration"])
+            self.assertEqual(animation["issues"], ["sampler[0] input accessor has no keyframes"])
+
+    def test_non_string_interpolation_is_unknown_not_linear(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["samplers"][0]["interpolation"] = 5
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "interpolation.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("interpolation: none", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["interpolations"], [])
+            self.assertIsNone(animation["samplers"][0]["interpolation"])
+            self.assertEqual(animation["issues"], ["sampler[0] has unknown interpolation 5"])
+
+    def test_wrong_typed_arrays_and_channels_are_reported(self):
+        gltf = {
+            "asset": {"version": "2.0"},
+            "scenes": {}, "nodes": 5, "meshes": "x", "materials": {},
+            "images": 3, "skins": {}, "animations": {}, "accessors": {},
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "types.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("invalid types: scenes=dict nodes=int meshes=str", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["invalid_types"], {
+                "scenes": "dict", "nodes": "int", "meshes": "str", "materials": "dict",
+                "images": "int", "skins": "dict", "animations": "dict", "accessors": "dict",
+            })
+
+            animated = animated_gltf()
+            animated["animations"][0]["channels"] = {}
+            with open(path, "wb") as handle:
+                handle.write(glb(animated, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["channel_count"], 0)
+            self.assertIn("animation channels is not an array", animation["issues"])
+
+    def test_cubic_spline_output_count_is_validated(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["samplers"][0]["interpolation"] = "CUBICSPLINE"
+        gltf["accessors"][3]["count"] = 6
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "cubic.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["interpolations"], ["CUBICSPLINE"])
+            self.assertEqual(animation["samplers"][0]["output_count"], 6)
+            self.assertEqual(animation["issues"], [])
+
+            gltf["accessors"][3]["count"] = 5
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                issues = json.load(handle)["animations"][0]["issues"]
+            self.assertTrue(any("has 5 output values for 2 keys with CUBICSPLINE interpolation" in issue
+                                for issue in issues))
 
 
 if __name__ == "__main__":

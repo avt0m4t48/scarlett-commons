@@ -19,7 +19,12 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD_PY = os.path.join(ROOT, "runtime", "test", "shaders", "build.py")
+SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
+BUILD_PY = os.path.join(SHADER_DIR, "build.py")
+sys.path.insert(0, SHADER_DIR)
+from check import EXE, pick_build_dir  # noqa: E402
+
+COMPUTE_TEST = "vk_compute_test" + EXE
 CONFIGS = [("AMD native", "*amd*,*radeon*", False), ("AMD --wave64-emulate", "*amd*,*radeon*", True),
            ("NVIDIA --wave64-emulate", "*nv*", True)]
 
@@ -36,20 +41,21 @@ def build(work, name, emulate, llvm_mc):
     return os.path.join(out, "spirv", name + ".spv")
 
 
-def segments(spv):
-    """(segments, continuation segments) of an emulated module: the cases of the scheduler's OpSwitch."""
-    text = open(spv[:-4] + ".spvasm", encoding="utf-8").read()
-    m = re.search(r"OpSwitch %pcv %sw_default ([^\n]+)", text)
-    if not m:
+def segments(spv: str) -> tuple[int, int] | None:
+    """Count scheduler cases and continuations, including inner switches in a partitioned dispatch."""
+    with open(spv[:-4] + ".spvasm", encoding="utf-8") as source:
+        text = source.read()
+    tables = re.findall(r"^[ \t]*OpSwitch %pcv %(?:sw_default|swm\d+) ([^\n]+)", text, re.MULTILINE)
+    if not tables:
         return None
-    cases = [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
+    cases = sorted(int(case) for table in tables for case in re.findall(r"(\d+) %blk\d+", table))
     blocks = next((i for i, c in enumerate(cases) if c != i), len(cases))   # blocks 0..n-1, then "done" = n, then segments
     return len(cases), len(cases) - blocks
 
 
 def run(tools, spv, groups, reps, driver, emulate):
     env = dict(os.environ, VK_LOADER_DRIVERS_SELECT=driver, VKC_BENCH=str(reps))
-    args = [os.path.join(tools, "vk_compute_test" + (".exe" if os.name == "nt" else "")), spv, str(groups), "dump"]
+    args = [os.path.join(tools, COMPUTE_TEST), spv, str(groups), "dump"]
     if not emulate:
         args.append("--require-wave64")
     try:
@@ -75,13 +81,16 @@ def positive_int(text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
+                    help="CMake build directory or a configuration directory such as RelWithDebInfo")
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
-    ap.add_argument("--groups", type=positive_int, default=65536)
+    # Vulkan guarantees support for at least 65,535 groups along X in one dispatch.
+    ap.add_argument("--groups", type=positive_int, default=65535)
     ap.add_argument("--reps", type=positive_int, default=30)
     ap.add_argument("--procs", type=positive_int, default=5)
     ap.add_argument("--shader", default="cs_bench_mix")
     a = ap.parse_args()
+    tools = pick_build_dir(a.build, (COMPUTE_TEST,))
     with tempfile.TemporaryDirectory(prefix="bench-w64-") as work:
         spv = {False: build(work, a.shader, False, a.llvm_mc), True: build(work, a.shader, True, a.llvm_mc)}
         seg = segments(spv[True])
@@ -92,7 +101,7 @@ def main():
         for name, driver, emulate in CONFIGS:
             med, mins, seen, dev = [], [], set(), None
             for _ in range(a.procs):
-                t, h, dev = run(a.build, spv[emulate], a.groups, a.reps, driver, emulate)
+                t, h, dev = run(tools, spv[emulate], a.groups, a.reps, driver, emulate)
                 if t is None:
                     med = None
                     print(f"{name}: failed or unsupported: {h}")

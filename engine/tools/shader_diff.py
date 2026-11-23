@@ -16,8 +16,8 @@ Usage:
 
 Exit code is 0 when every program matches, 1 on the first mismatch (with the
 case name, seed, lane, register, expected/actual bits and the RDNA2
-instruction that last wrote the value), 2 on harness errors. Skips are
-counted with reasons and never silent.
+instruction that last wrote the value), 2 on harness errors or when every
+program was skipped (nothing was compared). Skips are counted with reasons and never silent.
 """
 import argparse
 import gc
@@ -240,8 +240,6 @@ def run_one(name, lines, writers):
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return ("skip", f"translator unsupported: {e}")
-        except (IndexError, KeyError, ValueError) as e:
-            return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
         except UnsupportedConstruct as e:
@@ -354,7 +352,12 @@ def main(argv=None):
         print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

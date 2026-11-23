@@ -75,6 +75,16 @@ def _count(gltf: dict, key: str) -> int:
     return len(_array(gltf.get(key)))
 
 
+ARRAY_FIELDS = ("scenes", "nodes", "meshes", "materials", "images", "skins",
+                "animations", "accessors")
+
+
+def _invalid_types(gltf: dict) -> dict[str, str]:
+    """Known array fields that are present but hold a non-array value."""
+    return {key: type(gltf[key]).__name__ for key in ARRAY_FIELDS
+            if key in gltf and not isinstance(gltf[key], list)}
+
+
 def _entry(gltf: dict, key: str, index: object) -> dict | None:
     """The object at ``gltf[key][index]``, or None for a missing/invalid index."""
     if not _is_int(index) or index < 0:
@@ -128,15 +138,15 @@ def parse_glb(data: bytes) -> dict:
             )
         if chunk_length % 4:
             raise GlbError(f"{label} chunk at offset {offset} has length {chunk_length}, not a multiple of 4")
-        payload = data[offset + CHUNK_HEADER_SIZE:offset + CHUNK_HEADER_SIZE + chunk_length]
-        chunks.append({"type": chunk_type, "length": chunk_length, "payload": payload})
+        chunks.append({"type": chunk_type, "length": chunk_length})
         offset += CHUNK_HEADER_SIZE + chunk_length
 
     if not chunks or chunks[0]["type"] != CHUNK_TYPE_JSON:
         kind = _chunk_type_name(chunks[0]["type"]) if chunks else "none"
         raise GlbError(f"missing JSON chunk: first chunk is {kind}")
 
-    json_payload = chunks[0]["payload"]
+    json_offset = GLB_HEADER_SIZE + CHUNK_HEADER_SIZE
+    json_payload = data[json_offset:json_offset + chunks[0]["length"]]
     pad_start = len(json_payload.rstrip(b" \x00"))
     padding = len(json_payload) - pad_start
     nul_padding = json_payload[pad_start:].count(b"\x00")
@@ -154,7 +164,6 @@ def parse_glb(data: bytes) -> dict:
     if not isinstance(gltf, dict):
         raise GlbError("malformed JSON chunk: root is not a JSON object")
 
-    bin_payload = None
     bin_padding = None
     seen_bin = False
     for chunk_index, chunk in enumerate(chunks[1:], 1):
@@ -167,12 +176,12 @@ def parse_glb(data: bytes) -> dict:
         if chunk_index != 1:
             raise GlbError("BIN chunk must immediately follow the JSON chunk")
         seen_bin = True
-        bin_payload = chunk["payload"]
+        bin_length = chunk["length"]
         buffers = _array(gltf.get("buffers"))
         buffer0 = _object(buffers[0]) if buffers else {}
         declared = buffer0.get("byteLength")
-        if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= len(bin_payload):
-            bin_padding = len(bin_payload) - declared
+        if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= bin_length:
+            bin_padding = bin_length - declared
 
     chunk_table = []
     for chunk_index, chunk in enumerate(chunks):
@@ -210,7 +219,10 @@ def _accessor_max(accessor: dict | None) -> float | None:
     upper = accessor.get("max")
     if (isinstance(upper, list) and upper
             and isinstance(upper[0], (int, float)) and not isinstance(upper[0], bool)):
-        return float(upper[0])
+        try:
+            return float(upper[0])
+        except (OverflowError, ValueError):
+            return None  # an integer too large to be a float has no usable bound
     return None
 
 
@@ -221,16 +233,22 @@ def _accessor_type(gltf: dict, index: object) -> str | None:
 
 def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     """Summarize an animation and flag references that cannot be resolved."""
-    raw_samplers = _array(animation.get("samplers"))
-    raw_channels = _array(animation.get("channels"))
     issues: list[str] = []
+    raw_samplers_value = animation.get("samplers")
+    if raw_samplers_value is not None and not isinstance(raw_samplers_value, list):
+        issues.append("animation samplers is not an array")
+    raw_samplers = _array(raw_samplers_value)
+    raw_channels_value = animation.get("channels")
+    if raw_channels_value is not None and not isinstance(raw_channels_value, list):
+        issues.append("animation channels is not an array")
+    raw_channels = _array(raw_channels_value)
     samplers: list[dict] = []
     for sampler_index, sampler in enumerate(raw_samplers):
         if not isinstance(sampler, dict):
             issues.append(f"sampler[{sampler_index}] is not an object")
             samplers.append({"index": sampler_index, "input_accessor": None, "input_count": None,
                              "output_accessor": None, "output_count": None,
-                             "interpolation": None, "duration": None})
+                             "output_type": None, "interpolation": None, "duration": None})
             continue
         input_index = _index(sampler.get("input"))
         output_index = _index(sampler.get("output"))
@@ -240,8 +258,13 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         output_count = _accessor_count(gltf, output_index)
         input_type = _accessor_type(gltf, input_index)
         output_type = _accessor_type(gltf, output_index)
-        interpolation = _text(sampler.get("interpolation")) or "LINEAR"
-        duration = _accessor_max(input_accessor)
+        raw_interpolation = sampler.get("interpolation")
+        interpolation = _text(raw_interpolation)
+        if raw_interpolation is None:
+            interpolation = "LINEAR"
+        elif interpolation is None:
+            issues.append(f"sampler[{sampler_index}] has unknown interpolation {raw_interpolation!r}")
+        duration = _accessor_max(input_accessor) if input_count else None
         if input_accessor is None:
             issues.append(f"sampler[{sampler_index}] input accessor is missing")
         elif input_count is None or input_count == 0:
@@ -257,7 +280,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
                     f"sampler[{sampler_index}] has {output_count} output values for {input_count} "
                     f"keys with {interpolation} interpolation"
                 )
-        if interpolation not in ("LINEAR", "STEP", "CUBICSPLINE"):
+        if interpolation is not None and interpolation not in ("LINEAR", "STEP", "CUBICSPLINE"):
             issues.append(f"sampler[{sampler_index}] has unknown interpolation {interpolation!r}")
         samplers.append({
             "index": sampler_index,
@@ -491,6 +514,7 @@ def build_report(glb: dict, file_bytes: int) -> dict:
         count = sum(1 for entry in _array(gltf.get(key)) if not isinstance(entry, dict))
         if count:
             invalid_counts[key] = count
+    invalid_types = _invalid_types(gltf)
     report = {
         "bytes": file_bytes,
         "asset": {
@@ -516,6 +540,8 @@ def build_report(glb: dict, file_bytes: int) -> dict:
     }
     if any(invalid_counts.values()):
         report["invalid_counts"] = invalid_counts
+    if invalid_types:
+        report["invalid_types"] = invalid_types
     return report
 
 
@@ -552,6 +578,9 @@ def format_report(report: dict) -> str:
     invalid = report.get("invalid_counts")
     if invalid:
         lines.append("invalid entries: " + " ".join(f"{key}={value}" for key, value in invalid.items() if value))
+    invalid_types = report.get("invalid_types")
+    if invalid_types:
+        lines.append("invalid types: " + " ".join(f"{key}={value}" for key, value in invalid_types.items()))
     lines.append("chunks: " + ", ".join(
         f"{chunk['type']} {chunk['byte_length']} bytes (padding {_padding_text(chunk.get('padding'))})"
         for chunk in report["chunks"]))

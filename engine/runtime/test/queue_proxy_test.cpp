@@ -394,6 +394,23 @@ int check_slots(const Backend& b) {
         // methods, the contract xs_proxy_mock checks too. The two methods the proxy models — SignalX at
         // 23 and PresentX at 30 on the older layout the 16/17 calls above pinned — are checked below.
         // The fence tail below is still refused — nothing console-shaped was measured past its public chain.
+        // Fence slot 12 (value, descriptor, flags): the address of the completed value, which follows a queue's
+        // signal without another call (a wait on the real fence refreshes it).
+        {
+            before = fhits(12);
+            const auto* completed = reinterpret_cast<const volatile UINT64*>(raw_call(fence.p, 12, 9, 0, 0));
+            EXPECT(completed && *completed == fence->GetCompletedValue() && fhits(12) == before + 1);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)));
+            bool seen = false;
+            for (int i = 0; i < 5000 && !seen; ++i) {
+                seen = *completed == 9;
+                if (!seen) Sleep(1);
+            }
+            EXPECT(seen);
+            EXPECT(raw_call(fence.p, 12, 9, 0, 0) == reinterpret_cast<std::uint64_t>(completed));
+        }
+
+        // The refused tail: every slot from the end of the public chain to the end of the table, but fence slot 12.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
             if (slot == 23 || slot == 30) continue;
             before = qhits(slot);
@@ -413,6 +430,7 @@ int check_slots(const Backend& b) {
         EXPECT(as_hr(call_slot(queue.p, 30)) != E_NOTIMPL);
         EXPECT(qhits(30) == before + 1 && xs::queue_slot_first_call_seen(30));
         for (unsigned slot = fence_slots; slot < xs::fence_proxy_table_size(); ++slot) {
+            if (slot == 12) continue;
             before = fhits(slot);
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
@@ -425,6 +443,8 @@ int check_slots(const Backend& b) {
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
     std::printf("%s: every public queue and fence slot forwarded and counted; queue tail S_OK, fence tail "
                 "refused\n", label);
+    std::printf("%s: every public queue and fence slot forwarded and counted; fence slot 12 follows a queue "
+                "signal; tail refused\n", label);
     return 0;
 }
 

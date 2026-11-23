@@ -725,7 +725,74 @@ int check_lists() {
     return 0;
 }
 
-// ---- 8. The console tail and the guard region ----
+// ---- 8. SignalX layout detection ------------------------------------------------------------------------
+// A fence at queue slot 25 while the layout is still unknown is itself the newer-layout evidence: a title that
+// signals only through SignalX never reaches Signal/Wait at 16/17, so an unanswered SignalX used to return
+// S_OK having signalled nothing — a waiter on that fence value then hangs (shdann's report on #2490: the first
+// SignalX gave hr=0 calls=0, the value was lost).
+
+int check_signalx_detection() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    void* fence = make_fence(device);
+    EXPECT(queue && fence);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    const auto real_fence = word(xs::fence_proxy_real_fence(fence));
+    // Undetected layout, fence at slot 25: forwarded as Signal and pins the device to the newer layout.
+    EXPECT(hr_of(raw(queue, 25, word(fence), 7)) == S_OK && queue_mock->calls[14] == 1 &&
+           queue_mock->args[14][0] == real_fence && queue_mock->args[14][1] == 7);
+    // Now proven newer: Signal at 16 and SignalX at 25 keep forwarding.
+    EXPECT(hr_of(raw(queue, 16, word(fence), 8)) == S_OK && queue_mock->calls[14] == 2 &&
+           queue_mock->args[14][1] == 8);
+    EXPECT(hr_of(raw(queue, 25, word(fence), 9)) == S_OK && queue_mock->calls[14] == 3 &&
+           queue_mock->args[14][1] == 9);
+    // A second queue on the same device inherits the shared detection.
+    void* queue2 = make_queue(device);
+    EXPECT(queue2);
+    Mock* const queue2_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue2));
+    EXPECT(hr_of(raw(queue2, 25, word(fence), 11)) == S_OK && queue2_mock->calls[14] == 1 &&
+           queue2_mock->args[14][1] == 11);
+    EXPECT(release(queue2) == 0);
+    EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
+
+    // Proven older stays older: a non-fence at slot 16 pins the older layout (the frequency getter), and a
+    // fence at 25 afterwards is an unmodelled console method — S_OK with no forward, not a second detection.
+    Mock* mock2 = nullptr;
+    void* device2 = make_device(mock2, 9, true);
+    void* queue3 = make_queue(device2);
+    void* fence3 = make_fence(device2);
+    EXPECT(device2 && queue3 && fence3);
+    Mock* const queue3_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue3));
+    EXPECT(hr_of(raw(queue3, 16, 0, 0)) == S_OK && queue3_mock->calls[16] == 1 &&
+           queue3_mock->calls[14] == 0);
+    EXPECT(hr_of(raw(queue3, 25, word(fence3), 13)) == S_OK && queue3_mock->calls[14] == 0);
+    // The older SignalX at slot 23 still forwards under the pinned-older layout.
+    EXPECT(hr_of(raw(queue3, 23, word(fence3), 15)) == S_OK && queue3_mock->calls[14] == 1 &&
+           queue3_mock->args[14][1] == 15);
+    EXPECT(release(queue3) == 0 && release(fence3) == 0 && release(device2) == 0 && mock2->refs == 0);
+
+    // A fence at the older SignalX slot while undetected forwards but does NOT pin: a newer title could reach
+    // an unmodelled slot-23 method with a fence argument, and a premature older pin would drop its real
+    // SignalX at 25.
+    Mock* mock3 = nullptr;
+    void* device3 = make_device(mock3, 9, true);
+    void* queue4 = make_queue(device3);
+    void* fence4 = make_fence(device3);
+    EXPECT(device3 && queue4 && fence4);
+    Mock* const queue4_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue4));
+    EXPECT(hr_of(raw(queue4, 23, word(fence4), 17)) == S_OK && queue4_mock->calls[14] == 1 &&
+           queue4_mock->args[14][1] == 17);
+    EXPECT(hr_of(raw(queue4, 25, word(fence4), 19)) == S_OK && queue4_mock->calls[14] == 2 &&
+           queue4_mock->args[14][1] == 19);
+    EXPECT(release(queue4) == 0 && release(fence4) == 0 && release(device3) == 0 && mock3->refs == 0);
+    std::printf("xs_proxy_mock: SignalX on an undetected queue's slot 25 forwards as Signal and marks the "
+                "newer layout; proven-older stays older and a fence at 23 does not pin\n");
+    return 0;
+}
+
+// ---- 9. The console tail and the guard region ----
 
 int check_tail(bool want_guarded) {
     Mock* mock = nullptr;
@@ -851,7 +918,7 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_lists())
+        check_alloc_failures() || check_allocators() || check_lists() || check_signalx_detection())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

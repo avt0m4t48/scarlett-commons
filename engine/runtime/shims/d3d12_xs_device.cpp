@@ -755,8 +755,9 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 // The measured console queue slots (docs/d3d12_xs_console_abi.md §4): the older runtime keeps the PC order —
 // Signal 14, Wait 15, frequency 16, calibration 17, GetDesc 18 — and presents at slot 30, with SignalX at 23. A
 // newer game OS inserts two methods before Signal: Signal 16, Wait 17, frequency 18, calibration 19, GetDesc 20,
-// SignalX 25, PresentX 32. The layout is detected once, by a fence object reaching slot 16 or 17: on the older
-// layout those are the frequency and calibration getters, which take no object argument.
+// SignalX 25, PresentX 32. The layout is detected once, by a fence object reaching slot 16 or 17 (the older
+// layout's frequency and calibration getters take no object argument) or by a fence reaching SignalX slot 25 —
+// a title that signals only through SignalX would otherwise stay undetected and lose every signal.
 //
 // Every other console-only queue method answers S_OK (sibling layer: title frame pacing flows through them, and a
 // refusal wedges the present loop), still recorded by note_child_slot. Slot 148's AllocateUploadMemory is a list
@@ -859,7 +860,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // fence at slot 14 or 15 is the older Signal/Wait; a non-fence argument there is one of the newer
             // layout's two inserted console methods.
             // A queue made after another one detected the layout inherits it from the device; undetected queues
-            // assume the older layout, whose unshifted slots are also the PC chain.
+            // assume the older layout, whose unshifted slots are also the PC chain. A fence reaching SignalX
+            // slot 25 while the layout is still unknown is itself the newer-layout evidence: a title that
+            // signals only through SignalX never reaches Signal/Wait at 16/17, and an unanswered SignalX
+            // returns S_OK having signalled nothing, leaving a waiter on that fence value hanging.
             const bool newer = [&] {
                 if (self->queue_layout == ChildProxy::kQueueLayoutNewer) return true;
                 const unsigned char shared =
@@ -898,8 +902,20 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot - 2]);
                 return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             }
-            if (Slot == (newer ? 25u : 23u)) {  // SignalX: console Signal; the extra X word is dropped
+            if (Slot == (newer ? 25u : 23u) ||
+                (Slot == 25u && self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
+                 self->device->console_layout.load(std::memory_order_relaxed) ==
+                     ChildProxy::kQueueLayoutUnknown)) {
+                // SignalX: console Signal (older 23, newer 25); the extra X word is dropped. The slot-25
+                // alternative is the fence itself carrying the layout evidence, per the comment above; a
+                // proven-older queue still leaves slot 25 to the console-only no-op, since its fence-taking
+                // methods sit at 14/15/23 there.
                 if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
+                    if (Slot == 25u && !newer) {
+                        self->queue_layout = ChildProxy::kQueueLayoutNewer;
+                        self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
+                                                           std::memory_order_relaxed);
+                    }
                     static std::atomic<bool> logged{false};
                     if (!logged.exchange(true, std::memory_order_relaxed))
                         std::fprintf(stderr, "[rt] d3d12_xs: SignalX (queue slot %u) forwarded as Signal\n", Slot);

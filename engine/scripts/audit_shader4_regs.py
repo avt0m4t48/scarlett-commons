@@ -27,6 +27,10 @@ NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_c
                "s_waitcnt", "s_barrier", "s_nop", "s_endpgm", "s_sendmsg", "s_sleep",
                "exp", "buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store",
                "s_store", "s_buffer_store", "image_store", "ds_write")
+# DS ops that write args[0]; every other DS op without "_rtn" (atomics, ds_write*, src2 and GWS forms) only reads its
+# operands. Same rule as tools/lane_masks.py.
+DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume", "ds_ordered_count",
+              "ds_nop")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
 
 
@@ -175,6 +179,7 @@ def rbw_registers(insns):
             op.startswith(NO_DEST_OPS)
             or (is_gf_atomic and "glc" not in mods)
             or (is_bi_atomic and "glc" not in mods)
+            or (op.startswith("ds_") and "_rtn" not in op and not op.startswith(DS_HAS_DST))
         )
         reads_imm_dst = op in SGPR_RMW
         # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];

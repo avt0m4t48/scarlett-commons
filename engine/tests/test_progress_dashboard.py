@@ -59,6 +59,23 @@ class Contract(unittest.TestCase):
 
 
 class Tests(unittest.TestCase):
+    def test_unittest_file_is_skipped_only_when_all_cases_skip(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(pd, "ROOT", directory):
+            file = os.path.join(directory, "test_sample.py")
+            for skipped in (0, 1, 2):
+                with self.subTest(skipped=skipped):
+                    with open(file, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(f"import unittest\nclass Sample(unittest.TestCase):\n"
+                                f"    @unittest.skipIf({skipped} > 0, 'synthetic')\n"
+                                f"    def test_first(self): pass\n"
+                                f"    @unittest.skipIf({skipped} > 1, 'synthetic')\n"
+                                f"    def test_second(self): pass\n"
+                                f"unittest.main()\n")
+                    result = pd.run_one_test("test_sample.py", 15)
+                    self.assertEqual(result["result"], "pass", result)
+                    self.assertEqual(result["cases"], 2)
+                    self.assertEqual(result["all_skipped"], skipped == 2)
+
     def test_junit_ctest_and_pytest_flavours(self):
         ctest = '<testsuite><testcase name="loader" classname="loader" status="run" time="0.9"/>' \
                 '<testcase name="xmem" classname="xmem" status="fail"><failure message="C:\\Users\\me\\x\\out.txt bad"/></testcase></testsuite>'

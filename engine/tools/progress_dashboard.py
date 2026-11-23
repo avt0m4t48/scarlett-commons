@@ -244,12 +244,13 @@ def run_one_test(rel, timeout):
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT, capture_output=True, timeout=timeout)
         out = (r.stdout + r.stderr).decode("utf-8", "replace")
-        skipped = re.search(r"^OK \(skipped=(\d+)\)", out, re.M) and not re.search(r"Ran [1-9]\d* tests?", out.replace("skipped", ""))
+        skipped = re.search(r"^OK \(skipped=(\d+)\)\r?$", out, re.M)
         res = "pass" if r.returncode == 0 else "fail"
         tail = "" if res == "pass" else scrub(out)
         ran = re.search(r"Ran (\d+) tests?", out)
+        cases = int(ran.group(1)) if ran else None
         return {"test": rel, "result": res, "seconds": round(time.monotonic() - t0, 2), "detail": tail,
-                "cases": int(ran.group(1)) if ran else None, "all_skipped": bool(skipped)}
+                "cases": cases, "all_skipped": bool(skipped and cases == int(skipped.group(1)))}
     except subprocess.TimeoutExpired:
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 

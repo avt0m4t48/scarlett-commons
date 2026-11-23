@@ -6873,6 +6873,36 @@ class Gen:
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
             r = self.tmp()
             self.g_shuffle(r, v, src)
+            # op_sel:[FI, BOUND_CTRL] (LLVM: llvm.amdgcn.permlane16 <fi> <bound_control> -> op_sel bits 0 and 1).
+            # FI=1 fetches the value of a source lane that is off in EXEC. FI=0 does not: the destination lane keeps
+            # its old value (BOUND_CTRL=0) or gets 0 (BOUND_CTRL=1). Measured on RDNA2 (issue #374).
+            (fi, bc), _ = self.opsel_bits(mods, 2)
+            if not fi:
+                sa, ok, old, r2 = (self.tmp() for _ in range(4))
+                self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                act = self.tmp()
+                if self.emulate:
+                    self.g_shuffle(act, sa, src)
+                    self.emit(f"{ok} = OpINotEqual %bool {act} {self.cu(0)}")
+                else:
+                    # A source lane that is not in this subgroup (a workgroup smaller than the wave) is off too; a
+                    # shuffle from it is undefined, so redirect it first, as ds_lane_read does.
+                    ballot, present, safe_src, got = (self.tmp() for _ in range(4))
+                    self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
+                    self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
+                    self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {safe_src}")
+                    self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
+                    self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
+                    self.uses_subgroup = self.uses_ballot = True
+                if bc:
+                    self.emit(f"{r2} = OpSelect %uint {ok} {r} {self.cu(0)}")
+                else:
+                    ptr = self.tmp()   # a plain load, as dst() does: a VGPR that nothing has written yet is not an undefined value
+                    self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
+                    self.emit(f"{old} = OpLoad %uint {ptr}")
+                    self.emit(f"{r2} = OpSelect %uint {ok} {r} {old}")
+                r = r2
             self.dst(a[0], r)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)

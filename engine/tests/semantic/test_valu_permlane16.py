@@ -793,17 +793,17 @@ class NegativeControls(unittest.TestCase):
             r"\1 = OpCopyObject %uint \2",
             spv,
         )
-        self.assertEqual(n3, 1)
+        self.assertEqual(n3, 2)   # the data shuffle and, with FI=0 (no op_sel), the source lane's activity shuffle (SHADER-74)
         self.assertNotEqual(self._run(bad_shuf, 32, 32), want)
 
         # 4. Dropping the destination EXEC OpSelect overwrites inactive destination lanes.
-        bad_exec, n4 = re.subn(
-            r"(%\w+ = OpGroupNonUniformShuffle %uint %c3 %\w+ %\w+\n(?:.*\n){0,4}?\s*"
-            r"%\w+ = OpLoad %bool %active\n\s*"
-            r"(%\w+) = OpSelect %uint %\w+ (%\w+)) %\w+",
-            r"\1 \3",
-            spv,
-        )
+        # The select is the one dst() emits right before the OpStore of the destination VGPR (not the activity selects
+        # of the FI=0 path, which also follow a shuffle).
+        # The program writes four VGPRs (v1, v2, the permlane's v2, v21), so four such selects; the third is the permlane's.
+        dst_selects = list(re.finditer(r"(%\w+ = OpSelect %uint %\w+ (%\w+)) %\w+(\n\s*OpStore %\w+ %\w+\n)", spv))
+        n4 = 1 if len(dst_selects) == 4 else len(dst_selects)
+        m = dst_selects[2]
+        bad_exec = spv[:m.start()] + m.group(1) + " " + m.group(2) + m.group(3) + spv[m.end():]
         self.assertEqual(n4, 1)
         got_bad_exec = self._run(bad_exec, 32, 32)
         self.assertNotEqual(got_bad_exec, want)

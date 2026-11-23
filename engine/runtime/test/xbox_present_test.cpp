@@ -1249,6 +1249,14 @@ int main() {
             EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
             std::printf("no tearing mode (LEONIDA_PRESENT_NO_TEAR): late frame waits for the vblank: ok\n");
         }
+        // The device a title holds is the Xbox-ABI proxy, not `inner`: the presenter comes from it all the same
+        // (D3D-414: it used to be null, with nothing in the log).
+        {
+            auto from_proxy = rt::d3d12::create_window_presenter(device.p, window);
+            EXPECT(from_proxy && from_proxy->enable_capture());
+            EXPECT(SUCCEEDED(from_proxy->present_blank(1)));
+            std::printf("presenter from the Xbox device proxy: created, a blank frame presented: ok\n");
+        }
         // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
         // the colour that was presented, and the loop takes about 30 vblanks.
         auto presenter2 = rt::d3d12::create_window_presenter(inner, window);

@@ -8104,7 +8104,13 @@ bool device_has_swapchain_colorspace(ID3D12Device* device) {
 }
 
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
-    Device* d = Device::from<Device>(device);
+    // A title holds the Xbox-ABI proxy, not the layer's device: look behind it, as the helpers above do.
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (device && !d)
+        std::fprintf(stderr, "[rt] d3d12: create_window_presenter: %p is neither the Xbox device proxy nor a device of "
+                             "this layer; no presenter\n",
+                     static_cast<void*>(device));
     if (!d || !window) return nullptr;
     const VulkanDeviceInfo& info = d->state().info;
     if (!info.presentation) {

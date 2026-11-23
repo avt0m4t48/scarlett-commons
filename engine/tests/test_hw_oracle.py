@@ -184,9 +184,18 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertEqual(o._probe(), "device=test arch=gfx1103")
         self.assertEqual((seen, o.code_object), ([None, 5], 5))
 
+    def test_error_303_retries_as_v5_and_keeps_it(self):
+        o, seen = self.probe(loads={5}, error="hipModuleLoadData(&mod, img) -> hip error 303")
+        self.assertEqual(o._probe(), "device=test arch=gfx1103")
+        self.assertEqual((seen, o.code_object), ([None, 5], 5))
+
     def test_a_209_that_stays_and_other_errors_are_unavailable(self):
         o, seen = self.probe(loads=set())
         with self.assertRaisesRegex(runner.Unavailable, "209"):
+            o._probe()
+        self.assertEqual(seen, [None, 5])
+        o, seen = self.probe(loads=set(), error="hipModuleLoadData(&mod, img) -> hip error 303")
+        with self.assertRaisesRegex(runner.Unavailable, "303"):
             o._probe()
         self.assertEqual(seen, [None, 5])
         o, seen = self.probe(loads={5}, error="hipMalloc -> hip error 2")

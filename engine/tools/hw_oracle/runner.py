@@ -241,13 +241,14 @@ class Oracle:
         if co is None:
             raise Unavailable("probe kernel did not assemble: " + err[:300])
         rc, out, err = self._launch(co, names)
-        if rc == 3 and "hip error 209" in err and self.code_object is None:
+        if rc == 3 and any(e in err for e in ("hip error 209", "hip error 303")) and self.code_object is None:
             # LLVM 23 writes code object v6, which HIP runtimes from 2024 (amdhip64_6.dll) refuse as "no binary for
-            # this GPU". Ask for v5; a 209 that stays has another cause and is reported below.
+            # this GPU" (209) or "shared object init failed" (303). Ask for v5; an error that stays has another cause
+            # and is reported below.
             self.code_object = 5
             co, why = self._assemble(text)
             if co is None:
-                raise Unavailable("the HIP runtime refused the code object (209) and v5 did not assemble: " + why[:300])
+                raise Unavailable("the HIP runtime refused the code object and v5 did not assemble: " + why[:300])
             rc, out, err = self._launch(co, names)
         if rc == 77:
             raise Unavailable(err.strip() or "no AMD device")

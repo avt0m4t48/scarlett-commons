@@ -7622,9 +7622,9 @@ class Gen:
             # i16 forms differ only under clamp (signed saturation); v_add_i16 / v_sub_i16 are internal names.
             self._insn({**ins, "op": {"v_add_nc_u16": "v_add_u16_e64", "v_sub_nc_u16": "v_sub_u16_e64",
                                       "v_add_nc_i16": "v_add_i16_e64", "v_sub_nc_i16": "v_sub_i16_e64"}[op]})
-        elif op in ("v_lshrrev_b16", "v_lshlrev_b16", "v_ashrrev_i16", "v_add_u16", "v_sub_u16", "v_subrev_u16",
-                    "v_mul_lo_u16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16", "v_and_b16", "v_or_b16",
-                    "v_xor_b16", "v_add_i16", "v_sub_i16"):
+        elif op in ("v_lshrrev_b16", "v_lshlrev_b16", "v_ashrrev_i16", "v_add_u16", "v_sub_u16",
+                    "v_mul_lo_u16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16",
+                    "v_add_i16", "v_sub_i16"):
             # 16-bit integer ops on the low halves (op_sel picks high halves in the VOP3 form). Per Mesa ACO
             # (can_use_opsel): the opsel-capable VOP3 (_e64) forms are partial writes that keep the high half,
             # and the VOP2 (_e32) forms define the whole register (high half modelled as zero).
@@ -7671,11 +7671,8 @@ class Gen:
             else:
                 x = self.u16_half(self.src_u(a[1]), sb[0])
                 y = self.u16_half(self.src_u(a[2]), sb[1])
-                k = {"v_add_u16": "OpIAdd", "v_sub_u16": "OpISub", "v_mul_lo_u16": "OpIMul", "v_and_b16": "OpBitwiseAnd",
-                     "v_or_b16": "OpBitwiseOr", "v_xor_b16": "OpBitwiseXor"}.get(op)
-                if op == "v_subrev_u16":
-                    self.emit(f"{r} = OpISub %uint {y} {x}")
-                elif k:
+                k = {"v_add_u16": "OpIAdd", "v_sub_u16": "OpISub", "v_mul_lo_u16": "OpIMul"}.get(op)
+                if k:
                     self.emit(f"{r} = {k} %uint {x} {y}")
                 else:
                     self.emit(f"{r} = OpExtInst %uint %glsl {'UMax' if 'max' in op else 'UMin'} {x} {y}")
@@ -7687,9 +7684,9 @@ class Gen:
                     sat = self.tmp()
                     self.emit(f"{sat} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
                     r = sat
-                elif op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                elif op not in ("v_add_u16", "v_sub_u16"):
                     raise Unsupported(op + " clamp")
-                if op in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                if op in ("v_add_u16", "v_sub_u16"):
                     ov, sat = self.tmp(), self.tmp()
                     self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
                     self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
@@ -9666,14 +9663,13 @@ class Gen:
                 out = acc
             self.dst(a[0], out)
         elif op in ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
-                    "s_nand_b64", "s_nor_b64", "s_xnor_b64", "s_and_b32_mask", "s_or_b32_mask"):
+                    "s_nand_b64", "s_nor_b64", "s_xnor_b64"):
             k = {"and": "OpBitwiseAnd", "or": "OpBitwiseOr", "xor": "OpBitwiseXor", "andn2": "OpBitwiseAnd",
                  "orn2": "OpBitwiseOr", "nand": "OpBitwiseAnd", "nor": "OpBitwiseOr",
                  "xnor": "OpBitwiseXor"}[op.split("_")[1]]
             # s_nand/nor/xnor_b64: D = ~(S0 op S1). A lane's mask value is 0 or ~0, so the NOT is per lane too.
             inv = op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64")
-            if op.endswith("_mask") or \
-                    (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
+            if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
                     self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 r = self.tmp()

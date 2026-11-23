@@ -311,6 +311,28 @@ class TestFolder(unittest.TestCase):
         self.assertIn("ambiguous name", r.stdout)
         self.assertIn("1", r.stdout.split("ambiguous name")[1].split()[0])
 
+    def test_cli_names_row_cut_short_is_one_error_line(self):
+        with open(self.names, "a", encoding="utf-8", newline="") as fh:
+            fh.write("story,bank_01\n")          # an interrupted write: stream_id and later columns missing
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+        self.assertIn("line 5", r.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])     # nothing was tagged
+
+    def test_cli_names_row_cut_after_stream_id_is_one_error_line(self):
+        with open(self.names, "a", encoding="utf-8", newline="") as fh:
+            fh.write("story,bank_01,1FFFFFFF\n")   # cut after stream_id: the name column is missing
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+        self.assertIn("line 5", r.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])     # nothing was tagged
+
 
 if __name__ == "__main__":
     unittest.main()

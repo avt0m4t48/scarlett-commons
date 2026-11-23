@@ -48,6 +48,12 @@ STATUS = 0x1600             # xor eax, eax; ret
 CALLER = 0x1700             # call 0x1600; test al, al; je skip; call HANDLER; skip: ...
 CALLER_JE = 0x170B
 CALLER_CALL = 0x170D
+CHECK = 0x1800              # returns its argument; ends in HANDLER2 when (argument + 0x10) is 0 or 2
+CHECK_JAE = 0x1823
+CHECK_CALL = 0x1825
+HANDLER2 = 0x1900           # call XMemBar; int3
+HANDLER2_STOP = 0x1905
+USER = 0x1A00               # CHECK(device slot 8 result); CHECK(XMemFoo result)
 
 
 def call(at, target):
@@ -90,6 +96,20 @@ def functions():
     f[a] = (b"\x48\x83\xec\x28" + call(a + 4, STATUS) + b"\x84\xc0"                # call STATUS; test al, al
             + b"\x74\x05" + call(a + 0xD, HANDLER)                                  # je skip; call HANDLER
             + b"\x48\x83\xc4\x28\xc3")                                              # skip: add rsp; ret
+    a = CHECK
+    f[a] = (b"\x56\x48\x83\xec\x20\x8b\xf1"                               # push rsi; sub rsp; mov esi, ecx
+            + b"\x85\xc9\x78\x08"                                               # test ecx, ecx; js high
+            + b"\x8b\xc6\x48\x83\xc4\x20\x5e\xc3"                               # out: mov eax, esi; ...; ret
+            + b"\x8d\x46\x10\x83\xf8\x03\x77\xf0"                               # high: lea eax, [rsi+0x10]; cmp; ja out
+            + b"\xb9\x05\x00\x00\x00\x0f\xa3\xc1\x73\xe6"                       # mov ecx, 5; bt ecx, eax; jae out
+            + call(a + 0x25, HANDLER2) + b"\xeb\xdf")                              # call HANDLER2; jmp out
+    f[HANDLER2] = call(HANDLER2, THUNK_BAR) + b"\xcc"
+    a = USER
+    f[a] = (b"\x48\x83\xec\x28" + b"\x48\x8b\x0d" + rip(a + 4, 7, GLOBAL_DEVICE)  # mov rcx, [rip+device]
+            + b"\x48\x8b\x01\xff\x50\x40\x8b\xc8"                               # mov rax, [rcx]; call [rax+0x40]
+            + call(a + 0x13, CHECK)                                                 # mov ecx, eax; call CHECK
+            + call(a + 0x18, THUNK_FOO) + b"\x8b\xc8" + call(a + 0x1F, CHECK)       # call XMemFoo; mov; call
+            + b"\x48\x83\xc4\x28\xc3")
     return {start: (code, start + len(code)) for start, code in f.items()}
 
 
@@ -120,6 +140,9 @@ class Int3CauseTest(unittest.TestCase):
         self.assertEqual(f[HANDLER][0][HANDLER_STOP - HANDLER], 0xCC)
         self.assertEqual(f[HOT][0][HOT_JNE - HOT:HOT_JNE - HOT + 2], b"\x0f\x85")
         self.assertEqual(f[CALLER][0][CALLER_CALL - CALLER], 0xE8)
+        self.assertEqual(f[CHECK][0][CHECK_JAE - CHECK], 0x73)
+        self.assertEqual(f[CHECK][0][CHECK_CALL - CHECK], 0xE8)
+        self.assertEqual(len(f[CHECK][0]), 0x2C)
 
     def test_an_import_result_tested_far_from_the_stop(self):
         r = self.one(f"exe+{IMPORT_STOP:#x}")
@@ -157,6 +180,30 @@ class Int3CauseTest(unittest.TestCase):
         self.assertEqual((g["branch"], g["jump"], g["doomed_side"], g["condition"]),
                          (CALLER_JE, "je", "fall-through", "al != 0"))
         self.assertEqual(g["registers"][0]["function"], STATUS)
+
+    def test_a_check_on_its_argument_is_read_at_the_check_s_call_sites(self):
+        r = self.one(hex(HANDLER2_STOP))
+        self.assertTrue(r["never_returns"])
+        [c] = r["callers"]
+        self.assertEqual((c["at"], c["function"][0], c["never_returns"]), (CHECK_CALL, CHECK, False))
+        [g] = c["guards"]
+        self.assertEqual((g["branch"], g["doomed_side"], g["condition"]),
+                         (CHECK_JAE, "fall-through", "bit eax of ecx is set"))
+        regs = {x["register"]: x for x in g["registers"]}
+        self.assertEqual(regs["rcx"]["value"], "a constant")
+        # eax = esi + 0x10, esi = ecx at entry; the lea's block is reached only by the js.
+        self.assertEqual((regs["rax"]["value"], regs["rax"]["argument"], regs["rax"].get("derived")),
+                         ("argument", 1, True))
+        sites = c["arguments"]["sites"]
+        self.assertEqual([(x["at"], x["caller"][0], x["passed_as"]) for x in sites],
+                         [(USER + 0x13, USER, 1), (USER + 0x1F, USER, 1)])
+        self.assertEqual((sites[0]["source"]["slot"], sites[0]["source"]["this_global"]), (8, GLOBAL_DEVICE))
+        self.assertEqual(sites[1]["source"]["import"], "xmem.dll!XMemFoo")
+        text = int3_cause.to_text({"x": {"rva": HANDLER2_STOP, "stop": "int3", **r}})
+        self.assertIn("rax: derived from argument 1 (rcx)", text)
+        self.assertIn("argument 1 at the function's 2 direct call site(s):", text)
+        self.assertIn(f"1  a copy of the result of vtable slot 8 (this: global {GLOBAL_DEVICE:#x})", text)
+        self.assertIn("1  a copy of the result of xmem.dll!XMemFoo", text)
 
     def test_wine_reports_the_address_after_the_int3(self):
         r = self.one(f"exe+{IMPORT_STOP + 1:#x}")

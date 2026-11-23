@@ -28,7 +28,11 @@ function, so the test is not in sight of the stop. This finds it, with nothing r
    - an import (`dll!Name`, through its thunk or its address-table slot);
    - a vtable slot (`call [reg+disp]` is slot disp/8), with `this` noted when it was loaded from a global;
    - a function of the image, by RVA.
-   A register loaded from memory, set to a constant or computed is reported as such.
+   A register loaded from memory, set to a constant or computed is reported as such. A copy, a `lea r, [r2+disp]`
+   or an added constant is followed through. A block that follows a return or a jump is entered through the one
+   jump that reaches it. A register nothing wrote since the function start is one of its arguments (rcx, rdx, r8,
+   r9). The function's direct call sites are then read for what each passes in it, as a tally ("argument 1 at the
+   function's 53 call sites: 5 the result of vtable slot 133, ...").
 6. A function whose start is doomed never returns. Each of its direct call sites is then read the same way, as if
    the call were the stop. Steps 3 and 6 go at most 3 functions away from the stop.
 
@@ -53,7 +57,7 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from gdk_runtime_calls import RAX, RCX, RIP, VOLATILE, Code, writes  # noqa: E402
+from gdk_runtime_calls import R8, R9, RAX, RCX, RDX, RIP, VOLATILE, Code, writes  # noqa: E402
 from import_call_sites import import_slots  # noqa: E402
 import pe_inspect  # noqa: E402
 
@@ -61,6 +65,8 @@ DEPTH = 3                   # functions away from the stop that jumps in and cal
 TRACE_BACK = 48             # instructions walked back from a test to what wrote its register
 FLAGS_BACK = 8              # instructions walked back from a guard to the instruction that set its flags
 MAX_LINKS = 16              # jumps in or call sites followed per function
+MAX_SITES = 256             # call sites read for an argument the stop depends on
+ARGUMENTS = {RCX: 1, RDX: 2, R8: 3, R9: 4}
 
 JCC = ("jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja", "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg")
 # Taken-when of a jcc after `cmp a, b`, as `a <rel> b`.
@@ -93,6 +99,7 @@ class Image:
         self.code = Code(self.img)
         self.slots = import_slots(self.img)
         self._runs = {}
+        self._flows = {}
 
     # ---- decoding ----
 
@@ -116,8 +123,19 @@ class Image:
             self._runs[func] = out
         return self._runs[func]
 
+    def flow(self, func):
+        """(instructions, {rva: index}, {rva: [index of each jump to it]}) of the function."""
+        if func not in self._flows:
+            insns = self.run(func)
+            into = {}
+            for n, i in enumerate(insns):
+                if (is_jcc(i) or is_jmp(i)) and i.target is not None:
+                    into.setdefault(i.target, []).append(n)
+            self._flows[func] = (insns, {i.rva: n for n, i in enumerate(insns)}, into)
+        return self._flows[func]
+
     def lands_on(self, func, rva: int) -> bool:
-        return any(i.rva == rva for i in self.run(func))
+        return rva in self.flow(func)[1]
 
     # ---- names ----
 
@@ -335,42 +353,70 @@ def flags_setter(insns, k):
     return None
 
 
-def trace(image: Image, insns, k, reg: int):
-    """What wrote `reg` before insns[k], followed back through register copies."""
-    start = reg
-    for j in range(k - 1, max(-1, k - 1 - TRACE_BACK), -1):
-        insn = insns[j]
-        if insn.ends_flow():
-            return {"value": "not found: the code before it does not fall through"}
+def trace(image: Image, func, k: int, reg: int):
+    """What wrote `reg` before the instruction at index k of the function. Followed back through register copies,
+    `lea r, [r2+disp]` and adding a constant (marked derived), and into a block through the one jump that reaches
+    it; a register no instruction wrote since the function start is an argument (rcx, rdx, r8, r9)."""
+    insns, _, into = image.flow(func)
+    copied = derived = False
+    i = k
+
+    def tagged(out):
+        if derived:
+            out["derived"] = True
+        elif copied:
+            out["copied"] = True
+        return out
+
+    for _ in range(TRACE_BACK):
+        if i == 0:
+            if reg in ARGUMENTS:
+                return tagged({"value": "argument", "argument": ARGUMENTS[reg], "argument_register": NAMES64[reg]})
+            return tagged({"value": "set before the function is entered"})
+        before = insns[i - 1]
+        if before.ends_flow() or before.op in (0xCC, 0x10B):
+            ways = into.get(insns[i].rva, [])
+            if len(ways) != 1:
+                return {"value": "not found: the block it is in is reached by "
+                                 + ("several jumps" if ways else "no jump this tool read")}
+            i = ways[0]                        # the jump writes nothing; go on before it
+            continue
+        i -= 1
+        insn = insns[i]
         if insn.is_call():
             if reg == RAX:
-                out = {"call": insn.rva, **image.call_name(insns, j)}
-                if start != RAX:
-                    out["copied"] = True
-                return out
+                return tagged({"call": insn.rva, **image.call_name(insns, i)})
             if reg in VOLATILE:
-                return {"value": "clobbered by a call"}
+                return {"value": "clobbered by a call", "at": insn.rva}
             continue
         if reg not in writes(insn):
             continue
         if insn.mod == 3 and insn.op in COPY_OPS:
-            reg = insn.rm
+            copied, reg = copied or insn.rm != reg, insn.rm
             continue
         if insn.mod == 3 and insn.op in (0x88, 0x89):
-            reg = insn.reg
+            copied, reg = copied or insn.reg != reg, insn.reg
+            continue
+        if insn.op == 0x8D and insn.base not in (None, RIP) and insn.index is None:
+            derived, reg = True, insn.base
+            continue
+        if insn.op in (0x81, 0x83) and insn.mod == 3 and insn.reg & 7 in (0, 5) and insn.rm == reg:
+            derived = True
             continue
         if insn.op in LOAD_OPS and insn.mod != 3:
-            return {"value": "loaded from memory", "at": insn.rva,
-                    "from": memory_name(insn, 64 if insn.wide else 32)}
+            return tagged({"value": "loaded from memory", "at": insn.rva,
+                           "from": memory_name(insn, 64 if insn.wide else 32)})
         if (insn.op in (0x31, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or 0xB8 <= insn.op <= 0xBF or (
                 insn.op == 0xC7 and insn.mod == 3):
-            return {"value": "a constant", "at": insn.rva}
-        return {"value": "computed", "at": insn.rva}
+            return tagged({"value": "a constant", "at": insn.rva})
+        return tagged({"value": "computed", "at": insn.rva})
     return {"value": "not found within the instructions read"}
 
 
-def guard(image: Image, insns, k, taken: bool):
-    """The guard insns[k]: its condition for the doomed side and what the tested registers hold."""
+def guard(image: Image, func, k: int, taken: bool):
+    """The guard at index k of the function: its condition for the doomed side and what the tested registers
+    hold."""
+    insns = image.flow(func)[0]
     insn = insns[k]
     cc = insn.op & 0xF
     out = {"branch": insn.rva, "jump": JCC[cc] if insn.op < 0xE0 or insn.op >= 0x100 else "loop/jrcxz",
@@ -387,7 +433,7 @@ def guard(image: Image, insns, k, taken: bool):
         out["note"] = "the flags come from an instruction this tool does not read"
         return out
     out["condition"] = condition(test, cc if taken else cc ^ 1)
-    out["registers"] = [{"register": reg_name(r, 64, 1), **trace(image, insns, j, r)}
+    out["registers"] = [{"register": NAMES64[r], **trace(image, func, j, r)}
                         for r in dict.fromkeys(test["registers"])]
     return out
 
@@ -410,6 +456,21 @@ def rel32_sources(image: Image, targets: set[int], skip):
     return found
 
 
+def argument_sources(image: Image, func, numbers):
+    """For each argument number, what each direct call site of the function passes in it."""
+    sites = [rva for rva, kind, _ in rel32_sources(image, {func[0]}, func) if kind == "call"]
+    out = []
+    for rva in sites[:MAX_SITES]:
+        caller = image.function(rva)
+        if caller is None or not image.lands_on(caller, rva):
+            continue
+        k = image.flow(caller)[1][rva]
+        for n in numbers:
+            reg = next(r for r, m in ARGUMENTS.items() if m == n)
+            out.append({"at": rva, "caller": list(caller), "passed_as": n, "source": trace(image, caller, k, reg)})
+    return {"sites": out, "sites_not_read": max(0, len(sites) - MAX_SITES)}
+
+
 def explain(image: Image, seed: int, depth: int, seen: set):
     """Report for a stop (or a call that does not return, or a jump into doomed code) at `seed`."""
     func = image.function(seed)
@@ -424,24 +485,24 @@ def explain(image: Image, seed: int, depth: int, seen: set):
         if is_jcc(insn):
             t, f = insn.target in doomed, insn.end in doomed
             if t != f:
-                out["guards"].append(guard(image, insns, k, t))
+                out["guards"].append(guard(image, func, k, t))
     out["never_returns"] = func[0] in doomed
     if depth <= 0 or func in seen:
         return out
     seen = seen | {func}
-    links = rel32_sources(image, doomed, func)
-    for rva, kind, target in links[:MAX_LINKS]:
-        if kind == "call" and target != func[0]:
-            continue
-        if kind == "call" and not out["never_returns"]:
-            continue
+    numbers = sorted({r["argument"] for g in out["guards"] for r in g.get("registers", [])
+                      if r.get("value") == "argument"})
+    if numbers:
+        out["arguments"] = argument_sources(image, func, numbers)
+    links = [(rva, kind) for rva, kind, target in rel32_sources(image, doomed, func)
+             if kind != "call" or (target == func[0] and out["never_returns"])]
+    for rva, kind in links[:MAX_LINKS]:
         other = image.function(rva)
         if other is None or not image.lands_on(other, rva):
             continue
         if kind == "jcc":
-            others = image.run(other)
-            k = next(i for i, x in enumerate(others) if x.rva == rva)
-            out["jumps_in"].append({"from_function": list(other), **guard(image, others, k, True)})
+            k = image.flow(other)[1][rva]
+            out["jumps_in"].append({"from_function": list(other), **guard(image, other, k, True)})
         elif kind == "jmp":
             out["jumps_in"].append({"jump": "jmp", "branch": rva, "from": explain(image, rva, depth - 1, seen)})
         else:
@@ -475,8 +536,9 @@ def cause(data: bytes, addresses):
 
 # ---- text output ----
 
-def describe_register(r) -> str:
-    name = r["register"]
+def source(r) -> str:
+    """What a traced register holds, as text (without the register's name)."""
+    how = "derived from " if r.get("derived") else ("a copy of " if r.get("copied") else "")
     if "call" in r:
         if "import" in r:
             what = r["import"]
@@ -489,11 +551,35 @@ def describe_register(r) -> str:
             what = f"the function pointer at {r['pointer']:#x}"
         else:
             what = "a call through a register"
-        copy = "a copy of " if r.get("copied") else ""
-        return f"{name}: {copy}the result of {what}, call at {r['call']:#x}"
-    where = f" at {r['at']:#x}" if "at" in r else ""
+        return f"{how}the result of {what}"
+    if r["value"] == "argument":
+        return f"{how}argument {r['argument']} ({r['argument_register']})"
     src = f" ({r['from']})" if "from" in r else ""
-    return f"{name}: {r['value']}{src}{where}"
+    return f"{how}{r['value']}{src}"
+
+
+def describe_register(r) -> str:
+    where = f", call at {r['call']:#x}" if "call" in r else (f" at {r['at']:#x}" if "at" in r else "")
+    return f"{r['register']}: {source(r)}{where}"
+
+
+def argument_lines(args, indent: str):
+    """A tally of what the call sites pass, most frequent first."""
+    sites = args["sites"]
+    lines = []
+    for n in sorted({s["passed_as"] for s in sites}):
+        tally = {}
+        for s in sites:
+            if s["passed_as"] == n:
+                what = source(s["source"])
+                tally[what] = tally.get(what, 0) + 1
+        total = sum(tally.values())
+        lines.append(f"{indent}argument {n} at the function's {total} direct call site(s):")
+        for what, count in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"{indent}  {count:4}  {what}")
+    if args.get("sites_not_read"):
+        lines.append(f"{indent}{args['sites_not_read']} more call site(s) not read")
+    return lines
 
 
 def guard_lines(g, indent: str):
@@ -514,6 +600,8 @@ def report_lines(rep, indent: str = "  "):
     lines = []
     for g in rep["guards"]:
         lines += guard_lines(g, indent)
+    if rep.get("arguments"):
+        lines += argument_lines(rep["arguments"], indent)
     for j in rep["jumps_in"]:
         if j.get("jump") == "jmp":
             f = j["from"]
@@ -534,7 +622,7 @@ def report_lines(rep, indent: str = "  "):
         lines.append(f"{indent}no guard found: the stop is reached unconditionally from the function start, "
                      f"and nothing calls or jumps to it directly (a jump table or a pointer, if anything)")
     if rep.get("links_not_followed"):
-        lines.append(f"{indent}{rep['links_not_followed']} more jump(s) or call(s) in not followed")
+        lines.append(f"{indent}{rep['links_not_followed']} more jump(s) or call(s) into it not followed")
     return lines
 
 

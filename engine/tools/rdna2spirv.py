@@ -1183,13 +1183,17 @@ class Gen:
 
         That needs every intermediate in the f32 normal range, so the operands are first scaled by powers of two,
         which is exact, and the result scaled back: by 2^-64 when the product or z is at least 2^126 (the product may
-        overflow while z brings the sum back into range), by 2^96 when both are tiny (|x*y| < 2^-76 and
+        overflow while z brings the sum back into range; a z below 2^-62 there, which would scale out of the normal
+        range, becomes a signed 2^-126, see below), by 2^96 when both are tiny (|x*y| < 2^-76 and
         |z| < 2^-46), and a factor below 2^-100 is traded 2^64 against one above 2^-20, so the low split halves stay
         normal on a driver that flushes f32 denormals. Infinite or NaN operands, and finite ones whose product is
-        beyond even the scaled range (the result is +-inf), take the plain Fma. Exact (checked against an exact
-        rational reference in tests/semantic/test_fma_exact.py) for finite operands with a normal or zero result,
-        with f32 denormals kept or flushed; a result in the denormal range is scaled back with a second rounding,
-        and a denormal operand follows the driver's denormal mode, as for every f32 operation here."""
+        beyond even the scaled range (the result is +-inf), take the plain Fma, except that finite x and y with an
+        infinite z give z (a split Fma turns an overflowing x*y and the other infinity into a NaN), and normal x and y
+        with a zero z give the rounded x*y (the split path turns an underflowing negative product plus +0 into +0, not
+        -0). Exact (checked
+        against an exact rational reference in tests/semantic/test_fma_exact.py) for finite operands with a normal or
+        zero result, with f32 denormals kept or flushed; a result in the denormal range is scaled back with a second
+        rounding, and a denormal operand follows the driver's denormal mode, as for every f32 operation here."""
         t = self.tmp
         one = "%f1"
 
@@ -1212,7 +1216,8 @@ class Gen:
 
         up64, dn64, up96, dn96 = (self.fconst(2.0 ** e) for e in (64, -64, 96, -96))
         mx, my, mz = mag(x), mag(y), mag(z)
-        mp0 = mag(op("OpFMul", x, y))
+        p0 = op("OpFMul", x, y)
+        mp0 = mag(p0)
         big = op("OpLogicalOr", above(mp0, 0x7E7FFFFF), above(mz, 0x7E7FFFFF), ty="%bool")    # >= 2^126 (or inf)
         tiny = self.emit_land(below(mp0, 0x19800000), below(mz, 0x28800000))                   # < 2^-76, < 2^-46
         xsm = op("OpULessThan", mx, my, ty="%bool")
@@ -1221,7 +1226,14 @@ class Gen:
         fy = sel(big, sel(xsm, dn64, one), sel(tiny, sel(xsm, one, up96), one))
         fz = sel(big, dn64, sel(tiny, up96, one))
         fr = sel(big, up64, sel(tiny, dn96, one))
-        x1, y1, z1 = op("OpFMul", x, fx), op("OpFMul", y, fy), op("OpFMul", z, fz)
+        x1, y1 = op("OpFMul", x, fx), op("OpFMul", y, fy)
+        # big and 0 < |z| < 2^-62: z * 2^-64 would drop below 2^-126 (to 0, or to a denormal a flushing driver drops).
+        # The product is at least 2^126, so its last bit is at least 2^79 and z can only break a tie of it; a signed
+        # 2^-126 keeps that, as v_div_fmas_f32 does for its own pre-scaling.
+        lost = self.emit_land(big, self.emit_land(above(mz, 0), below(mz, 0x20800000)))
+        zst = op("OpBitcast", op("OpBitwiseOr", op("OpBitwiseAnd", op("OpBitcast", z, ty="%uint"), self.cu(0x80000000),
+                                                  ty="%uint"), self.cu(0x00800000), ty="%uint"))
+        z1 = sel(lost, zst, op("OpFMul", z, fz))
         # A factor below 2^-100 next to one above 2^-20: trade 2^64 between them (the product is unchanged).
         mx1, my1 = mag(x1), mag(y1)
         bx = self.emit_land(below(mx1, 0x0D800000), above(my1, 0x35800000))
@@ -1257,10 +1269,20 @@ class Gen:
                  op("OpISub", sbits, self.cu(1), ty="%uint"), ty="%uint")
         v = op("OpBitcast", op("OpSelect", self.emit_land(even, inexact), adj, sbits, ty="%uint"))
         rs = sel(op("OpFOrdEqual", v, "%f0", ty="%bool"), th, op("OpFAdd", th, v))
-        rr = op("OpFMul", rs, fr)
+        # z = +-0 with normal x and y: the exact x*y + z is x*y, which is not zero, so the one rounding of x*y is the
+        # result. The split path loses the sign of a product that underflows even after the 2^96 scale: p rounds to
+        # -0, th = p + z1 is -0 + +0 = +0, and so is the result where the exact one is -0.
+        xy_normal = self.emit_land(above(mx, 0x007FFFFF), above(my, 0x007FFFFF))
+        times = self.emit_land(op("OpIEqual", mz, self.cu(0), ty="%bool"), xy_normal)
+        rr = sel(times, p0, op("OpFMul", rs, fr))
         special = op("OpLogicalOr", op("OpLogicalOr", above(mx, 0x7F7FFFFF), above(my, 0x7F7FFFFF), ty="%bool"),
                      op("OpLogicalOr", above(mz, 0x7F7FFFFF), op("OpIsNan", rr, ty="%bool"), ty="%bool"), ty="%bool")
         g = op("OpExtInst", "%glsl Fma", x, y, z)
+        # Finite x and y with an infinite z give z. A split Fma would round x*y first, and when that overflows to the
+        # other infinity the sum is a NaN.
+        xyfin = op("OpLogicalNot", op("OpLogicalOr", above(mx, 0x7F7FFFFF), above(my, 0x7F7FFFFF), ty="%bool"),
+                   ty="%bool")
+        g = sel(self.emit_land(xyfin, op("OpIEqual", mz, self.cu(0x7F800000), ty="%bool")), z, g)
         self.emit(f"{r} = OpSelect %float {special} {g} {rr}")
 
     def fma_f16_odd(self, x, y, z):

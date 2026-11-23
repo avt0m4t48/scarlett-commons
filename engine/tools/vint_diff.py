@@ -16,6 +16,7 @@ What is modelled, per instruction:
     constants), integer inline constants -16..64, float inline constants (0.5, 1.0, 2.0, 4.0, their negatives and
     1/(2*pi)) as their f32 bits, and 32-bit literals. An e32 VOP2 has a VGPR in src1 and a literal only in src0; a
     VOP3 form has at most one literal and at most two scalar values (SGPRs and the literal: the GFX10 constant bus).
+    The 64-bit shifts take one scalar value: with an SGPR pair as S1, S0 is a VGPR or an inline constant.
   * v_mad_u32_u16 / v_mad_i32_i16 with op_sel on the two 16-bit sources (the high halves). A literal there has 16
     bits (zero-extended: its high half is 0); a float inline constant is its f32 bits (high half 0x3f00 for 0.5).
   * v_bfe_u32 / v_bfe_i32: offset and width are their low 5 bits, and the field stops at bit 31
@@ -27,7 +28,8 @@ What is modelled, per instruction:
     clamp they wrap.
   * the 64-bit shifts (OPS64): v_lshlrev_b64, v_lshrrev_b64, v_ashrrev_i64 shift S1 by S0 & 63 into a VGPR pair. S0
     is any 32-bit source; S1 is a VGPR pair (aligned or not), an SGPR pair, or an integer inline constant
-    sign-extended to 64 bits.
+    sign-extended to 64 bits. Their constant-bus limit is one on GFX10: llvm-mc and COMGR reject
+    `v_lshrrev_b64 v[2:3], 0x12345678, s[4:5]` and `..., s4, s[6:7]` ("violates constant bus restrictions").
 Every rule above the clamp and 64-bit shift bullets was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows
 driver 26.10.1) with --oracle hw. The clamp and 64-bit shift rules are the docs/design.md rows ("Integer clamp",
 "Vector integer additions") measured on gfx1035 with tools/int_hw_probe.py (SHADER-137); --oracle hw generates them,
@@ -356,8 +358,11 @@ class Gen:
             return [f"{name}_e64 v{d}, {', '.join(self.srcs(2, True))}{self.clamp(name)}"]
         if enc == "vop3_64":
             src = self.src64()
-            # an SGPR pair is one scalar value on the constant bus, so S0 may still be an SGPR or a literal
             sh = self.srcs(1, True)[0]
+            # the 64-bit shifts read at most one scalar value (their GFX10 constant-bus limit is one): with an SGPR
+            # pair as S1, the shift count is a VGPR or an inline constant
+            if src.startswith("s[") and scalar(sh):
+                sh = self.vreg() if r.random() < 0.5 else str(r.randint(-16, 64))
             n = r.choice(VPAIRS)
             return [f"{name} v[{n}:{n + 1}], {sh}, {src}"]
         line = f"{name} v{d}, {', '.join(self.srcs(n, True, lit16=2 if name in OP_SEL_OPS else 0))}"
@@ -405,6 +410,11 @@ def generate(rng, n_ops, ops):
 _OP_SEL = re.compile(r"\s+op_sel:\[([01,]+)\]\s*$")
 
 
+def scalar(tok):
+    """Whether a source token is read over the constant bus: an SGPR (or pair), VCC or a literal."""
+    return tok.startswith(("s", "vcc", "0x"))
+
+
 def value(tok, st):
     if re.fullmatch(r"v\d+", tok):
         return st["v"].get(int(tok[1:]), 0)
@@ -444,6 +454,10 @@ def reference(lines):
             sel = [int(x) for x in m.group(1).split(",")]
             rest = rest[:m.start()]
         args = [a.strip() for a in rest.split(",")]
+        base = op[:-4] if op.endswith(("_e32", "_e64")) else op
+        # before the early returns below: an s_mov_b32, v_cmp or v_cndmask with clamp must not run either
+        if clamp and (base not in CLAMP_OPS or op.endswith("_e32")):
+            raise RefError(f"{op}: clamp is not modelled")
         if op == "s_mov_b32":
             st["s"][args[0]] = value(args[1], st)
             continue
@@ -454,12 +468,11 @@ def reference(lines):
         if op == "v_cndmask_b32_e64":
             st["v"][int(args[0][1:])] = value(args[2] if value(args[3], st) & 1 else args[1], st)
             continue
-        base = op[:-4] if op.endswith(("_e32", "_e64")) else op
         if base not in OPS:
             raise RefError(f"{op} is not modelled")
-        if clamp and (base not in CLAMP_OPS or op.endswith("_e32")):
-            raise RefError(f"{op}: clamp is not modelled")
         if base in OPS64:
+            if sum(scalar(a) for a in args[1:]) > 1:
+                raise RefError(f"{line}: a 64-bit shift reads one scalar value (GFX10 constant bus)")
             n = dests(line)
             r = OPS64[base](value(args[1], st), value64(args[2], st))
             st["v"][n[0]], st["v"][n[1]] = r & M32, r >> 32

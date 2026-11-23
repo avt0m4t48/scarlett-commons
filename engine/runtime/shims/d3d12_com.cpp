@@ -26,20 +26,39 @@
 
 namespace rt::d3d12 {
 
-static std::uint64_t buffer_tiles(ID3D12Resource* buffer) {
-    if (!buffer) return 0;
-    const auto desc = buffer->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !desc.Width) return 0;
-    return 1 + (desc.Width - 1) / leonida::tile_size_in_bytes;
+struct TileGrid {
+    std::uint64_t columns = 0;
+    std::uint64_t rows = 0;
+};
+
+static TileGrid tile_grid(ID3D12Resource* resource) {
+    if (!resource) return {};
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width)
+        return {1 + (desc.Width - 1) / leonida::tile_size_in_bytes, 1};
+    if (!is_sparse_image(resource)) return {};
+    constexpr auto shape = leonida::element_tile_shape(false, 4);
+    return {1 + (desc.Width - 1) / shape.width, 1 + (desc.Height - 1) / shape.height};
 }
 
-static bool buffer_tile_region(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
-                               std::uint64_t tiles, leonida::BufferTileRegion& region) {
-    if (start && (start->Y || start->Z || start->Subresource)) return false;
-    if (size && size->UseBox && (size->Height != 1 || size->Depth != 1)) return false;
-    region.first = start ? start->X : 0;
-    region.count = size ? (size->UseBox ? size->Width : size->NumTiles) : (start ? 1 : tiles);
-    return region.count && region.first < tiles && region.count <= tiles - region.first;
+static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
+                                TileGrid grid, std::vector<leonida::TileRegion>& regions) {
+    const auto x = start ? start->X : 0;
+    const auto y = start ? start->Y : 0;
+    if ((start && (start->Z || start->Subresource)) || x >= grid.columns || y >= grid.rows) return false;
+    const auto first = y * grid.columns + x;
+    if (size && size->UseBox) {
+        if (size->Depth != 1 || !size->Width || !size->Height ||
+            size->Width > grid.columns - x || size->Height > grid.rows - y) return false;
+        for (UINT row = 0; row < size->Height; ++row)
+            regions.push_back({first + row * grid.columns, size->Width});
+        return true;
+    }
+    const auto tiles = grid.columns * grid.rows;
+    const auto count = size ? size->NumTiles : (start ? 1 : tiles);
+    if (!count || count > tiles - first) return false;
+    regions.push_back({first, count});
+    return true;
 }
 
 void stub(const char* method) {
@@ -480,12 +499,41 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
-        leonida::BufferTileRegion region;
+        const auto grid = tile_grid(tiled);
+        std::vector<leonida::TileRegion> regions;
         if (!start || !size || !linear || linear == tiled ||
-            !buffer_tile_region(start, size, buffer_tiles(tiled), region) ||
+            !append_tile_regions(start, size, grid, regions) ||
             (!to_linear && direction != D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE))
             return check(false);
         const auto tiled_id = resource_id(tiled), linear_id = resource_id(linear);
+        if (is_sparse_image(tiled)) {
+            const auto buffer = linear->GetDesc();
+            const auto desc = tiled->GetDesc();
+            const auto count = size->UseBox ? std::uint64_t(size->Width) * size->Height : size->NumTiles;
+            if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                linear_offset > buffer.Width || count > (buffer.Width - linear_offset) / leonida::tile_size_in_bytes)
+                return check(false);
+            constexpr auto shape = leonida::element_tile_shape(false, 4);
+            const leonida::CopyLocation image{tiled_id, false, 0, 0, 0, 0, 0, 0};
+            for (const auto& region : regions) {
+                for (std::uint64_t tile = region.first; tile < region.first + region.count; ++tile) {
+                    const auto x = std::uint32_t(tile % grid.columns) * shape.width;
+                    const auto y = std::uint32_t(tile / grid.columns) * shape.height;
+                    const auto width = std::min(shape.width, std::uint32_t(desc.Width) - x);
+                    const auto height = std::min(shape.height, desc.Height - y);
+                    const leonida::CopyLocation footprint{
+                        linear_id, true, 0, linear_offset, shape.width, shape.height, 1, shape.width * 4};
+                    auto copy = to_linear
+                        ? leonida::CopyTexture{footprint, 0, 0, 0, image, true, {x, y, 0, x + width, y + height, 1}}
+                        : leonida::CopyTexture{image, x, y, 0, footprint, true, {0, 0, 0, width, height, 1}};
+                    copy.tile_footprint = true;
+                    check(list_.copy_texture(copy));
+                    linear_offset += leonida::tile_size_in_bytes;
+                }
+            }
+            return;
+        }
+        const auto& region = regions.front();
         const auto tiled_offset = region.first * leonida::tile_size_in_bytes;
         const auto bytes = region.count * leonida::tile_size_in_bytes;
         check(list_.copy_buffer(to_linear
@@ -1289,10 +1337,10 @@ public:
                                               const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets,
                                               const UINT* counts, D3D12_TILE_MAPPING_FLAGS mapping_flags) override {
         constexpr auto method = "ID3D12CommandQueue::UpdateTileMappings";
-        if (!update_buffer_tiles(resource, region_count, starts, sizes, heap, range_count, flags, offsets,
-                                 counts, mapping_flags)) {
+        if (!update_tiles(resource, region_count, starts, sizes, heap, range_count, flags, offsets, counts,
+                          mapping_flags)) {
             d3d12_trace::record(method, "refused");
-            note_once("ID3D12CommandQueue::UpdateTileMappings: invalid mapping or buffer sparse residency unavailable");
+            note_once("ID3D12CommandQueue::UpdateTileMappings: invalid mapping or sparse residency unavailable");
         } else {
             d3d12_trace::record(method, "ok");
         }
@@ -1303,13 +1351,13 @@ public:
                                             const D3D12_TILE_REGION_SIZE* size, D3D12_TILE_MAPPING_FLAGS flags) override {
         constexpr auto method = "ID3D12CommandQueue::CopyTileMappings";
         std::lock_guard lock(mutex_);
-        leonida::BufferTileRegion from, to;
+        std::vector<leonida::TileRegion> from, to;
         if ((flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD) || !dst_start || !src_start || !size ||
-            !buffer_tile_region(src_start, size, buffer_tiles(src), from) ||
-            !buffer_tile_region(dst_start, size, buffer_tiles(dst), to) ||
-            !queue_.copy_tile_mappings(resource_id(dst), to.first, resource_id(src), from)) {
+            !append_tile_regions(src_start, size, tile_grid(src), from) ||
+            !append_tile_regions(dst_start, size, tile_grid(dst), to) ||
+            !queue_.copy_tile_mappings(resource_id(dst), to, resource_id(src), from)) {
             d3d12_trace::record(method, "refused");
-            note_once("ID3D12CommandQueue::CopyTileMappings: invalid mapping or buffer sparse residency unavailable");
+            note_once("ID3D12CommandQueue::CopyTileMappings: invalid mapping or sparse residency unavailable");
         } else {
             d3d12_trace::record(method, "ok");
         }
@@ -1468,23 +1516,26 @@ private:
         queue_.marker(kind, label.c_str());
     }
 
-    bool update_buffer_tiles(ID3D12Resource* resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE* starts,
-                             const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
-                             const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets, const UINT* counts,
-                             D3D12_TILE_MAPPING_FLAGS mapping_flags) {
+    bool update_tiles(ID3D12Resource* resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE* starts,
+                      const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
+                      const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets, const UINT* counts,
+                      D3D12_TILE_MAPPING_FLAGS mapping_flags) {
         if (!region_count || !range_count || (!starts && region_count != 1) ||
             (mapping_flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD)) return false;
-        const auto tiles = buffer_tiles(resource);
-        std::vector<leonida::BufferTileRegion> regions(region_count);
-        std::uint64_t total = 0;
+        const auto grid = tile_grid(resource);
+        std::vector<leonida::TileRegion> regions;
+        regions.reserve(region_count);
         for (UINT i = 0; i < region_count; ++i) {
-            if (!buffer_tile_region(starts ? starts + i : nullptr, sizes ? sizes + i : nullptr, tiles, regions[i]))
+            if (!append_tile_regions(starts ? starts + i : nullptr, sizes ? sizes + i : nullptr, grid, regions))
                 return false;
-            if (regions[i].count > UINT64_MAX - total) return false;
-            total += regions[i].count;
+        }
+        std::uint64_t total = 0;
+        for (const auto& region : regions) {
+            if (region.count > UINT64_MAX - total) return false;
+            total += region.count;
         }
 
-        std::vector<leonida::BufferTileRange> ranges;
+        std::vector<leonida::TileRange> ranges;
         ranges.reserve(range_count);
         std::uint64_t remaining = total, heap_tiles_required = 0;
         for (UINT i = 0; i < range_count; ++i) {
@@ -1519,7 +1570,9 @@ private:
             (!heap || heap_tiles_required > heap->GetDesc().SizeInBytes / leonida::tile_size_in_bytes))) return false;
         std::lock_guard lock(mutex_);
         return queue_.update_tiles(resource_id(resource), regions, ranges,
-                                   [&] { return heap_tiles_required ? tile_heap(heap, context_) : nullptr; });
+                                   [&](bool image, std::uint32_t types) {
+                                       return heap_tiles_required ? tile_heap(heap, context_, image, types) : nullptr;
+                                   });
     }
 
     D3D12_COMMAND_QUEUE_DESC desc_;

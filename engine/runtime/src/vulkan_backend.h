@@ -85,7 +85,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -381,6 +381,8 @@ private:
     VkPipeline statistics_pipeline_ = VK_NULL_HANDLE;
 };
 
+struct SparseResource;
+
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
 public:
@@ -388,6 +390,7 @@ public:
         bindless_slot,
         image_view,
         image,
+        sparse_resource,
         buffer,
         device_memory,
         acceleration_structure,
@@ -463,6 +466,10 @@ public:
                 break;
             case Kind::image:
                 vk.vkDestroyImage(device, reinterpret_cast<VkImage>(item.handle), nullptr);
+                break;
+            case Kind::sparse_resource:
+                // Releases the resource and its page backing together after outstanding submissions.
+                delete reinterpret_cast<std::shared_ptr<SparseResource>*>(item.handle);
                 break;
             case Kind::buffer:
                 vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
@@ -765,34 +772,39 @@ struct TileHeapAllocation {
     std::uint32_t memory_type = 0;
 };
 
-struct BufferTile {
+struct TileMapping {
     std::shared_ptr<const TileHeapAllocation> heap;
     VkDeviceSize offset = 0;
-    bool operator==(const BufferTile&) const = default;
+    bool operator==(const TileMapping&) const = default;
 };
 
-struct SparseBuffer {
-    SparseBuffer(VkDevice device, PFN_vkDestroyBuffer destroy) : device(device), destroy(destroy) {}
-    SparseBuffer(const SparseBuffer&) = delete;
-    SparseBuffer& operator=(const SparseBuffer&) = delete;
-    ~SparseBuffer() { if (buffer) destroy(device, buffer, nullptr); }
+struct SparseResource {
+    SparseResource(VkDevice device, const VulkanDeviceFunctions& vk) : device(device), vk(vk) {}
+    SparseResource(const SparseResource&) = delete;
+    SparseResource& operator=(const SparseResource&) = delete;
+    ~SparseResource() {
+        if (image) vk.vkDestroyImage(device, image, nullptr);
+        if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
+    }
 
     VkDevice device;
-    PFN_vkDestroyBuffer destroy;
+    const VulkanDeviceFunctions& vk;
     VkBuffer buffer = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkExtent2D image_extent{};
     std::uint64_t tile_count = 0;
     std::uint32_t memory_types = 0;
-    std::map<std::uint64_t, BufferTile> mapped;
+    std::map<std::uint64_t, TileMapping> mapped;
 };
 
-struct BufferTileRegion {
+struct TileRegion {
     std::uint64_t first = 0;
     std::uint64_t count = 0;
 };
 
 enum class TileRangeMode { sequential, unmap, skip, reuse };
 
-struct BufferTileRange {
+struct TileRange {
     TileRangeMode mode;
     std::uint64_t first;
     std::uint64_t count;
@@ -990,11 +1002,9 @@ public:
         }
     }
 
-    // An image that got a storage (unordered-access) view. A shader can write it before any command names it, so the
-    // layer would not know it was used and the first barrier or copy that does would zero-fill it (vulkan_replay.h,
-    // initialize). The next submission therefore moves each such image to GENERAL, the layout its descriptor names,
-    // zero-filled, ahead of its lists. An image already tracked beyond UNDEFINED is left as it is.
-    void note_storage_image(ResourceId id) {
+    // A shader can access a storage image or an initially unbound sparse image before any command names it.
+    // The first shader submission moves it to GENERAL, the descriptor's layout, ahead of its lists.
+    void note_shader_image(ResourceId id) {
         std::lock_guard lock(storage_mutex_);
         storage_pending_.insert(id);
     }
@@ -1007,14 +1017,19 @@ public:
         zero_pending_.push_back({id, buffer});
     }
 
-    void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
+    void add_sparse_resource(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseResource> sparse) {
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
-        sparse_buffers_.emplace(id, std::move(buffer));
+        sparse_resources_.emplace(id, std::move(sparse));
+        if (binding.image) {
+            std::lock_guard tlock(tracker_mutex_);
+            tracker_.track(id, binding, VK_IMAGE_LAYOUT_UNDEFINED);
+        }
     }
 
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
+        std::shared_ptr<SparseResource> sparse_resource;
         {
             std::unique_lock rlock(resource_mutex_);
             const auto it = resources_.find(id);
@@ -1022,7 +1037,10 @@ public:
             img = it->second.image;
             unindex_buffer(id, it->second);
             resources_.erase(it);
-            sparse_buffers_.erase(id);
+            if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
+                sparse_resource = std::move(sparse->second);
+                sparse_resources_.erase(sparse);
+            }
         }
         {
             std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
@@ -1039,6 +1057,9 @@ public:
                 }
             }
         }
+        if (sparse_resource)
+            defer_destroy(DeferredDeletionQueue::Kind::sparse_resource,
+                          new std::shared_ptr<SparseResource>(std::move(sparse_resource)));
         std::lock_guard tlock(tracker_mutex_);
         tracker_.forget(id);
     }
@@ -1362,7 +1383,7 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
-    std::unordered_map<ResourceId, std::shared_ptr<SparseBuffer>> sparse_buffers_;
+    std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
@@ -1534,18 +1555,18 @@ public:
     bool ok() const { return ok_; }
 
     template<typename GetHeap>
-    bool update_tiles(ResourceId id, std::span<const BufferTileRegion> regions,
-                      std::span<const BufferTileRange> ranges, GetHeap&& get_heap) {
+    bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
+                      std::span<const TileRange> ranges, GetHeap&& get_heap) {
         std::lock_guard state(state_mutex_);  // outermost: held batches are released from other threads
         std::unique_lock lock(context_.resource_mutex_);
-        const auto it = context_.sparse_buffers_.find(id);
-        if (it == context_.sparse_buffers_.end()) return false;
-        const auto& buffer = it->second;
+        const auto it = context_.sparse_resources_.find(id);
+        if (it == context_.sparse_resources_.end()) return false;
+        const auto& sparse = it->second;
         for (const auto& region : regions)
-            if (!valid_tiles(*buffer, region)) return false;
-        const auto heap = get_heap();
+            if (!valid_tiles(*sparse, region)) return false;
+        const auto heap = get_heap(sparse->image != VK_NULL_HANDLE, sparse->memory_types);
 
-        std::map<std::uint64_t, BufferTile> changes;
+        std::map<std::uint64_t, TileMapping> changes;
         std::size_t region_index = 0;
         std::uint64_t consumed = 0;
         for (const auto& range : ranges) {
@@ -1560,7 +1581,7 @@ public:
                 const auto first = region.first + consumed;
                 if (range.mode == TileRangeMode::unmap) {
                     const auto end = first + count;
-                    for (auto old = buffer->mapped.lower_bound(first); old != buffer->mapped.end() && old->first < end; ++old)
+                    for (auto old = sparse->mapped.lower_bound(first); old != sparse->mapped.end() && old->first < end; ++old)
                         changes[old->first] = {};
                     for (auto change = changes.lower_bound(first); change != changes.end() && change->first < end; ++change)
                         change->second = {};
@@ -1578,23 +1599,29 @@ public:
                 }
             }
         }
-        return region_index == regions.size() && bind_tiles(buffer, changes);
+        return region_index == regions.size() && bind_tiles(id, sparse, changes);
     }
 
-    bool copy_tile_mappings(ResourceId dst, std::uint64_t dst_first, ResourceId src, BufferTileRegion src_region) {
+    bool copy_tile_mappings(ResourceId dst, std::span<const TileRegion> dst_regions, ResourceId src,
+                            std::span<const TileRegion> src_regions) {
         std::lock_guard state(state_mutex_);
         std::unique_lock lock(context_.resource_mutex_);
-        const auto source = context_.sparse_buffers_.find(src), target = context_.sparse_buffers_.find(dst);
-        if (source == context_.sparse_buffers_.end() || target == context_.sparse_buffers_.end() ||
-            !valid_tiles(*source->second, src_region) ||
-            !valid_tiles(*target->second, {dst_first, src_region.count})) return false;
-        // Read the complete source mapping before changing any destination slot, including copies within one buffer.
-        std::map<std::uint64_t, BufferTile> changes;
-        for (std::uint64_t i = 0; i < src_region.count; ++i) {
-            const auto page = source->second->mapped.find(src_region.first + i);
-            changes.emplace(dst_first + i, page == source->second->mapped.end() ? BufferTile{} : page->second);
+        const auto source = context_.sparse_resources_.find(src), target = context_.sparse_resources_.find(dst);
+        if (source == context_.sparse_resources_.end() || target == context_.sparse_resources_.end() ||
+            bool(source->second->image) != bool(target->second->image) || src_regions.size() != dst_regions.size())
+            return false;
+        // Read the complete source mapping before changing any destination slot, including copies within one resource.
+        std::map<std::uint64_t, TileMapping> changes;
+        for (std::size_t row = 0; row < src_regions.size(); ++row) {
+            const auto from = src_regions[row], to = dst_regions[row];
+            if (!valid_tiles(*source->second, from) || !valid_tiles(*target->second, to) || from.count != to.count)
+                return false;
+            for (std::uint64_t i = 0; i < from.count; ++i) {
+                const auto page = source->second->mapped.find(from.first + i);
+                changes.emplace(to.first + i, page == source->second->mapped.end() ? TileMapping{} : page->second);
+            }
         }
-        return bind_tiles(target->second, changes);
+        return bind_tiles(dst, target->second, changes);
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
@@ -1910,8 +1937,8 @@ private:
             return ReplayResult::unsupported;
         }
         auto next_tracker = context_.tracker_;
-        // Images with a UAV view are moved to GENERAL (zeroed) by the first submission that can use a shader on them:
-        // not a copy queue (its family may not clear images), and one whose lists dispatch or draw.
+        // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
+        // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
         for (const CommandList* list : lists)
             for (const auto& command : list->commands())
@@ -2177,32 +2204,72 @@ private:
 
     struct PendingBindings {
         std::uint64_t ticket = 0;
-        // Vulkan needs the buffer until the bind completes and the previous allocation until it is unmapped.
+        // Vulkan needs the resource until the bind completes and the previous allocation until it is unmapped.
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
-        std::shared_ptr<SparseBuffer> buffer;
+        std::shared_ptr<SparseResource> resource;
     };
 
-    static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
-        return region.count && region.first < buffer.tile_count && region.count <= buffer.tile_count - region.first;
+    static bool valid_tiles(const SparseResource& resource, TileRegion region) {
+        return region.count && region.first < resource.tile_count && region.count <= resource.tile_count - region.first;
     }
 
-    bool bind_tiles(const std::shared_ptr<SparseBuffer>& buffer,
-                    std::map<std::uint64_t, BufferTile>& changes) {
+    bool initialize_sparse_image_layout(ResourceId id) {
+        std::lock_guard lock(context_.tracker_mutex_);
+        if (context_.tracker_.layout(id, 0) != VK_IMAGE_LAYOUT_UNDEFINED) return true;
+        auto* slot = acquire();
+        if (!slot) return false;
+        const VkCommandBuffer command_buffer = slot->buffer;
+        auto& vk = context_.vk;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
+            slot->ticket = 0;
+            return false;
+        }
+        // Transition while the image is still unbound. Doing this after binding could discard another image's
+        // contents in an aliased page. Subsequent uses keep the image in GENERAL.
+        constexpr VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        detail::image_barrier(context_.replay_, command_buffer, context_.resources_.at(id), range,
+                              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS || !submit(command_buffer, VK_NULL_HANDLE, 0)) {
+            slot->ticket = 0;
+            return false;
+        }
+        context_.tracker_.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
+        return true;
+    }
+
+    bool bind_tiles(ResourceId id, const std::shared_ptr<SparseResource>& resource,
+                    std::map<std::uint64_t, TileMapping>& changes) {
         auto& vk = context_.vk;
         if (!vk.vkQueueBindSparse || context_.is_device_lost()) return false;
-        const auto ticket = submitted_ + 1;
-        PendingBindings pending{ticket, {}, buffer};
+        PendingBindings pending{0, {}, resource};
         std::vector<VkSparseMemoryBind> binds;
+        std::vector<VkSparseImageMemoryBind> image_binds;
         for (const auto& [index, page] : changes) {
-            const auto old = buffer->mapped.find(index);
-            if (old != buffer->mapped.end()) {
+            const auto old = resource->mapped.find(index);
+            if (old != resource->mapped.end()) {
                 if (old->second == page) continue;
                 pending.old_heaps.push_back(old->second.heap);
             } else if (!page.heap) {
                 continue;
             }
-            if (page.heap && !(buffer->memory_types & (1u << page.heap->memory_type))) return false;
+            if (page.heap && !(resource->memory_types & (1u << page.heap->memory_type))) return false;
             const VkDeviceMemory memory = page.heap ? page.heap->memory : VK_NULL_HANDLE;
+            if (resource->image) {
+                constexpr auto shape = element_tile_shape(false, 4);
+                const auto extent = resource->image_extent;
+                const auto columns = 1 + (extent.width - 1) / shape.width;
+                const auto x = std::uint32_t(index % columns) * shape.width;
+                const auto y = std::uint32_t(index / columns) * shape.height;
+                image_binds.push_back({
+                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}, {std::int32_t(x), std::int32_t(y), 0},
+                    {std::min(shape.width, extent.width - x), std::min(shape.height, extent.height - y), 1},
+                    memory, page.offset, 0});
+                continue;
+            }
             const VkDeviceSize resource_offset = index * tile_size_in_bytes;
             if (!binds.empty()) {
                 auto& previous = binds.back();
@@ -2214,7 +2281,10 @@ private:
             }
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
-        if (binds.empty()) return true;
+        if (binds.empty() && image_binds.empty()) return true;
+        if (!image_binds.empty() && !initialize_sparse_image_layout(id)) return false;
+        const auto ticket = submitted_ + 1;
+        pending.ticket = ticket;
         collect_bindings(completed());
         auto semaphores = waits_;
         auto values = wait_values_;
@@ -2228,12 +2298,20 @@ private:
         tickets.pWaitSemaphoreValues = values.data();
         tickets.signalSemaphoreValueCount = 1;
         tickets.pSignalSemaphoreValues = &ticket;
-        const VkSparseBufferMemoryBindInfo buffer_bind{buffer->buffer, std::uint32_t(binds.size()), binds.data()};
+        const VkSparseBufferMemoryBindInfo buffer_bind{resource->buffer, std::uint32_t(binds.size()), binds.data()};
+        const VkSparseImageMemoryBindInfo image_bind{
+            resource->image, std::uint32_t(image_binds.size()), image_binds.data()};
         VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
         info.waitSemaphoreCount = std::uint32_t(semaphores.size());
         info.pWaitSemaphores = semaphores.data();
-        info.bufferBindCount = 1;
-        info.pBufferBinds = &buffer_bind;
+        if (!binds.empty()) {
+            info.bufferBindCount = 1;
+            info.pBufferBinds = &buffer_bind;
+        }
+        if (!image_binds.empty()) {
+            info.imageBindCount = 1;
+            info.pImageBinds = &image_bind;
+        }
         info.signalSemaphoreCount = 1;
         info.pSignalSemaphores = &progress_;
         pending_bindings_.push_back(std::move(pending));
@@ -2251,11 +2329,11 @@ private:
         waits_.clear();
         wait_values_.clear();
         for (auto it = changes.begin(); it != changes.end();) {
-            buffer->mapped.erase(it->first);
+            resource->mapped.erase(it->first);
             if (it->second.heap) ++it;
             else it = changes.erase(it);
         }
-        buffer->mapped.merge(changes);
+        resource->mapped.merge(changes);
         return true;
     }
 

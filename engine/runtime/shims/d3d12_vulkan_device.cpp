@@ -565,6 +565,7 @@ struct DeviceState {
     } arena;
 
     std::uint32_t sparse_buffer_memory_types = 0;
+    bool sparse_image_tiles = false;
 
     bool tiles_share_arena() const { return (sparse_buffer_memory_types & (1u << arena.memory_type)) != 0; }
 
@@ -1588,13 +1589,15 @@ public:
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
-        if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
+        if (image_ && !sparse_image_)
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    bool sparse_image() const { return sparse_image_; }
     VkBuffer buffer() const { return buffer_; }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     VkFormat format() const { return format_; }                  // of the image
@@ -1746,7 +1749,7 @@ public:
         if (!desc_.Width || desc_.Width > UINT64_MAX - tile_bytes ||
             desc_.SampleDesc.Count != 1 || desc_.SampleDesc.Quality != 0) return E_INVALIDARG;
         auto& vk = device_.context->vk;
-        auto sparse = std::make_shared<leonida::SparseBuffer>(device_.info.device, vk.vkDestroyBuffer);
+        auto sparse = std::make_shared<leonida::SparseResource>(device_.info.device, vk);
         sparse->tile_count = (desc_.Width + tile_bytes - 1) / tile_bytes;
         const auto info = device_.sparse_buffer_info(sparse->tile_count * tile_bytes);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &sparse->buffer) != VK_SUCCESS)
@@ -1764,7 +1767,62 @@ public:
         binding.size = desc_.Width;
         binding.va = va_;
         binding.sparse_buffer = true;
-        device_.context->add_sparse_buffer(id(), binding, std::move(sparse));
+        device_.context->add_sparse_resource(id(), binding, std::move(sparse));
+        return S_OK;
+    }
+
+    HRESULT create_sparse_image() {
+        auto& vk = device_.context->vk;
+        const auto format = device_.texture_format(desc_);
+        TextureCreateInfo create(desc_, format, false);
+        create.info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                             VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        HRESULT support = device_.check_image_support(create.info);
+        if (FAILED(support)) return support == E_INVALIDARG ? E_NOTIMPL : support;
+        device_.share(create.info);
+        auto sparse = std::make_shared<leonida::SparseResource>(device_.info.device, vk);
+        const auto result = vk.vkCreateImage(device_.info.device, &create.info, nullptr, &sparse->image);
+        if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return E_NOTIMPL;
+        if (result != VK_SUCCESS) return E_OUTOFMEMORY;
+
+        VkMemoryRequirements requirements{};
+        vk.vkGetImageMemoryRequirements(device_.info.device, sparse->image, &requirements);
+        if (requirements.alignment != leonida::tile_size_in_bytes ||
+            leonida::memory_type_order(device_.memory, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                       0, leonida::tile_size_in_bytes).empty())
+            return E_NOTIMPL;
+        std::uint32_t count = 0;
+        vk.vkGetImageSparseMemoryRequirements(device_.info.device, sparse->image, &count, nullptr);
+        if (count != 1) return E_NOTIMPL;  // exactly one color aspect, with no separately bound metadata
+        VkSparseImageMemoryRequirements image_requirements{};
+        vk.vkGetImageSparseMemoryRequirements(device_.info.device, sparse->image, &count, &image_requirements);
+        constexpr auto shape = leonida::element_tile_shape(false, 4);
+        const auto& properties = image_requirements.formatProperties;
+        const auto granularity = properties.imageGranularity;
+        if (properties.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || granularity.width != shape.width ||
+            granularity.height != shape.height || granularity.depth != 1 ||
+            !image_requirements.imageMipTailFirstLod || image_requirements.imageMipTailSize)
+            return E_NOTIMPL;
+
+        sparse->image_extent = {create.info.extent.width, create.info.extent.height};
+        sparse->tile_count = (1 + (sparse->image_extent.width - 1) / shape.width) *
+                             std::uint64_t(1 + (sparse->image_extent.height - 1) / shape.height);
+        sparse->memory_types = requirements.memoryTypeBits;
+        image_ = sparse->image;
+        sparse_image_ = true;
+        format_ = format.format;
+        aspects_ = format.aspects;
+        image_address_ = device_.next_image_address.fetch_add(256);
+        binding_.image = image_;
+        binding_.format = format_;
+        binding_.aspects = aspects_;
+        binding_.width = sparse->image_extent.width;
+        binding_.height = sparse->image_extent.height;
+        // An unbound tile reads as zero. Keep the layout stable once the image can share memory with an alias.
+        binding_.not_zeroed = true;
+        binding_.simultaneous_access = true;
+        binding_.sampled_in_general = true;
+        device_.context->add_sparse_resource(id(), binding_, std::move(sparse));
         return S_OK;
     }
 
@@ -1896,8 +1954,7 @@ public:
         return desc;
     }
 
-    // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
-    // was created with and has no heap of its own.
+    // Both sparse resources and the committed fallback report the reserved layout and have no heap of their own.
     void make_reserved(D3D12_TEXTURE_LAYOUT layout) {
         reserved_ = true;
         desc_.Layout = layout;
@@ -2208,6 +2265,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool reserved_ = false;
+    bool sparse_image_ = false;
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
@@ -2395,19 +2453,30 @@ public:
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
     D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
-    std::shared_ptr<const leonida::TileHeapAllocation> tiles(const leonida::VulkanContext& context) {
+    std::shared_ptr<const leonida::TileHeapAllocation> tiles(const leonida::VulkanContext& context, bool image,
+                                                           std::uint32_t memory_types) {
+        const auto denied = image ? D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES : D3D12_HEAP_FLAG_DENY_BUFFERS;
         if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
-            (desc_.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) || !device_.sparse_buffer_memory_types) return {};
-        if (device_.tiles_share_arena()) return allocation_;
+            (desc_.Flags & denied)) return {};
         std::lock_guard lock(backing_mutex_);
-        if (placed_buffer_) return {};
+        if (!image && device_.tiles_share_arena()) {
+            if (tile_allocation_) return {};
+            arena_tiles_ = true;
+            return allocation_;
+        }
+        // Vulkan only guarantees sparse aliasing between compatible images. A texture tile heap has its own
+        // backing, so a heap already used for buffer tiles or placed buffers cannot also map texture tiles.
+        if (arena_tiles_ || (tile_allocation_ && image_tiles_ != image)) return {};
+        if (placed_buffer_ || (image && placed_image_)) return {};
         if (!tile_allocation_) {
             std::uint32_t memory_type = 0;
+            if (!image) memory_types = device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
-                                                    device_.sparse_buffer_memory_types};
+                                                    memory_types};
             const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                                  nullptr, true, &memory_type);
+                                                  nullptr, !image, &memory_type);
             if (!memory) return {};
+            image_tiles_ = image;
             tile_allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
                 new leonida::TileHeapAllocation{memory, 0, desc_.SizeInBytes, memory_type},
                 [device = device_.info.device, free = device_.context->vk.vkFreeMemory]
@@ -2419,12 +2488,11 @@ public:
         return tile_allocation_;
     }
 
-    bool use_as_placed_buffer(bool create) {
+    bool use_as_placed_resource(bool buffer) {
         std::lock_guard lock(backing_mutex_);
-        // Some drivers only accept non-host-visible local memory for sparse buffers. A heap that uses this
-        // separate backing cannot also expose the arena's bytes as though they were the same allocation.
-        if (tile_allocation_) return false;
-        placed_buffer_ |= create;
+        // A placed resource cannot alias the separate sparse memory allocation.
+        if (tile_allocation_ && (buffer || image_tiles_)) return false;
+        (buffer ? placed_buffer_ : placed_image_) = true;
         return true;
     }
 
@@ -2435,6 +2503,9 @@ private:
     std::mutex backing_mutex_;
     std::shared_ptr<const leonida::TileHeapAllocation> tile_allocation_;
     bool placed_buffer_ = false;
+    bool placed_image_ = false;
+    bool arena_tiles_ = false;
+    bool image_tiles_ = false;
 };
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
@@ -4406,10 +4477,12 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
         }
 
-        if (state_.arena.memory && state_.context->vk.vkQueueBindSparse &&
-            info.features.sparseBinding && info.features.sparseResidencyBuffer && info.features.sparseResidencyAliased &&
-            properties.sparseProperties.residencyNonResidentStrict && info.queue_family < family_count &&
-            (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT)) {
+        const bool sparse_aliasing = state_.context->vk.vkQueueBindSparse && info.features.sparseBinding &&
+            info.features.sparseResidencyAliased && properties.sparseProperties.residencyNonResidentStrict &&
+            info.queue_family < family_count && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
+        state_.sparse_image_tiles = sparse_aliasing && info.features.sparseResidencyImage2D &&
+                                    state_.context->vk.vkGetImageSparseMemoryRequirements;
+        if (sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer) {
             auto& vk = state_.context->vk;
             const auto sparse_info = state_.sparse_buffer_info(leonida::tile_size_in_bytes);
             VkBuffer sample = VK_NULL_HANDLE;
@@ -5755,7 +5828,7 @@ public:
             return;
         }
         write_image_descriptor(*r, view, destination, true);
-        state_.context->note_storage_image(r->id());
+        state_.context->note_shader_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
@@ -6180,7 +6253,8 @@ public:
             }
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(true)) {
+        const bool buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        if (buffer && !heap->use_as_placed_resource(true)) {
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
             return d3d12_trace::result(method, E_NOTIMPL);
         }
@@ -6190,7 +6264,7 @@ public:
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (buffer) {
             hr = resource->create_placed_buffer();
         } else {
             hr = S_OK;
@@ -6203,6 +6277,10 @@ public:
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
+        }
+        if (SUCCEEDED(hr) && !buffer && !heap->use_as_placed_resource(false)) {
+            log_once("placed resource refused: heap uses a separate allocation for sparse tiles", 1);
+            hr = E_NOTIMPL;
         }
         if (FAILED(hr)) {
             resource->Release();
@@ -7209,6 +7287,7 @@ private:
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.r9g9b9e5_as_r32_uint());
+        if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
@@ -7367,7 +7446,7 @@ private:
             log_once("calibrated timestamps lack the DEVICE or QueryPerformanceCounter domain; domains:", int(count));
     }
 
-    // D3D12's layout rules for reserved resources. Buffers use sparse storage when supported.
+    // D3D12's layout rules for reserved resources. Use sparse backing for buffers and compatible color textures.
     // The arguments are answered as the host runtime answers them (d3d12_vulkan_device_test's
     // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules of a
     // committed resource on a default heap, the reserved layouts below, and only then E_UNEXPECTED for a null
@@ -7414,7 +7493,7 @@ private:
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12Resource* resource = nullptr;
-        HRESULT hr;
+        HRESULT hr = S_OK;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types) {
             auto* sparse = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
             sparse->attach_device(identity());
@@ -7424,7 +7503,21 @@ private:
                 return d3d12_trace::result(method, hr);
             }
             resource = sparse;
-        } else {
+        } else if (state_.sparse_image_tiles && backing.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                   backing.Format == DXGI_FORMAT_R8G8B8A8_UNORM && backing.Width && backing.Width <= UINT32_MAX &&
+                   backing.Height && backing.DepthOrArraySize == 1 && backing.MipLevels == 1 &&
+                   backing.SampleDesc.Count == 1 && !backing.SampleDesc.Quality &&
+                   backing.Flags == D3D12_RESOURCE_FLAG_NONE && !clear && !castable_count) {
+            auto* sparse = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
+            sparse->attach_device(identity());
+            hr = sparse->create_sparse_image();
+            if (SUCCEEDED(hr)) resource = sparse;
+            else {
+                sparse->Release();
+                if (hr != E_NOTIMPL) return d3d12_trace::result(method, hr);
+            }
+        }
+        if (!resource) {
             hr = create_committed_validated(nullptr, &heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
                                             clear, castable_count, castable, IID_PPV_ARGS(&resource));
         }
@@ -7539,9 +7632,15 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
     return hand_out(device, riid, out);
 }
 
-std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context) {
+std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context,
+                                                           bool image, std::uint32_t memory_types) {
     auto* object = Heap::from<Heap>(heap);
-    return object ? object->tiles(context) : nullptr;
+    return object ? object->tiles(context, image, memory_types) : nullptr;
+}
+
+bool is_sparse_image(ID3D12Resource* resource) {
+    const auto* object = Resource::from<Resource>(resource);
+    return object && object->sparse_image();
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
@@ -8253,6 +8352,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceFeatures enable{};
     enable.sparseBinding = chosen_features.sparseBinding;
     enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
+    enable.sparseResidencyImage2D = chosen_features.sparseResidencyImage2D;
     enable.sparseResidencyAliased = chosen_features.sparseResidencyAliased;
     info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7

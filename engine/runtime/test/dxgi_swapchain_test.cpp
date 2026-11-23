@@ -1271,6 +1271,29 @@ int main() {
         }
     }
 
+    // SetSourceSize stores the source region (GetSourceSize returns it), refuses one larger than the back buffers,
+    // needs both pointers on read, and ResizeBuffers resets it. All four are host-measured on Windows 11.
+    {
+        UINT sw = 0, sh = 0;
+        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 300 || sh != 200)
+            return fail("GetSourceSize should start at the back-buffer size");
+        if (sc->GetSourceSize(nullptr, nullptr) != DXGI_ERROR_INVALID_CALL ||
+            sc->GetSourceSize(&sw, nullptr) != DXGI_ERROR_INVALID_CALL ||
+            sc->GetSourceSize(nullptr, &sh) != DXGI_ERROR_INVALID_CALL)
+            return fail("GetSourceSize needs both pointers");
+        if (FAILED(sc->SetSourceSize(64, 32))) return fail("SetSourceSize");
+        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 64 || sh != 32) return fail("SetSourceSize round-trip");
+        if (sc->SetSourceSize(301, 32) != DXGI_ERROR_INVALID_CALL) return fail("SetSourceSize accepted a wider region");
+        if (sc->SetSourceSize(64, 201) != DXGI_ERROR_INVALID_CALL) return fail("SetSourceSize accepted a taller region");
+        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 64 || sh != 32)
+            return fail("a rejected SetSourceSize should keep the stored source size");
+        if (FAILED(sc->SetSourceSize(0, 0)) || FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 0 || sh != 0)
+            return fail("SetSourceSize(0, 0) should be accepted and stored");
+        if (FAILED(sc->ResizeBuffers(2, 96, 64, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers for source size");
+        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 96 || sh != 64)
+            return fail("ResizeBuffers should reset the source size to the new back buffers");
+    }
+
     // IDXGIFactory5::CheckFeatureSupport, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, and waitable frame-latency swapchains.
     {
         IDXGIFactory5* factory5 = nullptr;

@@ -900,13 +900,19 @@ def main(argv=None) -> int:
     rows.sort(key=lambda row: (row["name"].lower(), row["source"].lower()))
 
     summary = summarize(rows)
+    reports = []
+    for path, writer, values in ((args.csv, write_csv, (rows,)),
+                                 (args.json, write_json, (summary, rows))):
+        if path:
+            try:
+                writer(path, *values)
+            except OSError as exc:
+                print(f"ERROR: cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
+            reports.append(path)
     print_report(summary, rows)
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("wrote", args.csv)
-    if args.json:
-        write_json(args.json, summary, rows)
-        print("wrote", args.json)
+    for path in reports:
+        print("wrote", path)
     return 0
 
 

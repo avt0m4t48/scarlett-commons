@@ -277,6 +277,19 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("is a directory", result.stderr)
 
+    def test_report_write_failure_names_the_destination(self):
+        blocker = pathlib.Path(self.temp.name) / "file"
+        blocker.write_bytes(b"keep")
+        for flag in ("--json", "--csv"):
+            with self.subTest(flag=flag):
+                target = blocker / ("report." + flag[2:])
+                result = self.run_tool(self.root, flag, target)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"cannot write {target}", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(blocker.read_bytes(), b"keep")
+
     def test_report_inside_the_tree_but_not_an_input_is_allowed(self):
         out = self.root / "report.json"
         result = self.run_tool(self.root, "--json", out)

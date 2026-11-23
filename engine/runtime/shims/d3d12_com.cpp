@@ -767,6 +767,8 @@ public:
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
         if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;   // XDXR: BOX16 nodes (BLAS)
         cmd.dst_va = desc->DestAccelerationStructureData;
         cmd.src_va = desc->SourceAccelerationStructureData;
         cmd.scratch_va = desc->ScratchAccelerationStructureData;

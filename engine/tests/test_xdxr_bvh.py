@@ -85,6 +85,42 @@ class Layout(unittest.TestCase):
                 self.assertLessEqual(dlo[c], lo[c])
                 self.assertGreaterEqual(dhi[c], hi[c])
 
+    def test_half_round_edges(self):
+        # runtime/src/xdxr_build.comp half_directed computes the same bits; check-build compares the GPU's BOX16
+        # words with encode_box16, which uses this function
+        cases = [
+            (0.0, False, 0x0000), (0.0, True, 0x0000), (-0.0, False, 0x8000), (-0.0, True, 0x8000),
+            (1.0, False, 0x3C00), (1.0, True, 0x3C00), (1.0001, False, 0x3C00), (1.0001, True, 0x3C01),
+            (-1.0001, False, 0xBC01), (-1.0001, True, 0xBC00),
+            (65504.0, True, 0x7BFF), (65505.0, False, 0x7BFF), (65505.0, True, 0x7C00),
+            (-65505.0, False, 0xFC00), (-65505.0, True, 0xFBFF),
+            (math.inf, False, 0x7BFF), (-math.inf, True, 0xFBFF),          # an empty box stays min > max
+            (2.0 ** -14, False, 0x0400), (2.0 ** -14, True, 0x0400),
+            (3e-5, False, 0x0000), (3e-5, True, 0x0400), (-3e-5, False, 0x8400), (-3e-5, True, 0x8000),
+            (1e-30, True, 0x0400), (-1e-30, False, 0x8400),
+        ]
+        for x, up, want in cases:
+            self.assertEqual(X.half_round(x, up), want, (x, up))
+
+    def test_half_round_never_denormal(self):
+        rng = random.Random(3)
+        for _ in range(4000):
+            x = math.copysign(2.0 ** rng.uniform(-40, -10), rng.choice((-1, 1)))
+            for up in (False, True):
+                b = X.half_round(x, up)
+                self.assertFalse(b & 0x7C00 == 0 and b & 0x3FF, f"{x} -> denormal {b:#06x}")
+                v = X._half_value(b)
+                self.assertTrue(v >= x if up else v <= x)
+
+    def test_box16_rounding_check(self):
+        data, _ = X.build_blas(X.random_scene(random.Random(4), 60), box16=True)
+        self.assertEqual(X.box16_rounding(data), [])
+        bad = bytearray(data)
+        root = X.ptr_offset(struct.unpack_from("<I", data, 48)[0])
+        w = struct.unpack_from("<I", bad, root + 16)[0]
+        struct.pack_into("<I", bad, root + 16, w ^ 1)              # one half one step off
+        self.assertTrue(X.box16_rounding(bytes(bad)))
+
     def test_parent_table(self):
         data, info = X.build_blas(X.random_scene(random.Random(2), 40))
         self.assertEqual(X.validate(data), [])

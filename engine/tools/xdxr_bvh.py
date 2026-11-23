@@ -62,6 +62,7 @@ TRI_VERTS = {TRI0: (0, 1, 2), TRI1: (1, 3, 2), TRI2: (2, 3, 4), TRI3: (2, 4, 0)}
 
 FLT_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 HALF_MAX = 65504.0
+HALF_MIN_NORMAL = 2.0 ** -14
 INF = math.inf
 
 
@@ -107,11 +108,21 @@ def _half_step(bits, up):
 
 def half_round(x, up):
     """Round a float to a half that is >= x (up) or <= x, so a quantised box still contains the exact one. Values
-    beyond the half range become +-inf, which the decoder clamps to +-FLT_MAX: still conservative."""
+    beyond the half range become +-inf on their outward side (the decoder clamps them to +-FLT_MAX: still
+    conservative) and +-HALF_MAX on their inward side, so an empty box stays empty. No denormal half
+    is produced: a value below the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its
+    side, because a decoder that flushes half denormals to zero would otherwise shrink the box. The GPU builder
+    (runtime/src/xdxr_build.comp half_directed) computes the same bits."""
     if x > HALF_MAX:
         return 0x7C00 if up else _half_bits(HALF_MAX)
     if x < -HALF_MAX:
         return _half_bits(-HALF_MAX) if up else 0xFC00
+    if abs(x) < HALF_MIN_NORMAL:
+        if x == 0:
+            return _half_bits(x)                    # keeps the sign of a zero
+        if x > 0:
+            return _half_bits(HALF_MIN_NORMAL) if up else 0x0000
+        return 0x8000 if up else _half_bits(-HALF_MIN_NORMAL)
     b = _half_bits(x)
     v = _half_value(b)
     if (up and v < x) or (not up and v > x):
@@ -728,6 +739,81 @@ def validate(data, expect_bottom=None):
     return errs
 
 
+def box16_rounding(data):
+    """Checks that every BOX16 child box of a bottom-level BVH holds exactly encode_box16 of the exact box of the
+    triangles under that child: the bits, not just containment. The exact box comes from the leaves' own vertices, so
+    this needs nothing but the buffer. A triangle with a NaN vertex has an empty box, as in the builder. Returns a list
+    of problems (empty = every BOX16 word matches)."""
+    errs = []
+    root = struct.unpack_from("<I", data, 48)[0]
+    empty = ([INF] * 3, [-INF] * 3)
+    memo = {}
+
+    def exact(p):
+        if p in memo:
+            return memo[p]
+        kind, off = ptr_type(p), ptr_offset(p)
+        if kind <= TRI3:
+            pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
+            box = empty if any(math.isnan(c) for q in pts for c in q) else _bounds(pts)
+        else:
+            kids = struct.unpack_from("<4I", data, off)
+            boxes = [exact(k) for k in kids if k != INVALID]
+            boxes = [b for b in boxes if all(b[0][c] <= b[1][c] for c in range(3))]
+            box = _union(boxes) if boxes else empty
+            if kind == BOX16:
+                for i, k in enumerate(kids):
+                    want = encode_box16(*(exact(k) if k != INVALID else empty))
+                    got = struct.unpack_from("<3I", data, off + 16 + 12 * i)
+                    if tuple(got) != tuple(want):
+                        errs.append(f"BOX16 {p:#x} child {i}: {[hex(w) for w in got]}, expected "
+                                    f"{[hex(w) for w in want]}")
+        memo[p] = box
+        return box
+
+    if root != INVALID:
+        exact(root)
+    return errs
+
+
+def node_census(data):
+    """Reachable pointers of a valid BVH by node type: {type: count}, the root included."""
+    count = {}
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        count[kind] = count.get(kind, 0) + 1
+        if kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return count
+
+
+def pair_rotations(data):
+    """The (TRI0 remap byte, TRI1 remap byte) of every paired leaf reachable in a valid bottom-level BVH: which of
+    the three rotations each triangle of a pair was stored in."""
+    seen = set()
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind == TRI1:
+            remap = struct.unpack_from("<I", data, ptr_offset(p) + 60)[0]
+            seen.add((remap & 0xFF, (remap >> 8) & 0xFF))
+        elif kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return seen
+
+
+def count_pairs(data):
+    """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
+    return node_census(data).get(TRI1, 0)
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -811,6 +897,24 @@ def check_build(directory, rays=300, seed=1):
             if other != n:
                 mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        if desc["kind"] == "blas" and not errs:
+            errs += box16_rounding(data)
+        pairs = count_pairs(data) if desc["kind"] == "blas" and not errs else 0
+        if desc.get("pairs") is True and not pairs:
+            errs.append("built with pairing, but no TRI1 node is reachable")
+        if desc.get("pairs") is False and pairs:
+            errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
+        if desc.get("all_rotations") and not errs:   # every (first, sibling) rotation of a pair is exercised
+            rotations = pair_rotations(data)
+            if len(rotations) < 9:
+                errs.append(f"paired leaves use {len(rotations)} of the 9 (TRI0, TRI1) rotations: "
+                            f"{sorted(rotations)}")
+        if "box16" in desc and not errs:          # the node type the build was asked for, so no check runs vacuously
+            census = node_census(data)
+            want, other = (BOX16, BOX32) if desc["box16"] else (BOX32, BOX16)
+            if census.get(other) or not census.get(want):
+                errs.append(f"inner nodes {census.get(BOX16, 0)} BOX16 and {census.get(BOX32, 0)} BOX32, expected "
+                            f"only {'BOX16' if desc['box16'] else 'BOX32'}")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]
@@ -842,13 +946,19 @@ def check_build(directory, rays=300, seed=1):
             if ids is not None:
                 same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
+                # D3D12's barycentrics: a paired (TRI1) or rotated TRI0 triangle must still return them through its
+                # remap byte, not its slot order
+                same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
+                                    for g, w in zip(got["bary"], want["bary"]))
             else:
                 # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
                 want_id = inst_ids[want["instance"]][want["primitive"]]
                 same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
             bad += not same
-        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
+        paired = f", {pairs} TRI1" if pairs else ""
+        print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "
+              f"({hits} hits)")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
@@ -886,6 +996,7 @@ def selftest(seed=1, rays=400, verbose=False):
     for name, tris, b16, pair in cases:
         data, info = build_blas(tris, box16=b16, pair=pair)
         errs = validate(data, expect_bottom=True)
+        errs += box16_rounding(data)
         mem = Memory()
         mem.place(0x10000, data)
         bad = 0

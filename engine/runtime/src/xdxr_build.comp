@@ -6,7 +6,7 @@
 //
 // One pipeline, one dispatch per step, selected by pc.mode (xdxr_build.h records them in this order, with a compute
 // barrier between each):
-//   MODE_INIT      parent table to 0xffffffff, centroid bounds to empty
+//   MODE_INIT      parent table to 0xffffffff, centroid bounds to empty, a BOX16 layout's spare last unit to 0
 //   MODE_TRIANGLES one thread per triangle of one geometry: the leaf (TRI0, remap 0x09), its box, the centroid bounds
 //   MODE_INSTANCES one thread per D3D12_RAYTRACING_INSTANCE_DESC: the 128-byte INSTANCE record and its world box
 //   MODE_MORTON    one thread per element: 30-bit Morton key of its box centre (empty boxes sort last)
@@ -16,7 +16,9 @@
 //   MODE_SMALL_SORT up to SMALL_SORT_MAX keys: one workgroup sorts them in shared memory (bitonic, ties by element
 //                  index, so the order is the stable one), in one dispatch instead of the radix sort's 24, whose
 //                  fixed latency dominated small builds
-//   MODE_LEVEL     one thread per BOX32 node of one level: four consecutive entries of the level below
+//   MODE_LEVEL     one thread per inner node of one level: four consecutive entries of the level below. The nodes
+//                  are BOX32 (128 bytes, float boxes) or, with FLAG_BOX16, BOX16 (64 bytes, half boxes rounded
+//                  outward); scratch keeps every box exact either way, so rounding never compounds up the tree
 //   MODE_HEADER    one thread: the 64-byte header
 // An update (D3D12 PERFORM_UPDATE: same topology, new positions or transforms) refits instead: MODE_COPY copies the
 // source structure to the destination when they differ, MODE_TRIANGLES / MODE_INSTANCES rewrite the elements at their
@@ -58,8 +60,9 @@ const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_so
 const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
 const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
 const uint INVALID = 0xffffffffu;
-const uint TRI0 = 0u, BOX32 = 5u, INSTANCE = 6u;
+const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
 const uint REMAP_IDENTITY = 0x09u;
+const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
            INST_FLAGS_MASK = 0xc0000000u;
 
@@ -84,7 +87,8 @@ layout(push_constant) uniform Push {
     uint nodes_off;
     uint parents_off;
     uint total_size;
-    uint tlas;            // 1: elements are 128-byte instances
+    uint flags;           // FLAG_TLAS: elements are 128-byte instances; FLAG_BOX16: inner nodes are 64-byte BOX16;
+                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves
 } pc;
 
 // ---- 64-bit addresses as uvec2 ----
@@ -148,10 +152,43 @@ void grow_centroid_bounds(vec3 lo, vec3 hi) {
     atomicMax(s.w[3], ordered(c.x)); atomicMax(s.w[4], ordered(c.y)); atomicMax(s.w[5], ordered(c.z));
 }
 
-uint element_size() { return pc.tlas != 0u ? 128u : 64u; }
-uint element_ptr(uint e) { return ((pc.elements_off + e * element_size()) >> 6) << 3 | (pc.tlas != 0u ? INSTANCE : TRI0); }
-uint node_ptr(uint n) { return ((pc.nodes_off + n * 128u) >> 6) << 3 | BOX32; }
+bool is_tlas() { return (pc.flags & FLAG_TLAS) != 0u; }
+bool is_box16() { return (pc.flags & FLAG_BOX16) != 0u; }
+uint element_size() { return is_tlas() ? 128u : 64u; }
+uint node_size() { return is_box16() ? 64u : 128u; }
+uint element_ptr(uint e) { return ((pc.elements_off + e * element_size()) >> 6) << 3 | (is_tlas() ? INSTANCE : TRI0); }
+uint node_ptr(uint n) { return ((pc.nodes_off + n * node_size()) >> 6) << 3 | (is_box16() ? BOX16 : BOX32); }
 uint ptr_unit(uint p) { return p >> 3; }
+bool ptr_is_node(uint p) { return (p & 7u) == BOX16 || (p & 7u) == BOX32; }
+
+// ---- BOX16 bounds: six IEEE halves in three words (min.x | min.y << 16, min.z | max.x << 16, max.y | max.z << 16;
+// docs/bvh.md 3.1, XdxrDecompressBox16) ----
+// A float rounded to a half toward -inf (up = false) or +inf (up = true), so the quantised box still contains the
+// exact one. Integer code: packHalf2x16's rounding is implementation-defined (AMD's rounds toward zero), and this has
+// to be directed. Beyond the half range a value becomes +-inf on its outward side and +-HALF_MAX (0x7bff) on its
+// inward side, so an empty box (min +inf, max -inf) stays empty. No denormal half is produced: a value below the
+// smallest normal (2^-14) in magnitude goes to 0 or to +-2^-14, whichever is on its side, because a decoder that
+// flushes half denormals to zero would otherwise shrink the box. tools/xdxr_bvh.py half_round is the same function.
+uint half_directed(float x, bool up) {
+    uint u = floatBitsToUint(x);
+    uint sign = (u >> 16) & 0x8000u;
+    uint a = u & 0x7fffffffu;
+    bool away = up != (sign != 0u);          // round the magnitude up (away from zero) or down (toward zero)
+    if (a > 0x7f800000u) return sign | 0x7e00u;                     // NaN: not produced by the box code
+    if (a == 0u) return sign;
+    int e = int(a >> 23) - 127;
+    if (e >= 16) return sign | (away ? 0x7c00u : 0x7bffu);          // >= 65536, and +-inf
+    if (e < -14) return away ? (sign | 0x0400u) : sign;             // below the smallest normal half
+    uint m = a & 0x7fffffu;
+    uint h = uint(e + 15) << 10 | (m >> 13);
+    if (away && (m & 0x1fffu) != 0u) h += 1u;                       // 0x7bff + 1 carries into 0x7c00 = inf
+    return sign | h;
+}
+void store_box16(uint o, vec3 lo, vec3 hi) {
+    store(pc.dst, o, half_directed(lo.x, false) | half_directed(lo.y, false) << 16);
+    store(pc.dst, o + 4u, half_directed(lo.z, false) | half_directed(hi.x, true) << 16);
+    store(pc.dst, o + 8u, half_directed(hi.y, true) | half_directed(hi.z, true) << 16);
+}
 
 // ---- MODE_TRIANGLES ----
 vec3 vertex(uint v) {
@@ -393,11 +430,81 @@ void radix_scatter(uint w, uint t) {
 }
 
 // ---- MODE_LEVEL ----
+// TRI1 pairing (FLAG_PAIR, bottom level, the level above the leaves): among one node's children, a triangle and a
+// later sibling that shares an edge with it, traversed in the opposite direction (the same two vertices, bit for bit),
+// from the same geometry and both active, go into the first one's leaf: TRI0 reads slots (0, 1, 2) and TRI1 (1, 3, 2)
+// (docs/bvh.md 7a), so the first triangle is rotated to put the shared edge in slots 1 -> 2, the sibling's third
+// vertex goes in slot 3, its primitive index in PrimitiveIndex2 and its remap byte in byte 1. The node keeps one child
+// per triangle, each with its own box, so the tree is unchanged: the TRI1 child points at the first triangle's leaf
+// and the sibling's own leaf is left unreferenced. Both pointers have this node as parent. Pairs never cross nodes,
+// so no other thread touches these leaves. The barycentric remap byte of a node type returns D3D12's (b1, b2): bits
+// [1:0] and [3:2] are the positions, in the order that node type reads its slots, of the triangle's vertices 1 and 2.
+uint leaf_off(uint e) { return pc.elements_off + 64u * e; }
+uvec3 leaf_vertex(uint e, uint k) {
+    uint o = leaf_off(e) + 12u * k;
+    return uvec3(load(pc.dst, o), load(pc.dst, o + 4u), load(pc.dst, o + 8u));
+}
+void store_vertex(uint e, uint slot, uvec3 v) {
+    uint o = leaf_off(e) + 12u * slot;
+    store(pc.dst, o, v.x); store(pc.dst, o + 4u, v.y); store(pc.dst, o + 8u, v.z);
+}
+void pair_children(uint n, out uint kids[4]) {
+    uint e[4];
+    uvec3 v[4][3];
+    uint geo[4];
+    bool live[4], used[4];
+    uint count = min(4u, pc.arg0 - 4u * n);
+    for (uint c = 0u; c < 4u; ++c) { kids[c] = INVALID; live[c] = false; used[c] = false; e[c] = 0u; geo[c] = 0u; }
+    for (uint c = 0u; c < count; ++c) {
+        e[c] = load(pc.scratch, vals_off() + 4u * (4u * n + c));
+        kids[c] = element_ptr(e[c]);
+        geo[c] = load(pc.dst, leaf_off(e[c]) + 48u);
+        for (uint k = 0u; k < 3u; ++k) v[c][k] = leaf_vertex(e[c], k);
+        vec3 lo, hi;
+        load_box(e[c], lo, hi);
+        live[c] = !box_empty(lo, hi);   // inactive (NaN vertex): never paired. Conservative only: its box is empty,
+                                        // so a pair with it would never be traversed anyway
+    }
+    for (uint c = 0u; c < count; ++c) {
+        if (used[c] || !live[c]) continue;
+        used[c] = true;
+        for (uint d = c + 1u; d < count; ++d) {
+            if (used[d] || !live[d] || geo[d] != geo[c]) continue;
+            uint k = 3u, kd = 3u;
+            for (uint a = 0u; a < 3u && k == 3u; ++a) {
+                uvec3 p = v[c][a], q = v[c][(a + 1u) % 3u];      // edge p -> q of the first triangle
+                if (all(equal(p, q))) continue;
+                for (uint b = 0u; b < 3u; ++b) {
+                    if (all(equal(v[d][b], q)) && all(equal(v[d][(b + 1u) % 3u], p))) { k = a; kd = b; break; }
+                }
+            }
+            if (k == 3u) continue;
+            used[d] = true;
+            // the first triangle as (p0, p1, p2) with the shared edge p1 -> p2; slot 3 is the sibling's third vertex
+            store_vertex(e[c], 0u, v[c][(k + 2u) % 3u]);
+            store_vertex(e[c], 1u, v[c][k]);
+            store_vertex(e[c], 2u, v[c][(k + 1u) % 3u]);
+            store_vertex(e[c], 3u, v[d][(kd + 2u) % 3u]);
+            store(pc.dst, leaf_off(e[c]) + 56u, load(pc.dst, leaf_off(e[d]) + 52u));
+            // TRI0 reads (p0, p1, p2): vertex m of the first triangle is in slot (m + 4 - k) % 3. TRI1 reads
+            // (p1, p3, p2): vertex m of the sibling is in slot (m + 5 - kd) % 3.
+            uint remap0 = (5u - k) % 3u | ((6u - k) % 3u) << 2;
+            uint remap1 = (6u - kd) % 3u | ((7u - kd) % 3u) << 2;
+            store(pc.dst, leaf_off(e[c]) + 60u, remap0 | remap1 << 8);
+            kids[d] = (kids[c] & ~7u) | TRI1;
+            break;
+        }
+    }
+}
+
 void build_node(uint n) {
     uint node = pc.first + n;
     uint me = node_ptr(node);
-    uint o = pc.nodes_off + 128u * node;
+    uint o = pc.nodes_off + node_size() * node;
     vec3 ulo = vec3(uintBitsToFloat(0x7f800000u)), uhi = -ulo;
+    uint kids[4];
+    bool pairing = pc.arg2 != 1u && pc.arg1 == INVALID && !is_tlas() && (pc.flags & FLAG_PAIR) != 0u;
+    if (pairing) pair_children(n, kids);
     for (uint c = 0u; c < 4u; ++c) {
         uint entry = 4u * n + c;
         uint child = INVALID;
@@ -408,21 +515,22 @@ void build_node(uint n) {
             child = load(pc.dst, o + 4u * c);
             if (child != INVALID) {
                 uint at = ptr_unit(child) * 64u;
-                if ((child & 7u) == BOX32) {
-                    load_box(pc.elements + (at - pc.nodes_off) / 128u, lo, hi);
+                if (ptr_is_node(child)) {
+                    // the child's own type gives its node size (it is what the structure holds, whatever the flags)
+                    load_box(pc.elements + (at - pc.nodes_off) / ((child & 7u) == BOX16 ? 64u : 128u), lo, hi);
                 } else {
                     uint e = (at - pc.elements_off) / element_size();
                     load_box(e, lo, hi);
-                    if (pc.tlas != 0u) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
+                    if (is_tlas()) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
                 }
                 if (!box_empty(lo, hi)) { ulo = min(ulo, lo); uhi = max(uhi, hi); }
             }
         } else if (entry < pc.arg0) {
             if (pc.arg1 == INVALID) {
                 uint e = load(pc.scratch, vals_off() + 4u * entry);
-                child = element_ptr(e);
+                child = pairing ? kids[c] : element_ptr(e);
                 load_box(e, lo, hi);
-                if (pc.tlas != 0u) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
+                if (is_tlas()) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
             } else {
                 uint below = pc.arg1 + entry;
                 child = node_ptr(below);
@@ -432,11 +540,15 @@ void build_node(uint n) {
             if (!box_empty(lo, hi)) { ulo = min(ulo, lo); uhi = max(uhi, hi); }
         }
         store(pc.dst, o + 4u * c, child);
-        uint b = o + 16u + 24u * c;
-        storef(pc.dst, b, lo.x); storef(pc.dst, b + 4u, lo.y); storef(pc.dst, b + 8u, lo.z);
-        storef(pc.dst, b + 12u, hi.x); storef(pc.dst, b + 16u, hi.y); storef(pc.dst, b + 20u, hi.z);
+        if (is_box16()) {
+            store_box16(o + 16u + 12u * c, lo, hi);       // rounded outward; scratch keeps the exact box
+        } else {
+            uint b = o + 16u + 24u * c;
+            storef(pc.dst, b, lo.x); storef(pc.dst, b + 4u, lo.y); storef(pc.dst, b + 8u, lo.z);
+            storef(pc.dst, b + 12u, hi.x); storef(pc.dst, b + 16u, hi.y); storef(pc.dst, b + 20u, hi.z);
+        }
     }
-    for (uint k = 0u; k < 4u; ++k) store(pc.dst, o + 112u + 4u * k, 0u);
+    if (!is_box16()) for (uint k = 0u; k < 4u; ++k) store(pc.dst, o + 112u + 4u * k, 0u);   // BOX32 padding
     store_box(pc.elements + node, ulo, uhi);
 }
 
@@ -445,7 +557,7 @@ void build_header() {
     uint root = pc.first;                                // the root node's index
     vec3 lo, hi;
     load_box(pc.elements + root, lo, hi);
-    store(pc.dst, 0u, (pc.tlas != 0u ? 0u : FLAG_BOTTOM_LEVEL) | VERSION_2403);
+    store(pc.dst, 0u, (is_tlas() ? 0u : FLAG_BOTTOM_LEVEL) | VERSION_2403);
     store(pc.dst, 4u, pc.total_size / 64u - 1u);          // totalSizeIn64BNodes does not count the header: 64 * (field + 1) bytes
     store(pc.dst, 8u, 0u);                               // crc32: not computed for runtime builds
     store(pc.dst, 12u, pc.elements);
@@ -484,6 +596,7 @@ void main() {
     } else if (pc.mode == MODE_INIT) {
         store(pc.dst, pc.parents_off + 4u * i, INVALID);
         if (i < 3u) { store(pc.scratch, 4u * i, INVALID); store(pc.scratch, 12u + 4u * i, 0u); }
+        if (is_box16() && i < 16u) store(pc.dst, pc.total_size - 64u + 4u * i, 0u);   // the spare unit (xdxr_build.h)
     } else if (pc.mode == MODE_TRIANGLES) {
         build_triangle(i);
     } else if (pc.mode == MODE_INSTANCES) {

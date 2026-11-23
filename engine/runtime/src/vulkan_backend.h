@@ -893,15 +893,18 @@ public:
             if (xdxr_->loaded()) {
                 replay_.xdxr_check = [](const BuildAccelerationStructure& b) {
                     XdxrLayout layout;
-                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas) && b.dst_va &&
-                           b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va);
+                    // An update needs ALLOW_UPDATE (D3D12 requires it on the build and the update): a structure
+                    // built without it may have paired leaves, which a refit would rewrite as wrong geometry.
+                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b)) &&
+                           b.dst_va && b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va) &&
+                           (!b.update || (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0);
                 };
                 replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b) {
                     // Every address is a console VA in the GPU address arena: the device address is heap_base + VA,
                     // and the BLAS addresses in instance descs get the same bias.
                     const std::uint64_t base = replay_.heap_base;
                     XdxrLayout layout;
-                    layout.compute(xdxr_elements(b), b.is_tlas);
+                    layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b));
                     // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
                     // allows for an in-place update); a full build otherwise.
                     const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
@@ -911,7 +914,8 @@ public:
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
-                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from);
+                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from,
+                                           xdxr_pair(b));
                     }
                 };
                 replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
@@ -1151,6 +1155,22 @@ public:
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
     bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
 
+    // Whether a build's inner nodes are BOX16 (64 bytes, half boxes rounded outward) instead of BOX32: bottom-level
+    // builds with MINIMIZE_MEMORY (VK LOW_MEMORY). A top-level build keeps BOX32: it is in world space, where half
+    // precision would make boxes metres too large a few kilometres from the origin. The flags of an update must match
+    // its build's (D3D12), so prebuild info, the build and its refits agree. WARNING: an update that breaks that rule
+    // (MINIMIZE_MEMORY on one and not the other) is refitted with the wrong layout and writes past the structure; it
+    // cannot be detected when the command is recorded.
+    static bool xdxr_box16(const BuildAccelerationStructure& b) {
+        return !b.is_tlas && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR) != 0;
+    }
+    // Whether a bottom-level build pairs sibling triangles into TRI0/TRI1 leaves: not when the structure may be
+    // updated (ALLOW_UPDATE), since a refit rewrites the leaves one triangle each and would leave every TRI1 child
+    // reading wrong vertices. xdxr_check refuses an update without ALLOW_UPDATE for that reason. Pairing changes
+    // neither the layout nor the tree, so prebuild info does not depend on it.
+    static bool xdxr_pair(const BuildAccelerationStructure& b) {
+        return !b.is_tlas && !b.update && (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) == 0;
+    }
     // Triangles (BLAS) or instances (TLAS) a build has: what XdxrLayout is computed from, for the build and for
     // GetRaytracingAccelerationStructurePrebuildInfo.
     static std::uint32_t xdxr_elements(const BuildAccelerationStructure& b) {

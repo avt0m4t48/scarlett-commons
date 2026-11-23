@@ -3278,6 +3278,24 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 }
 
 
+// Slots 25, 26, 56 and 108 tell the two argument orders apart by which argument starts with the proxy vtable pointer. The
+// title's return buffer is uninitialised memory on its stack, and that memory can hold a stale copy of the pointer
+// (the device was passed in it by an earlier call): both arguments then look like the proxy, the buffer was taken for
+// the device, and the struct went over the real proxy. xcl hit that on a retail title (ivall/xcl, "struct-returning
+// device methods tell the return buffer from the device"). A device proxy is a heap object, never on a thread's stack,
+// so an argument inside the calling thread's stack is the buffer whatever its first word is.
+bool on_calling_thread_stack(const void* address) {
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    const auto at = reinterpret_cast<ULONG_PTR>(address);
+    return at >= low && at < high;
+}
+
+bool device_proxy_argument(std::uint64_t argument) {
+    const void* const address = reinterpret_cast<const void*>(argument);
+    return is_device_proxy(address) && !on_calling_thread_stack(address);
+}
+
 // Device slot 26, GetCustomHeapProperties, as the retail executable calls it. Measured on 1.0.2.1 under
 // gta6rt --run with a register probe in this slot's thunk: three calls right after device creation, each with the
 // device proxy in RDX and not in RCX, R8 = 1 and R9 = 1, 2, 3 (node mask 1; DEFAULT, UPLOAD, READBACK). So the
@@ -3529,10 +3547,10 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     note_slot(108);
     DeviceProxy* proxy = nullptr;
     D3D12_RESOURCE_ALLOCATION_INFO* ret = nullptr;
-    if (is_device_proxy(self)) {
+    if (device_proxy_argument(reinterpret_cast<std::uint64_t>(self))) {
         proxy = self;
         ret = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
-    } else if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+    } else if (device_proxy_argument(a1)) {
         proxy = reinterpret_cast<DeviceProxy*>(a1);
         ret = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self);
     }
@@ -3734,7 +3752,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if constexpr (Slot == 26) {
             // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
             // RDX; that call goes to the forwarder below, as before.
-            if (is_device_proxy(reinterpret_cast<const void*>(a1)))
+            if (device_proxy_argument(a1))
                 return reinterpret_cast<std::uint64_t>(proxy_get_custom_heap_properties(
                     reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
                     static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
@@ -3775,9 +3793,8 @@ void fill_vtable(void** vtable, std::index_sequence<I...>) {
 //
 // The runtime's own code and tests still call the proxy through d3d12.h, in the PC form, so these thunks accept both,
 // as the heap proxy's 9/10 do: whichever of the first two arguments is the device proxy (its first word is the proxy
-// vtable) is `this`, and the other is the return buffer. A return buffer never starts with that vtable pointer: the
-// C-form caller hands over uninitialised memory to be written, and the PC-form caller is this runtime. The buffer is
-// returned in RAX, as both conventions require.
+// vtable, and it is not on the calling thread's stack: see on_calling_thread_stack) is `this`, and the other is the
+// return buffer. The buffer is returned in RAX, as both conventions require.
 //   slot 25 GetResourceAllocationInfo -> D3D12_RESOURCE_ALLOCATION_INFO (16 bytes): same rule as slot 26 (inferred,
 //           no call site measured yet)
 //   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured; it has its own thunk above
@@ -3793,8 +3810,7 @@ struct StructReturnCall {
 };
 
 StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
-    void** const vtable = get_vtable();
-    if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
+    if (device_proxy_argument(a0))  // PC form: this, return buffer
         return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1), false};
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0), true};  // C form: return buffer, this
 }

@@ -1766,6 +1766,87 @@ int check_custom_heap_properties() {
     return 0;
 }
 
+// ---- 9a2. A return buffer that holds a stale copy of the proxy vtable pointer ----
+//
+// The title's return buffer is uninitialised stack memory. When it still holds the proxy vtable pointer from an
+// earlier call, both arguments of a C-form call look like the device proxy. Slots 25, 26 and 108 must still take the
+// stack argument for the buffer: the struct lands in it and the proxy is left whole.
+
+int check_struct_return_stale_vtable() {
+    // Slots 25 and 26 on a level 0 device.
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device);
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    const std::uint64_t proxy_word = *reinterpret_cast<const std::uint64_t*>(device);
+
+    union HeapBuffer {
+        std::uint64_t stale[4];
+        D3D12_HEAP_PROPERTIES value;
+    } heap_buffer;
+    heap_buffer.stale[0] = proxy_word;
+    heap_buffer.stale[1] = heap_buffer.stale[2] = heap_buffer.stale[3] = 0;
+    using HeapFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
+    EXPECT(reinterpret_cast<HeapFn>(vtable[26])(&heap_buffer.value, device, 1, 2) == word(&heap_buffer.value));
+    EXPECT(mock->calls[26] == 1 && heap_buffer.value.Type == D3D12_HEAP_TYPE_UPLOAD &&
+           heap_buffer.value.VisibleNodeMask == kHeapMarker);
+    EXPECT(*reinterpret_cast<const std::uint64_t*>(device) == proxy_word && xs::is_device_proxy(device) &&
+           word(xs::device_proxy_real_device(device)) == word(mock) && xs::device_proxy_ref_count(device) == 1);
+    // The PC form, proxy in RCX and the stale buffer in RDX: before, the buffer passed for the device in RDX and the
+    // struct was written over the proxy.
+    heap_buffer.stale[0] = proxy_word;
+    EXPECT(raw(device, 26, word(&heap_buffer.value), 1, 3) == word(&heap_buffer.value));
+    EXPECT(mock->calls[26] == 2 && heap_buffer.value.Type == D3D12_HEAP_TYPE_READBACK);
+    EXPECT(*reinterpret_cast<const std::uint64_t*>(device) == proxy_word && xs::device_proxy_ref_count(device) == 1);
+
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 100000;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    union InfoBuffer {
+        std::uint64_t stale[2];
+        D3D12_RESOURCE_ALLOCATION_INFO value;
+    } info_buffer;
+    info_buffer.stale[0] = proxy_word;
+    info_buffer.stale[1] = 0;
+    using InfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                            const D3D12_RESOURCE_DESC*);
+    EXPECT(reinterpret_cast<InfoFn>(vtable[25])(&info_buffer.value, device, 0, 1, &buffer) == &info_buffer.value);
+    EXPECT(info_buffer.value.SizeInBytes == 131072);
+    EXPECT(*reinterpret_cast<const std::uint64_t*>(device) == proxy_word &&
+           word(xs::device_proxy_real_device(device)) == word(mock));
+    // The PC form with the same stale buffer: the proxy is in RCX and is not on the stack, so it stays `this`.
+    info_buffer.stale[0] = proxy_word;
+    EXPECT(raw(device, 25, word(&info_buffer.value), 0, 1, word(&buffer)) == word(&info_buffer.value));
+    EXPECT(info_buffer.value.SizeInBytes == 131072);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // Slot 108 on a device with the Xbox slots.
+    device = make_device(mock, 11, true, true, true);
+    EXPECT(device);
+    vtable = *reinterpret_cast<void* const* const*>(device);
+    const std::uint64_t proxy_word11 = *reinterpret_cast<const std::uint64_t*>(device);
+    info_buffer.stale[0] = proxy_word11;
+    info_buffer.stale[1] = 0;
+    using Info2Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                             const D3D12_RESOURCE_DESC*,
+                                                             D3D12_RESOURCE_ALLOCATION_INFO1*);
+    EXPECT(reinterpret_cast<Info2Fn>(vtable[108])(&info_buffer.value, device, 1, 1, &buffer, nullptr) ==
+           &info_buffer.value);
+    EXPECT(mock->calls[68] == 1 && info_buffer.value.SizeInBytes != UINT64_MAX &&
+           info_buffer.stale[0] != proxy_word11);
+    EXPECT(*reinterpret_cast<const std::uint64_t*>(device) == proxy_word11 && xs::is_device_proxy(device) &&
+           word(xs::device_proxy_real_device(device)) == word(mock));
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slots 25, 26 and 108 take a stack buffer holding a stale proxy vtable pointer for the "
+                "return buffer and leave the proxy whole\n", g_label);
+    return 0;
+}
+
 // ---- 9b. Command lists (device slot 12): the console-shaped proxy and AllocateUploadMemory ----
 
 int check_lists() {
@@ -3141,7 +3222,7 @@ int main(int argc, char** argv) {
         check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() ||
         check_committed_resource3_x() || check_render_target_sizes() || check_allocation_descriptions_cleaned() ||
         check_committed_resource_leases() || check_slot74() || check_fence_completed_value() ||
-        check_list_cpu_handles() || check_slot70_placed_buffer())
+        check_list_cpu_handles() || check_slot70_placed_buffer() || check_struct_return_stale_vtable())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

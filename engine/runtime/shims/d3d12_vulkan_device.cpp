@@ -3516,10 +3516,12 @@ struct TextureView {
 };
 
 // In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
-// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs
-// and returns D3D12_ERROR_DRIVER_VERSION_MISMATCH for foreign or corrupt ones.
+// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs.
+// As on the host runtime (d3d12_pipeline_library_host_test), a foreign, truncated or corrupt blob is E_INVALIDARG;
+// one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH. A pipeline library is a device child,
+// not a pageable object: the host answers E_NOINTERFACE for ID3D12Pageable.
 class PipelineLibrary final
-    : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+    : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild,
                    ID3D12PipelineLibrary, ID3D12PipelineLibrary1> {
 public:
     // {6e2a9d41-7b5f-4c83-8e14-2a9d6f3c5b10}
@@ -3541,11 +3543,14 @@ public:
         entries_.clear();
     }
 
-    static bool valid_blob(const void* data, SIZE_T size) {
-        if (!data || size < sizeof(Header)) return false;
+    // S_OK for a blob of ours, D3D12_ERROR_DRIVER_VERSION_MISMATCH for one of ours from another version,
+    // E_INVALIDARG for anything else (foreign, truncated or corrupt).
+    static HRESULT check_blob(const void* data, SIZE_T size) {
+        if (!data || size < sizeof(Header)) return E_INVALIDARG;
         Header h{};
         std::memcpy(&h, data, sizeof(h));
-        return h.magic == kMagic && h.version == kVersion && h.reserved == 0;
+        if (h.magic != kMagic || h.reserved != 0) return E_INVALIDARG;
+        return h.version == kVersion ? S_OK : D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     }
 
     HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipeline) override {
@@ -3560,7 +3565,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                                                    REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
         return load_entry(name, false, true, riid, out);
@@ -3568,7 +3573,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                                   REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
         return load_entry(name, true, false, riid, out);
@@ -3576,7 +3581,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                            REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
         return load_entry(name, false, false, riid, out);
@@ -5286,11 +5291,13 @@ public:
     // Device1: in-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4).
     HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* blob, SIZE_T size, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device1::CreatePipelineLibrary";
-        if (out) *out = nullptr;
-        if (size > 0 && !blob) return d3d12_trace::result(method, E_INVALIDARG);
-        if (size > 0 && !PipelineLibrary::valid_blob(blob, size))
-            return d3d12_trace::result(method, D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+        // A refused blob leaves *out as it was, as the host runtime does; a wrong interface nulls it (hand_out).
+        if (size > 0) {
+            const HRESULT checked = PipelineLibrary::check_blob(blob, size);
+            if (FAILED(checked)) return d3d12_trace::result(method, checked);
+        }
         if (!out) return d3d12_trace::result(method, S_FALSE);
+        *out = nullptr;
         auto* lib = new PipelineLibrary();
         lib->attach_device(identity());
         return d3d12_trace::result(method, hand_out(lib, riid, out));

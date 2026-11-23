@@ -461,6 +461,20 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+void* bundled_main_module() {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->main_module)
+            if (void* h = entry.ops->main_module(entry.ctx)) return h;
+    return nullptr;
+}
+
+const std::filesystem::path* bundled_module_path(void* module) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_path)
+            if (const std::filesystem::path* p = entry.ops->module_path(entry.ctx, module)) return p;
+    return nullptr;
+}
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }

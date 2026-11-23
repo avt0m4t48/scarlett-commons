@@ -556,11 +556,21 @@ bool bundled_owns_handle(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->owns_module_handle(module);
 }
 
+void* bundled_main_module(void* ctx) {
+    return static_cast<Loader*>(ctx)->main_module();
+}
+
+const std::filesystem::path* bundled_module_path(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->module_path_for(module);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
+    &bundled_main_module,
+    &bundled_module_path,
 };
 }  // namespace
 
@@ -728,6 +738,19 @@ bool Loader::owns_module_handle(void* module_handle) const {
     for (const Module* m : order_)
         if (m->base == module_handle) return true;
     return false;
+}
+
+void* Loader::main_module() const {
+    std::lock_guard lock(mutex_);
+    return order_.empty() ? nullptr : static_cast<void*>(order_.front()->base);
+}
+
+const std::filesystem::path* Loader::module_path_for(void* module_handle) const {
+    std::lock_guard lock(mutex_);
+    if (!module_handle) return order_.empty() ? nullptr : &order_.front()->path;
+    for (Module* m : order_)
+        if (m->base == module_handle) return &m->path;
+    return nullptr;
 }
 
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing

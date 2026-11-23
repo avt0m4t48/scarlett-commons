@@ -39,6 +39,28 @@ class ArgumentTypes(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
                 rdna2spirv._shard_arg(text)
 
+    def test_max_structured_depth(self):
+        self.assertEqual(rdna2spirv._depth_arg("0"), 0)
+        self.assertEqual(rdna2spirv._depth_arg("64"), 64)
+        for text in ("-1", "x", "", "1.5"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                rdna2spirv._depth_arg(text)
+
+    def test_max_structured_depth_sets_the_bound(self):
+        # SHADER-427: the option replaces MAX_STRUCTURED_DEPTH for the run; without it the default is 64, written out
+        # here rather than read from the module so that changing the default fails this test.
+        self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, 64)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(rdna2spirv, "MAX_STRUCTURED_DEPTH", rdna2spirv.MAX_STRUCTURED_DEPTH):
+            for extra, expected in (([], 64), (["--max-structured-depth", "0"], 0),
+                                    (["--max-structured-depth", "40"], 40)):
+                with self.subTest(extra=extra), \
+                        mock.patch.object(sys, "argv", [TOOL, tmp, "--out", os.path.join(tmp, "o")] + extra), \
+                        redirect_stdout(io.StringIO()):
+                    rdna2spirv.MAX_STRUCTURED_DEPTH = 64
+                    rdna2spirv.main()
+                    self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, expected)
+
 
 class SourceDiscovery(unittest.TestCase):
     """The src argument is a .s file or a folder of .s files; other names are not inputs."""

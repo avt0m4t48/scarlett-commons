@@ -40,12 +40,14 @@ import wave64_emulate_opt  # noqa: E402
 import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
-# Deeper structured trees are emitted in the flat dispatch-loop form instead. `spirv-val`'s selection/loop
-# checking cost grows with the nesting depth: over the 1.0.2.1 corpus (26,503 modules) the deepest block of a
-# module is nested 118 constructs deep and 85% of the validation time is in modules nested 20 or deeper, while
-# the dispatch-loop form validates a depth-20 module 1.4x faster, a depth-50 one 2.3x and a depth-77 one 4.5x
-# (SHADER-299, docs/design.md "Control flow"). Both forms are equivalent; only the routing differs.
-MAX_STRUCTURED_DEPTH = 16
+# Deeper structured trees are emitted in the flat dispatch-loop form instead (--max-structured-depth, 0 = never).
+# `spirv-val`'s selection/loop checking cost grows with the nesting depth, and before cfg_structure hoisted tails
+# (#1904) the 1.0.2.1 corpus nested up to 118 deep, where the flat form validates 2.3x (depth 50-64) to 10x (118)
+# faster (SHADER-299). Since #1904 the corpus's deepest tree is 29 and the flat form saves only 12% of `spirv-val`
+# time on the modules deeper than 16, while NVIDIA compiles it 1.7-2x slower (SHADER-427). The bound sits above
+# the corpus, as a guard for depths where validation really grows. Both forms are equivalent; only the routing
+# differs. docs/design.md "Control flow" has the numbers.
+MAX_STRUCTURED_DEPTH = 64
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
@@ -13659,12 +13661,9 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
-    tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
-            else None)
-    if tree is not None:
-        nesting = cfg_structure.depth(tree)
-        if nesting > MAX_STRUCTURED_DEPTH:
-            tree = None                              # too deep to validate cheaply: use the flat form
+    tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
+                     else (None, None))
+    if nesting is not None:
         gen.nesting = nesting
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
@@ -15369,6 +15368,20 @@ def translate(path):
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
 
 
+def capped_tree(succ):
+    """(tree, nesting): the structured tree for `succ` and its depth, or (None, None) under --dispatch-loop or when
+    cfg_structure can't structure it; tree is None (nesting still the measured depth) when it nests deeper than
+    MAX_STRUCTURED_DEPTH. assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one
+    (SHADER-427 review): a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
+    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    if tree is None:
+        return None, None
+    nesting = cfg_structure.depth(tree)
+    if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
+        return None, nesting                         # too deep to validate cheaply: use the flat form
+    return tree, nesting
+
+
 def needs_barrier_rounds(g, blocks, succ):
     """SHADER-91: whether a native wave32 compute shader has to run in barrier rounds (bar_scheduler). On RDNA every
     s_barrier counts against the same workgroup barrier, so waves on different paths meet at different s_barrier
@@ -15389,7 +15402,7 @@ def needs_barrier_rounds(g, blocks, succ):
                 break
     if not with_barrier:
         return False
-    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 
@@ -16140,6 +16153,17 @@ def _shard_arg(text):
     return si, sn
 
 
+def _depth_arg(text):
+    """--max-structured-depth N: 0 (never fall back to the dispatch loop) or a positive nesting depth."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 (no bound) or a positive depth")
+    return value
+
+
 def _out_inside_input(src, out):
     """True when --out is the input folder or a folder inside it: translating there writes among the inputs.
 
@@ -16155,7 +16179,7 @@ def _out_inside_input(src, out):
 
 
 def main():
-    global MAX_SHARED_BYTES
+    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -16215,6 +16239,10 @@ def main():
                     help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
                          "for devices whose maxPushConstantsSize is below 144")
+    ap.add_argument("--max-structured-depth", type=_depth_arg, default=MAX_STRUCTURED_DEPTH, metavar="N",
+                    help="a shader whose structured control flow nests deeper than N is emitted in the dispatch-loop "
+                         "form instead (default %(default)s; 0 = never): that form validates faster at great depth "
+                         "but compiles 1.7-2x slower on NVIDIA (SHADER-427, docs/design.md \"Control flow\")")
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
@@ -16235,6 +16263,7 @@ def main():
     if ancestor and not os.path.isdir(ancestor):
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
+    MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo

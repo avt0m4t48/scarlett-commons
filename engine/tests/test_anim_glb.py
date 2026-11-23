@@ -362,6 +362,11 @@ class ClipChannelTest(unittest.TestCase):
         self.assertEqual(out_mid[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
         out_hi, _ = self.channels(0.095, 0.095, 1.0)
         self.assertEqual(out_hi[("mover", "translation")], [(0.0, (30.0, 0.0, 0.0))])
+        # Even when start == end sits slightly before a frame within 1e-4, timestamp stays 0.0.
+        self.anim["duration"] = 4 / 32
+        t = 2 / 32 - 2**-14
+        out_tol, _ = self.channels(t, t, 1 / 1024)
+        self.assertEqual(out_tol[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
 
     def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
         d = {

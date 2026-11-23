@@ -1630,6 +1630,24 @@ if(TARGET Vulkan::Headers)
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
 
+    # TEST-528: a real boot-movie frame (the package's Bink2Scarlett.dll) uploaded through the Xbox-ABI proxy and
+    # presented with PresentX, checked against the decoded BGRA. Package-gated like bink_decode_test: skips (77)
+    # unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set; no game data is written into the repo.
+    add_executable(d3d12_boot_movie_test
+      test/d3d12_boot_movie_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_link_libraries(d3d12_boot_movie_test PRIVATE gta6rt_d3d12_com user32 psapi)
+    target_compile_definitions(d3d12_boot_movie_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(d3d12_boot_movie_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(d3d12_boot_movie_test PRIVATE /OPT:NOREF)
+    add_dependencies(d3d12_boot_movie_test gta6rt_tls_host)
+    add_test(NAME d3d12_boot_movie COMMAND d3d12_boot_movie_test)
+    set_tests_properties(d3d12_boot_movie PROPERTIES SKIP_RETURN_CODE 77)
+
     # First light through D3D12 (docs/first_light.md): the real model and translated VS/PS that tools/first_light.py
     # wrote to LEONIDA_FIRST_LIGHT_DIR, drawn through the device proxy. Skips (77) unless that variable is set.
     add_executable(d3d12_first_light_test test/d3d12_first_light_test.cpp shims/d3d12_xs_device.cpp)

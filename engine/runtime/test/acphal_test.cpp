@@ -100,9 +100,18 @@ int main() {
     check(alloc_shape(&shape) == S_OK, "AcpHalAllocateShapeContexts succeeds");
     check(reinterpret_cast<uint8_t*>(&shape.contexts[4]) - reinterpret_cast<uint8_t*>(&shape) == 0x38 &&
               shape.contexts[4] && !shape.contexts[0] && !shape.contexts[5],
-          "the fifth pointer at +0x38 is set, zero counts get NULL");
+          "the fifth pointer at +0x38 is set, zero counts stay NULL");
     if (shape.contexts[4]) std::memset(shape.contexts[4], 0xA5, 350 * 64);
     check(release_shape() == S_OK, "AcpHalReleaseShapeContexts succeeds");
+    // A caller whose block ends after the fifth pointer (+0x40): the sixth pointer's bytes are not written.
+    shape = {};
+    shape.count[4] = 1;
+    std::memset(&shape.contexts[5], 0x5A, sizeof(void*));
+    void* guard;
+    std::memset(&guard, 0x5A, sizeof guard);
+    check(alloc_shape(&shape) == S_OK && shape.contexts[4] && shape.contexts[5] == guard,
+          "a zero count leaves its pointer untouched");
+    release_shape();
 
     // The object: slot 0 (0x1000, 0x1000), slot 2 as the boot call passes it, slot 1, slot 5 last.
     void* hal = nullptr;

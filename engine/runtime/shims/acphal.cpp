@@ -141,7 +141,7 @@ HRESULT AcpHalAllocateShapeContexts(ShapeContexts* s) {
         g_shape[i] = s->count[i] ? _aligned_malloc(s->count[i] * kShapeContextSize, 64) : nullptr;
         if (s->count[i] && !g_shape[i]) return kEOutOfMemory;
         if (g_shape[i]) std::memset(g_shape[i], 0, s->count[i] * kShapeContextSize);
-        s->contexts[i] = g_shape[i];
+        if (s->count[i]) s->contexts[i] = g_shape[i];  // a zero count leaves its pointer alone: only +0x38 is measured
     }
     return S_OK;
 }

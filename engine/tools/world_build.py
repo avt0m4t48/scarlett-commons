@@ -46,7 +46,6 @@ try:
     import msvcrt
 except ImportError:                       # POSIX
     msvcrt = None
-import tempfile
 import threading
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))

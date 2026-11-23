@@ -232,6 +232,7 @@ class _Module:
             self.consts[res] = False
         elif op == "OpConstantNull":
             self.consts[res] = self.zero(a[0])
+            self.id_type[res] = a[0]
         elif op == "OpConstantComposite":
             self.consts[res] = tuple(self.consts[x] for x in a[1:])
         elif op == "OpVariable":
@@ -818,6 +819,13 @@ class _Wave:
         name = a[2]
         args = [self.int_of(lane, x) for x in a[3:]]
         bits = self.m.bits(a[0])        # the operands have the result's type (GLSL.std.450)
+        if name in ("SAbs", "SMin", "SMax", "SClamp", "FindILsb", "FindSMsb", "FindUMsb"):
+            for operand in a[3:]:
+                if operand not in self.m.id_type:
+                    raise UnsupportedConstruct(f"{name}: unknown integer type for {operand}")
+                width = self.m.bits(self.m.id_type[operand])
+                if width != bits:
+                    raise UnsupportedConstruct(f"{name}: {width}-bit operand {operand} with a {bits}-bit result")
         s = lambda v: _signed(v, bits)  # noqa: E731
         if name == "UMin":
             return min(args)

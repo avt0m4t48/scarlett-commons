@@ -474,6 +474,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             constants[res] = values[res] = False
         elif op == "OpConstantNull":
             constants[res] = values[res] = types.zero(a[0])
+            id_type[res] = a[0]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if a[1] != cls:
@@ -961,6 +962,14 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
             name, args = a[2], [val(x) for x in a[3:]]
+            if name in ("SAbs", "SMin", "SMax", "SClamp", "FindILsb", "FindSMsb", "FindUMsb"):
+                bits = types.bits(a[0])
+                for operand in a[3:]:
+                    if operand not in id_type:
+                        raise UnsupportedConstruct(f"{name}: unknown integer type for {operand}")
+                    width = types.bits(id_type[operand])
+                    if width != bits:
+                        raise UnsupportedConstruct(f"{name}: {width}-bit operand {operand} with a {bits}-bit result")
             if name == "UnpackHalf2x16":
                 values[res] = (half_to_float(args[0]), half_to_float(args[0] >> 16))
             elif name == "PackHalf2x16":
@@ -984,7 +993,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
-                values[res] = abs(signed(args[0], types.bits(a[0]))) & wmask(a[0])
+                values[res] = abs(signed(args[0], bits)) & wmask(a[0])
             elif name in ("FMax", "FClamp"):
                 def fmax_clamp(*xs):
                     if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
@@ -1046,18 +1055,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "UMax":
                 values[res] = max(args)
             elif name == "SMax":
-                values[res] = max(args, key=lambda v: signed(v, types.bits(a[0])))
+                values[res] = max(args, key=lambda v: signed(v, bits))
             elif name == "SMin":
-                values[res] = min(args, key=lambda v: signed(v, types.bits(a[0])))
+                values[res] = min(args, key=lambda v: signed(v, bits))
             elif name in ("UClamp", "SClamp"):
                 # min(max(x, minVal), maxVal) (GLSL.std.450; undefined if minVal > maxVal, which raises here).
-                key = (lambda v: signed(v, types.bits(a[0]))) if name == "SClamp" else (lambda v: v)
+                key = (lambda v: signed(v, bits)) if name == "SClamp" else (lambda v: v)
                 x, lo, hi = args
                 if key(lo) > key(hi):
                     raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
                 values[res] = min(max(x, lo, key=key), hi, key=key)
-            elif name in ("FindILsb", "FindUMsb", "FindSMsb") and types.bits(a[0]) != 32:
-                raise UnsupportedConstruct(f"GLSL.std.450 {name} on a non-32-bit integer (32-bit components only)")
+            elif name in ("FindILsb", "FindUMsb", "FindSMsb") and bits != 32:
+                raise UnsupportedConstruct(f"GLSL.std.450 {name} on a {bits}-bit integer (32-bit components only)")
             elif name == "FindILsb":
                 # Bit number of the least significant 1 bit, -1 if the value is 0 (GLSL.std.450).
                 x = args[0] & MASK

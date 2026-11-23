@@ -447,6 +447,60 @@ class Unavailable(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
 
 
+class ClangOnPath(unittest.TestCase):
+    """find_clang when the compiler comes from PATH: real files in a folder, and a stand-in for what each compiler
+    prints for `--print-targets` and `--version`."""
+    EXT = ".exe" if os.name == "nt" else ""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def tool(self, *parts):
+        p = self.root.joinpath(*parts[:-1], parts[-1] + self.EXT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+        return str(p)
+
+    def tools(self, on_path, installed):
+        """PATH holds on_path ({name: file}); the compiler `c` reports installed[c] as its InstalledDir."""
+        def run(cmd, **kw):
+            out = "amdgcn" if "--print-targets" in cmd else f"clang version 23.0.0\nInstalledDir: {installed[cmd[0]]}\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        patches = [unittest.mock.patch.object(runner.shutil, "which", side_effect=lambda n: on_path.get(n)),
+                   unittest.mock.patch.object(runner.subprocess, "run", side_effect=run),
+                   unittest.mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": "", "HIP_PATH": "", "ROCM_PATH": ""})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_launcher_on_path_stands_for_the_clang_it_is_installed_as(self):
+        # The rocm-sdk wheels in a Python outside the checkout: `amdclang` in Scripts has the amdgcn target, while
+        # clang, ld.lld and amdgpu-arch sit in the folder it names as InstalledDir.
+        launcher = self.tool("Scripts", "amdclang")
+        clang, lld = self.tool("llvm", "bin", "clang"), self.tool("llvm", "bin", "ld.lld")
+        self.tools({"amdclang": launcher}, {launcher: str(self.root / "llvm" / "bin")})
+        found = runner.find_clang()
+        self.assertEqual(found, clang)
+        self.assertEqual(runner._find_lld(found), lld)
+
+    def test_a_clang_with_its_linker_beside_it_is_used_where_it_was_found(self):
+        clang = self.tool("bin", "clang")
+        self.tool("bin", "ld.lld")
+        self.tool("other", "clang")
+        self.tools({"clang": clang}, {clang: str(self.root / "other")})
+        self.assertEqual(runner.find_clang(), clang)
+
+    def test_a_launcher_that_names_a_folder_without_a_clang_is_kept(self):
+        launcher = self.tool("Scripts", "amdclang")
+        self.tools({"amdclang": launcher}, {launcher: str(self.root / "nothing-here")})
+        found = runner.find_clang()
+        self.assertEqual(found, launcher)
+        with self.assertRaises(runner.Unavailable):
+            runner._find_lld(found)
+
+
 def relocatable(sections, symbols):
     """A little-endian ELF64 relocatable object: sections is [(name, bytes, address)], symbols [(name, section
     number from 1, value)]. Only what drm.text_section reads is filled in."""

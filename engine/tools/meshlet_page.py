@@ -199,9 +199,14 @@ def group_triangles(data, group):
     at, k = group["offset"], group["meshlets"]
     rec_at, tri_at = at + 12, at + 12 + 16 * k
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, tri_at + 4 * group["triangles"])
+    vbases = []
+    vbase = 0
+    for m in range(k):
+        vbases.append(vbase)
+        vbase += (_u32(data, rec_at + 16 * m) & 0x7F) + 1
     for t in struct.unpack_from(f"<{group['triangles']}I", data, tri_at):
-        vbase = _u32(data, rec_at + 16 * (t >> 21) + 4) & 0xFFFF
-        yield refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]
+        vb = vbases[t >> 21]
+        yield refs[vb + (t & 0x7F)], refs[vb + ((t >> 7) & 0x7F)], refs[vb + ((t >> 14) & 0x7F)]
 
 
 def face_agreement(positions, triangles):
@@ -266,16 +271,20 @@ def cone_agreement(data, group, positions):
     rec_at, tri_at = at + 12, at + 12 + 16 * k
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, tri_at + 4 * group["triangles"])
     out = {"meshlets": k, "cones": 0, "axis_within_25_degrees": 0, "faces_inside": 0, "faces_inside_within_0_05": 0}
+    vb = tb = 0
     for m in range(k):
-        w0, w1, _, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        w0, _, _, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        vc, tc = (w0 & 0x7F) + 1, ((w0 >> 7) & 0x7F) + 1
+        m_vb, m_tb = vb, tb
+        vb += vc
+        tb += tc
         cone = meshlet_cone(w3)
         if cone is None:
             continue
         axis, cos_half = cone
-        vb, tb, tc = w1 & 0xFFFF, w1 >> 16, ((w0 >> 7) & 0x7F) + 1
         normals, total = [], [0.0, 0.0, 0.0]
-        for t in struct.unpack_from(f"<{tc}I", data, tri_at + 4 * tb):
-            idx = [refs[vb + ((t >> s) & 0x7F)] for s in (0, 7, 14)]
+        for t in struct.unpack_from(f"<{tc}I", data, tri_at + 4 * m_tb):
+            idx = [refs[m_vb + ((t >> s) & 0x7F)] for s in (0, 7, 14)]
             if max(idx) >= len(positions):
                 raise PageError("meshlet references a vertex past its block")
             p, q, r = (positions[i] for i in idx)
@@ -287,7 +296,7 @@ def cone_agreement(data, group, positions):
                 normals.append((n[0] / length, n[1] / length, n[2] / length))
                 total = [a + b for a, b in zip(total, n)]
         length = math.sqrt(sum(c * c for c in total))
-        if not normals or not length:
+        if not normals or not length or not math.isfinite(length):
             continue
         out["cones"] += 1
         out["axis_within_25_degrees"] += sum(a * c / length for a, c in zip(axis, total)) > 0.9
@@ -309,24 +318,35 @@ def centre_agreement(data, group, positions):
     out = {"meshlets": k, "default_words": 0, "coarse_steps": 0, "axes": 3 * k, "axes_exact": 0,
            "axes_within_step": 0,
            "radius_covers": 0, "radius_covers_within_rounding": 0, "radius_tight": 0}
+    vb = 0
     for m in range(k):
-        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        w0, _, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
         out["default_words"] += w2 == 0x007FF7FF and w3 == 0x7FF
-        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
-        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
+        vc = (w0 & 0x7F) + 1
+        m_vb = vb
+        vb += vc
+        pts = [positions[r] for r in refs[m_vb:m_vb + vc] if r < len(positions)]
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
         stored, size = meshlet_centre(w2, w3), centre_step(w2)
         out["coarse_steps"] += (w2 >> 28) != 0
         for i in range(3):
-            step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) / size)
-            out["axes_exact"] += step == 0
-            out["axes_within_step"] += abs(step) <= 1
-        radius, far = meshlet_radius(w0), max(math.dist(p, stored) for p in pts)
-        slack = math.sqrt(3) / 2 * size
-        out["radius_covers"] += radius >= far * (1 - 2 ** -11)
-        out["radius_covers_within_rounding"] += radius + slack >= far
-        out["radius_tight"] += radius <= 1.25 * far + slack
+            vals = [p[i] for p in pts]
+            if not all(math.isfinite(v) for v in vals):
+                continue
+            diff = ((min(vals) + max(vals)) / 2 - stored[i]) / size
+            if math.isfinite(diff):
+                step = round(diff)
+                out["axes_exact"] += step == 0
+                out["axes_within_step"] += abs(step) <= 1
+        radius = meshlet_radius(w0)
+        if math.isfinite(radius) and all(math.isfinite(c) for p in pts for c in p):
+            far = max(math.dist(p, stored) for p in pts)
+            if math.isfinite(far):
+                slack = math.sqrt(3) / 2 * size
+                out["radius_covers"] += radius >= far * (1 - 2 ** -11)
+                out["radius_covers_within_rounding"] += radius + slack >= far
+                out["radius_tight"] += radius <= 1.25 * far + slack
     return out
 
 
@@ -428,11 +448,14 @@ def centre_distance(data, group, positions):
     rec_at = at + 12
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, rec_at + 16 * k + 4 * group["triangles"])
     total = 0.0
+    vb = 0
     for m in range(k):
-        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
-        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
-        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
-        if len(pts) != vc:
+        w0, _, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        vc = (w0 & 0x7F) + 1
+        m_vb = vb
+        vb += vc
+        pts = [positions[r] for r in refs[m_vb:m_vb + vc] if r < len(positions)]
+        if len(pts) != vc or not all(math.isfinite(c) for p in pts for c in p):
             return None
         stored = meshlet_centre(w2, w3)
         total += sum(abs((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) for i in range(3))
@@ -485,6 +508,8 @@ def parse_group(data, at):
     if not head & 0x80000000:
         raise PageError(f"no group header at +0x{at:x}")
     meshlets = head & 0x7FFFFFFF
+    if not meshlets:
+        raise PageError(f"group at +0x{at:x} has no meshlets")
     triangles, refs = _u32(data, at + 4), _u32(data, at + 8)
     rec_at = at + 12
     tri_at = rec_at + 16 * meshlets

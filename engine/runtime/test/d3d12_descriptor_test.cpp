@@ -489,6 +489,7 @@ int main() {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER) != 0);
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
         EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
                                      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
@@ -1948,6 +1949,25 @@ int main() {
         }
         std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
         std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
+
+        // A gather across the center of each 2x2 block uses the A8 view's R-to-A swizzle.
+        // The remapped view of the same image forces alpha to zero.
+        std::array<std::uint8_t, 2 * bytes> gather_results{};
+        EXPECT(sample_through_set(d, set0, set0_layout, std::span(byte_keys).first(2), gather_results.data(),
+                                  LEONIDA_TEST_GATHER_ALPHA_SPV));
+        for (UINT y = 0; y + 1 < size; ++y) {
+            for (UINT x = 0; x + 1 < size; ++x) {
+                const UINT i = y * size + x;
+                const std::uint8_t alpha[] = {std::uint8_t(1 + 3 * (i + size)),
+                                              std::uint8_t(1 + 3 * (i + size + 1)),
+                                              std::uint8_t(1 + 3 * (i + 1)), std::uint8_t(1 + 3 * i)};
+                const std::uint8_t zero[4]{};
+                EXPECT(std::memcmp(gather_results.data() + 4 * i, alpha, sizeof(alpha)) == 0);
+                EXPECT(std::memcmp(gather_results.data() + bytes + 4 * i, zero, sizeof(zero)) == 0);
+            }
+        }
+        std::printf("A8 alpha gather: %u footprints matched for both default and remapped views\n",
+                    (size - 1) * (size - 1));
 
         // The border samplers, one tile to the right: every texel is the border.
         SampleKeys border_keys[3] = {};

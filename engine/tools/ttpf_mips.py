@@ -92,14 +92,16 @@ PATTERNS_64K = {
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
-# AMD Gfx10 3D SW_4KB_S intra-tile bit order (addrlib GFX10_SW_4K_S 3D):
-# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101).
+# AMD Gfx10 3D SW_4KB_S intra-tile bit order: Mesa addrlib GFX10_SW_4K_S3_PATINFO (and the identical
+# GFX10_SW_4K_S3_RBPLUS_PATINFO), first nibble01 + nibble2 entries per element size.
+# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101). The tile extents in
+# tex_headers._VOLUME_4K_TILE are 2**(number of X, Y and Z bits) of each row.
 VOLUME_PATTERNS_4K = {
     0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
-    1: (0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104),
-    2: (0, 0, 1, 2, 101, -1, 102, -2, 3, 103, -3, 104),
+    1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+    2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
     3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
-    4: (0, 0, 0, 0, 1, -1, 101, 2, -2, 102, 3, 103),
+    4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
 }
 VOLUME_FLOAT_FORMATS = {10: 4, 54: 1}  # DXGI format -> float16 channels per voxel
 

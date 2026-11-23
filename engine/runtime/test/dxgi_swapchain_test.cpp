@@ -352,6 +352,8 @@ int compare_failed_resize(IDXGIFactory4* ours, ID3D12CommandQueue* our_queue) {
         "GetBuffer(0) after it",
         "Present after it",
         "ResizeBuffers(2, 16, 16385)",
+        "SetSourceSize(100, 10) while 16x16385 is asked for",
+        "SetSourceSize(16, 16) while 16x16385 is asked for",
         "ResizeBuffers(0, 64, 64) after both",
         "GetDesc1 width after",
         "GetDesc1 BufferCount after",
@@ -386,24 +388,32 @@ int compare_failed_resize(IDXGIFactory4* ours, ID3D12CommandQueue* our_queue) {
             if (buffer) buffer->Release();
             return static_cast<long>(hr);
         };
+        // The host answers DXGI_STATUS_OCCLUDED (a success) for a window that isn't on screen, which depends on the
+        // desktop rather than on the swap chain; that counts as S_OK here. The failures stay strict.
+        const auto present = [&] {
+            const HRESULT hr = chain->Present(0, 0);
+            return static_cast<long>(hr == DXGI_STATUS_OCCLUDED ? S_OK : hr);
+        };
         r.push_back(chain->ResizeBuffers(2, 16385, 16, DXGI_FORMAT_UNKNOWN, 0));
         r.push_back(desc(0));
         r.push_back(desc(1));
         r.push_back(desc(2));
         r.push_back(get_buffer());
-        r.push_back(chain->Present(0, 0));
+        r.push_back(present());
         r.push_back(chain->ResizeBuffers(2, 16, 16385, DXGI_FORMAT_UNKNOWN, 0));
+        r.push_back(chain->SetSourceSize(100, 10));
+        r.push_back(chain->SetSourceSize(16, 16));
         r.push_back(chain->ResizeBuffers(0, 64, 64, DXGI_FORMAT_UNKNOWN, 0));
         r.push_back(desc(0));
         r.push_back(desc(2));
         r.push_back(get_buffer());
-        r.push_back(chain->Present(0, 0));
+        r.push_back(present());
         ID3D12Resource* held = nullptr;
         chain->GetBuffer(0, IID_PPV_ARGS(&held));
         r.push_back(chain->ResizeBuffers(2, 32, 32, DXGI_FORMAT_UNKNOWN, 0));
         if (held) held->Release();
         r.push_back(desc(0));
-        r.push_back(chain->Present(0, 0));
+        r.push_back(present());
         chain->Release();
         chain1->Release();
         DestroyWindow(hwnd);

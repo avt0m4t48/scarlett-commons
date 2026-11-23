@@ -563,8 +563,9 @@ public:
     // IDXGISwapChain2
     HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
         // Host-measured: a region larger than either back-buffer dimension is refused and keeps the stored one;
-        // zero is accepted. Present does not scale by it yet (documented difference).
-        const VkExtent2D extent = swapchain_.extent();
+        // zero is accepted. Present does not scale by it yet (documented difference). After a failed ResizeBuffers
+        // the host checks against the size that was asked for (16x16385 refuses 100x10, 16385x16 takes it).
+        const VkExtent2D extent = lost_ ? VkExtent2D{lost_width_, lost_height_} : swapchain_.extent();
         if (width > extent.width || height > extent.height) return DXGI_ERROR_INVALID_CALL;
         source_size_ = {width, height};
         return S_OK;

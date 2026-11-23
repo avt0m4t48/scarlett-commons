@@ -62,7 +62,6 @@ DEBT = {
     "test_salu_add_sub_co_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_and_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_andn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_bitfield_ins_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_nand_nor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_or_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_orn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",

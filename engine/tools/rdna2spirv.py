@@ -7539,8 +7539,10 @@ class Gen:
             # movrelsd does both. The register file is an array, so these become dynamic array accesses.
             # movrelsd_2 (GFX10) offsets each side by its own M0 field: VGPR[dst + M0[25:16]] =
             # VGPR[src + M0[9:0]] (RDNA2 ISA, VOP1 opcode 72; the RDNA3 ISA gives the same fields).
+            # Only movreld's source is not indexed, so it is any VOP1 source: an SGPR, M0, an inline constant or a
+            # literal too (LLVM VOP_MOVRELD's src0 is VSrc_b32; the other three take VRegSrc_32, a VGPR).
             d, s = a[0], a[1]
-            if d["k"] != "vgpr" or s["k"] != "vgpr":
+            if d["k"] != "vgpr" or (s["k"] != "vgpr" and op != "v_movreld_b32"):
                 raise Unsupported(op + " operands")
             m0 = self.tmp()
             self.emit(f"{m0} = OpLoad %uint %m0")
@@ -7556,7 +7558,7 @@ class Gen:
                 self.emit(f"{sp} = OpAccessChain %_ptr_Function_uint %vgpr {si}")
                 self.emit(f"{v} = OpLoad %uint {sp}")
             else:
-                v = self.load_reg("vgpr", s["r"])
+                v = self.src_u(s)
             if op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
                 di, dp, old, sel = (self.tmp() for _ in range(4))
                 self.emit(f"{di} = OpIAdd %uint {self.cu(d['r'])} {m0_dst}")

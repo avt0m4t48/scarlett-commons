@@ -19,6 +19,11 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+# cmd.exe expands %...% on every line of _build.cmd (twice on a CALL line), so a -Temp with % in it breaks the build.
+if ($Temp.Contains('%')) {
+    throw "-Temp '$Temp' contains '%', which cmd.exe expands in the generated _build.cmd. Choose a -Temp folder without % in its path."
+}
+
 if (-not $Keep) {
     # Compare directory boundaries, including when the paths do not exist yet.
     $paths = $ExecutionContext.SessionState.Path

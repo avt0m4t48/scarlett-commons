@@ -540,9 +540,9 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
-                # shaders (30) + assets (300) = 330 GB needed, only 250 GB free
+                # shaders (30) + assets (370) = 400 GB needed, only 250 GB free
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
-                                        match="about 330 GB is needed")
+                                        match="about 400 GB is needed")
                 self.assertIn("250 GB free", err)
                 ensure_submodule.assert_not_called()
 
@@ -601,11 +601,11 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             argv = ["make_game.py", "--game", os.path.join(tmp, "input"), "--out", os.path.join(tmp, "out")]
             with mock.patch.object(sys, "argv", argv):
                 disk.return_value = Usage(500 * gib, 470 * gib + 1, 30 * gib - 1)
-                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                error = self.assert_fails(make_game.main, match="about 400 GB is needed")
                 self.assertNotIn("--stages", error)
 
                 disk.return_value = Usage(500 * gib, 470 * gib, 30 * gib)
-                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                error = self.assert_fails(make_game.main, match="about 400 GB is needed")
                 suggestion = re.search(r"--stages ([a-z,]+)", error)
                 self.assertIsNotNone(suggestion, error)
                 for stage in ("shaders", "assets", "runtime", "pipelines"):
@@ -619,7 +619,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             stages["pipelines"].assert_not_called()
 
     def test_preflight_counts_assets_again_with_wav_even_when_exported(self):
-        # --wav decodes again over the exported audio (assets_exported says it is finished), so the 300 GB stays.
+        # --wav decodes again over the exported audio (assets_exported says it is finished), so the 370 GB stays.
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("make_game.assets_exported", return_value=True), \
@@ -631,7 +631,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 # Without --wav the exported assets are credited, so 250 GB free is enough for the asset tools.
                 make_game.preflight(["assets"], tmp_work, wav=False)
                 err = self.assert_fails(make_game.preflight, ["assets"], tmp_work, wav=True,
-                                        match="about 300 GB is needed")
+                                        match="about 370 GB is needed")
                 # c506d00c: the loader-only hint is offered only when shaders and runtime are selected and not --wav
                 self.assertNotIn("without exporting assets", err)
 
@@ -820,7 +820,7 @@ class PathAndGameSelectionTest(PreflightTestBase):
     def test_constants_definitions(self):
         self.assertEqual(make_game.STAGES, ["check", "shaders", "assets", "runtime", "pipelines"])
         self.assertEqual(make_game.PROBES, ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf"))
-        self.assertEqual(make_game.MIN_FREE_GB, {"shaders": 30, "assets": 300})
+        self.assertEqual(make_game.MIN_FREE_GB, {"shaders": 30, "assets": 370})
 
     def test_below_normal_priority_does_not_crash(self):
         make_game.below_normal()
@@ -876,20 +876,20 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     def test_exported_assets_need_only_the_shader_space(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
-            self.run_preflight(work, free_gb=220)  # 30 GB for the shaders, not 330
+            self.run_preflight(work, free_gb=220)  # 30 GB for the shaders, not 400
             err = self.assert_fails(self.run_preflight, work, free_gb=20, match="about 30 GB is needed")
             self.assertIn("20 GB free", err)
 
     def test_fresh_work_folder_still_needs_the_asset_space(self):
         with tempfile.TemporaryDirectory() as work:
             self.assertFalse(make_game.assets_exported(work))
-            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 400 GB is needed")
 
     def test_stopped_export_still_needs_the_asset_space(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)  # stopped before the XMA2 step
             self.assertFalse(make_game.assets_exported(work))
-            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 400 GB is needed")
 
     def test_stopped_export_counts_what_it_already_wrote(self):
         # Before: a stopped export that had written 277 GB still asked for all 300 GB free, so it couldn't resume.
@@ -925,7 +925,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
             self.write_xma(work, decoded=False)
-            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 400 GB is needed")
 
     def test_xma_streams_left_undecoded_without_ffmpeg_are_not_counted(self):
         # Without ffmpeg nothing decodes them, so the assets stage writes nothing more.
@@ -953,7 +953,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         # The WAV decode writes several times the Ogg Opus size and has no marker of its own.
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
-            self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 400 GB is needed")
 
     # A stopped export: models, textures and most pools on disk, no xma.done yet.
     def run_partial(self, work, free_gb, on_disk_gb, **kwargs):
@@ -962,16 +962,16 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         return walk
 
     def test_stopped_export_counts_what_is_already_on_disk(self):
-        # The case this was found on: 270 GB already exported, 205 GB free, refused for 330 GB.
+        # The case this was found on: 270 GB already exported, 205 GB free, refused for 400 GB.
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)
-            self.run_partial(work, free_gb=205, on_disk_gb=270)  # 30 + 300 - 270 = 60 GB
+            self.run_partial(work, free_gb=205, on_disk_gb=270)  # 30 + 370 - 270 = 130 GB
 
     def test_stopped_export_still_needs_what_is_left(self):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)
             err = self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=50,
-                                    match="about 280 GB is needed")
+                                    match="about 350 GB is needed")
             self.assertIn("205 GB free", err)
 
     def test_more_on_disk_than_the_estimate_leaves_the_shader_space(self):
@@ -988,7 +988,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)
             self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=270, wav=True,
-                              match="about 330 GB is needed")
+                              match="about 400 GB is needed")
 
     # The walk itself: only the output of steps assets() would skip on a rerun is counted.
     def put(self, work, rel, size):
@@ -1037,7 +1037,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.put(work, "big.bin", 4096)
             self.put(work, "levels/textures/abandoned.dds", 4096)    # a step that stopped before its manifest
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
-            self.assert_fails(self.run_preflight, work, free_gb=10, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=10, match="about 400 GB is needed")
 
     def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
         with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:

@@ -134,9 +134,10 @@ Current limits, by design:
   `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
   thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
   events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
-  existed before `load()` gets nothing:
-  call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
-  exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
+  was already running when `load()` ran, such as a worker of the process thread pool that the task queue later runs a
+  title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
+  loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
+  `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
   called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.

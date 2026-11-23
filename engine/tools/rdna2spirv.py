@@ -18272,7 +18272,10 @@ def main():
             why[str(e)] += 1
             drop_stale(name)
             continue
-        except (IndexError, KeyError, ValueError) as e:
+        except (IndexError, KeyError, ValueError, AssertionError, TypeError, AttributeError, ZeroDivisionError,
+                RecursionError) as e:
+            # A translator bug on one program refuses that program and is counted; it does not end a run over a
+            # whole pack (an assert in --wave64-emulate stopped make_game.py's shaders stage, #3976).
             why[f"translator error {type(e).__name__}"] += 1
             drop_stale(name)
             continue

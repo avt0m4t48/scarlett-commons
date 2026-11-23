@@ -16,6 +16,7 @@ Writes <name>.spvasm for each translated shader and <name>.spv only for validate
 Prints coverage and validation results.
 """
 import argparse
+import bisect
 import hashlib
 import os
 import re
@@ -14877,6 +14878,14 @@ def interp_ij_analysis(insns, g):
                 (g.pixel_interpolants[1] >> s["attr"]) & 1:
             raise Unsupported("computed I/J on 16-bit interpolant through v_interp_*_f32")
 
+    # Sites by (op, anchor register, attribute, channel), in program order, for partner(): the f16 p2 is
+    # keyed by its partial (the p1's vdst it names), every other op by its vdst.
+    by_key = defaultdict(list)
+    for t in sites:
+        anchor_reg = t["partial"] if t["op"] == "v_interp_p2_f16" else t["vdst"]
+        by_key[(t["op"], anchor_reg, t["attr"], t["chan"])].append(t)
+    n_by_key = {key: [t["n"] for t in ts] for key, ts in by_key.items()}
+
     def partner(k, s):
         """The other op of the pair: the p1 the p2 completes (nearest before), or the p2 that reads the
         p1's vdst as its partial (nearest after). Same attribute channel; the f32 pair's vdst is shared,
@@ -14891,14 +14900,26 @@ def interp_ij_analysis(insns, g):
             want = ("v_interp_p1ll_f16", "v_interp_p1lv_f16")
             anchor = s["partial"]
         # The f32 pair shares the vdst; the f16 p2 names the p1's vdst as its fourth operand (its
-        # partial), and its own vdst is just where the f16 result goes.
-        cand = [t for t in sites if t["op"] in want
-                and (t["partial"] if t["op"] == "v_interp_p2_f16" else t["vdst"]) == anchor
-                and t["attr"] == s["attr"] and t["chan"] == s["chan"]]
-        if s["op"] in P1:
-            after = [t for t in cand if t["n"] > k]
-            return min(after, key=lambda t: t["n"]) if after else None
-        return max((t for t in cand if t["n"] < k), key=lambda t: t["n"], default=None)
+        # partial), and its own vdst is just where the f16 result goes. by_key holds each kind's sites in
+        # program order, so the nearest one after (p1) or before (p2) the site is a binary search.
+        found = []
+        for op in want:
+            key = (op, anchor, s["attr"], s["chan"])
+            ts = by_key.get(key)
+            if not ts:
+                continue
+            ns = n_by_key[key]
+            if s["op"] in P1:
+                i = bisect.bisect_right(ns, k)
+                if i < len(ts):
+                    found.append(ts[i])
+            else:
+                i = bisect.bisect_left(ns, k)
+                if i:
+                    found.append(ts[i - 1])
+        if not found:
+            return None
+        return (min if s["op"] in P1 else max)(found, key=lambda t: t["n"])
 
     # Which pairs are computed (either operand is): both ops then take the computed model, so a p2 whose
     # own operand is pristine still weights with the I its p1 held.

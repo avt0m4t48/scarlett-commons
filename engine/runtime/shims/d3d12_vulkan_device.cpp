@@ -6555,8 +6555,12 @@ public:
                 planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
             const leonida::BlockFormat block = footprint_block(format, aspect);
             if (!block.bytes) return fail();
-            const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip));
-            const UINT height = one_d ? 1 : std::max<UINT>(1, desc->Height >> mip);
+            // D3D12 takes any MipLevels, and the PC runtime's own shifts wrap past the type's width: a 16x16 texture
+            // with 40 mips reports subresource 32 as 1x16 and 33 as 1x8, a volume's depth likewise (measured on an
+            // RTX 5060 Ti, compare_footprints). The masks give the same answers without shifting a 32-bit (or the
+            // 64-bit Width) value by its width or more, which C++ leaves undefined.
+            const UINT width = std::max<UINT>(1, UINT(desc->Width >> (mip & 63)));
+            const UINT height = one_d ? 1 : std::max<UINT>(1, desc->Height >> (mip & 31));
             const UINT blocks_wide = (width + block.block - 1) / block.block;
             const UINT blocks_high = (height + block.block - 1) / block.block;
             const UINT64 row_size = UINT64(blocks_wide) * block.bytes;
@@ -6567,7 +6571,7 @@ public:
             offset = align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
             DXGI_FORMAT footprint_format = desc->Format;
             if (planes == 2) footprint_format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
-            const UINT slices = std::max(1u, depth >> mip);
+            const UINT slices = std::max(1u, depth >> (mip & 31));
             if (layouts)
                 layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
             if (rows) rows[i] = blocks_high;

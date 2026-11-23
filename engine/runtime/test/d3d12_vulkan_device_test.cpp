@@ -533,6 +533,10 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        // Mip counts past 32 (and past 64 for the width): D3D12 accepts any count, every mip past the chain is 1x1.
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 40), 40},
+        {line_desc(16, 70, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 70},
+        {volume_desc(40), 40},
     };
     for (const auto& c : footprint_validity_cases()) cases.push_back({c.first, 1});
     int mismatches = 0;

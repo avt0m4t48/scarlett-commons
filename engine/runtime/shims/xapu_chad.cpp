@@ -12,7 +12,8 @@
 //   XApuGetResultCount(handle, 0)             1 site; 0 skips the loop that dequeues.
 //   XApuDequeueResult(handle, out*)           1 site, called count times into a zeroed 0x50-byte local; a negative
 //                                             HRESULT ends the loop.
-//   XApuDisconnect(handle)                    1 site; the return value is never read.
+//   XApuDisconnect(handle, 0x20)              1 site; the return value is never read. The constant second
+//                                             argument is not declared here: nothing reads it.
 //   XDspConnectWithMaximumStreamLimit(buffer, u32, u32, 0x80, 1, handle*)   1 site; success is a return of 0. The
 //                                             buffer comes from the title's XMemAlloc and stays the title's.
 //   XDspActivate(handle, ...4 more)           1 site; success is a return of 0, else the caller returns -1.

@@ -12,8 +12,10 @@ const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
 const worldSource = html.slice(worldBegin, worldEnd);
 
-function loadWorld(fetch, search = '') {
-    return vm.runInNewContext(worldSource + '\nloadWorld()', { fetch, location: { search }, URLSearchParams });
+function loadWorld(fetch, search = '', timers = { setTimeout, clearTimeout }) {
+    return vm.runInNewContext(worldSource + '\nloadWorld()', {
+        fetch, location: { search }, URLSearchParams, AbortController, ...timers,
+    });
 }
 
 function manifestResponse(manifest) {
@@ -65,13 +67,64 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
 test('test mode, a missing manifest, and an unreadable manifest have distinct messages', async () => {
     const explicit = await loadWorld(async () => assert.fail('test mode must not fetch'), '?test');
     const missing = await loadWorld(async () => ({ ok: false, status: 404 }));
+    const unavailable = await loadWorld(async () => ({ ok: false, status: 503 }));
     const invalid = await loadWorld(async () => ({ ok: true, json: async () => { throw new SyntaxError(); } }));
     const unreachable = await loadWorld(async () => { throw new TypeError(); });
-    for (const world of [explicit, missing, invalid, unreachable]) assert.equal(world.test, true);
+    for (const world of [explicit, missing, unavailable, invalid, unreachable]) assert.equal(world.test, true);
     assert.match(explicit.reason, /requested/);
     assert.match(missing.reason, /not found/);
+    assert.match(unavailable.reason, /HTTP 503/);
     assert.match(invalid.reason, /valid JSON/);
     assert.match(unreachable.reason, /could not be loaded/);
+});
+
+test('a stalled world manifest falls back to generated terrain at the startup deadline', async t => {
+    for (const phase of ['headers', 'body']) {
+        await t.test(phase, async () => {
+            let expire, signal, readingBody = false, deadlineCleared = false;
+            const timers = {
+                setTimeout(callback, delay) { assert.equal(delay, 10_000); expire = callback; return 1; },
+                clearTimeout(id) { assert.equal(id, 1); deadlineCleared = true; },
+            };
+            const loading = loadWorld((_url, options) => {
+                signal = options.signal;
+                const stall = () => new Promise((_, reject) => {
+                    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+                });
+                if (phase === 'headers') return stall();
+                return Promise.resolve({ ok: true, json() { readingBody = true; return stall(); } });
+            }, '', timers);
+            await new Promise(setImmediate);
+            assert.equal(readingBody, phase === 'body');
+            assert.equal(typeof expire, 'function');
+            assert.equal(signal.aborted, false);
+            assert.equal(deadlineCleared, false);
+            expire();
+            assert.equal(signal.aborted, true);
+            const world = await loading;
+            assert.equal(world.test, true);
+            assert.ok(world.chunks.length > 0);
+            assert.match(world.reason, /world\/world\.json.*timed out/);
+            assert.equal(deadlineCleared, true);
+        });
+    }
+});
+
+test('manifest success clears the deadline and explicit test mode never schedules it', async () => {
+    const scheduled = [], cleared = [];
+    const timers = {
+        setTimeout(callback) { scheduled.push(callback); return scheduled.length; },
+        clearTimeout(id) { cleared.push(id); },
+    };
+    const world = await loadWorld(manifestResponse({ spawn: [1, 2, 3], chunks: [] }), '', timers);
+    assert.equal(world.test, false);
+    assert.equal(scheduled.length, 1);
+    assert.deepEqual(cleared, [1]);
+
+    const explicit = await loadWorld(() => assert.fail('test mode must not fetch'), '?test', timers);
+    assert.equal(explicit.test, true);
+    assert.equal(scheduled.length, 1);
+    assert.deepEqual(cleared, [1]);
 });
 
 test('generated terrain shares vertex normals at both kinds of chunk border', () => {
@@ -300,6 +353,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
         document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
         devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        AbortController, setTimeout, clearTimeout,
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks }), GLTFLoader: class {},
     });
     const pressG = (repeat = false) => handlers.get('keydown')({ code: 'KeyG', repeat });

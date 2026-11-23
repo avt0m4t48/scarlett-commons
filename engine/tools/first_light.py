@@ -1,11 +1,11 @@
-"""First light: draw one real game model with its own translated vertex and pixel shaders.
+"""First light: draw an exported game model with a selected pair of translated game shaders.
 
 This assembles the smallest end-to-end path from the user's package to a Vulkan image: carve the game's
 `shaders.rpf`, translate one real VS/PS pair with the repository's translator, convert one exported model to the
 mesh the GPU harness reads, and run it on the device. Nothing is written outside `--work`, and no game data is
 committed: the tool is the recipe, the user's copy is the input.
 
-The default pair is a vertex shader that forwards POSITION and TEXCOORD to clip space and a pixel shader that
+Without a DDS texture, the vertex shader forwards clip-space POSITION and TEXCOORD. The default pixel shader
 writes the interpolated TEXCOORD, so the first image is the model's own UV map. Both are ordinary game shaders;
 `--vs` and `--ps` take other names from the carve index.
 
@@ -856,7 +856,7 @@ def load_json(
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Draw one real game model with its own translated VS/PS."
+        description="Draw an exported model with translated game shaders. Display its UVs or supply a texture with --dds."
     )
     ap.add_argument("--game", help="the package folder")
     ap.add_argument("--obj", help="an OBJ exported by rpf9dump models")

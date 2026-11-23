@@ -338,7 +338,8 @@ class VcvarsScript(unittest.TestCase):
             os.makedirs(work)
             argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
             with open(os.path.join(work, argv[-1]), "rb") as f:
-                lines = f.read().decode("ascii").split("\r\n")
+                # UTF-8, not ASCII: the /Fo folder sits in %TEMP%, which can hold a non-ASCII user name.
+                lines = f.read().decode("utf-8").split("\r\n")
         self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
         self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
 
@@ -419,7 +420,7 @@ class Unavailable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
             self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
-            script = (Path(tmp) / argv[3]).read_text(encoding="ascii")
+            script = (Path(tmp) / argv[3]).read_text(encoding="utf-8")       # UTF-8; tmp may be non-ASCII
             self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
             self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
             self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH

@@ -89,7 +89,7 @@ class ManifestTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True,
-                              text=True, encoding="utf-8", timeout=60)
+                              text=True, errors="replace", timeout=60)
 
     def test_csv_rows_codecs_and_bad_bank_skip(self):
         bank = self.write_bank()

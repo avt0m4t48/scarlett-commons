@@ -163,7 +163,9 @@ def main(argv):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
     dis, asm = _tools()
-    text = _run([dis, argv[1]], capture_output=True, text=True).stdout
+    # errors="replace": on Windows text=True decodes with the ANSI code page, and a program that answers in UTF-8
+    # (a path with non-ASCII letters in its error message) would otherwise kill the reader thread and lose stderr.
+    text = _run([dis, argv[1]], capture_output=True, text=True, errors="replace").stdout
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
     _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts), text=True)

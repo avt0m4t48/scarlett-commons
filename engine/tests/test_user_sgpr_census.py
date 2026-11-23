@@ -162,8 +162,10 @@ TOOL = os.path.join(ROOT, "tools", "user_sgpr_census.py")
 
 
 def run_cli(*args):
+    # A piped Python child writes in the locale encoding (the ANSI code page on Windows): read it back in that
+    # encoding, or a non-ASCII temp path in the error line no longer matches.
     return subprocess.run([sys.executable, "-I", TOOL, *map(str, args)], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+                          errors="replace")
 
 
 def assert_one_error_line(result, *fragments):

@@ -320,7 +320,7 @@ class ArchiveTest(unittest.TestCase):
                                      ("--limit", "-100", "must be at least 1")):
             out = os.path.join(self.root, "bad.json")
             p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
-                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn(message, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
@@ -333,7 +333,7 @@ class ArchiveTest(unittest.TestCase):
                                   (self.rpf, out_in_missing, out_in_missing)):
             with self.subTest(path=os.path.relpath(path, self.root)):
                 p = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 1, p.stderr)
                 self.assertTrue(p.stderr.startswith(path + ": "), p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
@@ -343,7 +343,7 @@ class ArchiveTest(unittest.TestCase):
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -357,7 +357,7 @@ class ArchiveTest(unittest.TestCase):
         with open(rigs, "w", encoding="utf-8") as f:
             f.write('{"previous": true}')
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("no anim/rigset/ keys found", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
@@ -368,14 +368,14 @@ class ArchiveTest(unittest.TestCase):
         folder_out = os.path.join(self.root, "out_folder")
         os.makedirs(folder_out)
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, folder_out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("is a folder, not a .csv or .json file", p.stderr)
 
     def test_cli_rejects_invalid_extension(self):
         txt_out = os.path.join(self.root, "out.txt")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, txt_out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output must end in .json or .csv", p.stderr)
 
@@ -392,25 +392,25 @@ class ArchiveTest(unittest.TestCase):
 
         # Refuse to overwrite carve manifest via out
         p = subprocess.run([sys.executable, "-I", TOOL, carve, manifest, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output would overwrite the carve manifest", p.stderr)
 
         # Refuse to overwrite carve manifest via --rigs
         p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", manifest, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs would overwrite the carve manifest", p.stderr)
 
         # Refuse to overwrite carved input file via out
         p = subprocess.run([sys.executable, "-I", TOOL, carve, bin_file, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output would overwrite an input file", p.stderr)
 
         # Refuse to overwrite carved input file via --rigs
         p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", bin_file, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs would overwrite an input file", p.stderr)
 
@@ -436,7 +436,7 @@ class ArchiveTest(unittest.TestCase):
             with self.subTest(flags=flags):
                 out = os.path.join(self.root, f"bad{i}.json")
                 p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *flags],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
                 for flag in flags[::2]:
@@ -541,12 +541,12 @@ class RigArchiveTest(unittest.TestCase):
         folder = os.path.join(self.root, "rig_folder")
         os.makedirs(folder)
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", folder, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("is a folder, not a JSON file", p.stderr)
 
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", os.path.join(self.root, "rigs.csv"), "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs must end in .json", p.stderr)
 
@@ -554,7 +554,7 @@ class RigArchiveTest(unittest.TestCase):
         out = os.path.join(self.root, "index.json")
         rigs = os.path.join(self.root, "rigs.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(rigs, encoding="utf-8") as f:
             doc = json.load(f)
@@ -583,7 +583,7 @@ class RigArchiveTest(unittest.TestCase):
                 out = os.path.join(self.root, label + "-index.json")
                 rigs = os.path.join(self.root, label + "-rigs.json")
                 p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--rigs", rigs, "--quiet"],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 with open(rigs, encoding="utf-8") as f:
                     summary = json.load(f)["rbf0"]["summary"]

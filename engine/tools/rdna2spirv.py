@@ -8184,10 +8184,40 @@ class Gen:
                     clamp_input = self.tmp()
                     self.emit(f"{clamp_input} = OpSelect %float {inf} %f0 {f}")
                     f = clamp_input
+            # SPIR-V leaves 1/0, InverseSqrt(x <= 0) and Sqrt(x < 0) undefined, so those operands are replaced by 1.0
+            # and the hardware's result is selected afterwards (docs/design.md, f16 transcendentals): rcp(+-0) = +-inf,
+            # rsq(+-0) = +-inf, rsq and sqrt of a negative operand (-inf included) = 0xfe00 (a negative quiet NaN).
+            x, edge = f, None
+            if op in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16"):
+                sg, zero, below, bad = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sg} = OpBitwiseAnd %uint {self.tou(f)} {self.cu(0x80000000)}")
+                self.emit(f"{zero} = OpFOrdEqual %bool {f} %f0")
+                self.emit(f"{below} = OpFOrdLessThan %bool {f} %f0")
+                if op == "v_rcp_f16":
+                    self.emit(f"{bad} = OpCopyObject %bool {zero}")
+                elif op == "v_rsq_f16":
+                    self.emit(f"{bad} = OpFOrdLessThanEqual %bool {f} %f0")
+                else:
+                    self.emit(f"{bad} = OpCopyObject %bool {below}")
+                x = self.tmp()
+                self.emit(f"{x} = OpSelect %float {bad} %f1 {f}")
+                edge = (sg, zero, below)
             if fn:
-                self.emit(f"{r} = OpExtInst %float %glsl {fn} {f}")
+                self.emit(f"{r} = OpExtInst %float %glsl {fn} {x}")
             else:
-                self.emit(f"{r} = OpFDiv %float %f1 {f}")
+                self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            if edge:
+                sg, zero, below = edge
+                ib, inf, nan, t = self.tmp(), self.tmp(), self.tof(self.cu(0xFFC00000)), self.tmp()
+                self.emit(f"{ib} = OpBitwiseOr %uint {sg} {self.cu(0x7F800000)}")
+                self.emit(f"{inf} = OpBitcast %float {ib}")
+                if op != "v_sqrt_f16":
+                    self.emit(f"{t} = OpSelect %float {zero} {inf} {r}")
+                    r = t
+                if op != "v_rcp_f16":
+                    t = self.tmp()
+                    self.emit(f"{t} = OpSelect %float {below} {nan} {r}")
+                    r = t
             if fn == "Fract":
                 r = self.fract_below_one(r)
             r = self.clamp_mods(r, mods)

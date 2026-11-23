@@ -928,6 +928,52 @@ class AwcIndexTableTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in streams], [1, 2])
 
 
+class MusicChannelFormatTest(unittest.TestCase):
+    """AwcRecovery.cs:380 rejects music channels outside 1000..192000 Hz or not coded as Opus."""
+
+    RATE_AT = 56 + 22      # one-channel descriptor starts at 56; rate is at +22
+    CODEC_AT = 56 + 24
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+
+    def bank(self, *, rate=None, codec=None):
+        d = bytearray(build_music_pcm_bank())
+        if rate is not None:
+            struct.pack_into("<H", d, self.RATE_AT, rate)
+        if codec is not None:
+            d[self.CODEC_AT] = codec
+        return bytes(d)
+
+    def channels(self, d):
+        _, music = awc.parse_awc(d)
+        return awc.music_channels(d, *music[0], collect_packets=False)
+
+    def test_zero_rate_is_rejected_and_sibling_pcm_is_kept(self):
+        d = self.bank(rate=0)
+        self.assertEqual(self.channels(d), [])
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(d)
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "streamed", "00000021.wav")))
+
+    def test_rate_below_reference_bound_is_rejected(self):
+        self.assertEqual(self.channels(self.bank(rate=999)), [])
+
+    def test_reference_rate_bounds_are_accepted(self):
+        # The field is u16, so 65535 is the highest rate a bank can actually declare.
+        for rate in (1000, 65535):
+            with self.subTest(rate=rate):
+                self.assertEqual(len(self.channels(self.bank(rate=rate))), 1)
+
+    def test_non_opus_codec_is_rejected(self):
+        self.assertEqual(self.channels(self.bank(codec=0)), [])
+
+
 class MalformedBankTest(unittest.TestCase):
     def test_truncated_pcm_bank_creates_no_outputs(self):
         pcm = b"\x01\x00" * 4

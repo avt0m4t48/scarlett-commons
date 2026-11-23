@@ -190,6 +190,10 @@ class Cli(unittest.TestCase):
         self.assertRegex(out, r"v_movrelsd_2_b32 +VGPR\[D \+ M0\[25:16\]\]")
         self.assertEqual(self.main("--ops", "v_nope")[0], 2)
         self.assertEqual(self.main("--wave", "16")[0], 2)
+        for argv in (("--programs", "-1"), ("--programs", "0"), ("--max-ops", "0"), ("--max-ops", "-3")):
+            rc, out = self.main(*argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertNotIn("programs match", out)
         rc, out = self.main("--programs", "2", "--seed", "1", "--wave", "both")
         self.assertEqual(rc, 0, out)
         self.assertIn("2/2 programs match", out)

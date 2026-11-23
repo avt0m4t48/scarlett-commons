@@ -117,6 +117,18 @@ def test_cluster_groups_shapes():
     assert ranked[0][1] == 2 and ranked[1][1] == 1
 
 
+def test_cluster_ties_and_example_names_are_stable():
+    index = {
+        "z_const": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]},
+        "y_ptr": {"user_sgpr_reads": [{"sgpr": 2, "kind": "ptr64_lo"}]},
+        "a_const": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]},
+        "b_ptr": {"user_sgpr_reads": [{"sgpr": 2, "kind": "ptr64_lo"}]},
+    }
+    ranked = rsc.cluster(index)
+    assert ranked == rsc.cluster(dict(reversed(list(index.items()))))
+    assert [row[2] for row in ranked] == [["a_const", "z_const"], ["b_ptr", "y_ptr"]]
+
+
 def test_cli_hard_fail_on_contradiction(tmp_path):
     index = {"bad": {"user_sgpr_reads": [{"sgpr": 31, "kind": "const32"}]}}
     index_path = tmp_path / "index.json"

@@ -21,7 +21,8 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
-constexpr auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+// Not constexpr: 0x101 is outside the unfixed enum's value range, which clang-cl rejects in a constant expression.
+inline const auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
 
 // The console allows a depth-stencil texture to allow unordered access too (measured locally at a title's call sites:
 // a 2D R32G8X24_TYPELESS texture with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS, sized through slot 25), but the PC

@@ -903,6 +903,21 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot - 2]);
                 return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             }
+            // Slot 18 while the layout is still unknown is ambiguous: the older GetDesc (a struct-return
+            // write of a whole desc) or the newer frequency getter (an 8-byte out). Answering it as GetDesc
+            // writes far past the 8 bytes a frequency caller passes, so the call goes to the frequency
+            // getter — the only interpretation that cannot overrun its argument, and a title often queries
+            // the frequency before its first fence call. A proven-older queue keeps the generic GetDesc
+            // path below; slots 19 and 20 stay no-ops, since their newer interpretations write through
+            // caller pointers an unmodelled older method might not supply.
+            if (Slot == 18 && !newer && self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
+                self->device->console_layout.load(std::memory_order_relaxed) !=
+                    ChildProxy::kQueueLayoutOlder) {
+                d3d12_trace::record(child_trace_name<K>(Slot));
+                using Fn = HRESULT(WINAPI*)(IUnknown*, UINT64*);
+                return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[16])(
+                    self->real, reinterpret_cast<UINT64*>(a1)));
+            }
             if (Slot == (newer ? 25u : 23u) ||
                 (Slot == 25u && self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
                  self->device->console_layout.load(std::memory_order_relaxed) ==

@@ -194,6 +194,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::queue && slot == 16 && a1) {
+        // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
+        // newer-layout Signal's fence, not an out pointer.
+        const auto at = static_cast<std::uintptr_t>(a1);
+        const auto base = reinterpret_cast<std::uintptr_t>(g_pool);
+        const bool is_mock = at >= base && at < base + sizeof(g_pool) && (at - base) % sizeof(Mock) == 0;
+        if (!is_mock) *reinterpret_cast<UINT64*>(a1) = 1000000;
+    }
     return S_OK;
 }
 
@@ -787,8 +795,28 @@ int check_signalx_detection() {
     EXPECT(hr_of(raw(queue4, 25, word(fence4), 19)) == S_OK && queue4_mock->calls[14] == 2 &&
            queue4_mock->args[14][1] == 19);
     EXPECT(release(queue4) == 0 && release(fence4) == 0 && release(device3) == 0 && mock3->refs == 0);
+
+    // Ambiguous slot 18 on an undetected queue: the older GetDesc or the newer frequency getter. It is
+    // served as the frequency query — a desc write is far wider than the 8 bytes a frequency caller
+    // passes (a title often reads the frequency before its first fence call); once a fence proves the
+    // layout the same call keeps reaching the getter through the shifted path.
+    Mock* mock4 = nullptr;
+    void* device4 = make_device(mock4, 9, true);
+    void* queue5 = make_queue(device4);
+    void* fence5 = make_fence(device4);
+    EXPECT(device4 && queue5 && fence5);
+    Mock* const queue5_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue5));
+    UINT64 hz = 0;
+    EXPECT(hr_of(raw(queue5, 18, word(&hz))) == S_OK && hz == 1000000 &&
+           queue5_mock->calls[16] == 1 && queue5_mock->calls[18] == 0);
+    hz = 0;
+    EXPECT(hr_of(raw(queue5, 16, word(fence5), 8)) == S_OK);
+    EXPECT(hr_of(raw(queue5, 18, word(&hz))) == S_OK && hz == 1000000 &&
+           queue5_mock->calls[16] == 2 && queue5_mock->calls[18] == 0);
+    EXPECT(release(queue5) == 0 && release(fence5) == 0 && release(device4) == 0 && mock4->refs == 0);
     std::printf("xs_proxy_mock: SignalX on an undetected queue's slot 25 forwards as Signal and marks the "
-                "newer layout; proven-older stays older and a fence at 23 does not pin\n");
+                "newer layout; proven-older stays older, a fence at 23 does not pin, and an undetected "
+                "slot 18 answers the frequency getter\n");
     return 0;
 }
 

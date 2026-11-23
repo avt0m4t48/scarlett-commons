@@ -13496,6 +13496,19 @@ def mesh_compute_epilogue(gen):
     return "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L)
 
 
+def insert_late_constants(gen, out, written):
+    """Define the uint constants assemble asked gen.cu for after it wrote the others (the format tables' lengths and
+    entries, prologue indices, ...), right after the last written one, so before any type or instruction that uses
+    them. Without this a constant nothing else had used (fmt_size_arr's length 128 in a shader with only a d16 typed
+    store) was an id with no definition, and the module failed spirv-val."""
+    late = sorted(v for v in gen.consts if v not in written)
+    if not late:
+        return
+    last = max(written)
+    at = out.index(f"{written[last]} = OpConstant %uint {last}") + 1
+    out[at:at] = [f"{gen.consts[v]} = OpConstant %uint {v}" for v in late]
+
+
 def assemble(gen):
     vs = gen.stage == "vs"
     cs = gen.stage == "cs"
@@ -13845,6 +13858,7 @@ def assemble(gen):
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
+    written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
@@ -14454,6 +14468,7 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
+    insert_late_constants(gen, out, written)
     return split_big_switch(no_contraction(dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
         "\n" + "\n".join(gen.body) + "\n" + tail)))

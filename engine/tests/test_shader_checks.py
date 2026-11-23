@@ -373,6 +373,28 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertNotIsInstance(problem, check.Skip)
         self.assertIn("vk_harness failed", problem)
 
+    def test_nan_payload_exception_is_limited_to_kosmickrisp(self):
+        payloads = self.readlane_pixels((0x7fc12345, 0xffc54321, 0x3f800000, 0x3f000000))
+        canonical = self.readlane_pixels((0x7fc00000, 0x7fc00000, 0x3f800000, 0x3f000000))
+        for driver in ("driver: KosmicKrisp\n", "driver: MoltenVK\n", ""):
+            with self.subTest(driver=driver):
+                out = f"device: Apple M1 Pro (subgroup 32..32)\n{driver}ok 64x64\n"
+                self.assertEqual(self.run_pixel("ps_nan_payload", 0, out, payloads), "")
+                problem = self.run_pixel("ps_nan_payload", 0, out, canonical)
+                if driver == "driver: KosmicKrisp\n":
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn("unexpected words", problem)
+
+    def test_kosmickrisp_still_rejects_bad_nan_and_finite_words(self):
+        out = "driver: KosmicKrisp\nok 64x64\n"
+        for words in ((0x7fc00001, 0x7fc00000, 0x3f800000, 0x3f000000),
+                      (0x7f800000, 0x7fc00000, 0x3f800000, 0x3f000000),
+                      (0x7fc00000, 0x7fc00000, 0x7fc00000, 0x3f000000)):
+            with self.subTest(words=words):
+                problem = self.run_pixel("ps_nan_payload", 0, out, self.readlane_pixels(words))
+                self.assertIn("unexpected words", problem)
+
     def test_bitmask_perm_skips_below_32_lanes(self):
         out = "device: fake (subgroup 8..8)\nok 64x64\n"
         problem = self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(8))

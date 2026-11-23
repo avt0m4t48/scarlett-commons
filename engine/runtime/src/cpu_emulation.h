@@ -13,7 +13,8 @@
 //   INSERTQ xmm1, xmm2             F2 0F 79 /r         same, len = xmm2[77:72], idx = xmm2[69:64]
 //   EXTRQ   xmm1, len, idx         66 0F 78 /0 ib ib   xmm1[63:0] = (xmm1[63:0] >> idx), `len` bits, zero-extended
 //   EXTRQ   xmm1, xmm2             66 0F 79 /r         same, len = xmm2[5:0], idx = xmm2[13:8]
-//   CLZERO                         0F 01 FC            zero the 64-byte cache line that rAX points into
+//   CLZERO                         0F 01 FC            zero the 64-byte cache line that rAX points into; a line
+//                                                       it cannot write raises that write fault, as the CPU does
 //   MONITORX                       0F 01 FA            arm an address monitor: a hint, nothing to do here
 //   MWAITX                         0F 01 FB            wait for the monitor or a timer; returning at once is one
 //                                                       of the exits the manual allows, so it is a pause
@@ -61,8 +62,8 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
     if (i + 2 > avail || code[i] != 0x0F) return {};
     const uint8_t op = code[i + 1];
     i += 2;
-    if (op == 0x01) {  // CLZERO, MONITORX, MWAITX: fixed three-byte forms, no 66/F2/F3
-        if (i >= avail || p66 || pf2 || pf3) return {};
+    if (op == 0x01) {  // CLZERO, MONITORX, MWAITX; F2/F3 select other instructions here (F3 0F 01 FA is MCOMMIT)
+        if (i >= avail || pf2 || pf3) return {};
         const uint8_t m = code[i++];
         d.op = m == 0xFC ? Op::clzero : m == 0xFA ? Op::monitorx : m == 0xFB ? Op::mwaitx : Op::none;
         d.length = i;
@@ -182,9 +183,10 @@ inline std::atomic<uint64_t>& count(Op op) {
 inline uint64_t& lo(CONTEXT* c, int r) { return c->FltSave.XmmRegisters[r].Low; }
 inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegisters[r].High); }
 
-// Apply one decoded instruction to `c` and step past it. False when the memory CLZERO zeroes is not writable, so
-// the original exception stands.
-inline bool apply(const Decoded& d, CONTEXT* c) {
+// Apply one decoded instruction to `c` and step past it. False when the line CLZERO zeroes cannot be written; then
+// `fault`, when given, receives the exception the write raised (STATUS_ACCESS_VIOLATION with the write flag and the
+// line's address, or STATUS_GUARD_PAGE_VIOLATION, as the real instruction would raise) and `c` is unchanged.
+inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullptr) {
     switch (d.op) {
     case Op::insertq_imm: lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), d.len, d.idx); break;
     case Op::insertq_reg: {
@@ -200,9 +202,17 @@ inline bool apply(const Decoded& d, CONTEXT* c) {
     }
     case Op::clzero: {
         const uint64_t addr = (d.addr32 ? (c->Rax & 0xFFFFFFFFu) : c->Rax) & ~uint64_t(63);
-        __try {
+        DWORD code = 0;
+        __try {  // a 64-byte aligned line never spans two pages: the whole write succeeds or none of it
             std::memset(reinterpret_cast<void*>(addr), 0, 64);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+            if (fault) {
+                std::memset(fault, 0, sizeof *fault);
+                fault->ExceptionCode = code;
+                fault->NumberParameters = 2;
+                fault->ExceptionInformation[0] = 1;  // a write
+                fault->ExceptionInformation[1] = ULONG_PTR(addr);
+            }
             return false;
         }
         break;
@@ -225,7 +235,19 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     const Decoded d = decode(code, avail);
-    if (d.op == Op::none || !apply(d, c)) return EXCEPTION_CONTINUE_SEARCH;
+    if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
+    EXCEPTION_RECORD fault;
+    if (!apply(d, c, &fault)) {
+        // CLZERO on a line it cannot write: the CPU would raise that fault at this instruction, so the next handlers
+        // see it instead of the #UD (RIP still points at the instruction).
+        EXCEPTION_RECORD* r = info->ExceptionRecord;
+        r->ExceptionCode = fault.ExceptionCode;
+        r->ExceptionFlags = 0;
+        r->NumberParameters = fault.NumberParameters;
+        r->ExceptionInformation[0] = fault.ExceptionInformation[0];
+        r->ExceptionInformation[1] = fault.ExceptionInformation[1];
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
                      reinterpret_cast<void*>(c->Rip - d.length));

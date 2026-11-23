@@ -57,7 +57,13 @@ void test_decode() {
     check(dec({0x0F, 0x01, 0xFA}).op == ce::Op::monitorx, "monitorx");
     check(dec({0x0F, 0x01, 0xFB}).op == ce::Op::mwaitx, "mwaitx");
     check(dec({0x0F, 0x01, 0xF9}).op == ce::Op::none, "rdtscp is not handled");
-    check(dec({0xF3, 0x0F, 0x01, 0xFA}).op == ce::Op::none, "F3 0F 01 FA is not monitorx");
+    check(dec({0xF3, 0x0F, 0x01, 0xFA}).op == ce::Op::none, "F3 0F 01 FA is MCOMMIT, not monitorx");
+    check(dec({0xF2, 0x0F, 0x01, 0xFC}).op == ce::Op::none, "F2 0F 01 FC is not clzero");
+    d = dec({0x66, 0x0F, 0x01, 0xFC});
+    check(d.op == ce::Op::clzero && d.length == 4, "clzero with 66");
+    d = dec({0x64, 0x48, 0x0F, 0x01, 0xFC});
+    check(d.op == ce::Op::clzero && d.length == 5, "clzero with a segment override and REX");
+    check(dec({0xF0, 0x0F, 0x01, 0xFC}).op == ce::Op::none, "LOCK clzero stays #UD");
 
     check(dec({0x66, 0x0F, 0xAE, 0x31}).length == 4, "clwb [rcx]");
     check(dec({0x66, 0x0F, 0xAE, 0x74, 0x01, 0x08}).length == 6, "clwb [rcx+rax+8]");
@@ -114,8 +120,13 @@ void test_apply() {
     for (int i = 0; i < 64; ++i) kept &= line[i] == 0xEE;
     check(zeroed && kept, "clzero zeroes exactly the line rax points into");
 
-    c.Rax = 0x10;  // the null page: not writable, so the original #UD stands
-    check(!ce::apply(dec({0x0F, 0x01, 0xFC}), &c) && c.Rip == rip + 3, "clzero on an unwritable line is refused");
+    c.Rax = 0x10;  // the null page: not writable, so the write fault the CPU would raise is reported
+    EXCEPTION_RECORD fault{};
+    check(!ce::apply(dec({0x0F, 0x01, 0xFC}), &c, &fault) && c.Rip == rip + 3,
+          "clzero on an unwritable line is refused and leaves rip");
+    check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.NumberParameters == 2 &&
+              fault.ExceptionInformation[0] == 1 && fault.ExceptionInformation[1] == 0,
+          "clzero on an unwritable line reports a write access violation at the line");
 }
 
 // ---- Running the real encodings ----
@@ -199,6 +210,21 @@ void test_live(const ce::Host& host) {
     for (int i = 0; i < 192; ++i) ok &= lines[i] == ((i >= 64 && i < 128) ? 0 : 0x5A);
     check(ok, "clzero zeroed one line");
     std::printf("clzero: %s\n", path(host.clzero));
+
+    // A read-only line: the CPU and the handler both raise a write access violation, not #UD.
+    if (auto* ro = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        DWORD old = 0;
+        VirtualProtect(ro, 4096, PAGE_READONLY, &old);
+        check(!run(clz, ro + 128, nullptr, &ex) && ex == STATUS_ACCESS_VIOLATION,
+              "clzero on a read-only line raises an access violation");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    }
+    if (!host.clzero) {  // the emulated path accepts the 66 prefix: mov rax,rcx; 66 clzero; ret
+        Code clz66({0x48, 0x89, 0xC8, 0x66, 0x0F, 0x01, 0xFC, 0xC3});
+        std::memset(lines, 0x5A, sizeof lines);
+        check(run(clz66, lines + 130, nullptr, &ex) && lines[128] == 0 && lines[191] == 0 && lines[127] == 0x5A,
+              "clzero with 66 emulated");
+    }
 
     // mov rax,rcx; xor ecx,ecx; xor edx,edx; monitorx; xor eax,eax; xor ecx,ecx; mwaitx; ret
     // (no timer: an interrupt or a store ends a native wait; the emulated one returns at once)

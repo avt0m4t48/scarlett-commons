@@ -80,13 +80,16 @@ std::string narrow(const std::wstring& w) {
 }
 
 [[noreturn]] void end_run(int code) {
+    // Read before signalling: once g_done is set, run_entry can return and clear g_running while the host is still
+    // finishing the run (main.cpp's "game exited" line and cleanup), which this thread must not cut short.
+    const bool running = g_running;
     bool expected = false;
     if (g_exited.compare_exchange_strong(expected, true)) {
         g_exit_code = code;
         if (g_done) SetEvent(g_done);
     }
     // Park until the host's ExitProcess, not ExitThread: Wine < 11.2 can exit 0 if the two race (4a9bc42a).
-    if (g_running) for (;;) Sleep(INFINITE);
+    if (running) for (;;) Sleep(INFINITE);
     // The run is already over: this is game code running during host shutdown (an atexit handler the game
     // registered with the shared CRT calling exit again). Finish the process with the game's exit code; ending
     // just this thread here would make the host's last thread, and so the process, exit with `code` instead.

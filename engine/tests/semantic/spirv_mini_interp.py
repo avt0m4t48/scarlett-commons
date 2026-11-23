@@ -312,6 +312,21 @@ class _Types:
             return sum(self.size(t) for t in k[1])
         raise UnsupportedConstruct(f"size of type {name} ({k[0]})")
 
+    def copy_value(self, name, value):
+        """Copy an aggregate across the memory boundary, retaining any pointer values it contains."""
+        kind = self.t.get(name)
+        if kind is None:
+            return value
+        if kind[0] == "arr":
+            members = (self.copy_value(kind[1], item) for item in value)
+        elif kind[0] == "struct":
+            members = (self.copy_value(member, item) for member, item in zip(kind[1], value))
+        elif kind[0] == "vec" and isinstance(value, list):
+            return value.copy()
+        else:
+            return value
+        return type(value)(members)
+
     def is_word_pair(self, kind):
         return kind and kind[0] == "vec" and kind[2] == 2 and self.t[kind[1]][:2] == ("int", 32)
 
@@ -531,6 +546,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             id_type[res] = a[0]
         elif op == "OpConstantComposite":           # a constant array or vector (e.g. %fmt_size_tab's table)
             values[res] = [values[x] for x in a[1:]]
+            id_type[res] = a[0]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if a[1] != cls:
@@ -543,11 +559,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
             elif cls in ("Function", "Output", "Workgroup", "Private"):
-                if len(a) > 2:
-                    init = values[a[2]]
-                    var_box[res] = [list(init) if isinstance(init, list) else init]
-                else:
-                    var_box[res] = [types.zero(pointee)]
+                init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
+                var_box[res] = [init]
                 if cls == "Output":
                     outputs.append(res)
             else:
@@ -688,8 +701,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             cls, pointee = ptr_types[a[0]]
             if cls != "Function":
                 raise UnsupportedConstruct("non-Function variable in body")
-            var_box[res] = [list(values[a[2]]) if len(a) > 2 and isinstance(values[a[2]], list)
-                            else (values[a[2]] if len(a) > 2 else types.zero(pointee))]
+            init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
+            var_box[res] = [init]
             pointers[res] = (var_box[res], 0)
         elif op == "OpAccessChain":
             base = a[1]
@@ -731,8 +744,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")
                 values[res] = memory.get(psb_word(p[1]), 0)
             else:
-                v = deref(p)
-                values[res] = list(v) if isinstance(v, list) else v
+                values[res] = types.copy_value(a[0], deref(p))
         elif op == "OpStore":
             p = pointers[a[0]]
             if p[0] == "pc":
@@ -744,7 +756,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct("PhysicalStorageBuffer store of a value that is not a 32-bit integer")
                 memory[psb_word(p[1])] = v
             else:
-                p[0][p[1]] = val(a[1])
+                p[0][p[1]] = types.copy_value(id_type.get(a[1]), val(a[1]))
         elif op in _ATOMICS:
             # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
             # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).

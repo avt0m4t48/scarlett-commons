@@ -629,5 +629,89 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(si.run_fragment(text)["%out"][0], 0)
 
 
+class AggregateValueTests(unittest.TestCase):
+    HEADER = """\
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v2uint = OpTypeVector %uint 2
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%seven = OpConstant %uint 7
+%array = OpTypeArray %uint %one
+%nested = OpTypeArray %array %one
+%null_array = OpConstantNull %array
+%null_nested = OpConstantNull %nested
+%const_array = OpConstantComposite %array %zero
+%ptr_array = OpTypePointer Function %array
+%ptr_nested = OpTypePointer Function %nested
+%ptr_word = OpTypePointer Function %uint
+%ptr_output = OpTypePointer Output %v2uint
+%out = OpVariable %ptr_output Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+"""
+
+    def test_whole_array_store_does_not_alias_its_operand(self):
+        body = """\
+%src = OpVariable %ptr_array Function %null_array
+%dst = OpVariable %ptr_array Function %null_array
+%saved = OpLoad %array %src
+OpStore %dst %saved
+%element = OpAccessChain %ptr_word %dst %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %saved 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_nested_array_load_keeps_its_original_elements(self):
+        body = """\
+%src = OpVariable %ptr_nested Function %null_nested
+%saved = OpLoad %nested %src
+%element = OpAccessChain %ptr_word %src %zero %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %saved 0 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_shared_nested_initializer_creates_separate_storage(self):
+        body = """\
+%src = OpVariable %ptr_nested Function %null_nested
+%other = OpVariable %ptr_nested Function %null_nested
+%element = OpAccessChain %ptr_word %src %zero %zero
+OpStore %element %seven
+%independent = OpAccessChain %ptr_word %other %zero %zero
+%old = OpLoad %uint %independent
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+    def test_array_constant_store_preserves_the_constant(self):
+        body = """\
+%dst = OpVariable %ptr_array Function
+OpStore %dst %const_array
+%element = OpAccessChain %ptr_word %dst %zero
+OpStore %element %seven
+%old = OpCompositeExtract %uint %const_array 0
+%new = OpLoad %uint %element
+%result = OpCompositeConstruct %v2uint %old %new
+OpStore %out %result
+"""
+        self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
+
+
 if __name__ == "__main__":
     unittest.main()

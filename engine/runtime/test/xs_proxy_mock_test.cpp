@@ -710,6 +710,10 @@ int check_lists() {
     vb_views[0].BufferLocation = p1;
     vb_views[1].BufferLocation = 0xDEAD0000;  // a VA outside the arena passes through
     EXPECT(hr_of(raw(list, 48, 0, 2, word(vb_views))) == S_OK && real->calls[44] == 1);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW so_view{};
+    so_view.BufferLocation = p1;
+    so_view.BufferFilledSizeLocation = p2;
+    EXPECT(hr_of(raw(list, 49, 0, 1, word(&so_view))) == S_OK && real->calls[45] == 1);
     // The console tail past the PC chain is refused with E_NOTIMPL only when the mapped PC slot is missing.
     EXPECT(hr_of(raw(list, 146, word(list), 0)) == S_OK && real->calls[80] == 1);  // enhanced Barrier -> GCL7 80
     EXPECT(release(list) == 0 && real->refs == 0);

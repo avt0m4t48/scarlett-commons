@@ -1849,8 +1849,9 @@ if(TARGET Vulkan::Headers)
           -o ${_indirect_count_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         COMMENT "Compiling the counted indirect dispatch test shader" VERBATIM)
-      add_executable(d3d12_indirect_dispatch_count_test test/d3d12_indirect_dispatch_count_test.cpp
-        ${_indirect_count_spv})
+      add_custom_target(gta6rt_indirect_count_shader DEPENDS ${_indirect_count_spv})
+      add_executable(d3d12_indirect_dispatch_count_test test/d3d12_indirect_dispatch_count_test.cpp)
+      add_dependencies(d3d12_indirect_dispatch_count_test gta6rt_indirect_count_shader)
       target_link_libraries(d3d12_indirect_dispatch_count_test PRIVATE gta6rt_d3d12_com d3d12 dxgi version)
       target_compile_definitions(d3d12_indirect_dispatch_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_TEST_INDIRECT_COUNT_SPV="${_indirect_count_spv}")
@@ -1860,6 +1861,7 @@ if(TARGET Vulkan::Headers)
       # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the checker
       # compiles that shader, then the test creates the same pipeline on the runtime's device from the cache.
       add_executable(pipeline_cache_seed_test test/pipeline_cache_seed_test.cpp)
+      add_dependencies(pipeline_cache_seed_test vk_pipeline_check gta6rt_indirect_count_shader)
       target_link_libraries(pipeline_cache_seed_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(pipeline_cache_seed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(pipeline_cache_seed_test PRIVATE /W4 /permissive- /utf-8)

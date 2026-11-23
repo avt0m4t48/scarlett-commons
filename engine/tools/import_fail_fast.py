@@ -26,8 +26,8 @@ How, with nothing run:
 
 What a count means: a site found here is code that can stop the title, not proof that the boot reaches it. Only
 straight-line code after the call is read, so a result stored and tested later, or a failure path that logs before
-it stops, is not seen. The counts are a lower bound. A stray `E8` or `FF 15` byte pair inside another instruction
-could add a site, which is rare. Output is import names, counts, conditions and RVAs only, no instruction bytes.
+it stops, is not seen. The counts are heuristic: they can miss sites that way, and a stray `E8` or `FF 15` byte pair
+inside another instruction could add a false one, which is rare. Output is import names, counts, conditions and RVAs only, no instruction bytes.
 
 `--json` prints every import the image names (or every one `--import`/`--dll` selects), including those with no
 call site (`"calls": 0`), with `"fatal"` empty when none of its sites is fatal. The table's last line,

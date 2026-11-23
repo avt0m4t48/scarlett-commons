@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 
@@ -70,12 +71,16 @@ HRESULT __stdcall XApuConnect(void* out24, void* out16, void** handle) {
     *handle = nullptr;
     void* buffer = VirtualAlloc(nullptr, kApuBufferSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // zeroed
     if (!buffer) return E_OUTOFMEMORY;
+    *handle = new (std::nothrow) ApuConnection{buffer};  // a throwing new would unwind into the title
+    if (!*handle) {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return E_OUTOFMEMORY;
+    }
     if (out24) std::memset(out24, 0, 24);
     if (out16) {
         const uint64_t info[2] = {reinterpret_cast<uint64_t>(buffer), kApuBufferSize};
         std::memcpy(out16, info, sizeof info);
     }
-    *handle = new ApuConnection{buffer};
     return S_OK;
 }
 
@@ -116,8 +121,8 @@ HRESULT __stdcall XDspConnectWithMaximumStreamLimit(void* buffer, uint32_t a, ui
     (void)b;
     (void)flags;
     if (!handle) return E_INVALIDARG;
-    *handle = new DspConnection{};
-    return S_OK;
+    *handle = new (std::nothrow) DspConnection{};
+    return *handle ? S_OK : E_OUTOFMEMORY;
 }
 
 HRESULT __stdcall XDspDisconnect(void* handle) {

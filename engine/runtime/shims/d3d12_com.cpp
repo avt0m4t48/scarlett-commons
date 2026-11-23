@@ -1346,6 +1346,16 @@ public:
                 d3d12_trace::record(method, "failed");
                 return;
             }
+            // A list runs only on a queue of its own type (the debug layer's EXECUTECOMMANDLISTS_COMMANDLISTMISMATCH,
+            // message 836): a DIRECT list's draws would otherwise be recorded for a COPY queue's transfer-only
+            // Vulkan family. The whole batch is refused, as for the other checks here.
+            if (list->type() != desc_.Type) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
+                             int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
             if (!timestamps_fit(*list)) {
                 last_result_ = leonida::ReplayResult::invalid_query;
                 d3d12_trace::record(method, "failed");

@@ -208,7 +208,7 @@ def animation(page, frames, tracks, sequences):
 
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
                external_hashes=(), parameters=1, times=None, axis=None, node=None, sample_lists=None,
-               node_axis_count=None):
+               node_axis_count=None, node_pairs=None):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -270,6 +270,9 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
             n_axes = len(axes) if node_axis_count is None else node_axis_count   # override: an axis array overrun
             struct.pack_into("<HH", p.b, node_at + 0x18, n_axes, n_axes)
             struct.pack_into("<I", p.b, node_at + anim_clips.NODE_SAMPLE_COUNT_AT[kind], count)
+            if node_pairs is not None:
+                p.ptr(node_at + 0x20, p.alloc(b"".join(struct.pack("<IIII", x, 0, y, 0) for x, y in node_pairs)))
+                struct.pack_into("<HH", p.b, node_at + 0x28, len(node_pairs), len(node_pairs))
     if axis is not None or node is not None:
         if parameters == 1:
             p.ptr(motion + 0x138, node_at)
@@ -486,6 +489,18 @@ class DecodeTest(unittest.TestCase):
                               stats[f"motion_samples:{kind}:lists_equal_node_samples"],
                               stats[f"motion_samples:{kind}:every_child_sampled"], stats["motion_axes"]),
                              (1, 1, n_axes - 1, 1, 1, 0))
+
+    def test_multi_axis_pairs(self):
+        motion = self.motion(children=[(1, 2)], node=(6, [(1, 0, 0)] * 4, 1), node_pairs=[(0xAA, 0xBB), (0xCC, 0xDD)])
+        self.assertEqual(motion["node"][1]["pairs"], [(0xAA, 0xBB), (0xCC, 0xDD)])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual(stats["motion_node_pairs:6:2"], 1)
+        motion = self.motion(children=[(1, 2)], node=(4, [(1, 0, 0)] * 2, 1))      # null +0x20
+        self.assertIsNone(motion["node"][1]["pairs"])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual(stats["motion_node_pairs:4:null"], 1)
 
     def test_type1_node(self):
         motion = self.motion(children=[(1, 2)], node=(1, [], 1), sample_lists=[[(0, 1.0, 1.0)]])

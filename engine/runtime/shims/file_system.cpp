@@ -24,6 +24,7 @@
 // host directly.
 #include <windows.h>
 
+#include <atomic>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -1096,6 +1097,8 @@ namespace {
 // it) kills a title under Wine 9 or a Proton built on it; pe_loader.cpp and loader_tls_test.cpp avoid it for the same
 // reason. GetProcAddress returns null there instead, and the fallback below runs.
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
+std::atomic<bool> g_force_copy_file2_fallback{false};
+
 CopyFile2Fn host_copy_file2() {
     static const CopyFile2Fn fn = [] {
         for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
@@ -1104,20 +1107,46 @@ CopyFile2Fn host_copy_file2() {
         }
         return CopyFile2Fn{};
     }();
-    return fn;
+    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : fn;
 }
 
-// CopyFile2 through CopyFileExW, for hosts without it. The flags both calls define are passed on; the rest are
-// CopyFile2-only hints and privilege requests (no offload, compressed traffic, low-free-space mode, ...) that don't
-// change what a plain file copy produces, and CopyFileExW refuses flags it doesn't know. The cancel flag has the same
-// type in both. A COPYFILE2 progress routine has another signature and message set, so it isn't called here.
-HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
-                            const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
-    constexpr DWORD kCopyFileExFlags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_RESTARTABLE |
+// The fallback's flags, by what CopyFileExW can do with them (values from the SDK's WinBase.h, spelled out because
+// some of the names are only declared for newer NTDDI_VERSION targets):
+// - passed on: the flags both calls define, with the same meaning;
+// - dropped: CopyFile2-only requests about how the copy runs (privileges, resuming a paused copy, no offload, EDP,
+//   destination DACL, compressed SMB traffic, pre-allocation, low-free-space mode, sparse copy) that leave the
+//   destination's contents as CopyFileExW writes them;
+// - everything else changes what the copy produces (0x80 DIRECTORY, 0x8000 SKIP_ALTERNATE_STREAMS, 0x200000
+//   OPEN_AND_COPY_REPARSE_POINT, 0x800000 IGNORE_SOURCE_ENCRYPTION) or isn't defined, so the fallback refuses the
+//   call with ERROR_NOT_SUPPORTED instead of copying something else.
+constexpr DWORD kFallbackPassedFlags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_RESTARTABLE |
                                        COPY_FILE_OPEN_SOURCE_FOR_WRITE | COPY_FILE_ALLOW_DECRYPTED_DESTINATION |
                                        COPY_FILE_COPY_SYMLINK | COPY_FILE_NO_BUFFERING;
-    const DWORD flags = parameters ? parameters->dwCopyFlags & kCopyFileExFlags : 0;
+constexpr DWORD kFallbackDroppedFlags = 0x00002000 /* REQUEST_SECURITY_PRIVILEGES */ |
+                                        0x00004000 /* RESUME_FROM_PAUSE */ | 0x00040000 /* NO_OFFLOAD */ |
+                                        0x00400000 /* IGNORE_EDP_BLOCK */ |
+                                        0x02000000 /* DONT_REQUEST_DEST_WRITE_DAC */ |
+                                        0x04000000 /* DISABLE_PRE_ALLOCATION */ |
+                                        0x08000000 /* ENABLE_LOW_FREE_SPACE_MODE */ |
+                                        0x10000000 /* REQUEST_COMPRESSED_TRAFFIC */ |
+                                        0x20000000 /* ENABLE_SPARSE_COPY */ | 0x80000000 /* DISABLE_SPARSE_COPY */;
+
+// Whether the fallback can run this call as CopyFile2 would: a COPYFILE2_EXTENDED_PARAMETERS block (the V2 block's
+// extra fields have no CopyFileExW equivalent) and no flag outside the two sets above.
+bool fallback_supports(const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    if (!parameters) return true;
+    if (parameters->dwSize != sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return false;
+    return (parameters->dwCopyFlags & ~(kFallbackPassedFlags | kFallbackDroppedFlags)) == 0;
+}
+
+// CopyFile2 through CopyFileExW, for hosts without it (only for calls fallback_supports). The cancel flag has the
+// same type in both; one already set is answered here, since Wine 9's CopyFileExW doesn't read it. A COPYFILE2
+// progress routine has another signature and message set, so it isn't called here.
+HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
+                            const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    const DWORD flags = parameters ? parameters->dwCopyFlags & kFallbackPassedFlags : 0;
     BOOL* const cancel = parameters ? parameters->pfCancel : nullptr;
+    if (cancel && *cancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (::CopyFileExW(source, destination, nullptr, nullptr, cancel, flags)) return S_OK;
     const DWORD error = GetLastError();
     return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
@@ -1125,12 +1154,21 @@ HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
 
 }  // namespace
 
+void force_copy_file2_fallback(bool force) { g_force_copy_file2_fallback.store(force, std::memory_order_relaxed); }
+
+// The parameter block is checked before the destination is prepared, so a refused call leaves nothing behind: a
+// block shorter than COPYFILE2_EXTENDED_PARAMETERS is E_INVALIDARG, as the host's CopyFile2 answers (measured on
+// Windows 11 for dwSize 0, 4 and 31, which also left no destination), and a call the fallback can't run as asked is
+// ERROR_NOT_SUPPORTED. A longer block goes to the host's CopyFile2, which checks it itself.
 HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    if (parameters && parameters->dwSize < sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return E_INVALIDARG;
+    const CopyFile2Fn host = host_copy_file2();
+    if (!host && !fallback_supports(parameters)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
     std::filesystem::path source, destination;
     DWORD error = 0;
     if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
-    if (const CopyFile2Fn host = host_copy_file2()) return host(source.c_str(), destination.c_str(), parameters);
+    if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }
 

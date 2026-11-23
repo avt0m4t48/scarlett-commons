@@ -49,7 +49,11 @@ inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
         pc.Layout = pc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
-    pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_resource_flags(xbox.Dimension, static_cast<std::uint32_t>(xbox.Flags)));
+    std::uint32_t flags = pc_resource_flags(xbox.Dimension, static_cast<std::uint32_t>(xbox.Flags));
+    // zebraso measured slot 25 rejecting B5G5R5A1 render targets with UAV on an RTX 5080 without storage-image support
+    // for that format (#7110). Depth-stencil textures lose UAV in pc_resource_flags.
+    if (pc.Format == DXGI_FORMAT_B5G5R5A1_UNORM) flags &= ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
     return pc;
 }
 

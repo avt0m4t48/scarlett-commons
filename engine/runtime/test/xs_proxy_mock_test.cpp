@@ -2201,6 +2201,27 @@ int check_allocation_descriptions_cleaned() {
         EXPECT(g_seen_descs[0].Layout == layout && g_seen_descs[1].Layout == layout);
     }
 
+    constexpr auto kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr auto kDepthStencil = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    constexpr auto kRenderTarget = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_RESOURCE_DESC formats[] = {
+        target_desc(64, 64, DXGI_FORMAT_B5G5R5A1_UNORM),
+        target_desc(64, 64, DXGI_FORMAT_R32G8X24_TYPELESS),
+        target_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM),
+        target_desc(64, 64, DXGI_FORMAT_R32_FLOAT),
+    };
+    formats[0].Flags = kPcFlags;
+    formats[1].Flags = kDepthStencil | kUav;
+    formats[2].Flags = kPcFlags;
+    formats[3].Flags = kUav;
+    g_seen_calls = 0;
+    EXPECT(get_info(&info, device, 0, 4, formats) == &info);
+    EXPECT(g_seen_desc_count == 4);
+    EXPECT(g_seen_descs[0].Flags == kRenderTarget);
+    EXPECT(g_seen_descs[1].Flags == kDepthStencil);
+    EXPECT(g_seen_descs[2].Flags == kPcFlags);
+    EXPECT(g_seen_descs[3].Flags == kUav);
+
     // A null array with a zero count reaches the PC device as it came.
     g_seen_desc_count = 99;
     g_seen_calls = 0;

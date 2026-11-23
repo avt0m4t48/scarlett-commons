@@ -113,6 +113,8 @@ int main() {
         check(reinterpret_cast<Slot0Fn>(vtbl[0])(hal, 0x1000, 0x1000) == S_OK, "slot 0 succeeds");
         check(reinterpret_cast<Slot2Fn>(vtbl[2])(hal, 2, 0xF0F0F0F0, 0xFFFFFFFF, &arg, 0) == S_OK,
               "slot 2 accepts a command");
+        check(reinterpret_cast<Slot1Fn>(vtbl[3])(hal) == 0 && reinterpret_cast<Slot1Fn>(vtbl[4])(hal) == 0,
+              "slots 3 and 4 answer 0 (no message waiting)");
         check(reinterpret_cast<Slot1Fn>(vtbl[1])(hal) == S_OK, "slot 1 succeeds");
         check(reinterpret_cast<Slot1Fn>(vtbl[5])(hal) == S_OK, "slot 5 releases the object");
     }

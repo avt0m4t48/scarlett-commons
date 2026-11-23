@@ -38,7 +38,6 @@ constexpr HRESULT kEFail = static_cast<HRESULT>(0x80004005L);
 constexpr HRESULT kEOutOfMemory = static_cast<HRESULT>(0x8007000EL);
 constexpr HRESULT kEInvalidArg = static_cast<HRESULT>(0x80070057L);
 constexpr HRESULT kEPointer = static_cast<HRESULT>(0x80004003L);
-constexpr HRESULT kENotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
 
 // Hypothesis: any nonzero base works, the title only passes APU addresses back to this DLL and to the hardware.
 // Nonzero so that address 0 stays "none" (ApuMapVirtualAddress(NULL) is 0).
@@ -167,8 +166,10 @@ struct AcpHal final {  // no virtual destructor: it would add a slot the title d
         warn_once(warned, "AcpHal command accepted and dropped: no audio processor on a PC (logged once)");
         return S_OK;
     }
-    virtual HRESULT slot3() { return kENotImpl; }
-    virtual HRESULT slot4() { return kENotImpl; }
+    // Not called by this title. Read elsewhere as PopMessage (bool) and GetNumMessages (count), a hypothesis; 0 is
+    // "no message" under that reading and S_OK under any other, where E_NOTIMPL would read as a pending message.
+    virtual uint32_t slot3() { return 0; }
+    virtual uint32_t slot4() { return 0; }
     virtual HRESULT release() {
         delete this;
         return S_OK;

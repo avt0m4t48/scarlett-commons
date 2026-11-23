@@ -1,9 +1,7 @@
 // The PC form of a resource description the retail title builds for the console, for the Xbox-ABI device proxy.
 //
-// The title's D3D12_RESOURCE_DESC carries console values the PC device cannot take: the layout word is 0x101 (tiled)
-// or 0x1 (row-major buffer), and the flags have bits above the PC ones set (docs/retail_boot_chain.md, #6982). Slot 76
-// replaces the layout word the same way before it forwards to CreateCommittedResource; slot 25 and the slot 127
-// stand-in need the same cleaning. The title's own description is never written: a caller gets a copy.
+// The title's D3D12_RESOURCE_DESC carries console layout words and flag bits the PC device cannot take
+// (docs/retail_boot_chain.md, #6982). The slot 25 cleaner returns a copy of the title's description.
 #pragma once
 
 #include <windows.h>
@@ -41,10 +39,13 @@ inline std::uint32_t pc_resource_flags(D3D12_RESOURCE_DIMENSION dimension, std::
     return without_depth_stencil_uav(dimension, xbox_flags & kPcResourceFlagsMask);
 }
 
-// Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
+// Strip Xbox-only flags and preserve the three supported PC layouts. In addition to 0x101, zebraso measured
+// layout words 0x102 and 0x105 reaching slot 25 during a retail boot.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
     D3D12_RESOURCE_DESC pc = xbox;
-    if (pc.Layout == kXboxTiledResourceLayout) {
+    if (pc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+        pc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
+        pc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
         pc.Layout = pc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }

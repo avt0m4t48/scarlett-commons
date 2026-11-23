@@ -2171,6 +2171,36 @@ int check_allocation_descriptions_cleaned() {
     EXPECT(std::memcmp(kept, titles, sizeof(kept)) == 0);
     EXPECT(info.SizeInBytes == 8847360 + 131072);
 
+    const D3D12_TEXTURE_LAYOUT normalized_layouts[] = {
+        static_cast<D3D12_TEXTURE_LAYOUT>(kXboxTiledLayout),
+        static_cast<D3D12_TEXTURE_LAYOUT>(0x102),
+        static_cast<D3D12_TEXTURE_LAYOUT>(0x105),
+        D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+    };
+    for (const auto layout : normalized_layouts) {
+        D3D12_RESOURCE_DESC descs[] = {titles[0], titles[1]};
+        descs[0].Layout = descs[1].Layout = layout;
+        g_seen_calls = 0;
+        EXPECT(get_info(&info, device, 0, 2, descs) == &info);
+        EXPECT(g_seen_desc_count == 2);
+        EXPECT(g_seen_descs[0].Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(g_seen_descs[1].Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    }
+
+    const D3D12_TEXTURE_LAYOUT preserved_layouts[] = {
+        D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE,
+    };
+    for (const auto layout : preserved_layouts) {
+        D3D12_RESOURCE_DESC descs[] = {titles[0], titles[1]};
+        descs[0].Layout = descs[1].Layout = layout;
+        g_seen_calls = 0;
+        EXPECT(get_info(&info, device, 0, 2, descs) == &info);
+        EXPECT(g_seen_desc_count == 2);
+        EXPECT(g_seen_descs[0].Layout == layout && g_seen_descs[1].Layout == layout);
+    }
+
     // A null array with a zero count reaches the PC device as it came.
     g_seen_desc_count = 99;
     g_seen_calls = 0;

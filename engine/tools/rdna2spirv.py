@@ -5957,6 +5957,15 @@ class Gen:
             out = result
         return out
 
+    def relative_vgpr_ptr(self, reg, offset):
+        """Use VGPR0 for out-of-range reads; callers also use the validity bit to guard writes."""
+        index, valid, safe, ptr = (self.tmp() for _ in range(4))
+        self.emit(f"{index} = OpIAdd %uint {self.cu(reg)} {offset}")
+        self.emit(f"{valid} = OpULessThan %bool {index} %n256")
+        self.emit(f"{safe} = OpSelect %uint {valid} {index} {self.cu(0)}")
+        self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %vgpr {safe}")
+        return ptr, valid
+
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
@@ -7759,7 +7768,7 @@ class Gen:
             # GFX10 VOP1 (opcode 104): swap VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]], the fields v_movrelsd_2_b32
             # uses (RDNA2 ISA: tmp = VGPR[D + M0[25:16]]; VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]];
             # VGPR[S0 + M0[9:0]] = tmp). Both registers are read before either is written; inactive lanes keep both.
-            # As for v_movrel*, the hardware's range check against the VGPR allocation is not modelled.
+            # Both operands are destinations. An out-of-range destination suppresses the entire swap.
             d, s0 = a[0], a[1]
             if d["k"] != "vgpr" or s0["k"] != "vgpr":
                 raise Unsupported(op + " operands")
@@ -7768,20 +7777,18 @@ class Gen:
             self.emit(f"{lo} = OpBitwiseAnd %uint {m0} {self.cu(0x3FF)}")
             self.emit(f"{hi} = OpShiftRightLogical %uint {m0} {self.cu(16)}")
             self.emit(f"{md} = OpBitwiseAnd %uint {hi} {self.cu(0x3FF)}")
-            ptrs, vals = [], []
-            for reg, off in ((d["r"], md), (s0["r"], lo)):
-                i, p_, v = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{i} = OpIAdd %uint {self.cu(reg)} {off}")
-                self.emit(f"{p_} = OpAccessChain %_ptr_Function_uint %vgpr {i}")
-                self.emit(f"{v} = OpLoad %uint {p_}")
-                ptrs.append(p_)
-                vals.append(v)
-            act = self.active_b()
+            dp, d_valid = self.relative_vgpr_ptr(d["r"], md)
+            sp, s_valid = self.relative_vgpr_ptr(s0["r"], lo)
+            d_old, s_old, both_valid, write = (self.tmp() for _ in range(4))
+            self.emit(f"{d_old} = OpLoad %uint {dp}")
+            self.emit(f"{s_old} = OpLoad %uint {sp}")
+            self.emit(f"{both_valid} = OpLogicalAnd %bool {d_valid} {s_valid}")
+            self.emit(f"{write} = OpLogicalAnd %bool {self.active_b()} {both_valid}")
             # D's slot gets S0's value, then S0's slot gets D's old value: when both name one register the second
             # store writes back its own value, so the register is unchanged, as a swap with itself is.
-            for p_, new, old in ((ptrs[0], vals[1], vals[0]), (ptrs[1], vals[0], vals[1])):
+            for p_, new, old in ((dp, s_old, d_old), (sp, d_old, s_old)):
                 sel = self.tmp()
-                self.emit(f"{sel} = OpSelect %uint {act} {new} {old}")
+                self.emit(f"{sel} = OpSelect %uint {write} {new} {old}")
                 self.emit(f"OpStore {p_} {sel}")
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
@@ -7800,18 +7807,17 @@ class Gen:
                 self.emit(f"{hi} = OpShiftRightLogical %uint {m0} {self.cu(16)}")
                 self.emit(f"{m0_dst} = OpBitwiseAnd %uint {hi} {self.cu(0x3FF)}")
             if op in ("v_movrels_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
-                si, sp, v = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{si} = OpIAdd %uint {self.cu(s['r'])} {m0_src}")
-                self.emit(f"{sp} = OpAccessChain %_ptr_Function_uint %vgpr {si}")
+                sp, _ = self.relative_vgpr_ptr(s["r"], m0_src)
+                v = self.tmp()
                 self.emit(f"{v} = OpLoad %uint {sp}")
             else:
                 v = self.load_reg("vgpr", s["r"])
             if op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
-                di, dp, old, sel = (self.tmp() for _ in range(4))
-                self.emit(f"{di} = OpIAdd %uint {self.cu(d['r'])} {m0_dst}")
-                self.emit(f"{dp} = OpAccessChain %_ptr_Function_uint %vgpr {di}")
+                dp, valid = self.relative_vgpr_ptr(d["r"], m0_dst)
+                old, write, sel = (self.tmp() for _ in range(3))
                 self.emit(f"{old} = OpLoad %uint {dp}")
-                self.emit(f"{sel} = OpSelect %uint {self.active_b()} {v} {old}")
+                self.emit(f"{write} = OpLogicalAnd %bool {self.active_b()} {valid}")
+                self.emit(f"{sel} = OpSelect %uint {write} {v} {old}")
                 self.emit(f"OpStore {dp} {sel}")
             else:
                 self.dst(d, v)

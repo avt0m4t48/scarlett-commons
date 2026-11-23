@@ -130,6 +130,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_prefixes_are_skipped(self):
         self.check("lock cmpxchg16b xmmword ptr [r8]", "CX16")
+        self.check("xacquire lock cmpxchg16b xmmword ptr [r8]", "CX16")
         self.check("lock add dword ptr [rax],1", None)
         self.check("rep stos byte ptr [rdi]", None)
 

@@ -173,7 +173,7 @@ YMM = re.compile(r"\bymm\d+\b")
 
 def classify(mnem: str, ops: str) -> str | None:
     """The feature (a FEATURES key) one dumpbin instruction needs, or None for the plain x86-64 baseline."""
-    if mnem in PREFIXES and ops:
+    while mnem in PREFIXES and ops:
         mnem, _, ops = ops.partition(" ")
         ops = ops.strip()
     if mnem == "int":

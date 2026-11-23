@@ -301,7 +301,14 @@ class Oracle:
         return co, ""
 
     def _launch(self, co, names, words=4):
-        r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+        except OSError as e:
+            if getattr(e, "winerror", None) != 225:
+                raise
+            # Defender quarantined the launcher just built (a small unsigned exe that loads a DLL): not a crash
+            raise Unavailable(f"Windows Defender blocked the launcher {self.exe} (WinError 225); add an exclusion for "
+                              f"{os.path.dirname(self.exe)} (Windows Security, Virus & threat protection) and rerun") from None
         return r.returncode, r.stdout, r.stderr
 
     def run(self, programs, words=4):

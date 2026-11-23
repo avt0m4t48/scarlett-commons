@@ -471,6 +471,18 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertIn("empty.bin", report.matched)
 
+    def test_cli_manifest_without_entries_is_an_error_not_ok(self) -> None:
+        # Every file would otherwise be NEW, and the run would print OK and exit 0 having verified nothing.
+        empty = os.path.join(self.root, "no_entries.json")
+        for doc in ({"files": {}}, {}, {"created": "2026-11-22 00:00:00"}):
+            with self.subTest(doc=doc):
+                with open(empty, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(doc, f)
+                res = self.run_cli(self.game_dir, "--manifest", empty, "--quiet")
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn(f"lists no files, but {self.game_dir} holds {len(SYNTHETIC_SIZES)}", res.stderr)
+                self.assertNotIn("OK", res.stdout)
+
     def test_cli_clean_verification(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--jobs", "2")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)

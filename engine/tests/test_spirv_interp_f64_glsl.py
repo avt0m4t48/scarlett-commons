@@ -34,6 +34,7 @@ def run_f64_glsl(consts, body_lines, out_type="%double"):
     spv = "\n".join(
         [
             "%uint = OpTypeInt 32 0",
+            "%bool = OpTypeBool",
             "%float = OpTypeFloat 32",
             "%double = OpTypeFloat 64",
             "%v2double = OpTypeVector %double 2",
@@ -228,6 +229,38 @@ class SpirvInterpF64GlslTests(unittest.TestCase):
         res = spirv_interp.run(spv)
         self.assertEqual((res.vgpr[4], res.vgpr[5]), (elo, ehi))
 
+    def test_integer_to_double_conversion_is_exact(self):
+        # Every 32-bit integer is a binary64; only a %float result rounds (v_cvt_f64_u32 of 0xffffffff once read 2^32).
+        cases = [("OpConvertUToF", 0xFFFFFFFF, 4294967295.0), ("OpConvertUToF", 0x80000001, 2147483649.0),
+                 ("OpConvertSToF", 0x80000001, -2147483647.0), ("OpConvertSToF", 0x80000000, -2147483648.0),
+                 ("OpConvertSToF", 0x7FFFFFFF, 2147483647.0)]
+        for op, word, expected in cases:
+            with self.subTest(op=op, word=hex(word)):
+                got = run_f64_glsl([("%a", "%uint", str(word))], [f"%res = {op} %double %a"])
+                self.assertEqual(f64_bits(got), f64_bits(expected))
+                got32 = run_f64_glsl([("%a", "%uint", str(word))], [f"%res = {op} %float %a"], out_type="%float")
+                self.assertEqual(got32, f32_round(expected))
+
+
+    def test_integer_ops_of_the_ldexp_lowering(self):
+        # v_ldexp_f64 lowers to 32-bit integer ops only; a module that also has a %double op runs here, not in spirv_mini_interp.
+        neg4096, big = 0xFFFFF000, 0x80000000
+        glsl = [("SClamp", (big, neg4096, 4096), neg4096), ("SClamp", (5000, neg4096, 4096), 4096),
+                ("SClamp", (0xFFFFFFF9, neg4096, 4096), 0xFFFFFFF9), ("UClamp", (0xFFFFFFFF, 1, 10), 10),
+                ("UClamp", (0, 1, 10), 1), ("FindUMsb", (0,), 0xFFFFFFFF), ("FindUMsb", (1,), 0),
+                ("FindUMsb", (big,), 31), ("FindUMsb", (0x000FFFFF,), 19)]
+        for fn, args, expected in glsl:
+            with self.subTest(fn=fn, args=[hex(a) for a in args]):
+                consts = [(f"%a{i}", "%uint", str(v)) for i, v in enumerate(args)]
+                operands = " ".join(f"%a{i}" for i in range(len(args)))
+                self.assertEqual(run_f64_glsl(consts, [f"%res = OpExtInst %uint %glsl {fn} {operands}"], out_type="%uint"), expected)
+        compares = [("OpSGreaterThan", 1, 0xFFFFFFFF, 1), ("OpSGreaterThan", 0xFFFFFFFF, 1, 0), ("OpSGreaterThan", 5, 5, 0),
+                    ("OpSLessThan", big, 0, 1), ("OpSLessThan", 0, big, 0), ("OpSLessThan", 5, 5, 0)]
+        for op, a, b, expected in compares:
+            with self.subTest(op=op, a=hex(a), b=hex(b)):
+                consts = [("%a", "%uint", str(a)), ("%b", "%uint", str(b))]
+                body = [f"%t = {op} %bool %a %b", "%res = OpSelect %uint %t %_c1 %_c0"]
+                self.assertEqual(run_f64_glsl(consts, body, out_type="%uint"), expected)
 
 if __name__ == "__main__":
     unittest.main()

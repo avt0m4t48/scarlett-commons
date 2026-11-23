@@ -197,6 +197,7 @@ def run(spvasm):
         "OpFOrdEqual": lambda a, b: a == b,
         "OpFOrdLessThanEqual": lambda a, b: a <= b, "OpFOrdGreaterThanEqual": lambda a, b: a >= b,   # False on a NaN
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
+        "OpSLessThan": lambda a, b: s32(a) < s32(b), "OpSGreaterThan": lambda a, b: s32(a) > s32(b),
         "OpSLessThanEqual": lambda a, b: s32(a) <= s32(b), "OpSGreaterThanEqual": lambda a, b: s32(a) >= s32(b),
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
@@ -253,6 +254,12 @@ def run(spvasm):
             return (max if fn == "SMax" else min)(*a, key=s32)
         if fn in ("UMax", "UMin"):
             return (max if fn == "UMax" else min)(*a)
+        if fn == "SClamp":
+            return min(max(a[0], a[1], key=s32), a[2], key=s32)
+        if fn == "UClamp":
+            return min(max(a[0], a[1]), a[2])
+        if fn == "FindUMsb":            # the highest set bit, -1 (all ones) for 0
+            return ((a[0] & M32).bit_length() - 1) & M32
         raise NotImplementedError("GLSL." + fn)
 
     for res, op, args in body:
@@ -319,9 +326,11 @@ def run(spvasm):
         elif op == "OpBitCount":
             val[res] = bin(get(args[1]) & M32).count("1")
         elif op == "OpConvertUToF":
-            val[res] = f32(float(get(args[1])))
+            x = float(get(args[1]))     # every 32-bit integer is a binary64: only a binary32 result rounds
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertSToF":
-            val[res] = f32(float(s32(get(args[1]))))
+            x = float(s32(get(args[1])))
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)
         elif op == "OpConvertFToS":

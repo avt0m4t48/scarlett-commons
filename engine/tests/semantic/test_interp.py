@@ -121,6 +121,59 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
 
+    def test_int32_to_float_uses_result_width(self):
+        # 2**24 + 1 is exact in binary64 but rounds to 2**24 in binary32.
+        text = """\
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %f32_control
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+OpDecorate %f32_control Location 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%sint = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%bool = OpTypeBool
+%u2 = OpTypeVector %uint 2
+%u4 = OpTypeVector %uint 4
+%unsigned = OpConstant %uint 16777217
+%signed = OpConstant %sint -16777217
+%rounded_unsigned = OpConstant %float 16777216
+%rounded_signed = OpConstant %float -16777216
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%ptr_out_words = OpTypePointer Output %u4
+%ptr_out_uint = OpTypePointer Output %uint
+%out = OpVariable %ptr_out_words Output
+%f32_control = OpVariable %ptr_out_uint Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%du = OpConvertUToF %double %unsigned
+%ds = OpConvertSToF %double %signed
+%bu = OpBitcast %u2 %du
+%bs = OpBitcast %u2 %ds
+%ulo = OpCompositeExtract %uint %bu 0
+%uhi = OpCompositeExtract %uint %bu 1
+%slo = OpCompositeExtract %uint %bs 0
+%shi = OpCompositeExtract %uint %bs 1
+%words = OpCompositeConstruct %u4 %ulo %uhi %slo %shi
+OpStore %out %words
+%fu = OpConvertUToF %float %unsigned
+%fs = OpConvertSToF %float %signed
+%u_ok = OpFOrdEqual %bool %fu %rounded_unsigned
+%s_ok = OpFOrdEqual %bool %fs %rounded_signed
+%f_ok = OpLogicalAnd %bool %u_ok %s_ok
+%control = OpSelect %uint %f_ok %one %zero
+OpStore %f32_control %control
+"""
+        outputs = si.run_fragment(text + FOOTER)
+        self.assertEqual(outputs["%f32_control"], (1,))
+        self.assertEqual(outputs["%out"], (0x10000000, 0x41700000, 0x10000000, 0xC1700000))
+
     def test_floor_ceil_trunc_and_signed_zero(self):
         def word(name, const, neg=False):
             pre = f"%n = OpFNegate %float {const}\n" if neg else ""

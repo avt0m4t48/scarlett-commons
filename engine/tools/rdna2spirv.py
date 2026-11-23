@@ -3881,7 +3881,8 @@ class Gen:
         no OpCapability Float64 needed)."""
         if ty != "f32" and any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
             raise Unsupported(f"v_cmp_class_{ty} output modifier")
-        mask = self.src_u(a[-1])
+        # For f16, the class mask takes float inline constants as 16-bit binary16 (low half over 0) before SDWA selection.
+        mask = self.src_h(a[-1]) if ty == "f16" else self.src_u(a[-1])
 
         def b(cond_line):
             t = self.tmp()

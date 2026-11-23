@@ -1836,7 +1836,7 @@ class Gen:
     # Full-width SINT and UINT preserve the same raw dwords. Keep separate kinds for signed D16 conversion.
     # Kinds: unorm/snorm/uint (the first entries), uscaled/sscaled (the integer converted to float, not divided), sint
     # (sign-extended), ufloat (the unsigned 5-bit-exponent 10/11-bit float). 10_11_11 and 11_11_10 are the FLOAT ones
-    # only: GFX10's UNORM/SNORM/USCALED/SSCALED/UINT/SINT codes of those two (30-35, 37-42) are not in the table.
+    # only on GFX11; GFX10's own UNORM/SNORM/USCALED/SSCALED/UINT/SINT codes of those two (30-35, 37-42) are in the table.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
                72: (12, "u32", (32, 32, 32)), 75: (16, "u32", (32, 32, 32, 32)),
@@ -1863,7 +1863,13 @@ class Gen:
                53: (4, "sscaled", (10, 10, 10, 2)), 54: (4, "uint", (10, 10, 10, 2)), 55: (4, "sint", (10, 10, 10, 2)),
                58: (4, "uscaled", (8, 8, 8, 8)), 59: (4, "sscaled", (8, 8, 8, 8)), 61: (4, "sint", (8, 8, 8, 8)),
                67: (8, "uscaled", (16, 16, 16, 16)), 68: (8, "sscaled", (16, 16, 16, 16)),
-               70: (8, "sint", (16, 16, 16, 16))}
+               70: (8, "sint", (16, 16, 16, 16)),
+               # 10_11_11 (x 11 bits, y 11, z 10) and 11_11_10 (x 10, y 11, z 11) with the other numeric formats: GFX11 has none
+               # of them, a real RDNA2 (gfx1036, @AwkGrep256, #2022) validated the layout and conversions of all twelve.
+               30: (4, "unorm", (11, 11, 10)), 31: (4, "snorm", (11, 11, 10)), 32: (4, "uscaled", (11, 11, 10)),
+               33: (4, "sscaled", (11, 11, 10)), 34: (4, "uint", (11, 11, 10)), 35: (4, "sint", (11, 11, 10)),
+               37: (4, "unorm", (10, 11, 11)), 38: (4, "snorm", (10, 11, 11)), 39: (4, "uscaled", (10, 11, 11)),
+               40: (4, "sscaled", (10, 11, 11)), 41: (4, "uint", (10, 11, 11)), 42: (4, "sint", (10, 11, 11))}
 
     def encode_norm_bits(self, u, w, signed):
         """Exact single-rounded UNORM/SNORM channel bits from an f32 bit pattern u (NaN already mapped to 0).

@@ -1,14 +1,12 @@
-; Typed buffer formats added for the SCALED, SINT, 10_11_11 / 11_11_10 FLOAT, 2_10_10_10 and 10_10_10_2 families
-; (tools/buffer_format_fuzz.py, docs/design.md "Typed buffer formats"). One thread. Words 0..111: 28 loads, 4 words each,
-; of the 16-byte inputs written at 0x200 (words 128..239): 25 through a V# whose FORMAT is the code, 3 through tbuffer's
-; own format; a channel the format lacks repeats component (c mod n) through the V# and is 0 through tbuffer. Words
-; 256..315: 15 buffer_store_format_xyzw into 0x400.., the rest of each 16 bytes left at 0xeeeeeeee.
-; The expected words are the MODEL of tools/buffer_format_fuzz.py, which the Radeon 880M (gfx1150, RDNA3.5, not RDNA2)
-; reproduced for 1.33 million validated elements of every format here that GFX11 has (only 10_10_10_2_USCALED/SSCALED, GFX10 codes
-; 46 and 47, and the 10_11_11/11_11_10 non-FLOAT codes have no GFX11 spelling and no measurement).
-; A two-component format takes channels x and w through this V# (identity selectors; gfx1150 and gfx1036, #2022), so the 16_16_SINT store
-; writes (x, 0) and the NORM stores round the exact product.
-; Run: VKC_OUT_WORDS=316 VKC_DUMP=<file> vk_compute_test cs_fmt_all.spv 1 dump; check.py compares all 316 words.
+; Typed buffer formats added for the SCALED, SINT, 10_11_11 / 11_11_10 and 2_10_10_10 / 10_10_10_2 families, and the older
+; ones' stores that now follow the hardware (tools/buffer_format_fuzz.py, docs/buffer_formats.md). One thread. Words 0..127: 32 loads, 4 words each,
+; of the 16-byte inputs written at 0x200 (words 128..255): 29 through a V# whose FORMAT is the code, 3 through tbuffer's
+; own format; a channel the format lacks repeats component (c mod n) through the V# and is 0 through tbuffer. Words 256..335:
+; 20 buffer_store_format_xyzw into 0x400.., the rest of each 16 bytes left at 0xeeeeeeee. A two-component format takes
+; channels x and w through a V#; 16-bit float stores round toward zero and saturate at 65504; NORM stores round the exact product.
+; The expected words are the MODEL of tools/buffer_format_fuzz.py, which the Radeon 880M (gfx1150, RDNA3.5) and a real RDNA2 (gfx1036,
+; @AwkGrep256, #2022) both reproduced: 1,330,469 elements of the 63 formats GFX11 has, and 199,144 of the 14 codes only GFX10 has.
+; Run: VKC_OUT_WORDS=336 VKC_DUMP=<file> vk_compute_test cs_fmt_all.spv 1 dump; check.py compares all 336 words.
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v8, 0xff
 v_mov_b32_e32 v9, 0x0
@@ -177,6 +175,30 @@ v_mov_b32_e32 v9, 0x0
 v_mov_b32_e32 v10, 0x0
 v_mov_b32_e32 v11, 0x0
 v_mov_b32_e32 v2, 0x3b0
+buffer_store_dwordx4 v[8:11], v2, s[0:3], 0 offen
+v_mov_b32_e32 v8, 0xfffff800
+v_mov_b32_e32 v9, 0x0
+v_mov_b32_e32 v10, 0x0
+v_mov_b32_e32 v11, 0x0
+v_mov_b32_e32 v2, 0x3c0
+buffer_store_dwordx4 v[8:11], v2, s[0:3], 0 offen
+v_mov_b32_e32 v8, 0x800ffe00
+v_mov_b32_e32 v9, 0x0
+v_mov_b32_e32 v10, 0x0
+v_mov_b32_e32 v11, 0x0
+v_mov_b32_e32 v2, 0x3d0
+buffer_store_dwordx4 v[8:11], v2, s[0:3], 0 offen
+v_mov_b32_e32 v8, 0xffc00fff
+v_mov_b32_e32 v9, 0x0
+v_mov_b32_e32 v10, 0x0
+v_mov_b32_e32 v11, 0x0
+v_mov_b32_e32 v2, 0x3e0
+buffer_store_dwordx4 v[8:11], v2, s[0:3], 0 offen
+v_mov_b32_e32 v8, 0xfff003ff
+v_mov_b32_e32 v9, 0x0
+v_mov_b32_e32 v10, 0x0
+v_mov_b32_e32 v11, 0x0
+v_mov_b32_e32 v2, 0x3f0
 buffer_store_dwordx4 v[8:11], v2, s[0:3], 0 offen
 s_waitcnt_vscnt null, 0x0
 s_mov_b32 s4, s0
@@ -350,6 +372,30 @@ tbuffer_load_format_xyzw v[4:7], v3, s[4:7], 0 format:[BUF_FMT_16_16_SINT] offen
 s_waitcnt vmcnt(0)
 v_mov_b32_e32 v8, 0x1b0
 buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+v_mov_b32_e32 v3, 0x3c0
+s_mov_b32 s7, 0x3101efac
+buffer_load_format_xyzw v[4:7], v3, s[4:7], 0 offen
+s_waitcnt vmcnt(0)
+v_mov_b32_e32 v8, 0x1c0
+buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+v_mov_b32_e32 v3, 0x3d0
+s_mov_b32 s7, 0x31026fac
+buffer_load_format_xyzw v[4:7], v3, s[4:7], 0 offen
+s_waitcnt vmcnt(0)
+v_mov_b32_e32 v8, 0x1d0
+buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+v_mov_b32_e32 v3, 0x3e0
+s_mov_b32 s7, 0x31022fac
+buffer_load_format_xyzw v[4:7], v3, s[4:7], 0 offen
+s_waitcnt vmcnt(0)
+v_mov_b32_e32 v8, 0x1e0
+buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+v_mov_b32_e32 v3, 0x3f0
+s_mov_b32 s7, 0x3102afac
+buffer_load_format_xyzw v[4:7], v3, s[4:7], 0 offen
+s_waitcnt vmcnt(0)
+v_mov_b32_e32 v8, 0x1f0
+buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
 v_mov_b32_e32 v4, 0x100
 v_mov_b32_e32 v5, 0x0
 v_mov_b32_e32 v6, 0x0
@@ -387,72 +433,107 @@ v_mov_b32_e32 v9, 0x440
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x12345
 v_mov_b32_e32 v5, 0xffff0000
-v_mov_b32_e32 v6, 0x0
-v_mov_b32_e32 v7, 0x0
+v_mov_b32_e32 v6, 0x7
+v_mov_b32_e32 v7, 0xffff8000
 s_mov_b32 s7, 0x3101cfac
 v_mov_b32_e32 v9, 0x450
+buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
+v_mov_b32_e32 v4, 0x3f800000
+v_mov_b32_e32 v5, 0x3f000000
+v_mov_b32_e32 v6, 0x3e800000
+v_mov_b32_e32 v7, 0x3f400000
+s_mov_b32 s7, 0x31010fac
+v_mov_b32_e32 v9, 0x460
+buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
+v_mov_b32_e32 v4, 0xbf800000
+v_mov_b32_e32 v5, 0x3f000000
+v_mov_b32_e32 v6, 0x3f800000
+v_mov_b32_e32 v7, 0x0
+s_mov_b32 s7, 0x3101ffac
+v_mov_b32_e32 v9, 0x470
+buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
+v_mov_b32_e32 v4, 0x7ff
+v_mov_b32_e32 v5, 0x5
+v_mov_b32_e32 v6, 0xffffffff
+v_mov_b32_e32 v7, 0x0
+s_mov_b32 s7, 0x31029fac
+v_mov_b32_e32 v9, 0x480
+buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
+v_mov_b32_e32 v4, 0x7149f2ca
+v_mov_b32_e32 v5, 0x3effffff
+v_mov_b32_e32 v6, 0x7f800001
+v_mov_b32_e32 v7, 0x80000000
+s_mov_b32 s7, 0x31047fac
+v_mov_b32_e32 v9, 0x490
+buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
+v_mov_b32_e32 v4, 0x3e99999a
+v_mov_b32_e32 v5, 0x37c000c0
+v_mov_b32_e32 v6, 0x0
+v_mov_b32_e32 v7, 0x0
+s_mov_b32 s7, 0x31017fac
+v_mov_b32_e32 v9, 0x4a0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3f800000
 v_mov_b32_e32 v5, 0xbf800000
 v_mov_b32_e32 v6, 0x3f000000
 v_mov_b32_e32 v7, 0xbf000000
 s_mov_b32 s7, 0x3103bfac
-v_mov_b32_e32 v9, 0x460
+v_mov_b32_e32 v9, 0x4b0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3f800000
 v_mov_b32_e32 v5, 0x40000000
 v_mov_b32_e32 v6, 0x3f000000
 v_mov_b32_e32 v7, 0x0
 s_mov_b32 s7, 0x31024fac
-v_mov_b32_e32 v9, 0x470
+v_mov_b32_e32 v9, 0x4c0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0xbf800000
 v_mov_b32_e32 v5, 0x7f800000
 v_mov_b32_e32 v6, 0x47ffe000
 v_mov_b32_e32 v7, 0x0
 s_mov_b32 s7, 0x31024fac
-v_mov_b32_e32 v9, 0x480
+v_mov_b32_e32 v9, 0x4d0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3f800000
 v_mov_b32_e32 v5, 0x477fe000
 v_mov_b32_e32 v6, 0x7f800001
 v_mov_b32_e32 v7, 0x0
 s_mov_b32 s7, 0x3102bfac
-v_mov_b32_e32 v9, 0x490
+v_mov_b32_e32 v9, 0x4e0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3f000000
 v_mov_b32_e32 v5, 0xbf800000
 v_mov_b32_e32 v6, 0x3f800000
 v_mov_b32_e32 v7, 0x3e99999a
 s_mov_b32 s7, 0x3102dfac
-v_mov_b32_e32 v9, 0x4a0
+v_mov_b32_e32 v9, 0x4f0
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3f800000
 v_mov_b32_e32 v5, 0x3f000000
 v_mov_b32_e32 v6, 0x3e800000
 v_mov_b32_e32 v7, 0x3f800000
 s_mov_b32 s7, 0x31034fac
-v_mov_b32_e32 v9, 0x4b0
+v_mov_b32_e32 v9, 0x500
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x7fffffff
 v_mov_b32_e32 v5, 0x80000000
 v_mov_b32_e32 v6, 0x5
 v_mov_b32_e32 v7, 0x5
 s_mov_b32 s7, 0x31037fac
-v_mov_b32_e32 v9, 0x4c0
+v_mov_b32_e32 v9, 0x510
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0x3ff
 v_mov_b32_e32 v5, 0x5
 v_mov_b32_e32 v6, 0x7d0
 v_mov_b32_e32 v7, 0x9
 s_mov_b32 s7, 0x31030fac
-v_mov_b32_e32 v9, 0x4d0
+v_mov_b32_e32 v9, 0x520
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 v_mov_b32_e32 v4, 0xffff8000
 v_mov_b32_e32 v5, 0x8000
 v_mov_b32_e32 v6, 0x7fff
 v_mov_b32_e32 v7, 0xffffffff
 s_mov_b32 s7, 0x31046fac
-v_mov_b32_e32 v9, 0x4e0
+v_mov_b32_e32 v9, 0x530
 buffer_store_format_xyzw v[4:7], v9, s[4:7], 0 offen
 s_endpgm

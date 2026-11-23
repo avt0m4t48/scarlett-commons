@@ -7,11 +7,12 @@ a buffer pre-filled with 0xDEAD0000, and every result word is compared with MODE
 translator's emission (Gen.decode_format / Gen.encode_format in tools/rdna2spirv.py) is held to the same MODEL by
 tests/semantic/test_buffer_formats_all.py, so the chain is hardware -> MODEL -> translated SPIR-V.
 
-A local GPU is not RDNA2. The Radeon 880M (gfx1150) is RDNA3.5 and numbers its formats differently (GFX11 has 63; its
-10_11_11 / 11_11_10 families keep only FLOAT and it has no SCALED 10_10_10_2), so a format is mapped by NAME. The twelve
-GFX10-only 10_11_11_* / 11_11_10_* non-FLOAT codes (30..35, 37..42) and the two 10_10_10_2 SCALED codes (46, 47) have no
-GFX11 spelling and cannot be measured here. A match supports the model for RDNA3.5; it does not prove RDNA2
-(docs/buffer_formats.md says so next to every rule this backs).
+The Radeon 880M (gfx1150) is RDNA3.5, not RDNA2, and numbers its formats differently (GFX11 has 63; its 10_11_11 / 11_11_10
+families keep only FLOAT and it has no SCALED 10_10_10_2), so a format is mapped by NAME and the 14 GFX10-only codes
+(30..35, 37..42, 46, 47) cannot be run there. On a GFX10 device (the Linux DRM backend, tools/hw_oracle/drm.py, native
+GFX10 numbers) the default run covers all 77. The model was validated on the 880M and on a real RDNA2 (gfx1036,
+@AwkGrep256, #2022: 1,330,469 elements on the 63 codes and 199,144 on the 14 others, 0 mismatches), with the same
+two-component buffer_store_format_* routing (x, w) on both (docs/buffer_formats.md).
 
 Usage:
     python -I tools/buffer_format_fuzz.py --self-test
@@ -248,8 +249,11 @@ def store_inputs(name, rng):
 
 # ---- the kernels ----
 
-def v_sharp_word3(arch_family, code):
-    w3 = 4 | 5 << 3 | 6 << 6 | 7 << 9 | code << 12 | 3 << 28        # DST_SEL XYZW, FORMAT, OOB_SELECT = raw
+SEL_CODES = {"0": 0, "1": 1, "X": 4, "Y": 5, "Z": 6, "W": 7}
+
+
+def v_sharp_word3(arch_family, code, sel="XYZW"):
+    w3 = sum(SEL_CODES[ch] << (3 * i) for i, ch in enumerate(sel)) | code << 12 | 3 << 28    # DST_SEL, FORMAT, OOB_SELECT = raw
     if arch_family == "gfx10":
         w3 |= 1 << 23                                                  # RESOURCE_LEVEL
     return w3
@@ -282,12 +286,12 @@ def load_lines(uid, family, ref, path, elems):
     return lines + _longs(words)
 
 
-def store_lines(uid, family, ref, path, rows, instr="xyzw"):
+def store_lines(uid, family, ref, path, rows, instr="xyzw", sel="XYZW"):
     """Lane i reads its four register values from the table, stores them with `buffer_store_format_<instr>` / tbuffer
     (instr xyzw or xy: the first two registers) into the output buffer at i * 16 (a V# whose base is the output pointer)."""
     regs = "v[8:11]" if instr == "xyzw" else "v[8:9]"
     code = ref if path == "mubuf" else 22
-    w3 = v_sharp_word3(family, code)
+    w3 = v_sharp_word3(family, code, sel)
     lines = ["s_getpc_b64 s[4:5]", f".Lpc{uid}:", f"s_add_u32 s4, s4, .Ldat{uid}-.Lpc{uid}", "s_addc_u32 s5, s5, 0",
              "s_mov_b32 s12, s4", "s_and_b32 s13, s5, 0xffff", "s_mov_b32 s14, 0x100000", f"s_mov_b32 s15, 0x{v_sharp_word3(family, 22):08x}",
              "s_mov_b32 s8, s2", "s_and_b32 s9, s3, 0xffff", "s_mov_b32 s10, 0x100000", f"s_mov_b32 s11, 0x{w3:08x}",
@@ -438,15 +442,17 @@ def encode_field(nfmt, w, reg):
     raise ValueError(nfmt)
 
 
-def encode_element(name, regs, instr="xyzw", route="translator"):
+def encode_element(name, regs, instr="xyzw", route="mubuf", sel="XYZW"):
     """The bytes a store of registers x, y, z, w writes (the element's size; nothing else is touched). instr "xy" gives
-    only x and y (z and w are 0). route "translator": component c takes channel c, as Gen.encode_format does; route "hw":
-    the Radeon 880M's `buffer_store_format_*`, which differs for a two-component format only: it takes channels x and w
-    (KNOWN DIFFERENCE, RDNA2 unmeasured, docs/buffer_formats.md). `tbuffer_store_format_*` takes (x, y) on the 880M too."""
+    only x and y (z and w are 0). route "mubuf" (`buffer_store_format_*`, the format from the V#): component c takes
+    channel c, except a two-component format, whose second component is channel y when the V#'s DST_SEL is Y in y and a
+    constant (0 or 1) in z (the runtime's XY01), channel w otherwise (identity XYZW: `_xy` then writes (x, 0)). Measured
+    on the Radeon 880M (gfx1150) for sixteen selector sets and on a real RDNA2, gfx1036 (@AwkGrep256, #2022: XYZW; the
+    narrow-integer fixtures: XY01). route "mtbuf" (`tbuffer_store_format_*`): component c takes channel c."""
     widths, nfmt = parse_name(name)
     chan = list(regs[:4]) if instr == "xyzw" else list(regs[:2]) + [0, 0]
-    if route == "hw" and len(widths) == 2:
-        chan = [chan[0], chan[3]]
+    if route == "mubuf" and len(widths) == 2:
+        chan = [chan[0], chan[1] if sel[1] == "Y" and sel[2] in "01" else chan[3]]
     big, bit = 0, 0
     for c, w in enumerate(widths):
         big |= encode_field(nfmt, w, chan[c]) << bit
@@ -454,10 +460,8 @@ def encode_element(name, regs, instr="xyzw", route="translator"):
     return big.to_bytes(bit // 8, "little")
 
 
-def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
-    """-> {code: [elements, mismatches, known]}. A mismatch is a store that differs from the hardware model (route "hw").
-    known counts the stores of a two-component format whose bytes differ between the hardware route and a plain (x, y) one (the translator
-    agrees with the hardware here since SHADER-364). They are counted apart from the validated elements."""
+def run_stores(oracle, family, fmts, path, rng, instr="xyzw", sel="XYZW"):
+    """-> {code: [elements, mismatches, 0]}. A mismatch is a store that differs from the model of its route."""
     from hw_oracle import asm
     jobs, kernels = [], []
     for code, name in fmts:
@@ -467,7 +471,7 @@ def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
         for lo in range(0, len(rows), CHUNK):
             part = rows[lo:lo + CHUNK]
             uid = len(kernels)
-            kernels.append(asm.Kernel(store_lines(uid, family, ref, path, part, instr), 32, len(part), len(part) * 4, raw=True))
+            kernels.append(asm.Kernel(store_lines(uid, family, ref, path, part, instr, sel), 32, len(part), len(part) * 4, raw=True))
             jobs.append((code, name, part))
     results = oracle.run(kernels, words=CHUNK * 4)
     out = {}
@@ -480,13 +484,10 @@ def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
         for i, row in enumerate(part):
             got = struct.pack("<4I", *res[4 * i:4 * i + 4])
             want = bytearray(struct.pack("<4I", *([PREFILL] * 4)))
-            route = "hw" if path == "mubuf" else "translator"      # tbuffer stores take (x, y) like the translator
-            want[:size] = encode_element(name, row, instr, route)
+            want[:size] = encode_element(name, row, instr, path, sel)
             rec[0] += 1
             if bytes(want) != got:
                 rec[1].append((row, bytes(want), got))
-            elif encode_element(name, row, instr, route) != encode_element(name, row, instr):
-                rec[2] += 1
     return out
 
 
@@ -495,10 +496,12 @@ def run_stores(oracle, family, fmts, path, rng, instr="xyzw"):
 GFX10_ONLY = tuple(c for c, n in GFX10_NAMES.items() if n not in GFX11_CODES)    # 30..35, 37..42: no GFX11 spelling
 
 
-def select_formats(spec):
+def select_formats(spec, family="gfx11"):
+    """The formats to run: the ones in `spec`, else every code the GPU family has (GFX10: all 77, GFX11: the 63 that have a
+    GFX11 spelling)."""
     codes = {n: c for c, n in GFX10_NAMES.items()}
     if not spec:
-        return [(c, n) for c, n in GFX10_NAMES.items() if n in GFX11_CODES]
+        return [(c, n) for c, n in GFX10_NAMES.items() if family == "gfx10" or n in GFX11_CODES]
     out = []
     for tok in spec.split(","):
         tok = tok.strip()
@@ -577,7 +580,7 @@ def report(title, results, fmts):
         cases_total += cases - known
         known_total += known
         bad_total += len(bad)
-        note = f"  (+{known} take channels (x, w), not (x, y), counted apart)" if known else ""
+        note = f"  (+{known} known difference)" if known else ""
         print(f"  {title:<14} {code:>3} {name:<22} {cases - known:>7} validated  {'ok' if not bad else f'MISMATCH {len(bad)}'}{note}")
         for first, want, got in bad[:3]:
             shown = first.hex() if isinstance(first, bytes) else [f"{w:08x}" for w in first]
@@ -610,7 +613,7 @@ def main():
         print(f"hardware oracle unavailable: {e}")
         return 77
     family = asm.family(oracle.arch)
-    fmts = select_formats(a.formats)
+    fmts = select_formats(a.formats, family)
     if family == "gfx12":
         print("GFX12 numbers its formats again; not built here")
         oracle.close()
@@ -634,8 +637,12 @@ def main():
                 for instr in ("xyzw", "xy"):
                     c, b_, k = report(f"store {instr} {path}", run_stores(oracle, family, fmts, path, rng, instr), fmts)
                     total, bad, known = total + c, bad + b_, known + k
-        print(f"{total} validated elements, {bad} mismatches; plus {known} two-component "
-              "buffer_store_format_* elements (identity selectors: channels (x, w)), counted apart, which the translator matches since SHADER-364")
+                if path == "mubuf":     # the runtime's selectors for a two-component format: X, Y, 0, 1
+                    two = [(c_, n_) for c_, n_ in fmts if len(parse_name(n_)[0]) == 2]
+                    for instr in ("xyzw", "xy"):
+                        c, b_, k = report(f"store {instr} XY01", run_stores(oracle, family, two, path, rng, instr, "XY01"), two)
+                        total, bad, known = total + c, bad + b_, known + k
+        print(f"{total} validated elements, {bad} mismatches" + (f"; plus {known} known-difference elements" if known else ""))
         return 1 if bad else 0
     finally:
         oracle.close()

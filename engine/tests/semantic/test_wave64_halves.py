@@ -754,6 +754,27 @@ class UniformVote(unittest.TestCase):
                                         "v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, vcc, s[16:17]"]
                      + VCCZ_SIDES, "unsafe-vote-branch")
 
+    def test_c_partial_write_keeps_varying_bits(self):
+        # v1 = lane << 8, then its low byte (SDWA, UNUSED_PRESERVE) or low half (16-bit add) from s4: the sources are
+        # uniform but bits the write keeps are not, so 0x2000 > v1 is yes for lanes 0..31 only (found by @shdann)
+        sides = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+                 "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+        self.differs("vs_uv_sdwa_partial", [
+            "v_lshlrev_b32_e32 v1, 8, v0",
+            "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_gt_u32_e32 vcc, 0x2000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+        self.differs("vs_uv_u16_partial", [
+            "v_lshlrev_b32_e32 v1, 16, v0", "v_add_u16_e64 v1, 1, s4",
+            "v_cmp_gt_u32_e32 vcc, 0x200000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+
+    def test_a_partial_write_over_a_uniform_register(self):
+        # the kept bits come from s4 too, so the register stays uniform
+        name = "vs_uv_sdwa_uniform"
+        (t, reasons, _), _ = meta_of(name, vs([
+            "v_mov_b32_e32 v1, s4", "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES))
+        self.assertEqual((t, reasons), ("A", []), name)
+
 
 class Refusal(unittest.TestCase):
     def test_error_mode_refuses_tier_c(self):

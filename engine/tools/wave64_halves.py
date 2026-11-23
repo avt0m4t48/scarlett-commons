@@ -37,6 +37,7 @@ Standard library only.
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -96,6 +97,24 @@ MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
 UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
+
+
+_TYPE16 = re.compile(r"^[biuf]16$")
+_TYPE = re.compile(r"^[biuf](8|16|24|32|64)$")
+
+
+def partial_write(ins, op):
+    """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest: SDWA with a byte or
+    word dst_sel and UNUSED_PRESERVE, or a 16-bit result (the first type in the name, e.g. v_add_u16, v_cvt_f16_f32;
+    not v_pk_*, which writes both halves, nor v_cvt_f32_f16 or v_mad_u32_u16, whose result is 32 bits)."""
+    mods = ins.get("mods") or []
+    if "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods):
+        return True
+    name = op.split("_e32")[0].split("_e64")[0].split("_sdwa")[0].split("_dpp")[0]
+    if name.startswith("v_pk_"):
+        return False
+    first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
+    return bool(first and _TYPE16.match(first))
 
 
 def base_op(op):
@@ -749,6 +768,10 @@ class Analysis:
                 uniform = st["f"] and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["u"] for r in _regs(x))) for x in srcs) and not uses
+                # a write of part of the VGPR (SDWA byte/word with UNUSED_PRESERVE, a 16-bit result) keeps the rest
+                # of it: uniform only if the whole register already was
+                if uniform and partial_write(ins, op):
+                    uniform = all(r[1] in st["u"] for d in dests for r in _regs(d) if isinstance(r, tuple))
             # a waterfall scalar used by a lane whose v equals it is that lane's own value
             if tj & WFS:
                 ok = st["xg"] and st["xg"][0] == "wf"

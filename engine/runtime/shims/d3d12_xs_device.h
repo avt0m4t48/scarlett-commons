@@ -118,6 +118,15 @@ bool is_allocator_proxy(const void* allocator);
 bool is_list_proxy(const void* list);
 ID3D12CommandList* list_proxy_real_list(const void* list);
 std::uint64_t list_slot_hits(unsigned slot);
+// The diagnostic name of a command-list slot on the list tail, where the newer console layout sits two slots later
+// than the older one from CopyTextureRegionX on (docs/d3d12_xs_console_abi.md 5.3: newer->older pairs 85->83,
+// 86->84, 87->85, 90->88, 91->89, 92->90, 95->93, 96->94). `console_layout` is the device-wide layout the queue
+// proxy detects (kConsoleLayoutOlder or kConsoleLayoutNewer). Null when the layout is not known yet or the slot is
+// not a measured tail slot of that layout, so that a slot number is never given the other layout's name. Naming
+// only: no slot is forwarded because of it.
+inline constexpr unsigned char kConsoleLayoutOlder = 1;
+inline constexpr unsigned char kConsoleLayoutNewer = 2;
+const char* list_tail_slot_name(unsigned slot, unsigned char console_layout);
 // The wrapped allocator (no reference added), or null when `allocator` is not an allocator proxy.
 ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator);
 unsigned allocator_proxy_slot_count(const void* allocator);

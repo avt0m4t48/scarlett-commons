@@ -1277,14 +1277,47 @@ struct ListStats {
     static inline std::atomic<bool> first[kListSlots];
 };
 
-void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+// The list tail (D3D-445). From CopyTextureRegionX on, the newer console layout sits two slots later than the older
+// one (docs/d3d12_xs_console_abi.md 5.3). The table is keyed by the older-layout slot. Only CopyTextureRegionX has a
+// measured name; the other measured pairs are named by their older slot, so that both layouts print the same text
+// for the same method.
+struct ListTailName {
+    unsigned older_slot;
+    const char* name;
+};
+constexpr ListTailName kListTailNames[] = {
+    {83, "CopyTextureRegionX"},         {84, "tail method, older slot 84"}, {85, "tail method, older slot 85"},
+    {88, "tail method, older slot 88"}, {89, "tail method, older slot 89"}, {90, "tail method, older slot 90"},
+    {93, "tail method, older slot 93"}, {94, "tail method, older slot 94"},
+};
+constexpr unsigned kListTailShift = 2;
+static_assert(kConsoleLayoutOlder == ChildProxy::kQueueLayoutOlder &&
+                  kConsoleLayoutNewer == ChildProxy::kQueueLayoutNewer,
+              "the list tail names use the queue proxy's layout values");
+
+// Null while the layout is unknown, and for a slot that is not a measured tail slot of that layout: a slot number
+// never gets the other layout's name.
+const char* list_tail_name(unsigned slot, unsigned char console_layout) {
+    if (console_layout != kConsoleLayoutOlder && console_layout != kConsoleLayoutNewer) return nullptr;
+    const unsigned shift = console_layout == kConsoleLayoutNewer ? kListTailShift : 0;
+    if (slot < shift) return nullptr;
+    for (const ListTailName& entry : kListTailNames)
+        if (entry.older_slot == slot - shift) return entry.name;
+    return nullptr;
+}
+
+void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
+                    unsigned char console_layout = 0) {
     if (slot >= kListSlots) return;
     ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
     bool expected = false;
-    if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u first call (args 0x%llx 0x%llx 0x%llx 0x%llx)\n", slot,
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+    if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        const char* name = list_tail_name(slot, console_layout);
+        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u%s%s%s first call (args 0x%llx 0x%llx 0x%llx 0x%llx)\n", slot,
+                     name ? " (" : "", name ? name : "", name ? ")" : "", static_cast<unsigned long long>(a1),
+                     static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                     static_cast<unsigned long long>(a4));
+    }
 }
 
 // The interfaces the console list answers: the base chain, ID3D12CommandList and every graphics-command-list
@@ -1373,7 +1406,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         return hr_to_u64(proxy_query_interface(self->device, reinterpret_cast<const IID*>(a1),
                                                reinterpret_cast<void**>(a2)));
     } else {
-        note_list_slot(Slot, a1, a2, a3, a4);
+        note_list_slot(Slot, a1, a2, a3, a4, self->device->console_layout.load(std::memory_order_relaxed));
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
             if constexpr (Slot == kConsoleAllocateUpload) {
@@ -2004,6 +2037,9 @@ ID3D12CommandList* list_proxy_real_list(const void* list) {
     return static_cast<const ListProxy*>(list)->real;
 }
 
+const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
+    return list_tail_name(slot, console_layout);
+}
 std::uint64_t list_slot_hits(unsigned slot) {
     return slot < kListSlots ? ListStats::hits[slot].load(std::memory_order_relaxed) : 0;
 }

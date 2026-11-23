@@ -925,6 +925,43 @@ int run_fault_mode(const char* mode) {
     return 2;
 }
 
+// ---- 9. List tail slot names (D3D-445) ---------------------------------------------------------------------
+// From CopyTextureRegionX on, the newer layout sits two slots later than the older one (d3d12_xs_console_abi.md
+// 5.3). A diagnostic name follows the device-wide layout, so slot 85 of the newer layout and slot 83 of the older
+// layout are both CopyTextureRegionX, and neither number gets that name under the other layout.
+
+int check_list_tail_names() {
+    const unsigned char older = xs::kConsoleLayoutOlder, newer = xs::kConsoleLayoutNewer;
+    const auto same = [](const char* a, const char* b) { return a && b && std::strcmp(a, b) == 0; };
+    EXPECT(same(xs::list_tail_slot_name(83, older), "CopyTextureRegionX"));
+    EXPECT(same(xs::list_tail_slot_name(85, newer), "CopyTextureRegionX"));
+    // The same numbers under the other layout are different methods.
+    EXPECT(!xs::list_tail_slot_name(83, newer));  // not a measured slot of the newer layout
+    EXPECT(xs::list_tail_slot_name(85, older) && !same(xs::list_tail_slot_name(85, older), "CopyTextureRegionX"));
+    // Every measured newer->older pair has one name, and the eight names differ.
+    const unsigned pairs[][2] = {{85, 83}, {86, 84}, {87, 85}, {90, 88}, {91, 89}, {92, 90}, {95, 93}, {96, 94}};
+    for (const auto& pair : pairs) {
+        EXPECT(same(xs::list_tail_slot_name(pair[0], newer), xs::list_tail_slot_name(pair[1], older)));
+        for (const auto& other : pairs)
+            EXPECT(pair[1] == other[1] ||
+                   !same(xs::list_tail_slot_name(pair[1], older), xs::list_tail_slot_name(other[1], older)));
+    }
+    // Slots outside the measured set have no tail name in either layout, and no slot has one before the layout is
+    // known: the log then prints the slot number only, as before.
+    for (unsigned slot = 0; slot < 160; ++slot) {
+        bool older_tail = false, newer_tail = false;
+        for (const auto& pair : pairs) {
+            newer_tail = newer_tail || slot == pair[0];
+            older_tail = older_tail || slot == pair[1];
+        }
+        EXPECT((xs::list_tail_slot_name(slot, older) != nullptr) == older_tail);
+        EXPECT((xs::list_tail_slot_name(slot, newer) != nullptr) == newer_tail);
+        EXPECT(!xs::list_tail_slot_name(slot, 0));
+        EXPECT(!xs::list_tail_slot_name(slot, 3));
+    }
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -946,7 +983,8 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_lists() || check_signalx_detection())
+        check_alloc_failures() || check_allocators() || check_lists() || check_signalx_detection() ||
+        check_list_tail_names())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

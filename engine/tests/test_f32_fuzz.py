@@ -238,6 +238,11 @@ class HardwareOracle(unittest.TestCase):
             oracle = runner.open_oracle()
         except runner.Unavailable as e:
             self.skipTest(f"hardware oracle unavailable: {e}")
+        from hw_oracle import asm
+        why = asm.rdna23_skip_reason(oracle.arch)
+        if why:
+            oracle.close()
+            self.skipTest(why)
         try:
             ff.hw_probe_modes(oracle)
             cases = ff.gen_cases(300, 21, tuple(ff.ALL_OPS)) + ff.gen_probes(2, 21, tuple(ff.ALL_OPS))

@@ -115,12 +115,26 @@ _MODE_FIELDS_GONE_ON_GFX1170 = ("ieee", "dx10_clamp")
 _MODE_FIXED = ("ieee", "dx10_clamp")
 
 
+def is_gfx1170_or_later(arch):
+    """True for GFX11.7 and GFX12 (gfx1170 and later), which RDNA2 and RDNA3 code does not assemble for as is."""
+    fam = family(arch)
+    return fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)
+
+
+def rdna23_skip_reason(arch):
+    """Why a fuzzer or test written for RDNA2 and RDNA3 cannot run on this GPU, or None. AMD clang (rocm-sdk-core 10.0.0)
+    rejects s_barrier and some 16-bit and memory operands for gfx1201 (TEST-873, found by @PeterGrieffindor in #3918),
+    which fails every program of a chunk; on gfx1170+ the caller reports a skip instead."""
+    if not is_gfx1170_or_later(arch):
+        return None
+    return f"{arch} (GFX11.7 or GFX12) is not RDNA2 or RDNA3: the kernels here do not assemble for it"
+
+
 def mode_skip_reason(mode, arch):
     """Why a kernel's starting MODE cannot be set on this architecture, or None. A kernel that asks for one of
     _MODE_FIXED on gfx1170+ (GFX11.7 and GFX12) is reported as not runnable there, rather than reaching the assembler,
     which rejects the directive and, when every kernel of a chunk sets it, the whole chunk."""
-    fam = family(arch)
-    if not (fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)):
+    if not is_gfx1170_or_later(arch):
         return None
     fixed = sorted(k for k in (mode or {}) if k in _MODE_FIXED)
     if not fixed:

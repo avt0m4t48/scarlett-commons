@@ -1093,6 +1093,12 @@ def main():
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}")
             return 77
+        from hw_oracle import asm
+        why = asm.rdna23_skip_reason(oracle.arch)
+        if why:
+            oracle.close()
+            print(f"hardware oracle unavailable: {why}")
+            return 77
         print(f"hardware oracle: {oracle.device}")
     if a.show is not None:
         parts = a.show.split(":")

@@ -295,6 +295,12 @@ class Filters(unittest.TestCase):
                                                     "round16_64": 2}, arch), arch)
             self.assertIsNone(asm.mode_skip_reason(None, arch))
 
+    def test_rdna23_skip_reason(self):
+        for arch in ("gfx1013", "gfx1030", "gfx1100", "gfx1150", "gfx1151"):
+            self.assertIsNone(asm.rdna23_skip_reason(arch), arch)
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            self.assertIn(arch, asm.rdna23_skip_reason(arch))
+
     def test_skip_reasons(self):
         self.assertIsNone(asm.skip_reason(PROG, "gfx1150"))
         self.assertIn("s_ff0", asm.skip_reason(PROG + ["s_ff0_i32_b32 s4, s5"], "gfx1150"))

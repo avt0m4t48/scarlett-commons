@@ -87,7 +87,9 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)                     \
+    X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -394,6 +396,7 @@ public:
         buffer,
         device_memory,
         acceleration_structure,
+        framebuffer,
     };
 
     struct Item {
@@ -481,6 +484,9 @@ public:
                 if (vk.vkDestroyAccelerationStructureKHR)
                     vk.vkDestroyAccelerationStructureKHR(
                         device, reinterpret_cast<VkAccelerationStructureKHR>(item.handle), nullptr);
+                break;
+            case Kind::framebuffer:
+                vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
                 break;
             }
         }
@@ -940,6 +946,18 @@ public:
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
+        if (vk.vkCreateRenderPass2 && vk.vkDestroyRenderPass && vk.vkCreateFramebuffer && vk.vkDestroyFramebuffer &&
+            vk.vkCmdBeginRenderPass && vk.vkCmdEndRenderPass) {
+            replay_.begin_render_pass = vk.vkCmdBeginRenderPass;
+            replay_.end_render_pass = vk.vkCmdEndRenderPass;
+            replay_.depth_resolve_framebuffer = [this](const ResourceBinding& source, VkImageView from,
+                                                       VkImageLayout from_layout, const ResourceBinding& target,
+                                                       VkImageView to, VkImageLayout to_layout,
+                                                       VkResolveModeFlagBits mode, VkExtent2D extent,
+                                                       VkRenderPass& pass) {
+                return depth_resolve_framebuffer(source, from, from_layout, target, to, to_layout, mode, extent, pass);
+            };
+        }
         replay_.query_pool = [this](QueryHeapId id) -> QueryPool* {  // called with resource_mutex_ held
             const auto it = query_pools_.find(id);
             return it == query_pools_.end() ? nullptr : &it->second;
@@ -953,6 +971,9 @@ public:
     ~VulkanContext() {
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
+        for (const auto& [key, framebuffer] : resolve_framebuffers_)
+            vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
+        for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
     }
 
@@ -1052,6 +1073,14 @@ public:
         }
         if (img) {
             std::lock_guard vlock(views_mutex_);
+            for (auto f = resolve_framebuffers_.begin(); f != resolve_framebuffers_.end();) {
+                if (std::get<0>(f->first) == img || std::get<1>(f->first) == img) {
+                    defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
+                    f = resolve_framebuffers_.erase(f);
+                } else {
+                    ++f;
+                }
+            }
             for (auto v = views_.begin(); v != views_.end();) {
                 if (std::get<0>(v->first) == img) {
                     defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
@@ -1430,6 +1459,68 @@ private:
         return view;
     }
 
+    // The render pass and framebuffer that resolve one layer of a depth-only multisampled image into one layer of
+    // another: views `from` and `to` (from view()), in the layouts given. Used where the dynamic-rendering resolve
+    // reads the wrong source layer (D3D-417; vulkan_replay.h says when). Both objects are cached: a pass by what it
+    // describes, a framebuffer by its images and views, until remove_resource retires either image.
+    VkFramebuffer depth_resolve_framebuffer(const ResourceBinding& source, VkImageView from, VkImageLayout from_layout,
+                                            const ResourceBinding& target, VkImageView to, VkImageLayout to_layout,
+                                            VkResolveModeFlagBits mode, VkExtent2D extent, VkRenderPass& pass) {
+        std::lock_guard lock(views_mutex_);
+        const auto pass_key = std::make_tuple(source.format, source.samples, from_layout, to_layout, mode);
+        if (const auto it = resolve_passes_.find(pass_key); it != resolve_passes_.end()) {
+            pass = it->second;
+        } else {
+            VkAttachmentDescription2 attachments[2]{};
+            for (auto& attachment : attachments) {
+                attachment.sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+                attachment.format = source.format;
+                attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+                attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;      // the source is read; the destination keeps
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;   // what is outside the render area
+                attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // depth-only formats
+                attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            }
+            attachments[0].samples = static_cast<VkSampleCountFlagBits>(source.samples);
+            attachments[0].initialLayout = attachments[0].finalLayout = from_layout;
+            attachments[1].initialLayout = attachments[1].finalLayout = to_layout;
+            const VkAttachmentReference2 from_reference{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 0,
+                                                        from_layout, VK_IMAGE_ASPECT_DEPTH_BIT};
+            const VkAttachmentReference2 to_reference{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 1, to_layout,
+                                                      VK_IMAGE_ASPECT_DEPTH_BIT};
+            VkSubpassDescriptionDepthStencilResolve resolve{
+                VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE};
+            resolve.depthResolveMode = mode;
+            resolve.stencilResolveMode = VK_RESOLVE_MODE_NONE;
+            resolve.pDepthStencilResolveAttachment = &to_reference;
+            VkSubpassDescription2 subpass{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2};
+            subpass.pNext = &resolve;
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.pDepthStencilAttachment = &from_reference;
+            VkRenderPassCreateInfo2 info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2};
+            info.attachmentCount = 2;
+            info.pAttachments = attachments;
+            info.subpassCount = 1;
+            info.pSubpasses = &subpass;
+            if (vk.vkCreateRenderPass2(device_, &info, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+            resolve_passes_[pass_key] = pass;
+        }
+        const auto key = std::make_tuple(source.image, target.image, from, to, pass);
+        if (const auto it = resolve_framebuffers_.find(key); it != resolve_framebuffers_.end()) return it->second;
+        const VkImageView views[] = {from, to};
+        VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        info.renderPass = pass;
+        info.attachmentCount = 2;
+        info.pAttachments = views;
+        info.width = extent.width;
+        info.height = extent.height;
+        info.layers = 1;
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        if (vk.vkCreateFramebuffer(device_, &info, nullptr, &framebuffer) != VK_SUCCESS) return VK_NULL_HANDLE;
+        resolve_framebuffers_[key] = framebuffer;
+        return framebuffer;
+    }
+
     VkDevice device_;
     bool loaded_ = false;
     bool ray_tracing_ = false;
@@ -1465,6 +1556,10 @@ private:
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
+    // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
+    std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
+        resolve_passes_;
+    std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::function<VkDescriptorSet()> bindless_current_;
     bool bindless_upload_pending_ = false;  // tracker_mutex_

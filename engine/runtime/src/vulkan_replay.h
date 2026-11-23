@@ -880,6 +880,14 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Optional. The framebuffer, and through the last argument the render pass, that resolve the depth of the
+    // source's one-layer view into the destination's (both from image_view, each image in the layout after its
+    // view); alive until execution completes. Null: not available. For the resolves prepare names (D3D-417).
+    std::function<VkFramebuffer(const ResourceBinding&, VkImageView, VkImageLayout, const ResourceBinding&, VkImageView,
+                                VkImageLayout, VkResolveModeFlagBits, VkExtent2D, VkRenderPass&)>
+        depth_resolve_framebuffer;
+    PFN_vkCmdBeginRenderPass begin_render_pass = nullptr;
+    PFN_vkCmdEndRenderPass end_render_pass = nullptr;
     // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
     // except E5B9G9R9_UFLOAT_PACK32 supports COLOR_ATTACHMENT.
     std::function<bool(VkFormat)> color_attachment_format;
@@ -961,6 +969,9 @@ struct Prepared {
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
+    // Set: the resolve runs in this render pass and framebuffer instead of a dynamic-rendering scope.
+    VkRenderPass resolve_pass = VK_NULL_HANDLE;
+    VkFramebuffer resolve_framebuffer = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
                                // (or a copy of an rgb96 texture: repacked by the same pass)
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
@@ -2753,6 +2764,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
                 if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
                     return result;
+                // D3D-417, a driver workaround: AMD's Windows driver (32.0.21042.62, Radeon RDNA2 iGPU) resolves a
+                // dynamic-rendering depth attachment from layer 0 of the image when the multisampled view starts at
+                // another layer (the resolve view's first layer it honours). The same two views in a framebuffer
+                // of a render pass resolve the right layer there, and on NVIDIA both ways do
+                // (docs/d3d12_vulkan.md). So a depth-only source above layer 0 goes through a render pass, on
+                // every GPU. A depth-stencil source does not: its planes can be in different layouts here.
+                if (p.source_range.baseArrayLayer && p.source.aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                    vk.depth_resolve_framebuffer && vk.begin_render_pass && vk.end_render_pass) {
+                    const VkExtent2D from = detail::mip_extent(p.source, p.source_range.baseMipLevel);
+                    const VkExtent2D to = detail::mip_extent(p.binding, p.range.baseMipLevel);
+                    p.resolve_framebuffer = vk.depth_resolve_framebuffer(
+                        p.source, p.view, image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                        p.binding, p.resolve_view,
+                        image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL), p.resolve_mode,
+                        {std::min(from.width, to.width), std::min(from.height, to.height)}, p.resolve_pass);
+                    if (!p.resolve_framebuffer) return ReplayResult::unsupported;
+                }
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -3635,6 +3663,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    attachment_access, attachment_stages, [&] {
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
                                        attachment_access, attachment_stages, [&] {
+                        if (p.resolve_framebuffer) {  // D3D-417 (prepare): the same resolve as a render pass
+                            VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                            begin.renderPass = p.resolve_pass;
+                            begin.framebuffer = p.resolve_framebuffer;
+                            begin.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
+                                                {p.resolve.extent.width, p.resolve.extent.height}};
+                            vk.begin_render_pass(command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE);
+                            vk.end_render_pass(command_buffer);
+                            return;
+                        }
                         VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                         info.imageView = p.view;
                         info.imageLayout = source_attachment;

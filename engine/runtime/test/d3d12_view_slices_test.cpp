@@ -5,9 +5,9 @@
 // depth) and TEXTURE2DMSARRAY views of 4x textures (read through a resolve). The layer must reach exactly the
 // slices from the first one on, in the view's mip only, and so must the host's D3D12 on the layer's adapter and on
 // WARP (skipped under Wine; WARP is not given the depth resolve, which removes its device, d3d12_depth_resolve_test).
-// The layer's 4x depth array is checked by its descriptor instead (the same bytes as the view that counts the
-// remaining slices, and the list runs): read through the layer's depth resolve, every slice of such a texture shows
-// slice 0 on the AMD driver, with a counted ArraySize as well, so that readback cannot tell the slices apart there.
+// The 4x depth array is also cleared through views that count their slices (slice 0 alone, slice 1 alone, slices
+// 1-3): its readback resolves each slice on its own, which is where D3D-417 showed (the layer's depth resolve of a
+// slice above 0 read slice 0 on the AMD driver, whatever the view had cleared).
 // A range the host's debug layer refuses stays refused by the layer: a first slice past the array (with -1 too), no
 // slices, more slices than are left, and UINT_MAX - 1. Those are not run on the host.
 // No game data or shaders. Needs a Vulkan GPU; LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
@@ -28,10 +28,7 @@ struct Case {
 
 // Seeds, clears through {mip, first, count} and reads back. `reached` gets one bit per subresource (mip + slice *
 // mips) the clear wrote. Returns an error text when the list was refused or the readback is not all zeros or ones.
-// With `by_descriptor` (the layer only, whose descriptor is the bytes of its slot) nothing is read back: the view's
-// slot must hold the bytes it holds for the view that counts the slices from `first` on, and the list must run.
-std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first, UINT count, std::uint32_t& reached,
-                          bool by_descriptor = false) {
+std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first, UINT count, std::uint32_t& reached) {
     ID3D12Device* device = run.device;
     const bool msaa = c.samples > 1;
     D3D12_RESOURCE_DESC desc{};
@@ -90,18 +87,7 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
     };
     for (UINT slice = 0; slice < kSlices; ++slice)
         for (UINT level = 0; level < desc.MipLevels; ++level) clear(level, slice, 1, 0.0f);
-    std::vector<std::uint8_t> counted;
-    if (by_descriptor) {
-        clear(mip, first, kSlices - first, 0.0f);
-        const auto* at = reinterpret_cast<const std::uint8_t*>(slot.ptr);
-        counted.assign(at, at + device->GetDescriptorHandleIncrementSize(heap_desc.Type));
-    }
     clear(mip, first, count, 1.0f);
-    if (by_descriptor) {
-        if (std::memcmp(counted.data(), reinterpret_cast<const void*>(slot.ptr), counted.size()))
-            return "the descriptor is not the one of the view that counts the remaining slices";
-        return run.submit();
-    }
 
     if (msaa) {
         run.barrier(texture.p, written, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
@@ -205,31 +191,35 @@ int main() {
         {"RTV R8G8B8A8_UNORM of TYPELESS 4x", false, DXGI_FORMAT_R8G8B8A8_TYPELESS, rgba8, 4},
         {"DSV D32_FLOAT 4x", true, depth32, depth32, 4},
     };
-    unsigned failures = 0, compared = 0, refused = 0;
+    unsigned failures = 0, cleared = 0, compared = 0, refused = 0;
+    struct Range { UINT first, count; };
     for (const Case& c : cases) {
         const UINT mips = c.samples > 1 ? 1 : 3;
-        // Every slice from the first on, in the view's mip.
-        for (const UINT first : {0u, 1u, 3u}) {
-            const UINT mip = c.samples > 1 ? 0 : std::min(first, 2u);
+        // Every slice from the first on, in the view's mip; for the 4x depth array, counted slices as well.
+        std::vector<Range> ranges{{0, UINT_MAX}, {1, UINT_MAX}, {3, UINT_MAX}};
+        if (c.depth && c.samples > 1) ranges.insert(ranges.end(), {{0, 1}, {1, 1}, {1, 3}});
+        for (const Range range : ranges) {
+            const UINT first = range.first, mip = c.samples > 1 ? 0 : std::min(first, 2u);
+            const UINT end = range.count == UINT_MAX ? kSlices : first + range.count;
             std::uint32_t expected = 0;
-            for (UINT slice = first; slice < kSlices; ++slice) expected |= 1u << (mip + slice * mips);
+            for (UINT slice = first; slice < end; ++slice) expected |= 1u << (mip + slice * mips);
             const auto check = [&](ID3D12Device* device, bool is_ours, const char* who) {
                 copycmp::Run run;
                 std::uint32_t reached = 0;
                 std::string error = run.init(device, is_ours) ? "" : "no queue or list";
                 if (error.empty()) {
                     run.begin();
-                    const bool by_descriptor = is_ours && c.depth && c.samples > 1;
-                    error = clear_through(run, c, mip, first, UINT_MAX, reached, by_descriptor);
-                    if (by_descriptor && error.empty()) reached = expected;
+                    error = clear_through(run, c, mip, first, range.count, reached);
                 }
                 if (error.empty() && reached == expected) return;
                 ++failures;
-                std::fprintf(stderr, "%s, mip %u, first slice %u, ArraySize -1, on %s: %s%s; expected slice.mip%s\n",
-                             c.name, mip, first, who, error.empty() ? "cleared slice.mip" : error.c_str(),
+                std::fprintf(stderr, "%s, mip %u, first slice %u, ArraySize %d, on %s: %s%s; expected slice.mip%s\n",
+                             c.name, mip, first, int(range.count), who,
+                             error.empty() ? "cleared slice.mip" : error.c_str(),
                              error.empty() ? slices_of(reached, mips).c_str() : "", slices_of(expected, mips).c_str());
             };
             check(ours.p, true, "the layer");
+            ++cleared;
             for (const Host& host : hosts) {
                 if (!host.device.p || (host.warp && c.depth && c.samples > 1)) continue;
                 check(host.device.p, false, host.name.c_str());
@@ -237,7 +227,6 @@ int main() {
             }
         }
         // What the host's debug layer refuses, the layer refuses: the list fails at Close or when it runs.
-        struct Range { UINT first, count; };
         for (const Range range : {Range{kSlices, UINT_MAX}, Range{UINT_MAX, UINT_MAX}, Range{0, 0}, Range{3, 2},
                                   Range{0, kSlices + 1}, Range{1, UINT_MAX - 1}}) {
             copycmp::Run run;
@@ -255,8 +244,7 @@ int main() {
         }
     }
     if (hosts[0].device.p) std::printf("host reference: %s, and WARP\n", hosts[0].name.c_str());
-    std::printf("ArraySize -1 views: %u clears on the layer, %u on the host; %u out-of-range views refused; "
-                "%u failures\n",
-                unsigned(std::size(cases)) * 3, compared, refused, failures);
+    std::printf("array views: %u clears on the layer, %u on the host; %u out-of-range views refused; %u failures\n",
+                cleared, compared, refused, failures);
     return failures || vk.validation_errors() ? 1 : 0;
 }

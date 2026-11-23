@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -460,6 +461,8 @@ int main() {
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(list->Close()));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        HANDLE fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(fence_event != nullptr);
 
         // The movie frame as a display-capable texture: committed, ALLOW_DISPLAY, in PRESENT.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -504,7 +507,8 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
             return SUCCEEDED(queue->Signal(fence.p, ++signalled)) &&
-                   SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr));
+                   SUCCEEDED(fence->SetEventOnCompletion(signalled, fence_event)) &&
+                   WaitForSingleObject(fence_event, 60'000) == WAIT_OBJECT_0;
         };
 
         // Uploads `bgra` to the display texture and copies the texture back to the
@@ -553,8 +557,9 @@ int main() {
             return differing == 0;
         };
 
-        EXPECT(upload_and_verify(decoded_first, "first"));
-        check(true, "first frame texture round-trip bit-exact");
+        const bool first_round_trip = upload_and_verify(decoded_first, "first");
+        check(first_round_trip, "first frame texture round-trip bit-exact");
+        if (!first_round_trip) return 1;
 
         const UINT period = rt::d3d12::xbox_frame_interval_60hz_us;
         EXPECT(SUCCEEDED(xbox.SetFrameIntervalX(nullptr, period, 1, 0)));
@@ -582,6 +587,11 @@ int main() {
             std::printf("%s presented extent: %ux%u (movie %ux%u, swapchain format %d, %s filter)%s\n", label, ew, eh,
                         W, H, int(frame.format), scaling_linear ? "linear" : "nearest",
                         one_to_one ? "" : " (scaled comparison)");
+            if (frame.format == VK_FORMAT_B8G8R8A8_SRGB) {
+                std::printf("%s: sRGB swapchain, pixel comparison skipped (the blit encodes sRGB and these bytes "
+                            "are compared as UNORM)\n", label);
+                return;
+            }
             uint64_t exact = 0, within1 = 0, within2 = 0;
             int worst = 0;
             UINT bad_x = 0, bad_y = 0;
@@ -647,8 +657,9 @@ int main() {
         compare_presented(presented_first, decoded_first, "first");
 
         if (has_second) {
-            EXPECT(upload_and_verify(decoded_second, "second"));
-            check(true, "second frame texture round-trip bit-exact");
+            const bool second_round_trip = upload_and_verify(decoded_second, "second");
+            check(second_round_trip, "second frame texture round-trip bit-exact");
+            if (!second_round_trip) return 1;
             EXPECT(present("second", presented_second));
             compare_presented(presented_second, decoded_second, "second");
             if (presented_first.extent.width == presented_second.extent.width &&
@@ -666,6 +677,7 @@ int main() {
         }
 
         upload->Unmap(0, nullptr);
+        CloseHandle(fence_event);
     }
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);

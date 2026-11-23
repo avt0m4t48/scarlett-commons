@@ -334,6 +334,8 @@ class Tally:
         self.fail_items = Counter()        # reason -> occurrences
         self.stats = Counter()
         self.examples = {}
+        self.raw = set()            # offsets of streams no classifier recognised
+        self.consumed = set()       # offsets of continuation streams joined to a bvh4-chunk
 
     def add(self, offset, res):
         self.checked += 1
@@ -354,6 +356,8 @@ class Tally:
         self.fail_streams.update(other.fail_streams)
         self.fail_items.update(other.fail_items)
         self.stats.update(other.stats)
+        self.raw |= other.raw
+        self.consumed |= other.consumed
         for reason, ex in other.examples.items():
             mine = self.examples.setdefault(reason, [])
             mine.extend(ex)
@@ -361,7 +365,12 @@ class Tally:
             del mine[EXAMPLES:]
 
     def report(self):
-        return {"kinds": dict(sorted(self.kinds.items())), "checked": self.checked, "passed": self.passed,
+        # A continuation that starts in a later window is seen there as an unrecognised stream; count it once.
+        kinds = Counter(self.kinds)
+        raw = len(self.raw - self.consumed)
+        if raw:
+            kinds["raw"] = raw
+        return {"kinds": dict(sorted(kinds.items())), "checked": self.checked, "passed": self.passed,
                 "failed": self.checked - self.passed,
                 "fail_streams": dict(sorted(self.fail_streams.items())),
                 "fail_items": dict(sorted(self.fail_items.items())),
@@ -391,7 +400,10 @@ def scan_window(args):
                 pos = s + used
                 row = I.classify(data[:I.HEAD], len(data))
                 kind = row["kind"]
-                tally.kinds[kind] += 1
+                if kind == "raw":
+                    tally.raw.add(s)
+                else:
+                    tally.kinds[kind] += 1
                 if kind == "bvh4-chunk":
                     # Join the continuation streams that follow, up to the declared end.
                     parts, have, q = [data], len(data), pos
@@ -402,6 +414,8 @@ def scan_window(args):
                             break
                         parts.append(more[0])
                         have += len(more[0])
+                        tally.kinds["continuation"] += 1
+                        tally.consumed.add(nxt.start())
                         q = nxt.start() + more[1]
                     data = b"".join(parts)
                     if have < row["declared_bytes"]:

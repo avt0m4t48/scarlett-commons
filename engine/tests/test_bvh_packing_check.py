@@ -132,6 +132,28 @@ class TestBroken(unittest.TestCase):
         f = fails(build(level0=[([leaf(0), leaf(1), ptr(NODES + 128, R.BOX16)], {}), ([leaf(2), leaf(3)], {})]))
         self.assertIn("root_referenced", f)
 
+    def test_too_many_children(self):
+        # a node word claiming five children (the fifth pointer is read from the group as well)
+        level0 = [([leaf(0), leaf(1), leaf(2), leaf(3), ptr(NODES + 64, R.BOX16)], {}), ([], {})]
+        self.assertIn("too_many_children", fails(build(level0=level0)))
+
+    def test_child_not_a_node(self):
+        f = fails(build(level1=[([ptr(NODES, R.BOX16), ptr(NODES + 192, R.BOX16)], {})]))
+        self.assertIn("child_not_a_node", f)
+        self.assertNotIn("child_wrong_width", f)
+
+    def test_invalid_child(self):
+        f = fails(build(level0=[([leaf(0), leaf(1)], {}), ([leaf(2), R.INVALID], {})]))
+        self.assertIn("invalid_child", f)
+        self.assertIn("leaf_unreferenced", f)
+
+    def test_root_not_a_box(self):
+        # a TRI0 root over four leaves is not the single-leaf form
+        self.assertEqual(fails(build(root=leaf(0))), {"root_not_a_box": 1})
+
+    def test_leaves_past_end(self):
+        self.assertEqual(fails(build(n_leaves=20, orders=[GOOD_ORDER] * 20)), {"leaves_past_end": 1})
+
     def test_other_child_type(self):
         f = fails(build(level0=[([leaf(0), leaf(1) | 6], {}), ([leaf(2), leaf(3)], {})]))
         self.assertIn("child_type_6", f)
@@ -212,6 +234,8 @@ class TestArchive(unittest.TestCase):
             self.assertEqual((rep["checked"], rep["passed"]), (3, 2), (workers, window))
             self.assertEqual(rep["fail_streams"], {"leaf_vertex_order": 1})
             self.assertEqual(rep["kinds"].get("bvh4-chunk-joined"), 1)
+            self.assertEqual(rep["kinds"].get("continuation"), 1)
+            self.assertNotIn("raw", rep["kinds"])
 
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:

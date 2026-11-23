@@ -767,9 +767,15 @@ void __cdecl on_host_thread_event(DWORD reason) {
 
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
 bool prefer_host_copy(const std::string& dll) {
+    // The second row is the Debug builds of the same DLLs. A Debug build of a stand-in image (tiny_game) links them,
+    // and without them here its C++ exceptions were not redirected below: a throw caught inside the image ended the
+    // run with 0xE06D7363 (run_tiny_game_eh in a Debug build).
     static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
                                   "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
-                                  "concrt140.dll", "vccorlib140.dll", "vcomp140.dll"};
+                                  "concrt140.dll", "vccorlib140.dll", "vcomp140.dll",
+                                  "vcruntime140d.dll", "vcruntime140_1d.dll", "msvcp140d.dll", "msvcp140_1d.dll",
+                                  "msvcp140_2d.dll", "msvcp140d_atomic_wait.dll", "msvcp140d_codecvt_ids.dll",
+                                  "concrt140d.dll", "vccorlib140d.dll", "vcomp140d.dll"};
     for (auto* n : names)
         if (dll == n) return true;
     return false;

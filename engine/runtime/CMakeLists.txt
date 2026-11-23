@@ -1192,7 +1192,9 @@ if(TARGET Vulkan::Headers)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
+    # /bigobj: a Debug build of d3d12_vulkan_device.cpp has more sections than a COFF object holds by default
+    # (fatal error C1128), because without optimisation every inline function keeps its own COMDAT.
+    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8 /bigobj)
 
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)

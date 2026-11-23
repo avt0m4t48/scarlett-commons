@@ -1120,11 +1120,17 @@ def main(argv=None):
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    _make_parent(out)
-    with open(out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(summary, f, indent=1, allow_nan=False)
-    if a.csv:
-        write_csv(a.csv, rows)
+    report_path = out
+    try:
+        _make_parent(out)
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(summary, f, indent=1, allow_nan=False)
+        if a.csv:
+            report_path = a.csv
+            write_csv(a.csv, rows)
+    except OSError as exc:
+        print(f"ERROR: cannot write {report_path}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1, allow_nan=False))
         print("wrote %s" % out + (", %s" % a.csv if a.csv else ""))

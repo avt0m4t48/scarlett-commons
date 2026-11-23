@@ -732,6 +732,24 @@ class NavmeshDecodeTest(unittest.TestCase):
             with open(out_csv, newline="", encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 1)
 
+    def test_cli_reports_a_blocked_report_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            blocker = os.path.join(tmp, "blocked")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            for flag in ("--out", "--csv"):
+                with self.subTest(flag=flag):
+                    target = os.path.join(blocker, "nav" + (".json" if flag == "--out" else ".csv"))
+                    command = [sys.executable, "-I", TOOL, archive, flag, target, "--quiet"]
+                    result = subprocess.run(command, cwd=tmp, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(target, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
     def test_cli_refuses_to_overwrite_its_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive = os.path.join(tmp, "nav.rpf")

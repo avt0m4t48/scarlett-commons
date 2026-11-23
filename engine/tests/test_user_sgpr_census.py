@@ -39,6 +39,25 @@ def test_lowest_pointer_per_stage():
     assert s["vs"]["most_common_lowest_pointer_sgpr"] is None
 
 
+def test_tie_most_common_prefers_smaller_sgpr_regardless_of_insertion_order(tmp_path, capsys):
+    """Equal highest counts must pick the smaller SGPR, not depend on dict insertion order."""
+    forward = {"x": {"stage": "ps", "user_sgpr_reads": reads((8, "ptr32_lo"))},
+               "y": {"stage": "ps", "user_sgpr_reads": reads((9, "ptr32_lo"))}}
+    reversed_order = {"y": forward["y"], "x": forward["x"]}
+
+    a = usc.census(forward)
+    b = usc.census(reversed_order)
+    assert a["ps"]["most_common_lowest_pointer_sgpr"] == 8
+    assert b["ps"]["most_common_lowest_pointer_sgpr"] == 8
+
+    # --expect must agree for both orderings.
+    p = tmp_path / "index.json"
+    p.write_text(json.dumps(reversed_order), encoding="utf-8")
+    assert usc.main([str(p), "--expect", "ps=8"]) == 0
+    assert usc.main([str(p), "--expect", "ps=9"]) == 1
+    capsys.readouterr()
+
+
 def test_const_reads_are_not_pointers():
     s = usc.census({"x": {"stage": "ps", "user_sgpr_reads": reads((0, "const32"), (3, "const32"))}})
     assert s["ps"]["lowest_pointer_sgpr"] == {}

@@ -283,7 +283,14 @@ def parse_source_args(line):
     return bits[0], bits[1].rstrip(","), [x.strip() for x in args]
 
 
-def ref_program(lines, include_known=False):
+FMA_FOLD_ZERO_SIGN = ("NVIDIA's Vulkan driver folds a Fma whose operands are all constants with the sign of the zero from an "
+                      "underflowing product lost (measured on an RTX 4070: the same Fma on runtime operands gives the IEEE "
+                      "sign), so a flipped zero sign is not judged")
+
+
+def ref_program(lines, include_known=False, notes=None):
+    """The four exported words. ``notes`` (a list) receives (kind, destination register) for results a GPU oracle may
+    legitimately get wrong in a known way (see FMA_FOLD_ZERO_SIGN)."""
     vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, M32
     for line in lines:
         s = line.strip()
@@ -374,7 +381,10 @@ def ref_program(lines, include_known=False):
             # With VCC set the result is scaled by 2^+128 when exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise: the
             # gfx1036 measurement in the docs/design.md v_div_fmas row (the older rule was a fixed 2^64).
             if vcc: exact *= Fraction(2) ** (128 if ((z >> 52) & 0x7FF) > 1023 else -128)
-            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(round_fraction(exact))
+            d = int(dst[2:-1].split(":")[0]); result = round_fraction(exact)
+            if notes is not None and is_zero(z) and exact != 0 and is_zero(result) and (result ^ z) & 0x8000000000000000:
+                notes.append(("fma-fold-zero-sign", d))      # an underflowing product against an opposite-signed zero
+            vgpr[d], vgpr[d + 1] = bits_to_words(result)
         else:
             raise HarnessError(f"reference does not implement {op}")
     return [vgpr.get(r, 0) & M32 for r in range(8, 12)]
@@ -622,7 +632,8 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
                 return "skip", f"KNOWN_DIVERGENCE fclamp-nan-zero: {KNOWN_DIVERGENCES['fclamp-nan-zero']}", None, None
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
-    try: expected = ref_program(lines, include_known)
+    notes = []
+    try: expected = ref_program(lines, include_known, notes)
     except SkipCase as exc: return "skip", str(exc), None, None
     except (ArithmeticError, IndexError, KeyError, ValueError) as exc:
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None
@@ -639,7 +650,13 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
     try: actual = run_gpu(lines, name, tmp, gpu) if oracle == "gpu" else translate(lines, name, tmp)
     except (rdna2spirv.Unsupported, UnsupportedConstruct, SkipCase) as exc: return "skip", f"{type(exc).__name__}: {exc}", expected, None
     except (IndexError, KeyError, ValueError, OverflowError) as exc: return "skip", f"translator/interpreter limitation: {type(exc).__name__}: {exc}", expected, None
-    return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
+    if equivalent(expected, actual, output_kind(lines)): return "match", "", expected, actual
+    if oracle == "gpu":
+        for kind, d in notes:
+            if kind == "fma-fold-zero-sign" and d in (8, 10):
+                flipped = list(expected); flipped[d - 8 + 1] ^= 0x80000000      # the high word of v[d:d+1]
+                if equivalent(flipped, actual, output_kind(lines)): return "skip", FMA_FOLD_ZERO_SIGN, expected, actual
+    return "mismatch", "word comparison", expected, actual
 
 
 def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=None, include_known=False):

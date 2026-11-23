@@ -279,6 +279,49 @@ class F64DiffTests(unittest.TestCase):
                                       "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], v[10:11]"])
                 self.assertEqual(fd.words_to_bits(*got[:2]) >> 32, want_hi)
 
+    # A Fma of constant operands whose product underflows, against an opposite-signed zero: the RTX 4070 driver folds it
+    # to the wrong zero sign (the same Fma on runtime operands is IEEE: -0), so a GPU result that differs only in that
+    # sign is a counted skip (FMA_FOLD_ZERO_SIGN), never a pass for anything else.
+    TINY = "0x1a700000"                       # high word of 2^-600
+    FMAS_UNDERFLOW = ["v_mov_b32 v12, 0x0", f"v_mov_b32 v13, {TINY}", "v_mov_b32 v14, 0x0",
+                      "v_mov_b32 v15, 0x9a700000"]               # 2^-600 * -2^-600 underflows to -0
+
+    def fmas(self, addend):
+        return [*self.FMAS_UNDERFLOW, f"v_div_fmas_f64 v[8:9], v[12:13], v[14:15], {addend}"]
+
+    def test_ref_program_flags_an_underflowing_fma_against_an_opposite_zero(self):
+        for addend, flagged in (("0", True), ("-0.0", False), ("1.0", False)):
+            with self.subTest(addend=addend):
+                notes = []
+                words = fd.ref_program(self.fmas(addend), notes=notes)
+                self.assertEqual(notes, [("fma-fold-zero-sign", 8)] if flagged else [])
+                if flagged: self.assertEqual(words[:2], [0, 0x80000000])          # the IEEE result is -0
+        notes = []                      # symmetric: a +0 result against a -0 addend is flagged too (its GPU sign is unobserved)
+        fd.ref_program([*self.FMAS_UNDERFLOW[:3], f"v_mov_b32 v15, {self.TINY}",
+                        "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], -0.0"], notes=notes)
+        self.assertEqual(notes, [("fma-fold-zero-sign", 8)])
+
+    def test_gpu_zero_sign_difference_of_a_folded_fma_is_a_counted_skip(self):
+        lines = self.fmas("0")
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = fd.ref_program(lines)
+            def gpu(words):
+                return mock.patch.object(fd, "run_gpu", return_value=words)
+            with gpu([expected[0], expected[1] ^ 0x80000000, expected[2], expected[3]]):      # +0 instead of -0
+                status, reason, _, actual = fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})
+            self.assertEqual((status, reason), ("skip", fd.FMA_FOLD_ZERO_SIGN))
+            self.assertEqual(actual[1], 0)
+            with gpu(list(expected)):
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "match")
+            with gpu([expected[0], expected[1] ^ 0x80000000, expected[2] ^ 1, expected[3]]):  # something else differs too
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+            with gpu([expected[0] ^ 1, expected[1], expected[2], expected[3]]):               # a real low-word mismatch
+                self.assertEqual(fd.run_one(lines, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+            normal = self.fmas("1.0")                                                           # no zero involved: a flip is real
+            wrong = fd.ref_program(normal)
+            with gpu([wrong[0], wrong[1] ^ 0x80000000, wrong[2], wrong[3]]):
+                self.assertEqual(fd.run_one(normal, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+
     def test_frexp_table(self):
         half = 0x3FE0000000000000
         table = [

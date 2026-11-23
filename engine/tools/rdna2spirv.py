@@ -10296,20 +10296,48 @@ class Gen:
                 self.mask_dst(sd, m)
         elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
             # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended
-            # (u16) or sign-extended (i16); op_sel bits 0 / 1 read the high half of S0 / S1. S2 and D are whole
-            # dwords, so an op_sel bit on them, and clamp, are not modelled: rejected rather than guessed.
+            # (u16) or sign-extended (i16); op_sel bits 0 / 1 read the high half of S0 / S1. Measured on RDNA2
+            # (gfx1036, raw kernels, wave32 and wave64, EGEN-HW-MAD-U32-U16) for the other bits: op_sel bit 2 adds
+            # S2[31:16] zero-extended, also in the i16 op (S2 = 0xffff8000 adds 0xffff); op_sel bit 3 writes the
+            # result shifted left by 16 (low half 0, the old D not kept); clamp saturates the sum to [0, 0xffffffff]
+            # (u16) or [0x80000000, 0x7fffffff] (i16), before that shift.
             sel, dhi = self.opsel_bits(mods, 3)
-            if sel[2] or dhi or "clamp" in mods:
-                raise Unsupported(op + " op_sel/clamp")
-            ext = "OpBitFieldSExtract" if op == "v_mad_i32_i16" else "OpBitFieldUExtract"
+            signed = op == "v_mad_i32_i16"
+            ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             hs = []
             for i, src in enumerate(a[1:3]):
                 h = self.tmp()
                 self.emit(f"{h} = {ext} %uint {self.src_u(src)} {self.cu(16 * sel[i])} {self.cu(16)}")
                 hs.append(h)
+            c = self.src_u(a[3])
+            if sel[2]:
+                c2 = self.tmp()
+                self.emit(f"{c2} = OpShiftRightLogical %uint {c} {self.cu(16)}")
+                c = c2
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpIMul %uint {hs[0]} {hs[1]}")
-            self.emit(f"{r} = OpIAdd %uint {m} {self.src_u(a[3])}")
+            self.emit(f"{r} = OpIAdd %uint {m} {c}")
+            if "clamp" in mods:
+                # Two 16-bit halves never overflow their 32-bit product, so only the addition can: unsigned when
+                # the sum is below the product, signed when product and addend share a sign the sum lacks.
+                ov, sat, rs = self.tmp(), self.tmp(), self.tmp()
+                if signed:
+                    x1, x2, both, neg = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{x1} = OpBitwiseXor %uint {r} {m}")
+                    self.emit(f"{x2} = OpBitwiseXor %uint {r} {c}")
+                    self.emit(f"{both} = OpBitwiseAnd %uint {x1} {x2}")
+                    self.emit(f"{ov} = OpSLessThan %bool {self.as_int(both)} {self.as_int(self.cu(0))}")
+                    self.emit(f"{neg} = OpSLessThan %bool {self.as_int(c)} {self.as_int(self.cu(0))}")
+                    self.emit(f"{sat} = OpSelect %uint {neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                else:
+                    self.emit(f"{ov} = OpULessThan %bool {r} {m}")
+                    sat = self.cu(0xFFFFFFFF)
+                self.emit(f"{rs} = OpSelect %uint {ov} {sat} {r}")
+                r = rs
+            if dhi:
+                rd = self.tmp()
+                self.emit(f"{rd} = OpShiftLeftLogical %uint {r} {self.cu(16)}")
+                r = rd
             self.dst(a[0], r)
         elif op in ("v_dot4_i32_i8", "v_dot4c_i32_i8"):
             # The four products of the signed bytes of two dwords, summed, plus an addend: the third source for

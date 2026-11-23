@@ -37,6 +37,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
+                          Measured on gfx1036 (ps_valu16_mad_sel.asm): op_sel bit 2 adds S2[31:16] zero-extended
+                          (i16 too), bit 3 writes the result << 16, clamp saturates to u32 / i32 before that shift.
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
   16-bit SDWA ops       with dst_sel:DWORD the 16-bit result is written zero-extended: the high half of D is
     (v_add/mul_f16,       cleared whatever dst_unused says (measured on gfx1036, ps_sdwa_dword_hi.asm).
@@ -97,6 +99,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_VALU16_MAD_SEL = [0x00008003, 0xDB880000, 0xFFFFFFFF, 0x80000000]     # hardware-measured
 # ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
 EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 # ps_vint_*: 32-bit integer VALU ops on the heap VINT_HEAP (h0..h7, the words check.py's VINT_ENV seeds).
@@ -341,6 +344,16 @@ def reference_valu16_mad():
             _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
 
 
+def reference_valu16_mad_sel():
+    # op_sel bit 2 adds S2[31:16] zero-extended; bit 3 shifts the result left by 16; clamp saturates the sum.
+    v0, v1, v3, v5, v6, v7 = 0x1234FFFF, 0x5678FFFE, 0x8001FFF0, 0x00018000, 0xFFFF7FFF, 0x80000000
+    x = _mad_32_16(True, v0, v1, v3 >> 16)
+    y = (_mad_32_16(False, v0, v1, v3, sel=(1, 0)) << 16) & 0xFFFFFFFF
+    z = min((v0 & 0xFFFF) * (v0 & 0xFFFF) + v3, 0xFFFFFFFF)
+    w = max(-(1 << 31), min((1 << 31) - 1, -32768 * 32767 - (1 << 31))) & 0xFFFFFFFF   # v5.lo * v6.lo + v7
+    return [x, y, z, w]
+
+
 def reference_sdwa_dword_hi():
     # Low/high halves of the sources: v2.lo 1.0, v4.lo 3.0, v4.hi -2.0, v6.hi 7. Each result is the 16-bit value
     # alone; nothing of the destinations' 0xdeadbeef is left.
@@ -491,6 +504,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_valu16_mad_sel(), EXPECTED_VALU16_MAD_SEL)
         self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
         self.assertEqual(reference_vint(), EXPECTED_VINT)
         self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
@@ -561,6 +575,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
         # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
         self.check("ps_valu16_mad", EXPECTED_VALU16_MAD)
+
+    def test_mad_u32_u16_i32_i16_op_sel_s2_d_and_clamp(self):
+        # EGEN-HW-MAD-U32-U16: S2's high half zero-extended even in the i16 op (0x8001, not -32767), the result
+        # shifted into D's high half, and u32 / i32 saturation; all four used to be Unsupported.
+        self.check("ps_valu16_mad_sel", EXPECTED_VALU16_MAD_SEL)
 
     def test_subrev_f16_reversed_and_keeps_high_half(self):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also

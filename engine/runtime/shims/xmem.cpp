@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -549,7 +550,10 @@ bool unmap_range(uintptr_t start, uintptr_t end) {
         const uintptr_t base = it->first;
         const View view = it->second;
         const uintptr_t view_end = base + view.count * kPhysicalPageSize;
-        const SplitGuard guard(base, view_end);
+        // Only a view that keeps pages outside the range is published. A fault on a view unmapped whole is a real
+        // fault, and publishing that view would push the split before it out of g_last_split.
+        std::optional<SplitGuard> guard;
+        if (base < start || view_end > end) guard.emplace(base, view_end);
         if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(base),
                                            MEM_PRESERVE_PLACEHOLDER)) {
             return false;

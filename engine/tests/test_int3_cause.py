@@ -255,6 +255,35 @@ class Int3CauseTest(unittest.TestCase):
         self.assertIn("1  a constant (0)", text)
         self.assertIn("1  the result of xmem.dll!XMemFoo", text)
 
+    def test_the_indexes_find_what_a_full_scan_finds(self):
+        # Call, jump and store sources come from sorted indexes built once per image. A scan of every code byte for
+        # the same patterns finds the same sources for every target, in address order.
+        image = int3_cause.Image(self.data)
+        limit = 1 << (image._shift - 2)
+        rel32, stores = {}, {}
+        for base, data in image.code.sections:
+            for m in int3_cause._REL32.finditer(data):
+                if m.end() + 4 <= len(data):
+                    to = base + m.end() + 4 + struct.unpack_from("<i", data, m.end())[0]
+                    kind = {0xE8: "call", 0xE9: "jmp"}.get(data[m.start()], "jcc")
+                    rel32.setdefault(to, []).append((base + m.start(), kind))
+            for m in int3_cause._RIP_STORE.finditer(data):
+                op = data[m.start()]
+                if (op in (0xC6, 0xC7) and data[m.start() + 1] != 0x05) or m.end() + 4 > len(data):
+                    continue
+                to = base + m.end() + 4 + {0xC6: 1, 0xC7: 4}.get(op, 0) + struct.unpack_from("<i", data, m.end())[0]
+                stores.setdefault(to, []).append(base + m.start())
+        rel32 = {t: v for t, v in rel32.items() if 0 <= t < limit}
+        self.assertGreaterEqual(len(rel32), 5)
+        for target, sources in rel32.items():
+            self.assertEqual(image.rel32_from(target), sources, hex(target))
+        for target, sources in stores.items():
+            if 0 <= target < limit:
+                self.assertEqual(image.stores_to(target), sources, hex(target))
+        self.assertEqual(len(image.stores_to(GLOBAL_PTR)), 2)
+        self.assertEqual(image.rel32_from(GLOBAL_PTR), [])
+        self.assertEqual(image.stores_to(CHECK), [])
+
     def test_any_instruction_names_the_branches_that_decide_it_runs(self):
         out = int3_cause.cause(self.data, [hex(IMPORT_CHECK + 0x11), hex(IMPORT_CHECK)], any_instruction=True)
         ok = out[hex(IMPORT_CHECK + 0x11)]                  # add rsp, 0x28 on the success path

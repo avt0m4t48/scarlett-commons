@@ -59,11 +59,13 @@ read, 1 when one is not, 2 when the image can't be read. Standard library only.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import re
 import struct
 import sys
+from array import array
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -79,6 +81,8 @@ MAX_LINKS = 16              # jumps in or call sites followed per function
 MAX_SITES = 256             # call sites read for an argument the stop depends on
 MAX_STORES = 64             # stores read per global the stop depends on
 _RIP_STORE = re.compile(rb"[\x88\x89\xc6\xc7][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]")
+_REL32 = re.compile(rb"\xe8|\xe9|\x0f[\x80-\x8f]")
+_REL32_KINDS = ("call", "jmp", "jcc")
 ARGUMENTS = {RCX: 1, RDX: 2, R8: 3, R9: 4}
 
 JCC = ("jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja", "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg")
@@ -113,6 +117,11 @@ class Image:
         self.slots = import_slots(self.img)
         self._runs = {}
         self._flows = {}
+        self._rel32 = None   # sorted target << shift | rva << 2 | kind, for every rel32 call/jmp/jcc pattern
+        self._stores = None  # sorted target << shift | rva, for every `mov [rip+x], r/imm` pattern
+        # Room for any RVA of the image (code targets and globals alike), plus two bits for the kind.
+        ends = [self.img.size_of_image] + [b + len(d) for b, d in self.code.sections]
+        self._shift = max(ends).bit_length() + 2
 
     # ---- decoding ----
 
@@ -149,6 +158,56 @@ class Image:
 
     def lands_on(self, func, rva: int) -> bool:
         return rva in self.flow(func)[1]
+
+    # ---- indexes: one pass over the code, built on first use, then a bisect per target ----
+    #
+    # Each entry packs (target, rva, kind) into one integer that sorts by target, then rva, so a lookup is a bisect
+    # on the target's range and the results come out in address order, as a scan would find them. Matches are the
+    # same non-overlapping regex matches a scan sees; a pattern that is not really an instruction is dropped later,
+    # when the caller checks that decoding the function lands on it.
+
+    def _lookup(self, index: array, target: int):
+        lo = bisect.bisect_left(index, target << self._shift)
+        hi = bisect.bisect_left(index, (target + 1) << self._shift)
+        return index[lo:hi]
+
+    def rel32_from(self, target: int):
+        """[(rva, kind)] of each rel32 call/jmp/jcc pattern aimed at target, in address order."""
+        if self._rel32 is None:
+            limit, shift, entries = 1 << (self._shift - 2), self._shift, []
+            for base, data in self.code.sections:
+                end = len(data) - 4
+                for m in _REL32.finditer(data):
+                    at = m.end()
+                    if at > end:
+                        continue
+                    to = base + at + 4 + struct.unpack_from("<i", data, at)[0]
+                    if 0 <= to < limit:
+                        kind = {0xE8: 0, 0xE9: 1}.get(data[m.start()], 2)
+                        entries.append(to << shift | (base + m.start()) << 2 | kind)
+            self._rel32 = array("Q", sorted(entries))
+        mask = (1 << (self._shift - 2)) - 1
+        return [(e >> 2 & mask, _REL32_KINDS[e & 3]) for e in self._lookup(self._rel32, target)]
+
+    def stores_to(self, target: int):
+        """RVAs of each `mov [rip+x], r/imm` pattern (its opcode) storing to target, in address order."""
+        if self._stores is None:
+            limit, shift, entries = 1 << (self._shift - 2), self._shift, []
+            for base, data in self.code.sections:
+                for m in _RIP_STORE.finditer(data):
+                    op = data[m.start()]
+                    if op in (0xC6, 0xC7) and data[m.start() + 1] != 0x05:
+                        continue
+                    at = m.end()
+                    if at + 4 > len(data):
+                        continue
+                    end = at + 4 + {0xC6: 1, 0xC7: 4}.get(op, 0)
+                    to = base + end + struct.unpack_from("<i", data, at)[0]
+                    if 0 <= to < limit:
+                        entries.append(to << shift | (base + m.start()))
+            self._stores = array("Q", sorted(entries))
+        mask = (1 << self._shift) - 1
+        return [e & mask for e in self._lookup(self._stores, target)]
 
     # ---- names ----
 
@@ -522,41 +581,21 @@ def guard(image: Image, func, k: int, taken: bool):
 def rel32_sources(image: Image, targets: set[int], skip):
     """RVAs of `jmp rel32`, `jcc rel32` and `call rel32` in executable sections whose target is in `targets`,
     outside the range `skip`, each with its kind."""
-    pattern = re.compile(rb"\xe8|\xe9|\x0f[\x80-\x8f]")
-    found = []
-    for base, data in image.code.sections:
-        for m in pattern.finditer(data):
-            at = m.end()
-            if at + 4 > len(data):
-                continue
-            target = base + at + 4 + struct.unpack_from("<i", data, at)[0]
-            rva = base + m.start()
-            if target in targets and not (skip[0] <= rva < skip[1]):
-                kind = {0xE8: "call", 0xE9: "jmp"}.get(data[m.start()], "jcc")
-                found.append((rva, kind, target))
-    return found
+    found = [(rva, kind, target) for target in targets for rva, kind in image.rel32_from(target)
+             if not (skip[0] <= rva < skip[1])]
+    return sorted(found)
 
 
 def global_writers(image: Image, target: int):
     """Each `mov [rip+x], r` / `mov [rip+x], imm` storing to the global at `target`, with what it stores."""
     found = []
-    for base, data in image.code.sections:
-        for m in _RIP_STORE.finditer(data):
-            op = data[m.start()]
-            if op in (0xC6, 0xC7) and data[m.start() + 1] != 0x05:
-                continue
-            at = m.end()
-            if at + 4 > len(data):
-                continue
-            end = at + 4 + {0xC6: 1, 0xC7: 4}.get(op, 0)
-            if base + end + struct.unpack_from("<i", data, at)[0] != target:
-                continue
-            for back in (0, 1, 2):                 # the opcode, or a REX / 66 prefix before it
-                rva = base + m.start() - back
-                func = image.function(rva)
-                if func is not None and image.lands_on(func, rva):
-                    found.append((rva, func))
-                    break
+    for at in image.stores_to(target):
+        for back in (0, 1, 2):                 # the opcode, or a REX / 66 prefix before it
+            rva = at - back
+            func = image.function(rva)
+            if func is not None and image.lands_on(func, rva):
+                found.append((rva, func))
+                break
     out = []
     for rva, func in found[:MAX_STORES]:
         k = image.flow(func)[1][rva]

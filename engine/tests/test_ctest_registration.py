@@ -25,8 +25,13 @@ def built_test_executables(text):
 
 
 def registered_commands(text):
-    # add_test may span lines, e.g. add_test(NAME x\n  COMMAND foo_test ...).
-    return set(re.findall(r"add_test\([^)]*?\bCOMMAND\s+\"?([A-Za-z0-9_]+)", text, re.S))
+    # add_test may span lines, e.g. add_test(NAME x\n  COMMAND foo_test ...). A test a CMake script drives names its
+    # executable as $<TARGET_FILE:foo_test> (add_test(NAME x COMMAND "${CMAKE_COMMAND}" "-DTEST=$<TARGET_FILE:foo_test>"
+    # -P check.cmake)); ctest runs that one too.
+    direct = re.findall(r"add_test\([^)]*?\bCOMMAND\s+\"?([A-Za-z0-9_]+)", text, re.S)
+    scripted = {name for body in re.findall(r"add_test\(([^)]*)\)", text)
+                for name in re.findall(r"\$<TARGET_FILE:([A-Za-z0-9_]+)>", body)}
+    return set(direct) | scripted
 
 
 class CTestRegistrationTest(unittest.TestCase):

@@ -431,10 +431,33 @@ def block4240_checks(data, block):
         ends = [(b, b + s * q) for b, s, q in zip(bias, scale, (0xFFFFFF, 0xFFFFFF, 0xFFFF))]
         if all(math.isfinite(e) for pair in ends for e in pair) and all(abs(e) <= 300 for pair in ends for e in pair):
             return {"positions_4240": n, "positions_4240_finite": n, "positions_4240_within_300m": n}
-    pos = positions_4240(data, block)
-    finite = [p for p in pos if all(math.isfinite(c) for c in p)]
-    return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
-            "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+
+    slots = {i: (tag, off) for i, tag, off in block["slots"]}
+    if slots.get(0, (None,))[0] != 0x42:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not a packed position (tag 0x42)")
+    axis = _u32(data, at + 0x6C)
+    if axis > 2:
+        raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
+
+    b0, b1, b2 = bias
+    s0, s1, s2 = scale
+    total = 0
+    finite_count = 0
+    within_300m_count = 0
+
+    slot0_off = slots[0][1]
+    for (q,) in struct.iter_unpack("<Q", memoryview(data)[at + slot0_off:at + slot0_off + 8 * n]):
+        total += 1
+        a = b0 + s0 * ((q >> 8) & 0xFFFFFF)
+        b = b1 + s1 * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
+        c = b2 + s2 * (q >> 48)
+        if math.isfinite(a) and math.isfinite(b) and math.isfinite(c):
+            finite_count += 1
+            if abs(a) <= 300 and abs(b) <= 300 and abs(c) <= 300:
+                within_300m_count += 1
+
+    return {"positions_4240": total, "positions_4240_finite": finite_count,
+            "positions_4240_within_300m": within_300m_count}
 
 
 def parse_group(data, at):
@@ -636,6 +659,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
+    counts_4240 = {b["vertices"] for b in others}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
             "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
@@ -654,8 +678,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
             "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
             "blocks_4240_flags": sorted({b["flags"] for b in others}),
             "blocks_4240_axes": sorted({b["axis"] for b in others}),
-            "groups_matching_4240_block_here": sum(1 for g in groups
-                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups if g["vertex_span"] in counts_4240),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}

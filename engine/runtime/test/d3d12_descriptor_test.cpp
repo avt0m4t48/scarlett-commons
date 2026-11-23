@@ -514,6 +514,23 @@ int main() {
                                                              __uuidof(ID3D12Resource), nullptr)) == allowed);
             EXPECT((device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX) == !allowed);
         }
+        // A sampled A8 texture of the retail boot's shape (2D 128x1, no flags, the full mip chain) is sized as its
+        // R8 image, at the default 64 KiB alignment and at the 4 KiB small-resource one it fits.
+        {
+            D3D12_RESOURCE_DESC line{};
+            line.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            line.Width = 128;
+            line.Height = 1;
+            line.DepthOrArraySize = 1;
+            line.Format = DXGI_FORMAT_A8_UNORM;
+            line.SampleDesc.Count = 1;
+            for (const UINT64 alignment : {UINT64(0), UINT64(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT)}) {
+                line.Alignment = alignment;
+                const D3D12_RESOURCE_ALLOCATION_INFO sized = device->GetResourceAllocationInfo(0, 1, &line);
+                EXPECT(sized.SizeInBytes != UINT64_MAX && sized.SizeInBytes > 0);
+                EXPECT(sized.Alignment == (alignment ? alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
+            }
+        }
         Ref<ID3D12Resource> byte_textures[2];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
         for (UINT f = 0; f < 2; ++f) {

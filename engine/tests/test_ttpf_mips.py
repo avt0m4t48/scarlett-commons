@@ -1189,6 +1189,27 @@ class SyntheticPoolTest(unittest.TestCase):
             self.assertIn(why, err.getvalue())
             self.assertIn(bad, err.getvalue())
 
+    def test_scan_skips_directories_named_like_pools(self):
+        root = os.path.join(self.tmp.name, "game")
+        standard = os.path.join(root, "data", "ttdb")
+        os.makedirs(os.path.join(standard, "backup.ttpf"))
+        os.makedirs(os.path.join(root, "pack", "patch", "data", "ttdb", "backup.ttpf"))
+
+        fallback = os.path.join(root, "extra", "backup.ttpf")
+        os.makedirs(fallback)
+        fallback_pool = os.path.join(fallback, "actual.ttpf")
+        build_pool(fallback_pool)
+        self.assertEqual(ttpf.find_pools(root), [fallback_pool])
+
+        standard_pool = os.path.join(standard, "actual.ttpf")
+        build_pool(standard_pool)
+        self.assertEqual(ttpf.find_pools(root), [standard_pool])
+        out = os.path.join(self.tmp.name, "scan.json")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["scan", root, "--json", out]), 0)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["total"]["pools"], 1)
+
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
         build_pool(path, meta=0x599)

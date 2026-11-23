@@ -104,6 +104,25 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             self.assertTrue((sub / "manifest.json").exists())
             self.assertEqual(dds.read_bytes()[:4], b"DDS ")
 
+    def test_unknown_mode_exits_nonzero_before_the_source_or_output_is_touched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "package.rpf"     # never created: the mode is rejected before the source is opened
+            out = root / "out"
+            bad = run("invalidmode", src, out)
+            self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+            self.assertIn("unknown mode 'invalidmode'", bad.stdout + bad.stderr)
+            self.assertNotIn("ok=0 fail=0 skip=0", bad.stdout, "an unknown mode still reported a finished run")
+            self.assertFalse(out.exists(), "an unknown mode created the output folder")
+            self.assertEqual([p.name for p in root.iterdir()], [], "an unknown mode touched the work folder")
+
+    def test_usage_lists_every_mode(self):
+        short = run()
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn("usage: rpf9dump", short.stdout)
+        for mode in ("ttpf", "models", "textures", "audio", "xma"):
+            self.assertIn(mode, short.stdout, f"usage does not list {mode}")
+
 
 if __name__ == "__main__":
     unittest.main()

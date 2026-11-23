@@ -326,6 +326,10 @@ for _t, _lit, _words in (
     ("u8", "255", [0xFF]), ("u8", "256", None), ("u8", "-1", None),
     ("i8", "127", [0x7F]), ("i8", "128", None), ("i8", "-128", [0xFFFFFF80]), ("i8", "-129", None),
     ("i8", "0xFF", [0xFFFFFFFF]), ("i8", "0x80", [0xFFFFFF80]),
+    # A signed hex literal (+0x...) is a value, not a bit pattern: it must fit the signed range (@mrbean56, #3931).
+    ("i16", "+0xFFFF", None), ("i16", "+0x8000", None), ("i16", "+0x7FFF", [0x7FFF]), ("i8", "+0x80", None),
+    ("i32", "+0xFFFFFFFF", None), ("i32", "+0x7FFFFFFF", [0x7FFFFFFF]), ("i64", "+0xFFFFFFFFFFFFFFFF", None),
+    ("u16", "+0xFFFF", [0xFFFF]), ("u32", "+0xFFFFFFFF", [0xFFFFFFFF]),
     ("u64", "18446744073709551615", [0xFFFFFFFF, 0xFFFFFFFF]), ("u64", "18446744073709551616", None),
     ("u64", "-1", None),
     ("i64", "-1", [0xFFFFFFFF, 0xFFFFFFFF]), ("i64", "9223372036854775807", [0xFFFFFFFF, 0x7FFFFFFF]),
@@ -344,6 +348,7 @@ for _t, _lit, _words in (
     ("i32", "-1", [0xFFFFFFFF]), ("i32", "2147483648", None),
     ("i16", "0xFFFF", [0xFFFFFFFF]), ("i16", "0x8000", [0xFFFF8000]), ("i16", "32768", None),
     ("u16", "65536", None), ("i8", "0x80", [0xFFFFFF80]),
+    ("i32", "+0xFFFFFFFF", None), ("i16", "+0x8000", None), ("i32", "0xFFFFFFFF", [0xFFFFFFFF]),
     ("u64", "18446744073709551615", [0xFFFFFFFF, 0xFFFFFFFF]), ("u64", "18446744073709551616", None),
     ("u64", "-1", None), ("i64", "-1", [0xFFFFFFFF, 0xFFFFFFFF]),
 ):

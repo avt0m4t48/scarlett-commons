@@ -151,7 +151,8 @@ def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
 
     As SPIRV-Tools reads it: an unsigned type takes 0..2^width-1 and no minus sign (not even -0); a signed type
     takes -2^(width-1)..2^(width-1)-1, or a hex literal 0..2^width-1 read as the bit pattern (0xFFFF for a 16-bit
-    signed type is -1). A type narrower than 32 bits fills its word as the spec says: zero-extended when unsigned,
+    signed type is -1). Only a bare hex literal is a bit pattern: with a sign (+0xFFFF) it is a value and must fit the
+    signed range, as SPIRV-Tools reads it. A type narrower than 32 bits fills its word as the spec says: zero-extended when unsigned,
     sign-extended when signed (0x8000 for a 16-bit signed type is 0xFFFF8000). Returns the value as an unsigned
     number of max(width, 32) bits.
     """
@@ -162,7 +163,7 @@ def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
             raise SpirvAsmError(f"line {lineno}: cannot put a negative number in an unsigned literal: {tok}")
         if val >> width:
             raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
-    elif re.match(r"\+?0[xX]", tok) and val >> width == 0:
+    elif re.match(r"0[xX]", tok) and val >> width == 0:
         if val >> (width - 1):
             val -= 1 << width
     elif not -(1 << (width - 1)) <= val < 1 << (width - 1):

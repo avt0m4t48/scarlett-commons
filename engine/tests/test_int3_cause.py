@@ -1,0 +1,210 @@
+"""Unit tests for tools/int3_cause.py: from an int3 back to the call whose result was tested, on an image built here.
+
+The image is tests/test_import_call_sites.py's PE32+ (xmem.dll imports XMemFoo, XMemBar and #7 behind thunks) with
+hand-assembled functions and a `.pdata` directory added:
+
+- an import call, `test eax, eax` and a `js` to a fail block at the end of the function;
+- a vtable slot call on an object loaded from a global, its result copied to ebx before the test;
+- a cold chunk with its own `.pdata` entry, reached by a `jne` from another function;
+- a handler that ends in int3 on every path, and a caller that calls it when a function returns nonzero in al.
+
+It needs no game files and no third-party packages.
+
+    python -I tests/test_int3_cause.py
+"""
+import contextlib
+import io
+import json
+import os
+import struct
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import int3_cause  # noqa: E402
+from gdk_runtime_calls import decode  # noqa: E402
+from test_import_call_sites import (IDATA_RVA, IMAGE_BASE, THUNK_BAR, THUNK_FOO, build_image,  # noqa: E402
+                                    rel32)
+
+PDATA_RVA = IDATA_RVA + 0x400
+GLOBAL_DEVICE = IDATA_RVA + 0x800
+GLOBAL_FLAG = IDATA_RVA + 0x808
+
+IMPORT_CHECK = 0x1100       # call XMemFoo; test eax, eax; js fail ... fail: lea; call XMemBar; int3
+IMPORT_STOP = 0x1122
+SLOT_CHECK = 0x1200         # this = [global]; call [vtable+0x180]; mov ebx, eax; test ebx, ebx; jns ok; int3
+SLOT_STOP = 0x121D
+HOT = 0x1300                # call 0x1600; cmp eax, 2; jne cold
+HOT_JNE = 0x130C
+COLD = 0x1400               # cold: mov ecx, 5; call XMemBar; int3
+COLD_STOP = 0x140A
+HANDLER = 0x1500            # cmp byte [flag], 1; jne stop; call XMemBar; stop: int3
+HANDLER_STOP = 0x1512
+STATUS = 0x1600             # xor eax, eax; ret
+CALLER = 0x1700             # call 0x1600; test al, al; je skip; call HANDLER; skip: ...
+CALLER_JE = 0x170B
+CALLER_CALL = 0x170D
+
+
+def call(at, target):
+    return b"\xe8" + rel32(at + 5, target)
+
+
+def rip(at, length, target):
+    """disp32 of a RIP-relative operand in an instruction of `length` bytes at `at` (the disp ends at length-tail)."""
+    return rel32(at + length, target)
+
+
+def functions():
+    """{start: (code bytes, end)}: the functions the image holds, each with its .pdata entry."""
+    f = {}
+    a = IMPORT_CHECK
+    f[a] = (b"\x48\x83\xec\x28" + call(a + 4, THUNK_FOO) + b"\x85\xc0"             # sub rsp; call; test eax, eax
+            + b"\x0f\x88" + rel32(a + 0x11, a + 0x16)                               # js fail
+            + b"\x48\x83\xc4\x28\xc3"                                               # add rsp; ret
+            + b"\x48\x8d\x0d" + rip(a + 0x16, 7, GLOBAL_FLAG)                       # fail: lea rcx, [rip+x]
+            + call(a + 0x1D, THUNK_BAR) + b"\xcc")                                  # call XMemBar; int3
+    a = SLOT_CHECK
+    f[a] = (b"\x53\x48\x83\xec\x20"                                                 # push rbx; sub rsp, 0x20
+            + b"\x48\x8b\x0d" + rip(a + 5, 7, GLOBAL_DEVICE)                        # mov rcx, [rip+device]
+            + b"\x48\x8b\x01"                                                       # mov rax, [rcx]
+            + b"\xff\x90\x80\x01\x00\x00"                                           # call [rax+0x180]
+            + b"\x8b\xd8\x33\xc9\x85\xdb"                                           # mov ebx, eax; xor; test
+            + b"\x79\x01\xcc"                                                       # jns ok; int3
+            + b"\x48\x83\xc4\x20\x5b\xc3")                                          # ok: add rsp; pop rbx; ret
+    a = HOT
+    f[a] = (b"\x48\x83\xec\x28" + call(a + 4, STATUS) + b"\x83\xf8\x02"            # call STATUS; cmp eax, 2
+            + b"\x0f\x85" + rel32(a + 0x12, COLD)                                   # jne cold
+            + b"\x48\x83\xc4\x28\xc3")
+    a = COLD
+    f[a] = b"\xb9\x05\x00\x00\x00" + call(a + 5, THUNK_BAR) + b"\xcc"
+    a = HANDLER
+    f[a] = (b"\x48\x83\xec\x28" + b"\x80\x3d" + rip(a + 4, 7, GLOBAL_FLAG) + b"\x01"  # cmp byte [flag], 1
+            + b"\x75\x05" + call(a + 0xD, THUNK_BAR) + b"\xcc")                     # jne stop; call; stop: int3
+    f[STATUS] = b"\x33\xc0\xc3"
+    a = CALLER
+    f[a] = (b"\x48\x83\xec\x28" + call(a + 4, STATUS) + b"\x84\xc0"                # call STATUS; test al, al
+            + b"\x74\x05" + call(a + 0xD, HANDLER)                                  # je skip; call HANDLER
+            + b"\x48\x83\xc4\x28\xc3")                                              # skip: add rsp; ret
+    return {start: (code, start + len(code)) for start, code in f.items()}
+
+
+def build():
+    buf = bytearray(build_image([]))
+    entries = sorted(functions().items())
+    for start, (code, end) in entries:
+        buf[start:end] = code
+    for i, (start, (_, end)) in enumerate(entries):
+        struct.pack_into("<III", buf, PDATA_RVA + i * 12, start, end, 0)
+    struct.pack_into("<II", buf, 0x58 + 112 + 3 * 8, PDATA_RVA, len(entries) * 12)  # exception directory
+    return bytes(buf)
+
+
+class Int3CauseTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.data = build()
+
+    def one(self, address):
+        return int3_cause.cause(self.data, [address])[address]
+
+    def test_layout_matches_the_named_offsets(self):
+        f = functions()
+        self.assertEqual(f[IMPORT_CHECK][0][IMPORT_STOP - IMPORT_CHECK], 0xCC)
+        self.assertEqual(f[SLOT_CHECK][0][SLOT_STOP - SLOT_CHECK], 0xCC)
+        self.assertEqual(f[COLD][0][COLD_STOP - COLD], 0xCC)
+        self.assertEqual(f[HANDLER][0][HANDLER_STOP - HANDLER], 0xCC)
+        self.assertEqual(f[HOT][0][HOT_JNE - HOT:HOT_JNE - HOT + 2], b"\x0f\x85")
+        self.assertEqual(f[CALLER][0][CALLER_CALL - CALLER], 0xE8)
+
+    def test_an_import_result_tested_far_from_the_stop(self):
+        r = self.one(f"exe+{IMPORT_STOP:#x}")
+        self.assertEqual((r["stop"], r["at"], r["function"]), ("int3", IMPORT_STOP, [IMPORT_CHECK, IMPORT_STOP + 1]))
+        self.assertFalse(r["never_returns"])
+        [g] = r["guards"]
+        self.assertEqual((g["jump"], g["doomed_side"], g["condition"]), ("js", "taken", "eax < 0"))
+        [reg] = g["registers"]
+        self.assertEqual((reg["register"], reg["import"], reg["call"]), ("rax", "xmem.dll!XMemFoo", IMPORT_CHECK + 4))
+
+    def test_a_vtable_slot_result_copied_before_the_test(self):
+        r = self.one(f"{SLOT_STOP:x}")
+        [g] = r["guards"]
+        self.assertEqual((g["jump"], g["doomed_side"], g["condition"]), ("jns", "fall-through", "ebx < 0"))
+        [reg] = g["registers"]
+        self.assertEqual((reg["slot"], reg["this_global"], reg.get("copied")), (48, GLOBAL_DEVICE, True))
+
+    def test_a_cold_chunk_reached_from_another_function(self):
+        r = self.one(hex(COLD_STOP))
+        self.assertEqual(r["guards"], [])
+        [j] = r["jumps_in"]
+        self.assertEqual((j["from_function"], j["branch"], j["jump"]), ([HOT, HOT_JNE + 0xB], HOT_JNE, "jne"))
+        self.assertEqual(j["condition"], "eax != 2")
+        self.assertEqual(j["registers"][0]["function"], STATUS)
+        self.assertEqual(r["callers"], [])
+
+    def test_a_handler_that_never_returns_is_read_at_its_callers(self):
+        r = self.one(hex(IMAGE_BASE + HANDLER_STOP))         # a virtual address
+        self.assertEqual(r["at"], HANDLER_STOP)
+        self.assertTrue(r["never_returns"])
+        self.assertEqual(r["guards"], [])
+        [c] = r["callers"]
+        self.assertEqual((c["at"], c["function"][0]), (CALLER_CALL, CALLER))
+        [g] = c["guards"]
+        self.assertEqual((g["branch"], g["jump"], g["doomed_side"], g["condition"]),
+                         (CALLER_JE, "je", "fall-through", "al != 0"))
+        self.assertEqual(g["registers"][0]["function"], STATUS)
+
+    def test_wine_reports_the_address_after_the_int3(self):
+        r = self.one(f"exe+{IMPORT_STOP + 1:#x}")
+        self.assertEqual((r["rva"], r["at"]), (IMPORT_STOP + 1, IMPORT_STOP))
+        self.assertEqual(r["guards"][0]["condition"], "eax < 0")
+
+    def test_comparisons_read_as_conditions(self):
+        def cond(code, jcc_cc):
+            insn = decode(code, 0, 0)
+            self.assertEqual(insn.size, len(code))
+            return int3_cause.condition(int3_cause.read_test(insn, code), jcc_cc)
+        self.assertEqual(cond(b"\x83\xf8\xff", 0x2), "eax <u 0xffffffff")       # cmp eax, -1; jb
+        self.assertEqual(cond(b"\x83\xf8\xff", 0x4), "eax == -1")
+        self.assertEqual(cond(b"\x48\x3b\xc1", 0xC), "rax < rcx")                # cmp rax, rcx; jl
+        self.assertEqual(cond(b"\xa8\x01", 0x5), "(al & 0x1) != 0")              # test al, 1; jne
+        self.assertEqual(cond(b"\xf6\xc4\x02", 0x4), "(ah & 0x2) == 0")          # test ah, 2; je
+        self.assertEqual(cond(b"\x83\xe0\x03", 0x5), "(eax & 0x3) != 0")         # and eax, 3; jne
+        self.assertEqual(cond(b"\x0f\xa3\xc1", 0x3), "bit eax of ecx is clear")   # bt ecx, eax; jae
+        self.assertEqual(cond(b"\x0f\xba\xe0\x05", 0x2), "bit 5 of eax is set")   # bt eax, 5; jb
+        self.assertEqual(cond(b"\x85\xc0", 0x2), None)                          # test; jb: never taken
+
+    def test_text_and_exit_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = int3_cause.main([path, f"exe+{SLOT_STOP:#x}", hex(HANDLER_STOP)])
+            self.assertEqual(status, 0)
+            text = out.getvalue()
+            self.assertIn(f"jns at {SLOT_STOP - 2:#x}, fall-through side: stops when ebx < 0", text)
+            self.assertIn(f"rbx: a copy of the result of vtable slot 48 (this: global {GLOBAL_DEVICE:#x})", text)
+            self.assertIn("never returns", text)
+            self.assertIn(f"call at {CALLER_CALL:#x} in function {CALLER:#x}", text)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = int3_cause.main([path, hex(IMPORT_CHECK), "--json"])
+            self.assertEqual(status, 1)                      # not a stop
+            self.assertIsNone(json.loads(out.getvalue())[hex(IMPORT_CHECK)]["stop"])
+
+            err = io.StringIO()
+            with open(os.path.join(tmp, "bad.exe"), "wb") as f:
+                f.write(b"MZ" + bytes(62))
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(int3_cause.main([os.path.join(tmp, "bad.exe"), "0x1000"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

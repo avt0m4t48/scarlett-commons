@@ -3,8 +3,9 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo,
-// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths and the HRESULTs of invalid
-// arguments to resource, heap, queue and fence creation and Map are compared with the host PC runtime's
+// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths, fence semantics and the
+// HRESULTs of invalid arguments to resource, heap, queue and fence creation and Map are compared with the host PC
+// runtime's
 // (LEONIDA_D3D49_VERBOSE=1 prints every argument case). WriteToSubresource/ReadFromSubresource run on
 // devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
@@ -4807,6 +4808,54 @@ int compare_check_feature_support(ID3D12Device* ours) {
     return mismatches;
 }
 
+// Fences and queues must follow the host runtime's semantics: Signal raises the completed value and a null event set
+// for a reached value blocks until then. Runs the same sequence on ours and the host and compares the completed value
+// and the HRESULT at each step. A signal of an already-passed (lower) value is a documented deviation: the shim drops
+// it and stays monotonic because a Vulkan timeline cannot go back, so that case is checked against the documented
+// behaviour rather than the host. Returns the number of mismatches, or -1 when the host has no D3D12 device.
+int compare_fences(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> oq, hq;
+    Ref<ID3D12Fence> of, hf;
+    if (FAILED(ours->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&oq.p))) ||
+        FAILED(host->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&hq.p))) ||
+        FAILED(ours->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&of.p))) ||
+        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hf.p))))
+        return -1;
+    int mismatches = 0;
+    const auto check = [&](const char* what, UINT64 a, UINT64 b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours %llu host %llu\n", what, static_cast<unsigned long long>(a),
+                         static_cast<unsigned long long>(b));
+    };
+    const auto check_hr = [&](const char* what, HRESULT a, HRESULT b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours 0x%08x host 0x%08x\n", what, static_cast<unsigned>(a),
+                         static_cast<unsigned>(b));
+    };
+    // A signal raises the completed value; a null event blocks until it is reached.
+    check_hr("signal 5", oq->Signal(of.p, 5), hq->Signal(hf.p, 5));
+    check_hr("block to 5", of->SetEventOnCompletion(5, nullptr), hf->SetEventOnCompletion(5, nullptr));
+    check("completed at 5", of->GetCompletedValue(), hf->GetCompletedValue());
+    // A higher signal raises it again.
+    check_hr("signal 9", oq->Signal(of.p, 9), hq->Signal(hf.p, 9));
+    check_hr("block to 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    check("completed at 9", of->GetCompletedValue(), hf->GetCompletedValue());
+    // An event for an already-reached value returns at once.
+    check_hr("event at reached 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    // A signal of an already-passed (lower) value: the host is free to lower the fence on some drivers, but a Vulkan
+    // timeline only increases. The shim deliberately drops it and keeps the higher value (see Fence::claim in
+    // d3d12_com.cpp), so this is checked against the documented behaviour, not the host.
+    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), S_OK);
+    if (of->GetCompletedValue() != 9 && mismatches++ < 24)
+        std::fprintf(stderr, "fence lower signal: ours %llu, want 9\n",
+                     static_cast<unsigned long long>(of->GetCompletedValue()));
+    return mismatches;
+}
+
 }  // namespace
 
 int main() {
@@ -5326,6 +5375,10 @@ int main() {
         if (feature_error_mismatches < 0)
             std::printf("CheckFeatureSupport error paths: no host D3D12 device to compare with, skipped\n");
         EXPECT(feature_error_mismatches <= 0);
+        const int fence_mismatches = compare_fences(device.p);
+        if (fence_mismatches < 0)
+            std::printf("Fences: no host D3D12 device to compare with, skipped\n");
+        EXPECT(fence_mismatches <= 0);
 
         // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
         // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
@@ -7844,6 +7897,6 @@ int main() {
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
                 "BC copies, a resolve, reserved resources, queries, GetCopyableFootprints, GetResourceTiling and "
-                "CheckFeatureSupport error paths all matched\n");
+                "CheckFeatureSupport error paths and fence semantics all matched\n");
     return 0;
 }

@@ -15,6 +15,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
@@ -564,7 +565,8 @@ struct DeviceState {
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
     // dwords 32-33) is its device address. It is at most 4 GiB, so every VA fits the 32-bit descriptor-table
-    // pointers some shaders use. The first 64 KiB are never handed out, so no resource has VA 0.
+    // pointers some shaders use, and no larger than the device's maxBufferSize and maxMemoryAllocationSize
+    // (src/arena_size.h). The first 64 KiB are never handed out, so no resource has VA 0.
     struct Arena {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -4407,6 +4409,10 @@ public:
                     conservative.primitiveOverestimationSize, conservative.degenerateTrianglesRasterized == VK_TRUE));
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+                const leonida::ArenaLimits limits = leonida::query_arena_limits(get_props2, info.physical);
+                if (!state_.info.max_buffer_size) state_.info.max_buffer_size = limits.max_buffer_size;
+                if (!state_.info.max_memory_allocation_size)
+                    state_.info.max_memory_allocation_size = limits.max_allocation_size;
             }
         }
 
@@ -4671,19 +4677,20 @@ public:
         return true;
     }
 
-    // LEONIDA_ARENA_MB sets its size (default 256, at most 4095): it holds every default-heap buffer, shader-
-    // visible descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
+    // LEONIDA_ARENA_MB sets its size (default 256, at most 4095, and no more than the device's maxBufferSize and
+    // maxMemoryAllocationSize allow: src/arena_size.h): it holds every default-heap buffer, shader-visible
+    // descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
     bool create_arena() {
         auto& vk = state_.context->vk;
         if (!vk.vkGetBufferDeviceAddress) return false;
-        VkDeviceSize megabytes = 256;
         char text[16] = {};
         size_t length = 0;
-        if (getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1)
-            megabytes = std::clamp<VkDeviceSize>(std::strtoull(text, nullptr, 10), 16, 4095);
+        const bool set = getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1;
+        const leonida::ArenaLimits limits{state_.info.max_buffer_size, state_.info.max_memory_allocation_size};
+        leonida::ArenaSize size = leonida::decide_arena_size(set ? text : nullptr, limits);
         auto& arena = state_.arena;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = megabytes << 20;
+        info.size = size.bytes;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -4695,12 +4702,35 @@ public:
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         state_.share(info);
-        if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
-            arena.buffer = VK_NULL_HANDLE;
-            return false;
-        }
         VkMemoryRequirements requirements{};
-        vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
+        const auto create_buffer = [&] {
+            if (info.size <= kArenaReserved ||
+                vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
+                arena.buffer = VK_NULL_HANDLE;
+                return false;
+            }
+            vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
+            return true;
+        };
+        if (!create_buffer()) return false;
+        // The allocation is requirements.size, which alignment can make larger than the buffer: past
+        // maxMemoryAllocationSize, make the buffer smaller by that much once.
+        if (limits.max_allocation_size && requirements.size > limits.max_allocation_size) {
+            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+            size = leonida::decide_arena_size(set ? text : nullptr, limits, requirements.size - info.size);
+            info.size = size.bytes;
+            if (!create_buffer()) return false;
+            if (requirements.size > limits.max_allocation_size) {
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                arena.buffer = VK_NULL_HANDLE;
+                return false;
+            }
+        }
+        if (size.capped)
+            std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB of the %llu MiB asked for, capped by the "
+                                 "device's %s\n",
+                         static_cast<unsigned long long>(size.bytes >> 20),
+                         static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
         arena.memory = state_.allocate(requirements,
                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
@@ -7919,6 +7949,14 @@ bool device_upload_in_vram(ID3D12Device* device) {
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
     return d && d->state().sparse_buffer_memory_types != 0;
+}
+
+std::uint64_t device_arena_size(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    return d ? d->state().arena.size : 0;
 }
 
 namespace {

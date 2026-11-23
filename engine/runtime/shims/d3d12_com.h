@@ -87,6 +87,10 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
+    // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
+    VkDeviceSize max_buffer_size = 0;
+    VkDeviceSize max_memory_allocation_size = 0;
     // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
     // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
     leonida::SubgroupSizeCaps subgroup;
@@ -234,6 +238,9 @@ bool device_upload_in_vram(ID3D12Device* device);
 
 // True when the device can map reserved buffers onto its D3D12 heaps.
 bool device_sparse_buffer_tiles(ID3D12Device* device);
+
+// The size in bytes of the device's GPU address arena, or 0 without one. For tests.
+std::uint64_t device_arena_size(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is

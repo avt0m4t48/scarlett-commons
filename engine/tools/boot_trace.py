@@ -19,7 +19,8 @@ strings instead of printing them, and only the tests' synthetic fixtures go into
 error classes from a real run, not its trace (AGENTS.md, "No game data").
 
 Standard library only; reads files, never runs them. A truncated last line (the expected shape after a crash) is
-counted, not fatal; a file with no valid event is an error (exit 2).
+counted, not fatal; a file with no valid event is an error (exit 2). When one of two requested traces fails to
+parse, the report still includes the other trace.
 """
 
 from __future__ import annotations
@@ -293,18 +294,22 @@ def main(argv=None) -> int:
     if a.limit < 1:
         print("error: --limit must be at least 1", file=sys.stderr)
         return 2
-    try:
-        startup = parse_startup(a.startup, a.limit) if a.startup else None
-        d3d12 = parse_d3d12(a.d3d12, a.limit) if a.d3d12 else None
-    except TraceError as e:
-        print(f"error: {e}", file=sys.stderr)
+    summary = summarize(None, None)
+    exit_code = 0
+    for section, path, parse in (("startup", a.startup, parse_startup), ("d3d12", a.d3d12, parse_d3d12)):
+        if path:
+            try:
+                summary[section] = parse(path, a.limit)
+            except TraceError as e:
+                print(f"error: {e}", file=sys.stderr)
+                exit_code = 2
+    if not any(summary.values()):
         return 2
-    summary = summarize(startup, d3d12)
     if a.json:
         print(json.dumps(summary, indent=1))
     else:
         print(format_text(summary, a.limit))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

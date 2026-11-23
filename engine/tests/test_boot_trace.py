@@ -259,6 +259,31 @@ class BootTraceTests(unittest.TestCase):
             self.assertEqual(bt.main(["--limit", "0", self.startup]), 2)
         self.assertIn("cannot read", err.getvalue())
 
+    def test_attach_failure_is_reported_before_any_d3d12_call(self):
+        self.write(self.startup, [{"kind": "error", "what": "guest.dll: DllMain returned FALSE"}])
+        self.write_lines(self.d3d12, ["error: guest.dll: DllMain returned FALSE"])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12]), 2)
+        self.assertIn("error: guest.dll: DllMain returned FALSE", out.getvalue())
+        self.assertIn("no [d3d12-trace] line", err.getvalue())
+
+    def test_missing_startup_preserves_d3d12_json(self):
+        self.write_lines(self.d3d12, ["[d3d12-trace] #1 CreateCommandQueue failed"])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12, "--json"]), 2)
+        self.assertIn("cannot read", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue()), bt.summarize(None, bt.parse_d3d12(self.d3d12)))
+
+    def test_no_report_when_neither_input_can_be_read(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12, "--json"]), 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(self.startup, err.getvalue())
+        self.assertIn(self.d3d12, err.getvalue())
+
     def test_d3d12_log_without_trace_lines_is_an_error(self):
         self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
         err = io.StringIO()

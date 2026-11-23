@@ -71,7 +71,7 @@ def parse_rbf0(data, string_limit=None):
     p = 8 if wide else 4
     scalar = 8 if wide else 4
     descs = []
-    stack = []                 # [attribute_count, attributes_seen]
+    stack = []                 # [attribute_count, attributes_seen, content_started]
     strings = []
     ints = []
     floats = []
@@ -168,7 +168,7 @@ def parse_rbf0(data, string_limit=None):
                 raise RbfError(f"unknown record type {kind:#04x}", at)
             values += 1
             types[TYPE_NAMES.get(kind, f"{kind:#04x}")] += 1
-            if stack and not stack[-1][2] and stack[-1][1] < stack[-1][0]:
+            if stack and stack[-1][1] < stack[-1][0]:
                 stack[-1][1] += 1
     except RbfError as exc:
         status = "truncated" if exc.truncated else "bad"

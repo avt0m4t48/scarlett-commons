@@ -1064,6 +1064,11 @@ std::uint64_t fence_completed_value_address(ChildProxy* self, std::uint64_t valu
 
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held. A fence's
 // mirror wait is unregistered first, waiting for a callback in flight, so none runs on a released fence.
+//
+// The mirror's last SetEventOnCompletion can still be pending on the real fence, and nothing cancels one: only the
+// fence's destruction drops it. So the event is closed only when this release destroyed the fence. When another
+// reference keeps the fence alive, the event stays open (one handle per such fence) and a later completion sets
+// that event, not a closed or reused handle.
 void destroy_child(ChildProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
@@ -1077,9 +1082,9 @@ void destroy_child(ChildProxy* self) {
         CloseThreadpoolWait(mirror->wait);
     }
     delete self;
-    if (real) real->Release();
+    const unsigned long left = real ? real->Release() : 0;
     if (mirror) {
-        if (mirror->event) CloseHandle(mirror->event);
+        if (mirror->event && left == 0) CloseHandle(mirror->event);
         delete mirror;
     }
     if (device) proxy_release(device);

@@ -120,6 +120,18 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+def ieee_nan(r, *operands):
+    """`r`, except that a NaN produced from non-NaN operands (inf - inf, 0 * inf) is the x86 "real indefinite" NaN.
+
+    The measured words pinned in the tests were taken with the default NaN of x86 SSE, 0xFFC00000 (sign set).
+    Python leaves the sign of such a NaN to the host CPU, and ARM64 (Apple Silicon, Linux on ARM) gives
+    0x7FC00000, so the tests passed on x86-64 only. A NaN that comes from a NaN operand is left alone: both
+    architectures pass that operand through with its sign."""
+    if r != r and not any(o != o for o in operands):
+        return -math.nan
+    return r
+
+
 class _F32(float):
     """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
 
@@ -142,7 +154,7 @@ def fma_f32(x, y, z):
     The product and sum are exact rationals; rounding them through a double first could land on a binary32
     midpoint and round the wrong way (for example (1 + 2**-12)**2 + 2**-70)."""
     if not all(math.isfinite(v) for v in (x, y, z)):
-        return f32(x * y + z)                 # inf/NaN rules: Python's float arithmetic follows IEEE here
+        return f32(ieee_nan(x * y + z, x, y, z))   # inf/NaN rules: Python's float arithmetic follows IEEE here
     exact = Fraction(x) * Fraction(y) + Fraction(z)
     if exact == 0:
         product_zero = x == 0.0 or y == 0.0
@@ -969,8 +981,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     return math.nan
                 return f32(p / q)       # x/inf is a signed zero, as in Python
 
-            fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
-                  "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]
+            fn = {"OpFAdd": (lambda p, q: f32(ieee_nan(p + q, p, q))),
+                  "OpFSub": (lambda p, q: f32(ieee_nan(p - q, p, q))),
+                  "OpFMul": (lambda p, q: f32(ieee_nan(p * q, p, q))), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))

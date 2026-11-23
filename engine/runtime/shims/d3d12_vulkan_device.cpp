@@ -1688,6 +1688,9 @@ public:
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
+    const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const { return in_arena_ ? UINT64(arena_offset_) : 0; }
+
 private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
@@ -5460,8 +5463,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                                  D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
-        // output is E_UNEXPECTED.
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE (non-zero
+        // D3D12_COMMAND_LIST_FLAGS are ignored by the host runtime), then a null output is E_UNEXPECTED.
         if (out) *out = nullptr;
         if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -5546,14 +5549,31 @@ public:
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* out) override {
         if (!out) return;
         *out = {};
+        if (!desc) return;
+        if (desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+            desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+            return;
+        if (desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+            return;
+        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        if (!is_tlas && desc->NumDescs > 0) {
+            if (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY) {
+                if (!desc->pGeometryDescs) return;
+            } else {
+                if (!desc->ppGeometryDescs) return;
+                for (UINT i = 0; i < desc->NumDescs; ++i)
+                    if (!desc->ppGeometryDescs[i]) return;
+            }
+        }
         auto& vk = state_.context->vk;
-        if (desc && state_.context->xdxr_acceleration_structures()) {
+        if (state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
             // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
             // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
             // update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
-            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            build.is_tlas = is_tlas;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
                 build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
             if (build.is_tlas) {
@@ -5562,9 +5582,9 @@ public:
                 for (UINT i = 0; i < desc->NumDescs; ++i) {
                     const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
                         (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
-                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
-                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
-                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                            ? desc->ppGeometryDescs[i]
+                            : &desc->pGeometryDescs[i];
+                    if (gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
                     leonida::RtTriangleGeometry t{};
                     t.vertex_count = gd->Triangles.VertexCount;
                     t.index_count = gd->Triangles.IndexCount;
@@ -5581,9 +5601,8 @@ public:
             out->UpdateScratchDataSizeInBytes = layout.scratch;
             return;
         }
-        if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
+        if (!state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
-        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         std::vector<VkAccelerationStructureGeometryKHR> geoms;
         std::vector<std::uint32_t> max_prims;
         if (is_tlas) {
@@ -5726,6 +5745,7 @@ public:
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
+        layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
@@ -7074,20 +7094,31 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
             *opts = {};
-            opts->DoublePrecisionFloatShaderOps = TRUE;
-            opts->OutputMergerLogicOp = TRUE;
+            // Answer what the layer will actually honour, not what the GPU offers: docs/d3d12_vulkan.md 4.1 says a
+            // false "supported" is worse than a false "unsupported" at boot, and the PSO paths refuse these same
+            // features when they are missing (logic ops, per the mapping vkd3d-proton's
+            // d3d12_device_caps_init_feature_options uses).
+            opts->DoublePrecisionFloatShaderOps = state_.info.features.shaderFloat64;
+            opts->OutputMergerLogicOp = state_.info.features.logicOp;
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
             opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
             opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
-            opts->PSSpecifiedStencilRefSupported = TRUE;
+            // No VK_EXT_shader_stencil_export is enabled and the translator emits no stencil-ref write, so a pixel
+            // shader that writes the stencil ref would be refused: answer unsupported, the direction 4.1 prefers.
+            opts->PSSpecifiedStencilRefSupported = FALSE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
-            opts->ROVsSupported = TRUE;
+            // POPS: the translator only declares PixelInterlockOrderedEXT, enabled exactly when the GPU offers
+            // VK_EXT_fragment_shader_interlock and its fragmentShaderPixelInterlock feature.
+            opts->ROVsSupported = state_.info.fragment_shader_interlock;
             opts->ConservativeRasterizationTier = state_.conservative_raster_tier;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
-            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
+            // A translated vertex shader writing a layer or viewport index needs both Vulkan 1.2 features enabled
+            // (vkCreateShaderModule refuses the module without them, VUID-...-pCode-08740).
+            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
+                state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
             return d3d12_trace::result(method, S_OK);
         }
@@ -8305,6 +8336,17 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
+IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base) {
+    if (!heap) return nullptr;
+    if (ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap)) heap = real;
+    const DescriptorHeap* d = DescriptorHeap::from<DescriptorHeap>(heap);
+    if (!d) return nullptr;
+    desc = d->raw_desc();
+    gpu_base = d->gpu_base();
+    return d->attached_device();
+}
+
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
@@ -8629,6 +8671,21 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
                                                                                 static_cast<uint32_t>(r.bottom - r.top)};
                                                                     }
                                                                     return {0, 0};
+                                                                },
+                                                                [create_surface, hinstance = GetModuleHandleW(nullptr),
+                                                                 hwnd = window, instance = info.instance]() -> VkSurfaceKHR {
+                                                                    // A lost surface (display gone) is remade for the
+                                                                    // same window; VulkanSwapchain never retained the
+                                                                    // hwnd, this callback does.
+                                                                    VkWin32SurfaceCreateInfoKHR surface_info{
+                                                                        VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+                                                                    surface_info.hinstance = hinstance;
+                                                                    surface_info.hwnd = hwnd;
+                                                                    VkSurfaceKHR made = VK_NULL_HANDLE;
+                                                                    if (create_surface(instance, &surface_info, nullptr,
+                                                                                       &made) != VK_SUCCESS)
+                                                                        return VK_NULL_HANDLE;
+                                                                    return made;
                                                                 });
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");

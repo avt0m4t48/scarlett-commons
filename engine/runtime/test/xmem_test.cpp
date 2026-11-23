@@ -4,6 +4,8 @@
 // convention the runtime installs for xmem.dll imports instead of a private copy of the implementation. The checks
 // cover what the measured call sites use: 64-byte-aligned allocations, XMemFree, working-set statistics with the
 // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
+// XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
+// nothing committed, and one trace event per distinct (type, size).
 #include <windows.h>
 #include <psapi.h>
 
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -27,6 +30,9 @@ using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 using XMemGetWriteWatchFn = UINT(WINAPI*)(DWORD, void*, SIZE_T, void**, ULONG_PTR*, ULONG*);
 using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
+// BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
+// samples call (see runtime/shims/xmem.cpp).
+using XMemTransferMemoryFn = BOOL(WINAPI*)(uint32_t, SIZE_T);
 constexpr uint32_t kMeasuredKind = 0x20000001;
 
 int g_checks = 0;
@@ -218,14 +224,35 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
           "unsupported large-page allocation is rejected before host allocation");
 
-    SetLastError(ERROR_SUCCESS);
-    void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+    // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
+    MEMORY_BASIC_INFORMATION mbi{};
+    void* const pool = virtual_alloc(nullptr, SIZE_T{8} << 30, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
+    check(pool != nullptr, "attributes 0x21 with 64 KiB pages reserves 8 GiB");
+    if (pool) {
+        check(VirtualQuery(pool, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE, "the 8 GiB pool is reserve-only");
+        check(VirtualFree(pool, 0, MEM_RELEASE), "release the 8 GiB pool");
+    }
+
+    void* const noaccess = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x3, 0x801);
+    check(noaccess != nullptr, "attributes 0x3 with protect PAGE_GRAPHICS_NOACCESS|PAGE_NOACCESS succeeds");
+    if (noaccess) {
+        check(VirtualQuery(noaccess, &mbi, sizeof mbi) && mbi.AllocationProtect == PAGE_NOACCESS,
+              "protect 0x801 becomes PAGE_NOACCESS");
+        check(VirtualFree(noaccess, 0, MEM_RELEASE), "release the PAGE_NOACCESS pool");
+    }
+
+    void* const gpu = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, 0x22004);
+    check(gpu != nullptr, "attributes 0x183 with protect 0x22004 succeeds");
+    if (gpu) {
+        check(VirtualQuery(gpu, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE, "protect 0x22004 becomes PAGE_READWRITE");
+        static_cast<volatile uint8_t*>(gpu)[0] = 0x5a;
+        check(static_cast<volatile uint8_t*>(gpu)[0] == 0x5a, "the 0x183 allocation is writable");
+        check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
+    }
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
     const std::wstring path =
@@ -244,6 +271,9 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     free_mem(b, 0x5e50000);  // same word again: no second event
     free_mem(c, 0x99);
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
+    void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
+                                  : nullptr;
+    if (v) VirtualFree(v, 0, MEM_RELEASE);
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -255,14 +285,98 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
         for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
         return n;
     };
-    check(count("\"kind\":\"xmem_attributes\"") == 5, "five events: two XMemAlloc words and three XMemFree words");
+    check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
+    check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
+          "XMemVirtualAlloc 0x183 is recorded once, with its size");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
           "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 5, "every event names its caller");
+    check(count("\"caller\":\"") == 6, "every event names its caller");
+    DeleteFileW(path.c_str());
+}
+
+// XMemTransferMemory moves budget between the console's title and system partitions; a PC has neither, so the shim
+// succeeds for every direction and size and moves (allocates) nothing. The XMEM_TRANSFER_TYPE values are not public,
+// so the directions here are just the first few enum values and one far outside any plausible range.
+void test_transfer_memory(XMemTransferMemoryFn transfer) {
+    constexpr SIZE_T kMiB = 1024 * 1024;
+    const uint32_t types[] = {0u, 1u, 2u, 0xffffffffu};
+    // 2 MiB and 40 MiB are the sizes the samples pass ("Must be multiples of 2MB sizes"); 0, an odd size and SIZE_MAX
+    // are the boundaries.
+    const SIZE_T sizes[] = {0, 2 * kMiB, 40 * kMiB, 2 * kMiB + 1, (std::numeric_limits<SIZE_T>::max)()};
+
+    PROCESS_MEMORY_COUNTERS_EX before{};
+    const bool have_before = GetProcessMemoryInfo(GetCurrentProcess(),
+                                                  reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&before), sizeof(before));
+    bool all_true = true;
+    bool last_error_kept = true;
+    for (const uint32_t type : types) {
+        for (const SIZE_T size : sizes) {
+            SetLastError(0x2bad);
+            const BOOL result = transfer(type, size);
+            if (result != TRUE) {
+                all_true = false;
+                std::printf("  XMemTransferMemory(%u, %zu) -> %d\n", type, static_cast<size_t>(size), result);
+            }
+            last_error_kept &= GetLastError() == 0x2bad;
+        }
+    }
+    check(all_true, "XMemTransferMemory returns TRUE (1) for every direction and size, 0 and SIZE_MAX included");
+    check(last_error_kept, "XMemTransferMemory leaves the thread's last error alone");
+
+    PROCESS_MEMORY_COUNTERS_EX after{};
+    const bool have_after = GetProcessMemoryInfo(GetCurrentProcess(),
+                                                 reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&after), sizeof(after));
+    // 20 calls asked to move up to 40 MiB each; nothing may be committed for them. 1 MiB of slack covers the CRT's
+    // own buffers (the one-time stderr line).
+    check(have_before && have_after && after.PrivateUsage < before.PrivateUsage + kMiB,
+          "XMemTransferMemory commits no memory for the transferred sizes");
+
+    // A bool-returning declaration reads only AL: TRUE must be non-zero there as well.
+    const auto as_bool = reinterpret_cast<bool(WINAPI*)(uint32_t, SIZE_T)>(reinterpret_cast<void*>(transfer));
+    check(as_bool(0, 2 * kMiB), "XMemTransferMemory's result also reads as true through a bool return");
+
+    // The enum is 32 bits: garbage in the upper half of RCX must not change anything.
+    const auto wide = reinterpret_cast<BOOL(WINAPI*)(uint64_t, SIZE_T)>(reinterpret_cast<void*>(transfer));
+    check(wide(0xdead000000000000ull, 2 * kMiB) == TRUE, "XMemTransferMemory ignores the upper half of RCX");
+}
+
+// gta6rt --trace: one "xmem_transfer" event per distinct (type, size), none with the trace off.
+void test_transfer_trace(XMemTransferMemoryFn transfer) {
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring path =
+        std::wstring(temp) + L"xmem_transfer_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
+    DeleteFileW(path.c_str());
+
+    check(transfer(7, 12345) == TRUE, "XMemTransferMemory with the trace off still returns TRUE");
+
+    check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    transfer(0, 2097152);
+    transfer(0, 2097152);  // same pair again: no second event
+    transfer(0, 41943040);
+    transfer(1, 2097152);
+    rt::startup_trace::close();
+
+    std::ifstream in(path);
+    std::stringstream text;
+    text << in.rdbuf();
+    const std::string log = text.str();
+    auto count = [&](const std::string& needle) {
+        int n = 0;
+        for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
+        return n;
+    };
+    check(count("\"kind\":\"xmem_transfer\"") == 3, "three xmem_transfer events: one per distinct (type, size)");
+    check(count("\"api\":\"XMemTransferMemory\",\"type\":0,\"size\":2097152") == 1,
+          "type 0 / 2 MiB is recorded once although it was called twice");
+    check(count("\"api\":\"XMemTransferMemory\",\"type\":0,\"size\":41943040") == 1, "type 0 / 40 MiB is recorded");
+    check(count("\"api\":\"XMemTransferMemory\",\"type\":1,\"size\":2097152") == 1, "type 1 / 2 MiB is recorded");
+    check(count("\"size\":12345") == 0, "nothing was recorded while the trace was off");
+    check(count("\"caller\":\"") == 3, "every transfer event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -281,6 +395,14 @@ void test_title_virtual_alloc() {
         check(alloc != nullptr, what);
         if (!alloc) continue;
 
+        void* const gfx = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x2004);  // PAGE_GRAPHICS_READWRITE
+        check(gfx != nullptr, "title VirtualAlloc with protect 0x2004 succeeds");
+        if (gfx) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            check(VirtualQuery(gfx, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
+                  "protect 0x2004 commits PAGE_READWRITE");
+            VirtualFree(gfx, 0, MEM_RELEASE);
+        }
         for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
             void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
             std::snprintf(what, sizeof what, "%s!VirtualAlloc with type bits %#lx returns memory", dll,
@@ -319,6 +441,8 @@ int main() {
         reinterpret_cast<XMemGetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemGetWriteWatch"));
     const auto reset_write_watch =
         reinterpret_cast<XMemResetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemResetWriteWatch"));
+    const auto transfer =
+        reinterpret_cast<XMemTransferMemoryFn>(rt::shims::find("xmem.dll", "XMemTransferMemory"));
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
@@ -327,6 +451,7 @@ int main() {
     check(virtual_alloc != nullptr, "registry exposes xmem.dll!XMemVirtualAlloc");
     check(get_write_watch != nullptr, "registry exposes xmem.dll!XMemGetWriteWatch");
     check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
+    check(transfer != nullptr, "registry exposes xmem.dll!XMemTransferMemory");
 
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
@@ -339,7 +464,11 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
-    test_attribute_trace(alloc, free_mem);
+    test_attribute_trace(alloc, free_mem, virtual_alloc);
+    if (transfer) {
+        test_transfer_memory(transfer);
+        test_transfer_trace(transfer);
+    }
 
     test_title_virtual_alloc();
 

@@ -374,6 +374,20 @@ class ScanTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_truncated_rpf9_header_is_one_error_line(self) -> None:
+        # Before: scan() unpacked the data-start word from an unchecked 8-byte head, so a 5-byte "9FPR" file
+        # died in a struct.error traceback. A truncated header is a usage error: one ERROR line, exit 2.
+        short = os.path.join(self.tmp.name, "short.rpf")
+        with open(short, "wb") as f:
+            f.write(b"9FPR\x01")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = T.main([short])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"ERROR: {short}: the RPF9 header is 5 bytes, the format needs 8", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("struct.error", err.getvalue())
+
     def test_summary_write_failure_is_one_error_line(self) -> None:
         # --out naming a directory: IsADirectoryError/PermissionError on most systems. The input half
         # of main already answers with one ERROR line; the write half must too.
@@ -415,6 +429,18 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["lane_graph"]["nodes"], 4)
         self.assertEqual(summary["lane_graph"]["junctions"], 1)
         self.assertEqual(summary["graph_resources"], {"junctions": 1, "links": 1, "nodes": 1})
+
+    def test_duplicate_light_definitions_compare_values_not_just_counts(self):
+        total = T.scan(self.rpf)
+        total["archetype_lights"] = {
+            1: [[{"posn": [0, 1, 0]}], [{"posn": [0, 1, 0]}]],
+            2: [[{"posn": [0, 1, 0]}], [{"posn": [1, 0, 0]}]],
+            3: [[], [{"intensity": 2}]],
+            4: [[{"intensity": 2}]],
+        }
+        summary = T.summarize(total)
+        self.assertEqual(summary["archetypes_defined_more_than_once"], 3)
+        self.assertEqual(summary["archetype_light_definitions_differ"], 2)
 
     def test_jobs_give_the_same_summary(self):
         one = T.summarize(T.scan(self.rpf, jobs=1))

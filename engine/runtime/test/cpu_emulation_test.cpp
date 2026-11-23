@@ -58,7 +58,17 @@ void test_decode() {
     check(dec({0x0F, 0x01, 0xFB}).op == ce::Op::mwaitx, "mwaitx");
     check(dec({0x0F, 0x01, 0xF9}).op == ce::Op::none, "rdtscp is not handled");
     check(dec({0xF3, 0x0F, 0x01, 0xFA}).op == ce::Op::none, "F3 0F 01 FA is MCOMMIT, not monitorx");
-    check(dec({0xF2, 0x0F, 0x01, 0xFC}).op == ce::Op::none, "F2 0F 01 FC is not clzero");
+    for (uint8_t pfx : {uint8_t(0x66), uint8_t(0xF2), uint8_t(0xF3), uint8_t(0x48)}) {
+        d = dec({pfx, 0x0F, 0x01, 0xFC});
+        check(d.op == ce::Op::clzero && d.length == 4, "clzero with 66, F2, F3 or REX (native on Zen 3)");
+    }
+    d = dec({0x48, 0x66, 0x0F, 0x01, 0xFC});
+    check(d.op == ce::Op::clzero && d.length == 5, "clzero with REX before 66 (the REX is ignored)");
+    d = dec({0x48, 0x48, 0x0F, 0x01, 0xFC});
+    check(d.op == ce::Op::clzero && d.length == 5, "clzero with two REX bytes");
+    check(dec({0xF2, 0x0F, 0x01, 0xFB}).op == ce::Op::none, "F2 0F 01 FB is not mwaitx");
+    d = dec({0x48, 0x66, 0x0F, 0x78, 0xC1, 1, 1});
+    check(d.op == ce::Op::extrq_imm && d.dst == 1, "a REX before 66 does not extend extrq's register");
     d = dec({0x66, 0x0F, 0x01, 0xFC});
     check(d.op == ce::Op::clzero && d.length == 4, "clzero with 66");
     d = dec({0x64, 0x48, 0x0F, 0x01, 0xFC});
@@ -97,13 +107,21 @@ void test_apply() {
     c.FltSave.XmmRegisters[1].Low = 0xAB;
     check(ce::apply(dec({0xF2, 0x0F, 0x78, 0xC1, 0x08, 0x10}), &c), "apply insertq");
     check(c.FltSave.XmmRegisters[0].Low == 0x1111111111AB1111ull && c.Rip == 0x1006, "insertq result and rip");
-    check(c.FltSave.XmmRegisters[0].High == 0x2222222222222222ll, "insertq keeps the upper quadword");
+    check(c.FltSave.XmmRegisters[0].High == 0, "insertq zeroes the upper quadword, as a Zen 3 does");
 
     c.FltSave.XmmRegisters[2].Low = 0xFFFF;
-    c.FltSave.XmmRegisters[2].High = (12ll << 8) | 20;  // len 12 at bits 77:72, idx 20 at bits 69:64
+    c.FltSave.XmmRegisters[2].High = (20ll << 8) | 12;  // len 12 at bits 69:64, idx 20 at bits 77:72 (APM vol. 4)
     c.FltSave.XmmRegisters[3].Low = 0;
     check(ce::apply(dec({0xF2, 0x0F, 0x79, 0xDA}), &c), "apply insertq reg");  // insertq xmm3, xmm2
     check(c.FltSave.XmmRegisters[3].Low == (0xFFFull << 20), "insertq reg takes len and idx from the upper half");
+
+    // Measured on a Zen 3 in #7111's review: control 0x0810 (len 16 in bits 5:0, idx 8 in bits 13:8 of the upper
+    // quadword) inserts 16 bits of 0xAB at bit 8 of 0x1234.
+    c.FltSave.XmmRegisters[6].Low = 0x1234;
+    c.FltSave.XmmRegisters[7].Low = 0xAB;
+    c.FltSave.XmmRegisters[7].High = 0x0810;
+    check(ce::apply(dec({0xF2, 0x0F, 0x79, 0xF7}), &c) && c.FltSave.XmmRegisters[6].Low == 0xAB34,
+          "insertq reg: the measured 0x0810 case");  // insertq xmm6, xmm7
 
     c.FltSave.XmmRegisters[4].Low = 0xFEDCBA9876543210ull;
     c.FltSave.XmmRegisters[5].Low = (4 << 8) | 8;  // idx 4 at bits 13:8, len 8 at bits 5:0
@@ -170,12 +188,12 @@ void test_live(const ce::Host& host) {
     check(out[0] == ce::insert_bits(in[0], in[2], 12, 20), "insertq imm result");
     std::printf("insertq imm: %s\n", path(host.sse4a));
 
-    // same with the register form: insertq xmm0, xmm1 (len and idx in xmm1[127:64])
+    // same with the register form: insertq xmm0, xmm1 (len in xmm1[69:64], idx in xmm1[77:72])
     Code insr({0xF3, 0x0F, 0x6F, 0x01, 0xF3, 0x0F, 0x6F, 0x49, 0x10, 0xF2, 0x0F, 0x79, 0xC1,
                0xF3, 0x0F, 0x7F, 0x02, 0xC3});
-    in[3] = (7ull << 8) | 33;
+    in[3] = (7ull << 8) | 33;  // len 33, idx 7
     check(run(insr, in, out, &ex), "insertq reg ran");
-    check(out[0] == ce::insert_bits(in[0], in[2], 7, 33), "insertq reg result");
+    check(out[0] == ce::insert_bits(in[0], in[2], 33, 7), "insertq reg result");
 
     // movdqu xmm0,[rcx]; extrq xmm0,9,13; movdqu [rdx],xmm0; ret
     Code exti({0xF3, 0x0F, 0x6F, 0x01, 0x66, 0x0F, 0x78, 0xC0, 9, 13, 0xF3, 0x0F, 0x7F, 0x02, 0xC3});
@@ -199,7 +217,7 @@ void test_live(const ce::Host& host) {
     check(run(ymm, in, out, &ex), "insertq between AVX code ran");
     check(out[0] == ce::insert_bits(in[0], in[4], 8, 8), "insertq between AVX code: low quadword");
     check(out[2] == in[2] && out[3] == in[3], "insertq keeps ymm0[255:128]");
-    if (!host.sse4a) check(out[1] == in[1], "emulated insertq keeps xmm0[127:64]");
+    if (!host.sse4a) check(out[1] == 0, "emulated insertq zeroes xmm0[127:64], as a Zen 3 does");
 
     // mov rax,rcx; clzero; ret
     Code clz({0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0xC3});

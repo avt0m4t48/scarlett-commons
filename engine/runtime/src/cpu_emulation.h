@@ -10,7 +10,7 @@
 // for INSERTQ, EXTRQ) and the Intel SDM vol. 2 for CLWB:
 //   INSERTQ xmm1, xmm2, len, idx   F2 0F 78 /r ib ib   insert the low `len` bits of xmm2[63:0] into xmm1[63:0] at
 //                                                       bit `idx` (len 0 means 64)
-//   INSERTQ xmm1, xmm2             F2 0F 79 /r         same, len = xmm2[77:72], idx = xmm2[69:64]
+//   INSERTQ xmm1, xmm2             F2 0F 79 /r         same, len = xmm2[69:64], idx = xmm2[77:72]
 //   EXTRQ   xmm1, len, idx         66 0F 78 /0 ib ib   xmm1[63:0] = (xmm1[63:0] >> idx), `len` bits, zero-extended
 //   EXTRQ   xmm1, xmm2             66 0F 79 /r         same, len = xmm2[5:0], idx = xmm2[13:8]
 //   CLZERO                         0F 01 FC            zero the 64-byte cache line that rAX points into; a line
@@ -20,8 +20,9 @@
 //                                                       of the exits the manual allows, so it is a pause
 //   CLWB m8                        66 0F AE /6 (mem)   write a line back, keeping it cached: ordinary write-back
 //                                                       memory is coherent, so there is nothing to do here
-// INSERTQ and EXTRQ leave xmm1[127:64] undefined; the emulation keeps them, so code cannot tell the difference.
-// A field with len + idx > 64 is undefined too; the emulation keeps the bits that fit.
+// The APM leaves xmm1[127:64] undefined after INSERTQ and EXTRQ; a Zen 3 zeroes it in all four forms (measured in
+// #7111's review), so the emulation does too. A field with len + idx > 64 is undefined as well; the emulation keeps
+// the bits that fit, which matched that Zen 3 on every len/idx pair.
 #pragma once
 
 #include <cstddef>
@@ -48,8 +49,11 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
     std::size_t i = 0;
     bool p66 = false, pf2 = false, pf3 = false;
     uint8_t rex = 0;
-    for (; i < avail && i < 14; ++i) {  // legacy prefixes, then at most one REX right before the opcode
+    // Legacy prefixes and REX bytes in any order; only a REX right before the opcode counts, an earlier one is
+    // ignored (as AMD CPUs do: `48 66 0F 01 FC` and `48 48 0F 01 FC` are CLZERO). LOCK (F0) ends the scan: #UD.
+    for (; i < avail && i < 14; ++i) {
         const uint8_t b = code[i];
+        if ((b & 0xF0) == 0x40) { rex = b; continue; }
         if (b == 0x66) p66 = true;
         else if (b == 0xF2) pf2 = true;
         else if (b == 0xF3) pf3 = true;
@@ -58,13 +62,15 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
         else break;
         rex = 0;
     }
-    if (i < avail && (code[i] & 0xF0) == 0x40) rex = code[i++];
     if (i + 2 > avail || code[i] != 0x0F) return {};
     const uint8_t op = code[i + 1];
     i += 2;
-    if (op == 0x01) {  // CLZERO, MONITORX, MWAITX; F2/F3 select other instructions here (F3 0F 01 FA is MCOMMIT)
-        if (i >= avail || pf2 || pf3) return {};
+    if (op == 0x01) {  // CLZERO, MONITORX, MWAITX
+        if (i >= avail) return {};
         const uint8_t m = code[i++];
+        // AMD CPUs run CLZERO with 66, F2 or F3 in front (measured on Zen 3 in #7055's reviews). For FA/FB an F3
+        // selects another instruction (F3 0F 01 FA is MCOMMIT), so those stay #UD with F2/F3.
+        if ((pf2 || pf3) && m != 0xFC) return {};
         d.op = m == 0xFC ? Op::clzero : m == 0xFA ? Op::monitorx : m == 0xFB ? Op::mwaitx : Op::none;
         d.length = i;
         return d.op == Op::none ? Decoded{} : d;
@@ -180,6 +186,37 @@ inline std::atomic<uint64_t>& count(Op op) {
     return counts[int(op)];
 }
 
+// 0 when the page holding `addr` can be written; otherwise the exception a write raises there. A guard page loses
+// its guard on that first touch and reports STATUS_GUARD_PAGE_VIOLATION, as the system does for a real access.
+inline DWORD writable(uint64_t addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
+        return DWORD(STATUS_ACCESS_VIOLATION);
+    if (mbi.Protect & PAGE_GUARD) {
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(addr & ~uint64_t(0xFFF)), 1, mbi.Protect & ~DWORD(PAGE_GUARD), &old);
+        return DWORD(STATUS_GUARD_PAGE_VIOLATION);
+    }
+    const DWORD p = mbi.Protect & 0xFF;
+    const bool ok = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
+                    p == PAGE_EXECUTE_WRITECOPY;
+    return ok ? 0 : DWORD(STATUS_ACCESS_VIOLATION);
+}
+
+// How many of the `want` bytes at `addr` can be read, by page protection (no fault is taken to find out).
+inline std::size_t readable(uint64_t addr, std::size_t want) {
+    std::size_t got = 0;
+    while (got < want) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(addr + got), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !mbi.Protect)
+            break;
+        const uint64_t end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        got += std::size_t(end - (addr + got)) < want - got ? std::size_t(end - (addr + got)) : want - got;
+    }
+    return got;
+}
+
 inline uint64_t& lo(CONTEXT* c, int r) { return c->FltSave.XmmRegisters[r].Low; }
 inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegisters[r].High); }
 
@@ -188,24 +225,33 @@ inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegi
 // line's address, or STATUS_GUARD_PAGE_VIOLATION, as the real instruction would raise) and `c` is unchanged.
 inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullptr) {
     switch (d.op) {
-    case Op::insertq_imm: lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), d.len, d.idx); break;
+    case Op::insertq_imm:
+        lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), d.len, d.idx);
+        c->FltSave.XmmRegisters[d.dst].High = 0;
+        break;
     case Op::insertq_reg: {
         const uint64_t ctl = hi(c, d.src);
-        lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), unsigned(ctl >> 8) & 63, unsigned(ctl) & 63);
+        lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), unsigned(ctl) & 63, unsigned(ctl >> 8) & 63);
+        c->FltSave.XmmRegisters[d.dst].High = 0;
         break;
     }
-    case Op::extrq_imm: lo(c, d.dst) = extract_bits(lo(c, d.dst), d.len, d.idx); break;
+    case Op::extrq_imm:
+        lo(c, d.dst) = extract_bits(lo(c, d.dst), d.len, d.idx);
+        c->FltSave.XmmRegisters[d.dst].High = 0;
+        break;
     case Op::extrq_reg: {
         const uint64_t ctl = lo(c, d.src);
         lo(c, d.dst) = extract_bits(lo(c, d.dst), unsigned(ctl) & 63, unsigned(ctl >> 8) & 63);
+        c->FltSave.XmmRegisters[d.dst].High = 0;
         break;
     }
     case Op::clzero: {
         const uint64_t addr = (d.addr32 ? (c->Rax & 0xFFFFFFFFu) : c->Rax) & ~uint64_t(63);
-        DWORD code = 0;
-        __try {  // a 64-byte aligned line never spans two pages: the whole write succeeds or none of it
-            std::memset(reinterpret_cast<void*>(addr), 0, 64);
-        } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        // The line's page is checked first instead of catching a fault from the write: a compiler may turn the
+        // write into inline stores that a local __try does not cover (clang-cl without /EHa). A 64-byte aligned
+        // line never spans two pages, so one query answers for all of it.
+        const DWORD code = writable(addr);
+        if (code) {
             if (fault) {
                 std::memset(fault, 0, sizeof *fault);
                 fault->ExceptionCode = code;
@@ -215,6 +261,7 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
             }
             return false;
         }
+        std::memset(reinterpret_cast<void*>(addr), 0, 64);
         break;
     }
     case Op::mwaitx: YieldProcessor(); break;
@@ -229,11 +276,8 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
     uint8_t code[15] = {};
-    std::size_t avail = 0;
-    __try {  // the faulting instruction was fetched, but read byte by byte in case it ends at a page boundary
-        for (; avail < sizeof code; ++avail) code[avail] = reinterpret_cast<const volatile uint8_t*>(c->Rip)[avail];
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
+    const std::size_t avail = readable(c->Rip, sizeof code);  // the instruction may end at a page boundary
+    std::memcpy(code, reinterpret_cast<const void*>(c->Rip), avail);
     const Decoded d = decode(code, avail);
     if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
     EXCEPTION_RECORD fault;

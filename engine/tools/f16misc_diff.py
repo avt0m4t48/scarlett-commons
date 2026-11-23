@@ -963,9 +963,9 @@ def grid_program(chunk, rng):
 
 
 def exhaustive_programs(ops=None):
-    """(op, lines) programs: every f16 input through the frexp ops and ldexp, four inputs per program."""
+    """(op, lines) programs: every f16 input through the frexp ops and ldexp, four inputs per program, yielded one at
+    a time."""
     exps = (-64, -25, -15, -1, 1, 15, 30, 64)
-    out = []
     for op in ("v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16"):
         if ops and op not in ops:
             continue
@@ -981,8 +981,7 @@ def exhaustive_programs(ops=None):
                 else:
                     lines.append(f"v_mov_b32 v{12 + i}, 0x{h | 0xabcd0000:08x}")
                     body.append(f"{op}_e32 {d}, v{12 + i}")
-            out.append((op, [f"v_mov_b32 v{r}, 0x5a5a5a5a" for r in DSTS] + lines + body))
-    return out
+            yield op, [f"v_mov_b32 v{r}, 0x5a5a5a5a" for r in DSTS] + lines + body
 
 
 # ---- the oracles ----
@@ -1068,44 +1067,51 @@ def _run(counts, items, tag):
     return failure
 
 
-def run_sweep(seed, ops=None):
-    counts = _new_counts()
-    items = []
+# Each stage yields its (label, lines, ops) items one at a time, so a run holds one program's text, not the whole list.
+def sweep_items(seed, ops=None):
     for case in sweep_cases(ops):
         op, form, kinds = case
         for rep in range(SWEEP_REPEAT):
             tag = f"{op}:{form}:{'/'.join(kinds)}:{rep}"
             rng = random.Random(f"{seed}:{tag}")
-            items.append((f"sweep {tag} (seed {seed})", sweep_program(case, rng), [op]))
-    return counts, _run(counts, items, "sw")
+            yield f"sweep {tag} (seed {seed})", sweep_program(case, rng), [op]
+
+
+def grid_items(ops=None):
+    cases = grid_cases(ops)
+    rng = random.Random("f16misc_diff:grid-programs")
+    for i in range(0, len(cases), GRID_PER_PROGRAM):
+        chunk = cases[i:i + GRID_PER_PROGRAM]
+        yield f"edge grid program {i // GRID_PER_PROGRAM}", grid_program(chunk, rng), [c[0] for c in chunk]
+
+
+def suite_items(programs, seed, max_ops=6, ops=None):
+    rng = random.Random(f"suite:{seed}")
+    for i in range(programs):
+        lines, used = program(rng, rng.randint(1, max_ops), ops)
+        yield f"program {i} (seed {seed})", lines, used
+
+
+def run_sweep(seed, ops=None):
+    counts = _new_counts()
+    return counts, _run(counts, sweep_items(seed, ops), "sw")
 
 
 def run_grid(ops=None):
     counts = _new_counts()
-    cases = grid_cases(ops)
-    rng = random.Random("f16misc_diff:grid-programs")
-    items = []
-    for i in range(0, len(cases), GRID_PER_PROGRAM):
-        chunk = cases[i:i + GRID_PER_PROGRAM]
-        items.append((f"edge grid program {i // GRID_PER_PROGRAM}", grid_program(chunk, rng), [c[0] for c in chunk]))
-    return counts, _run(counts, items, "gr")
+    return counts, _run(counts, grid_items(ops), "gr")
 
 
 def run_exhaustive(ops=None):
     counts = _new_counts()
-    items = [(f"exhaustive f16 program {i} ({op})", lines, [op] * GRID_PER_PROGRAM)
-             for i, (op, lines) in enumerate(exhaustive_programs(ops))]
+    items = ((f"exhaustive f16 program {i} ({op})", lines, [op] * GRID_PER_PROGRAM)
+             for i, (op, lines) in enumerate(exhaustive_programs(ops)))
     return counts, _run(counts, items, "ex")
 
 
 def run_suite(programs, seed, max_ops=6, ops=None):
     counts = _new_counts()
-    rng = random.Random(f"suite:{seed}")
-    items = []
-    for i in range(programs):
-        lines, used = program(rng, rng.randint(1, max_ops), ops)
-        items.append((f"program {i} (seed {seed})", lines, used))
-    return counts, _run(counts, items, "rn")
+    return counts, _run(counts, suite_items(programs, seed, max_ops, ops), "rn")
 
 
 REJECTED = (

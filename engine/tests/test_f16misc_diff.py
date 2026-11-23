@@ -14,6 +14,7 @@ than half an f32 ulp:
   M  0x2817 * 0x23d3 = 2^-11 (1 - 11 / 2^21); + (1 + 2^-10) (0x3c01): once -> below the tie -> 0x3c01; f32 lands on
      the tie 1 + 3 * 2^-11, even is 0x3c02
 """
+import inspect
 import io
 import os
 import random
@@ -265,7 +266,7 @@ class Generator(unittest.TestCase):
         self.assertFalse(any(all(v in nans for v in w) for w in triples))
 
     def test_exhaustive_programs_cover_every_half(self):
-        progs = f.exhaustive_programs(["v_frexp_exp_i16_f16"])
+        progs = list(f.exhaustive_programs(["v_frexp_exp_i16_f16"]))
         self.assertEqual(len(progs), (1 << 16) // f.GRID_PER_PROGRAM)
         seen = {int(line.split("0x")[1], 16) & M16 for _, lines in progs for line in lines
                 if re.match(r"v_mov_b32 v1[2-5], ", line)}
@@ -293,6 +294,25 @@ class Translated(unittest.TestCase):
         self.assertEqual((failure, counts["skip"]), (None, {}))
         self.assertGreater(counts["events"]["v_fmamk_f16"]["tie"], 10)
         self.assertGreater(counts["events"]["v_min3_f16"]["NaN"], 100)
+
+    def test_each_program_is_checked_before_the_next_is_made(self):
+        # a run holds one program's text at a time, not the whole --programs list
+        made, seen = [], []
+        real = f.program, f.sweep_program, f.grid_program, f.run_one
+
+        def count(fn):
+            return lambda *a: made.append(1) or fn(*a)
+        try:
+            f.program, f.sweep_program, f.grid_program = (count(fn) for fn in real[:3])
+            f.run_one = lambda lines, name, tmp, events=None: seen.append(len(made)) or ("match", None)
+            f.run_suite(5, 1)
+            f.run_sweep(1, ["v_ldexp_f16"])
+            f.run_grid(["v_min3_f16"])
+        finally:
+            f.program, f.sweep_program, f.grid_program, f.run_one = real
+        self.assertGreater(len(seen), 10)
+        self.assertEqual(seen, list(range(1, len(seen) + 1)))
+        self.assertTrue(inspect.isgenerator(f.exhaustive_programs()))
 
     def test_fma_rounds_once_through_the_translator(self):
         for x, y, z, single, _ in BY_HAND:

@@ -551,8 +551,10 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
                                                const IID* riid, void** out) {
     g_committed3 = {g_committed3.calls + 1, self, heap, flags, *desc, layout, clear, session, castable_count,
                     castable_formats, riid, out};
+    // As the PC runtime: a buffer may not be a render target or depth-stencil (unordered access is fine). The slot 133
+    // record below stays as the last successful call.
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-        (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+        (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
         return E_INVALIDARG;
     ++g_committed3_133.calls;
     if (heap) g_committed3_133.heap = *heap;

@@ -14,6 +14,7 @@ As a module:
 
 As a CLI:
     python3 -I tools/spirv_asm.py input.spvasm -o output.spv [--target-env vulkan1.2]
+Usage: `python -I tools/spirv_asm.py --help` lists the options.
 """
 import argparse
 import array
@@ -506,7 +507,14 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
-            sel_ti = type_info.get(id_to_type.get(sel_id))
+            if sel_id not in id_to_type:
+                # The single top-down pass has not seen a typed definition of the selector. The case literals' width
+                # comes from that type, so guessing 32 bits would emit a 64-bit selector's literals as one word each.
+                # spirv-as refuses this too, and spirv-val refuses a module whose selector block comes after the switch.
+                raise SpirvAsmError(
+                    f"line {lineno}: OpSwitch selector {toks[arg_idx]} has no known type: it must be defined before "
+                    "the OpSwitch (blocks are laid out in dominance order)")
+            sel_ti = type_info.get(id_to_type[sel_id])
             if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
                 switch_type = (sel_ti[1], bool(sel_ti[2]))
 

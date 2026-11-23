@@ -90,6 +90,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
+    case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -201,12 +202,15 @@ public:
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
         return type_;
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    bool invalid() const { return invalid_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
     // reports it.
@@ -247,6 +251,7 @@ public:
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ExecuteBundle");
+        if (list_.closed()) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
         if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
@@ -278,13 +283,47 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
 
-    // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
-    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {
-        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps", "ignored");
+    // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md §3.2/§3.4).
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT num, ID3D12DescriptorHeap* const* heaps) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (num > 2 || (num && !heaps)) return check(false);
+
+        ID3D12DescriptorHeap* cbv = nullptr;
+        ID3D12DescriptorHeap* smp = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS cbv_base = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS smp_base = 0;
+        IUnknown* const owner = this->attached_device();
+        for (UINT i = 0; i < num; ++i) {
+            ID3D12DescriptorHeap* raw = heaps[i];
+            if (!raw) return check(false);
+            if (ID3D12DescriptorHeap* real = d3d12_xs::heap_proxy_real_heap(raw)) raw = real;
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            D3D12_GPU_VIRTUAL_ADDRESS base = 0;
+            IUnknown* const heap_owner = descriptor_heap_info(raw, desc, base);
+            if (!heap_owner || (owner && heap_owner != owner)) return check(false);
+            if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return check(false);
+            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                if (cbv) return check(false);
+                cbv = raw;
+                cbv_base = base;
+            } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+                if (smp) return check(false);
+                smp = raw;
+                smp_base = base;
+            } else {
+                return check(false);
+            }
+        }
+        hold(cbv);
+        hold(smp);
+        if (defer([=](GraphicsCommandList& l) { l.verify_bundle_descriptor_heaps(cbv, smp); })) return;
+        set_descriptor_heaps(cbv, cbv_base, smp, smp_base);
     }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
@@ -333,12 +372,14 @@ public:
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         reset_state(state);
     }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
@@ -357,6 +398,7 @@ public:
     }
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        if (list_.closed()) return;
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
         if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
         set_index_buffer(view);
@@ -404,6 +446,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        if (list_.closed()) return;
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                                   : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
         if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
@@ -411,6 +454,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
@@ -431,6 +475,20 @@ public:
             }, true))
             return;
         record_draw(true, indices, instances, first_index, base_vertex, first_instance);
+    }
+
+    // ID3D12GraphicsCommandList6: a mesh draw. The bound graphics pipeline must have a mesh shader (checked at
+    // execution, where the pipeline is resolved). D3D12 caps each count at 65535 and their product at 2^22
+    // (D3D12_MS_DISPATCH_MAX_THREAD_GROUPS_PER_GRID); a larger grid is a recording error.
+    void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
+        if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        check(list_.draw(std::move(draw)));
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -749,6 +807,29 @@ public:
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
+        const auto arg_desc = argument_buffer->GetDesc();
+        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
+            return check(false);
+        if (count_buffer) {
+            const auto count_desc = count_buffer->GetDesc();
+            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
+                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
+                return check(false);
+        } else if (count_buffer_offset != 0) {
+            return check(false);
+        }
+        if (max_command_count) {
+            const UINT64 record_size =
+                kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+                : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : 0;
+            if (!record_size || stride < record_size || stride % 4 != 0)
+                return check(false);
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
@@ -769,7 +850,17 @@ public:
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        if (postbuild_count && !postbuild) return check(false);
+        for (UINT i = 0; i < postbuild_count; ++i) {
+            if (!valid_postbuild_info_type(postbuild[i].InfoType)) return check(false);
+        }
         const auto& in = desc->Inputs;
+        if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+            in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+            return check(false);
+        if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+            return check(false);
         leonida::BuildAccelerationStructure cmd{};
         cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
@@ -844,6 +935,7 @@ public:
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
         info.dest_va = desc->DestBuffer;
         info.type = static_cast<std::uint32_t>(desc->InfoType);
@@ -855,12 +947,37 @@ public:
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!valid_copy_mode(mode)) return check(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
+    static bool valid_postbuild_info_type(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE type) {
+        switch (type) {
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TOOLS_VISUALIZATION:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool valid_copy_mode(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
+        switch (mode) {
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE:
+            return true;
+        default:
+            return false;
+        }
+    }
     template<class E>
     static std::uint32_t u(E value) {
         return static_cast<std::uint32_t>(value);
@@ -1067,6 +1184,10 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
+    ID3D12DescriptorHeap* sampler_heap_ = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1131,10 +1252,44 @@ private:
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
+    void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
+                              ID3D12DescriptorHeap* smp, D3D12_GPU_VIRTUAL_ADDRESS smp_base) {
+        cbv_srv_uav_heap_ = cbv;
+        cbv_srv_uav_base_ = cbv_base;
+        sampler_heap_ = smp;
+        sampler_base_ = smp_base;
+    }
+
+    // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
+    // currently bound heap of that type, without clearing any omitted heap slot on the parent.
+    void verify_bundle_descriptor_heaps(ID3D12DescriptorHeap* cbv, ID3D12DescriptorHeap* smp) {
+        if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
+    }
+
+    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
+        if (!layout) return;
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+            if (!cbv_srv_uav_heap_)
+                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
+            else
+                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+            if (!sampler_heap_)
+                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
+            else
+                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+    }
+
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
         compute_ = {};
         graphics_ = {};
+        cbv_srv_uav_heap_ = nullptr;
+        sampler_heap_ = nullptr;
+        cbv_srv_uav_base_ = 0;
+        sampler_base_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1163,6 +1318,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
@@ -1182,6 +1338,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
@@ -1364,6 +1521,12 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        if (count > 0 && !lists) {
+            note_once("ExecuteCommandLists: null command list array with non-zero count");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "failed");
+            return;
+        }
         std::vector<const leonida::CommandList*> recorded;
         std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
@@ -1380,6 +1543,13 @@ public:
             if (list->type() != desc_.Type) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
                              int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose recording failed (Close returned E_INVALIDARG) must not replay its earlier commands.
+            if (list->invalid()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is invalid; refusing batch\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 d3d12_trace::record(method, "failed");
                 return;
@@ -1815,6 +1985,15 @@ bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Com
     if (!l) return false;
     const auto recorded = l->commands().commands();
     commands.assign(recorded.begin(), recorded.end());
+    return true;
+}
+
+bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
+                                 D3D12_GPU_VIRTUAL_ADDRESS& sampler) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    cbv_srv_uav = l->cbv_srv_uav_base();
+    sampler = l->sampler_base();
     return true;
 }
 

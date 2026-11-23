@@ -806,6 +806,15 @@ def main(argv=None):
         return 2
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
+    inputs = [("archive", a.archive)]
+    if a.entities:
+        inputs.append(("--entities", a.entities))
+    for rname, rpath in (("--out", a.out), ("--lights-out", a.lights_out)):
+        if not rpath:
+            continue
+        for iname, ipath in inputs:
+            if same_report_path(rpath, ipath):
+                ap.error("%s must use a different path than %s" % (rname, iname))
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
     try:
         summary = summarize(total, a.entities, a.lights_out)

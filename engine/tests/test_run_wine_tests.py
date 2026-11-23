@@ -481,6 +481,11 @@ class MainTest(unittest.TestCase):
             {"properties": {"TIMEOUT": 10}},
             {"properties": [{"name": "TIMEOUT"}]},
             {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": 42}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": "D:/win/\0root"}]},
+            {"properties": [{"name": "PASS_REGULAR_EXPRESSION", "value": [42]}]},
+            {"properties": [{"name": "FAIL_REGULAR_EXPRESSION", "value": {"bad": True}}]},
+            {"properties": [{"name": "SKIP_REGULAR_EXPRESSION", "value": None}]},
             {"name": []},
         ):
             with self.subTest(fields=fields):
@@ -499,6 +504,21 @@ class MainTest(unittest.TestCase):
         self.assertIn("[FAIL] unbuilt", out)
         self.assertIn("no command", out)
         self.assertEqual(err, "")
+
+    def test_ctest_property_strings_and_expression_lists_are_valid_inventory(self):
+        properties = {
+            "WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact",
+            "PASS_REGULAR_EXPRESSION": ["good", "also good"],
+            "FAIL_REGULAR_EXPRESSION": "unexpected",
+            "SKIP_REGULAR_EXPRESSION": [],
+            "MEASUREMENTS": {"custom": "value"},
+        }
+        row = ctest_entry("ok", self.command("ok.py"), properties)
+        with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+            code, _, err = self.run_main([row], "--require", "ok")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        launch.assert_called_once()
 
     def test_an_explicit_empty_tests_list_is_accepted(self):
         code, out, _ = self.run_main_json({"tests": []})

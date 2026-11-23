@@ -243,6 +243,17 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_property(entry) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or "value" not in entry:
+        return False
+    name, value = entry["name"], entry["value"]
+    if name == "WORKING_DIRECTORY":
+        return isinstance(value, str) and "\0" not in value
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+        return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
+    return True
+
+
 def valid_test_row(test) -> bool:
     if not isinstance(test, dict) or not isinstance(test.get("name"), str):
         return False
@@ -251,10 +262,7 @@ def valid_test_row(test) -> bool:
     if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
         return False
     entries = test.get("properties", [])
-    return isinstance(entries, list) and all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
-        for entry in entries
-    )
+    return isinstance(entries, list) and all(valid_test_property(entry) for entry in entries)
 
 
 def read_tests(path: str) -> list[dict] | None:

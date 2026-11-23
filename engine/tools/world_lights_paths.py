@@ -40,7 +40,6 @@ import os
 import statistics
 import struct
 import sys
-import tempfile
 import zlib
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
@@ -50,6 +49,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -750,33 +750,6 @@ def summarize(total, entities=None, lights_out=None):
         summary["lane_graph"] = {"nodes": len(nodes), "links": len(links), "junctions": len(junctions),
                                  "note": "graph statistics need exactly one node list and one link list"}
     return summary
-
-
-def same_report_path(first, second):
-    first, second = os.path.realpath(first), os.path.realpath(second)
-    if os.path.normcase(first) == os.path.normcase(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return False
-
-    first_dir, first_name = os.path.split(first)
-    second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
-        return False
-    try:
-        if not os.path.samefile(first_dir, second_dir):
-            return False
-        # normcase on POSIX does not tell us whether this volume folds case.
-        # Try the two names in a scratch directory on the destination volume before scanning.
-        with tempfile.TemporaryDirectory(prefix=".world-lights-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
-    except OSError:
-        return False
 
 
 def main(argv=None):

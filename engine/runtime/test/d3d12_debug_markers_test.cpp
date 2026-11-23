@@ -135,18 +135,25 @@ int run_markers(ID3D12Device* device) {
     const char ansi[] = "ansi pass and more";
     const wchar_t spans[] = L"spans two lists";
     const std::uint64_t blob[2] = {0x1234, 0x5678};
-    first->SetMarker(0, frame, sizeof(frame));
-    first->SetMarker(0, nullptr, 0);
-    first->BeginEvent(1, ansi, 9);  // "ansi pass"
-    first->BeginEvent(0, nested, sizeof(nested));
-    first->EndEvent();
-    first->BeginEvent(0, spans, sizeof(spans));  // left open: the next list ends it
-    EXPECT(first->Close() == S_OK);
-    second->EndEvent();  // "spans two lists"
-    second->EndEvent();  // "ansi pass"
-    second->EndEvent();  // nothing open: dropped
-    second->BeginEvent(2, blob, sizeof(blob));  // left open: ended with the submission
-    EXPECT(second->Close() == S_OK);
+    // The proxy hands back console-shaped lists, and the console ABI has no SetMarker or BeginEvent — its
+    // only marker slot is EndEvent at console 60, landing on the same PC method. The PC marker calls go to
+    // the real list behind each proxy; ExecuteCommandLists still takes and unwraps the proxies below.
+    auto* first_list = static_cast<ID3D12GraphicsCommandList*>(rt::d3d12_xs::list_proxy_real_list(first.p));
+    auto* second_list =
+        static_cast<ID3D12GraphicsCommandList*>(rt::d3d12_xs::list_proxy_real_list(second.p));
+    EXPECT(first_list && second_list);
+    first_list->SetMarker(0, frame, sizeof(frame));
+    first_list->SetMarker(0, nullptr, 0);
+    first_list->BeginEvent(1, ansi, 9);  // "ansi pass"
+    first_list->BeginEvent(0, nested, sizeof(nested));
+    first_list->EndEvent();
+    first_list->BeginEvent(0, spans, sizeof(spans));  // left open: the next list ends it
+    EXPECT(first_list->Close() == S_OK);
+    second_list->EndEvent();  // "spans two lists"
+    second_list->EndEvent();  // "ansi pass"
+    second_list->EndEvent();  // nothing open: dropped
+    second_list->BeginEvent(2, blob, sizeof(blob));  // left open: ended with the submission
+    EXPECT(second_list->Close() == S_OK);
 
     const wchar_t queue_frame[] = L"queue frame";
     const char after[] = "after";

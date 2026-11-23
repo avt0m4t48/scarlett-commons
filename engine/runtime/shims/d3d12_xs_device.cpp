@@ -203,6 +203,133 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
     return handle;
 }
 
+// ---- Buffers placed at a console address (device slot 133), found again by that address (device slot 70) --------
+//
+// The console's CreatePlacedResourceX puts a buffer at an address the title chose, and the title later names the
+// buffer by that address alone: device slot 70 makes a view from a description and an address, with no resource
+// object. The PC resource behind the proxy has an address of its own, which equals the title's only when the
+// device behind the proxy could put the buffer on the title's pages. So the proxy keeps which resource it made for
+// which range, whatever made it, and slot 70 asks here first.
+//
+// An entry holds no reference: the title owns the resource. A small object attached to the resource as private
+// data takes the entry out when the resource dies (an object releases its private-data interfaces then), and the
+// entries of a device go with its proxy. A lookup adds its reference under the lock, so it cannot meet a removal
+// half done; a title that releases a buffer on one thread while it makes a view of it on another has the race it
+// would have on the console.
+struct PlacedBuffer {
+    std::uint64_t va;
+    std::uint64_t size;
+    ID3D12Resource* resource;  // not referenced (see above)
+    const DeviceProxy* device;
+    std::uint64_t id;
+};
+
+std::mutex& placed_buffer_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<PlacedBuffer>& placed_buffers() {
+    static auto* v = new std::vector<PlacedBuffer>;
+    return *v;
+}
+
+std::atomic<std::size_t> g_placed_buffer_count{0};  // lets slot 70 skip the lock when nothing was ever placed
+std::uint64_t g_next_placed_buffer_id = 0;          // under placed_buffer_mutex
+
+void forget_placed_buffer(std::uint64_t id) {
+    std::lock_guard lock(placed_buffer_mutex());
+    auto& buffers = placed_buffers();
+    std::erase_if(buffers, [id](const PlacedBuffer& buffer) { return buffer.id == id; });
+    g_placed_buffer_count.store(buffers.size(), std::memory_order_release);
+}
+
+void forget_placed_buffers_of(const DeviceProxy* device) {
+    if (g_placed_buffer_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(placed_buffer_mutex());
+    auto& buffers = placed_buffers();
+    std::erase_if(buffers, [device](const PlacedBuffer& buffer) { return buffer.device == device; });
+    g_placed_buffer_count.store(buffers.size(), std::memory_order_release);
+}
+
+// {b0a8d6c2-5e1f-4c37-9a44-7f3e2d1c0b95}: the private-data key of the object below.
+constexpr GUID kPlacedBufferPrivateData{0xb0a8d6c2, 0x5e1f, 0x4c37, {0x9a, 0x44, 0x7f, 0x3e, 0x2d, 0x1c, 0x0b, 0x95}};
+
+// What a placed resource holds as private data: its last Release, which the resource makes when it dies, takes the
+// resource's entry out.
+struct PlacedBufferTag final : IUnknown {
+    std::atomic<ULONG> refs{1};
+    const std::uint64_t id;
+
+    explicit PlacedBufferTag(std::uint64_t entry) : id(entry) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!IsEqualIID(riid, __uuidof(IUnknown))) return E_NOINTERFACE;
+        AddRef();
+        *out = static_cast<IUnknown*>(this);
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (left == 0) {
+            forget_placed_buffer(id);
+            delete this;
+        }
+        return left;
+    }
+};
+
+// Records that `created` (what a slot 133 call just handed the title) is the buffer at [va, va + size). Nothing is
+// recorded when the object is no ID3D12Resource, when it cannot hold private data (its death could not be seen), or
+// when memory is short: slot 70 then goes on to the device's own provider, as before.
+void remember_placed_buffer(const DeviceProxy* device, std::uint64_t va, std::uint64_t size, void* created) {
+    if (!created || !va || !size || va > (std::numeric_limits<std::uint64_t>::max)() - size) return;
+    ID3D12Resource* resource = nullptr;
+    if (FAILED(static_cast<IUnknown*>(created)->QueryInterface(__uuidof(ID3D12Resource),
+                                                                reinterpret_cast<void**>(&resource))) ||
+        !resource)
+        return;
+    PlacedBufferTag* tag = nullptr;
+    {
+        std::lock_guard lock(placed_buffer_mutex());
+        tag = new (std::nothrow) PlacedBufferTag(++g_next_placed_buffer_id);
+        if (tag) {
+            try {
+                placed_buffers().push_back({va, size, resource, device, tag->id});
+                g_placed_buffer_count.store(placed_buffers().size(), std::memory_order_release);
+            } catch (const std::bad_alloc&) {
+                delete tag;  // no entry was made, and its Release would take the lock held here
+                tag = nullptr;
+            }
+        }
+    }
+    if (tag) {
+        // The resource takes its own reference; when it took none (a refusal), the Release below removes the entry.
+        resource->SetPrivateDataInterface(kPlacedBufferPrivateData, tag);
+        tag->Release();
+    }
+    resource->Release();  // the QueryInterface reference: the entry itself holds none
+}
+
+// The newest buffer `device` placed over `va`, with a reference added for the caller, or null. `start` and `size`
+// are the range it was placed at.
+ID3D12Resource* add_ref_placed_buffer(const DeviceProxy* device, std::uint64_t va, std::uint64_t* start,
+                                      std::uint64_t* size) {
+    if (g_placed_buffer_count.load(std::memory_order_acquire) == 0) return nullptr;
+    std::lock_guard lock(placed_buffer_mutex());
+    const auto& buffers = placed_buffers();
+    for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
+        if (it->device != device || va < it->va || va - it->va >= it->size) continue;
+        it->resource->AddRef();
+        *start = it->va;
+        *size = it->size;
+        return it->resource;
+    }
+    return nullptr;
+}
+
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
@@ -420,6 +547,7 @@ unsigned long proxy_release(DeviceProxy* self) {
     if (refs == 0) {
         destroy_present_state(self->present_state);
         destroy_upload_state(self->upload_state.load(std::memory_order_relaxed));
+        forget_placed_buffers_of(self);
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -2439,13 +2567,22 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
 
     RawSrvShape shape{};
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
-    if (why || !self->resource_provider) {
-        log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
+    if (why) {
+        log_slot70_null_once(why, texture_words, view_desc);
         write_null_srv(self, destination);
         return;
     }
+    // The buffer the title placed over this address through slot 133, whatever the PC resource's own address is;
+    // then a buffer the device behind the proxy knows at that address.
     std::uint64_t start = 0, size = 0;
-    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
+    ID3D12Resource* resource = add_ref_placed_buffer(self, shape.va, &start, &size);
+    if (!resource && !self->resource_provider) {
+        log_slot70_null_once("no buffer was placed at the address and there is no resource provider", texture_words,
+                             view_desc);
+        write_null_srv(self, destination);
+        return;
+    }
+    if (!resource) resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
     if (!resource || shape.va < start || shape.va - start >= size) {
         if (resource) resource->Release();
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
@@ -3162,7 +3299,9 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
 // texture): through ID3D12Device10::CreateCommittedResource3 with the layout as given (UNDEFINED for a buffer), or on
 // an older PC device through CreateCommittedResource with the legacy state of that layout (COMMON for UNDEFINED and
 // for layouts without one). The resource is not backed by the memory at va: what the title writes there does not reach
-// it. Backing it needs the physical-page mapper; until then this gets the title past the call.
+// it. Backing it needs the physical-page mapper; until then this gets the title past the call. Whichever way a buffer
+// was made, the proxy remembers it as the buffer at [va, va + Width) (remember_placed_buffer), because the title names
+// it by that address afterwards (slot 70).
 constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
 constexpr unsigned kPcCreateCommittedResource3Slot = 76;  // ID3D12Device10's CreateCommittedResource3
 
@@ -3216,7 +3355,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
             placed_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPlacedAtVaResourceFlags);
             const HRESULT placed =
                 handler(self->real, reinterpret_cast<void*>(va), placed_desc, initial_state, *riid, out);
-            if (SUCCEEDED(placed)) return placed;
+            if (SUCCEEDED(placed)) {
+                remember_placed_buffer(self, va, pc_desc.Width, *out);
+                return placed;
+            }
             *out = nullptr;
         }
     }
@@ -3238,11 +3380,14 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
         const HRESULT hr = create(device10, &heap, D3D12_HEAP_FLAG_NONE, &desc1, layout, clear, nullptr, 0, nullptr,
                                   riid, out);
         static_cast<IUnknown*>(device10)->Release();
+        if (SUCCEEDED(hr) && buffer) remember_placed_buffer(self, va, pc_desc.Width, *out);
         return hr;
     }
 #endif
-    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
-                                               legacy_state_for_layout(initial_state, buffer), clear, *riid, out);
+    const HRESULT hr = self->real->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &pc_desc, legacy_state_for_layout(initial_state, buffer), clear, *riid, out);
+    if (SUCCEEDED(hr) && buffer) remember_placed_buffer(self, va, pc_desc.Width, *out);
+    return hr;
 }
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an

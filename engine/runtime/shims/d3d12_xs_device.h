@@ -21,9 +21,10 @@
 //             A measured shape (PR 7066, eugen1763): a raw buffer SRV. arg1 starts with a desktop D3D12_RESOURCE_DESC
 //             (buffer), arg2 with a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (R32_TYPELESS, BUFFER, RAW) followed at
 //             once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA a slot-133 call registered. When the VA is inside a
-//             buffer the device's resource provider knows, the destination gets a raw view of it (PC
-//             CreateShaderResourceView with that resource). Any other shape, or an unknown VA, gets the PC null view
-//             (CreateShaderResourceView with no resource) and the call returns.
+//             buffer a slot-133 call placed (the proxy remembers each one by its range, whatever address the PC
+//             resource behind it has), or else inside one the device's resource provider knows, the destination
+//             gets a raw view of it (PC CreateShaderResourceView with that resource). Any other shape, or an
+//             unknown VA, gets the PC null view (CreateShaderResourceView with no resource) and the call returns.
 //   slot 74   (pointer, u32, pointer): not measured, returns S_OK. The PC slot 74 is ShaderCacheControl(kinds, control),
 //             which reads the first word as flags and returns E_INVALIDARG. Nothing is written, the PC device is not called.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.

@@ -778,6 +778,7 @@ int check_levels() {
             static D3D12_RESOURCE_DESC seen_desc{};
             static GUID seen_iid{};
             static std::uint32_t seen_layout = 0;
+            static Mock* made = nullptr;  // a real object: the proxy asks what it hands the title for ID3D12Resource
             const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
                                                      const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
                                                      REFIID iid, void** out) -> HRESULT {
@@ -786,7 +787,9 @@ int check_levels() {
                 seen_va = va;
                 seen_desc = desc;
                 seen_iid = iid;
-                *out = reinterpret_cast<void*>(0x1330);
+                made = new_mock(Kind::resource);
+                made->refs = 1;
+                *out = made;
                 return S_OK;
             };
             xs::set_placed_at_va_handler(handler);
@@ -803,13 +806,14 @@ int check_levels() {
             const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
                                            word(&resource_iid), word(&placed)));
             xs::set_placed_at_va_handler(nullptr);
-            EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(r133 == S_OK && placed && word(placed) == word(made));
             EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
             EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
             EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
             EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
             EXPECT(xs::device_slot_overridden(133));
+            EXPECT(release(placed) == 0);
         }
 
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
@@ -2293,6 +2297,181 @@ int check_allocation_descriptions_cleaned() {
     return 0;
 }
 
+// ---- 8b. Device slots 133 and 70 together: a buffer placed at an address is found again by that address ----
+//
+// The PC resource behind a slot 133 buffer has an address of its own (the mock's resources have none at all), so
+// the proxy must remember which resource it made for which range. Slot 70 then writes a view of that resource, not
+// the null view.
+
+D3D12_RESOURCE_DESC placed_buffer_desc(std::uint64_t width) {
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    d.Width = width;
+    d.Height = 1;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = 1;
+    d.SampleDesc.Count = 1;
+    d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);         // the Xbox row-major word
+    d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004);      // UNORDERED_ACCESS and an Xbox bit
+    return d;
+}
+
+Mock* g_handler_made = nullptr;  // the resource the placed-at-VA handler below last made
+
+int check_slot70_placed_buffer() {
+    constexpr std::uint64_t kVaA = 0x7f0000000000ull, kSizeA = 0x10000;
+    constexpr std::uint64_t kVaB = kVaA + 0x40000, kSizeB = 0x2000;
+    constexpr std::uint64_t kLayoutUndefined = 0xFFFFFFFFu;
+    const std::uint64_t destination = 0x7000;
+    // Level 9 makes the buffer with CreateCommittedResource, level 10 with CreateCommittedResource3.
+    for (const int level : {9, 10}) {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, level, true);
+        EXPECT(device);
+        const D3D12_RESOURCE_DESC desc_a = placed_buffer_desc(kSizeA), desc_b = placed_buffer_desc(kSizeB);
+        void* a = nullptr;
+        void* b = nullptr;
+        EXPECT(hr_of(raw6(device, 133, kVaA, word(&desc_a), kLayoutUndefined, 0, word(&kResourceIid), word(&a))) ==
+               S_OK && a);
+        EXPECT(hr_of(raw6(device, 133, kVaB, word(&desc_b), kLayoutUndefined, 0, word(&kResourceIid), word(&b))) ==
+               S_OK && b);
+        Mock* const mock_a = reinterpret_cast<Mock*>(a);
+        Mock* const mock_b = reinterpret_cast<Mock*>(b);
+        // The title's reference is the only one: the proxy remembers the buffer without holding it.
+        EXPECT(mock_a->refs == 1 && mock_b->refs == 1 && mock_a->private_data && mock_b->private_data);
+
+        // 0x800 bytes at +0x1000 of A: a raw view of A from element 0x400, 0x200 elements, and no reference left.
+        unsigned views = mock->calls[18];
+        RawShape shape = raw_shape(kVaA + 0x1000, 0x800);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(a) && mock->args[18][2] == destination);
+        EXPECT(mock->srv.Format == DXGI_FORMAT_R32_TYPELESS && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+               (mock->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && mock->srv.Buffer.FirstElement == 0x400 &&
+               mock->srv.Buffer.NumElements == 0x200);
+        EXPECT(mock_a->refs == 1 && mock->calls[70] == 0);
+        // The first and the last word of B are B's; a width past B's end is cut there.
+        shape = raw_shape(kVaB, 4);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(b) && mock->srv.Buffer.FirstElement == 0 &&
+               mock->srv.Buffer.NumElements == 1);
+        shape = raw_shape(kVaB + kSizeB - 4, 0x1000);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(b) &&
+               mock->srv.Buffer.FirstElement == (kSizeB - 4) / 4 && mock->srv.Buffer.NumElements == 1);
+        EXPECT(mock_b->refs == 1);
+        // Just below A, between the two and just past B: no buffer was placed there, so the null view.
+        for (const std::uint64_t va : {kVaA - 4, kVaA + kSizeA, kVaB - 4, kVaB + kSizeB}) {
+            shape = raw_shape(va, 0x100);
+            raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+            EXPECT(mock->calls[18] == ++views && is_null_view(mock));
+        }
+        EXPECT(mock_a->refs == 1 && mock_b->refs == 1);
+
+        // A texture placed at an address is not a buffer a raw view can name.
+        D3D12_RESOURCE_DESC texture = placed_buffer_desc(64);
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Height = 64;
+        texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        constexpr std::uint64_t kVaTexture = kVaA + 0x100000;
+        void* placed_texture = nullptr;
+        EXPECT(hr_of(raw6(device, 133, kVaTexture, word(&texture), 6, 0, word(&kResourceIid),
+                          word(&placed_texture))) == S_OK && placed_texture);
+        EXPECT(!reinterpret_cast<Mock*>(placed_texture)->private_data);
+        shape = raw_shape(kVaTexture, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && is_null_view(mock));
+        EXPECT(release(placed_texture) == 0);
+
+        // The device's own provider still answers for an address no slot 133 call placed, and a placed buffer wins
+        // where both could answer.
+        g_buffer = new_mock(Kind::resource);
+        g_buffer->refs = 1;
+        EXPECT(xs::set_device_resource_provider(device, &find_buffer));
+        shape = raw_shape(kBufferStart + 0x40, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(g_buffer) && g_buffer->refs == 1);
+        g_asked_bytes = 0;
+        shape = raw_shape(kVaA + 8, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(a) && g_asked_bytes == 0);
+        EXPECT(xs::set_device_resource_provider(device, nullptr));
+        g_buffer = nullptr;
+
+        // The title places another buffer over the start of A's range: the newer one answers for its range, A for
+        // the rest of its own, and A for all of it again once the newer one is gone.
+        const D3D12_RESOURCE_DESC desc_c = placed_buffer_desc(0x4000);
+        void* c = nullptr;
+        EXPECT(hr_of(raw6(device, 133, kVaA, word(&desc_c), kLayoutUndefined, 0, word(&kResourceIid), word(&c))) ==
+               S_OK && c);
+        shape = raw_shape(kVaA + 0x1000, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(c));
+        shape = raw_shape(kVaA + 0x4000, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(a) && mock->srv.Buffer.FirstElement == 0x1000);
+        EXPECT(release(c) == 0);
+        shape = raw_shape(kVaA + 0x1000, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(a));
+
+        // A released buffer is forgotten: its address gets the null view, and nothing touches the dead resource.
+        EXPECT(release(a) == 0);
+        const unsigned a_calls = mock_a->calls[1];
+        shape = raw_shape(kVaA + 0x1000, 0x100);
+        raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(mock->calls[18] == ++views && is_null_view(mock) && mock_a->calls[1] == a_calls && mock_a->refs == 0);
+
+        // The device goes before B: its entries go with it, and B's release afterwards finds nothing to remove.
+        EXPECT(release(device) == 0 && mock->refs == 0);
+        Mock* other_mock = nullptr;
+        void* other = make_device(other_mock, level, true);
+        EXPECT(other);
+        shape = raw_shape(kVaB, 0x100);
+        raw(other, 70, word(&shape.resource), word(&shape.view), destination);
+        EXPECT(other_mock->calls[18] == 1 && is_null_view(other_mock) && mock_b->refs == 1);
+        EXPECT(release(b) == 0);
+        EXPECT(release(other) == 0 && other_mock->refs == 0);
+    }
+
+    // A buffer the device behind the proxy made on the title's pages (set_placed_at_va_handler) is remembered the
+    // same way; one the handler refuses falls back to a committed buffer, which is remembered too.
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    static bool refuse = false;
+    xs::set_placed_at_va_handler([](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t, REFIID,
+                                    void** out) -> HRESULT {
+        if (refuse) return E_NOTIMPL;
+        g_handler_made = new_mock(Kind::resource);
+        g_handler_made->refs = 1;
+        *out = g_handler_made;
+        return S_OK;
+    });
+    const D3D12_RESOURCE_DESC desc = placed_buffer_desc(kSizeA);
+    void* on_pages = nullptr;
+    EXPECT(hr_of(raw6(device, 133, kVaA, word(&desc), kLayoutUndefined, 0, word(&kResourceIid), word(&on_pages))) ==
+           S_OK && on_pages && word(on_pages) == word(g_handler_made) && mock->calls[27] == 0);
+    RawShape shape = raw_shape(kVaA + 0x20, 0x40);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 1 && mock->args[18][0] == word(on_pages) && mock->srv.Buffer.FirstElement == 8 &&
+           mock->srv.Buffer.NumElements == 0x10 && g_handler_made->refs == 1);
+    refuse = true;
+    void* fallback = nullptr;
+    EXPECT(hr_of(raw6(device, 133, kVaB, word(&desc), kLayoutUndefined, 0, word(&kResourceIid), word(&fallback))) ==
+           S_OK && fallback && mock->calls[27] == 1);
+    xs::set_placed_at_va_handler(nullptr);
+    refuse = false;
+    shape = raw_shape(kVaB, 0x40);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 2 && mock->args[18][0] == word(fallback));
+    EXPECT(release(on_pages) == 0 && release(fallback) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a buffer placed at an address through device slot 133 (committed, CreateCommittedResource3 or on "
+                "the title's pages) is the resource of a slot 70 view of that address, until it or its device dies\n",
+                g_label);
+    return 0;
+}
+
 // ---- 11. The console tail and the guard region ----
 // ---- 9. The refused tail and the guard region ----
 
@@ -2962,7 +3141,7 @@ int main(int argc, char** argv) {
         check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() ||
         check_committed_resource3_x() || check_render_target_sizes() || check_allocation_descriptions_cleaned() ||
         check_committed_resource_leases() || check_slot74() || check_fence_completed_value() ||
-        check_list_cpu_handles())
+        check_list_cpu_handles() || check_slot70_placed_buffer())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

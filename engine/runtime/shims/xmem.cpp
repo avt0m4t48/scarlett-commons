@@ -21,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 
 #include "shims.h"
@@ -29,34 +30,35 @@
 namespace {
 
 constexpr size_t kAlign = 64;
+constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
-// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
+// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
 // bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
 // which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({api, attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+    std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    if (size != kNoSize) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
               rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -140,16 +142,27 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     return true;
 }
 
+// The console's PAGE_GRAPHICS_* protection bits (winnt.h: PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE
+// 0x40000). The host refuses them with ERROR_INVALID_PARAMETER, and the D3D12 layer reads guest memory through the
+// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
+constexpr DWORD kPageGraphicsMask = 0x0007F800;
+
+DWORD host_protect(DWORD p) {
+    const DWORD cpu = p & ~kPageGraphicsMask;
+    return cpu ? cpu : PAGE_NOACCESS;
+}
+
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+    // region.
+    //
+    // The attribute word is recorded, not applied, as for XMemAlloc: the host has no allocator ids or memory types.
+    // The retail executable passes 0x21, 0x3, 0x183, 0x283 and 0x181 and stops at an int3 when a reservation
+    // returns NULL, so refusing a nonzero word is not an option.
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
-    if (attributes != 0) {
-        SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
 
@@ -207,7 +220,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect);
+    return VirtualAlloc(address, size, host_type, host_protect(protect));
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
@@ -219,18 +232,64 @@ UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
     return ResetWriteWatch(base_address, region_size);
 }
 
+// BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE type, SIZE_T size). Its reference page and the XMEM_TRANSFER_TYPE enum
+// page (gaming/gdk/docs/reference/system/xmem/{functions/xmemtransfermemory,enums/xmem_transfer_type}) are NDA
+// topics on Microsoft Learn, so the shape comes from public code built against the GDK's xmem.h: Microsoft's
+// XBOX-MonoGame-NetRumble sample (console/NetRumble.Bootstrap/Main.cpp) and FNA-XNA/NativeAOT-Xbox (Bootstrap/Main.cpp)
+// both call `if (!XMemTransferMemory(XMemTransferTitleToSystem, additionalKernelPoolMemory))` with a `const size_t`,
+// commented "Transfer additional memory to kernel pool" and "Must be multiples of 2MB sizes". So: two arguments, the
+// enum (32 bits) in ECX and the size in RDX, and a zero return is failure. The public XLaunchNewGame page adds that
+// "Memory transferred to the system using XMemTransferMemory (NDA topic) is persisted", and the game-save debugging
+// page suggests it for E_OUTOFMEMORY "to transfer some memory to the system partition".
+//
+// On the console it moves budget between the title's partition and the system's. A PC has one pool and no budget
+// split, so there is nothing to move: every direction and size returns TRUE and nothing is allocated or reserved. Not
+// known (the pages are NDA): the numeric XMEM_TRANSFER_TYPE values, and whether the console refuses or rounds a size
+// that is not a multiple of 2 MiB. Refusing would stop a title at startup (both samples return -1), while succeeding
+// changes nothing here. TRUE is 1 in EAX, so it also reads as true if the real return type is a one-byte bool.
+//
+// gta6rt --trace FILE: the first call for each distinct (type, size) pair goes to the startup trace as an
+// "xmem_transfer" event with the caller as module+RVA, so a run with the executable records the values it passes.
+BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemTransferMemory(type %u, %zu bytes): a PC has no title/system memory partition; "
+                     "returning TRUE without moving anything (logged once)\n",
+                     type, static_cast<size_t>(size));
+    }
+    if (rt::startup_trace::enabled()) {
+        static std::mutex mutex;
+        static std::set<std::pair<uint32_t, uint64_t>> seen;
+        bool first = false;
+        {
+            const std::lock_guard lock(mutex);
+            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+        }
+        if (first) {
+            rt::startup_trace::event(
+                "xmem_transfer",
+                "\"api\":\"XMemTransferMemory\",\"type\":" + std::to_string(type) +
+                    ",\"size\":" + std::to_string(static_cast<uint64_t>(size)) + ",\"caller\":" +
+                    rt::startup_trace::quote(
+                        rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress()))));
+        }
+    }
+    return TRUE;
+}
+
 // kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
 // (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
 // 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
 // NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
-// the rest is passed through. Not done: the console protection bits, and whether graphics memory has to come from
-// an arena the D3D12 layer can see (#313).
+// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether
+// graphics memory has to come from an arena the D3D12 layer can see (#313).
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
+    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
 }
 
 }  // namespace
@@ -258,4 +317,5 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
+    {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
 );

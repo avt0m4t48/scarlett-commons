@@ -32,7 +32,9 @@ function, so the test is not in sight of the stop. This finds it, with nothing r
    or an added constant is followed through. A block that follows a return or a jump is entered through the one
    jump that reaches it. A register nothing wrote since the function start is one of its arguments (rcx, rdx, r8,
    r9). The function's direct call sites are then read for what each passes in it, as a tally ("argument 1 at the
-   function's 53 call sites: 5 the result of vtable slot 133, ...").
+   function's 53 call sites: 5 the result of vtable slot 133, ..."). For a load, the pointer register is followed
+   too. A value read from a global, or from a field of an object a global points to, is read at the global's
+   stores, each `mov [rip+x], r` or `mov [rip+x], imm` to it, with what it stores (the call that set it, or 0).
 6. A function whose start is doomed never returns. Each of its direct call sites is then read the same way, as if
    the call were the stop. Steps 3 and 6 go at most 3 functions away from the stop.
 
@@ -57,7 +59,7 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from gdk_runtime_calls import R8, R9, RAX, RCX, RDX, RIP, VOLATILE, Code, writes  # noqa: E402
+from gdk_runtime_calls import R8, R9, RAX, RCX, RDX, RIP, RSP, VOLATILE, Code, writes  # noqa: E402
 from import_call_sites import import_slots  # noqa: E402
 import pe_inspect  # noqa: E402
 
@@ -66,6 +68,8 @@ TRACE_BACK = 48             # instructions walked back from a test to what wrote
 FLAGS_BACK = 8              # instructions walked back from a guard to the instruction that set its flags
 MAX_LINKS = 16              # jumps in or call sites followed per function
 MAX_SITES = 256             # call sites read for an argument the stop depends on
+MAX_STORES = 64             # stores read per global the stop depends on
+_RIP_STORE = re.compile(rb"[\x88\x89\xc6\xc7][\x05\x0d\x15\x1d\x25\x2d\x35\x3d]")
 ARGUMENTS = {RCX: 1, RDX: 2, R8: 3, R9: 4}
 
 JCC = ("jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja", "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg")
@@ -353,10 +357,11 @@ def flags_setter(insns, k):
     return None
 
 
-def trace(image: Image, func, k: int, reg: int):
+def trace(image: Image, func, k: int, reg: int, level: int = 0):
     """What wrote `reg` before the instruction at index k of the function. Followed back through register copies,
     `lea r, [r2+disp]` and adding a constant (marked derived), and into a block through the one jump that reaches
-    it; a register no instruction wrote since the function start is an argument (rcx, rdx, r8, r9)."""
+    it; a register no instruction wrote since the function start is an argument (rcx, rdx, r8, r9). For a load,
+    the pointer register is traced too (two levels)."""
     insns, _, into = image.flow(func)
     copied = derived = False
     i = k
@@ -404,8 +409,14 @@ def trace(image: Image, func, k: int, reg: int):
             derived = True
             continue
         if insn.op in LOAD_OPS and insn.mod != 3:
-            return tagged({"value": "loaded from memory", "at": insn.rva,
-                           "from": memory_name(insn, 64 if insn.wide else 32)})
+            out = {"value": "loaded from memory", "at": insn.rva, "from": memory_name(insn, 64 if insn.wide else 32)}
+            if insn.base == RIP:
+                out["global"] = insn.target
+            elif insn.base == RSP:
+                out["value"] = "loaded from a stack slot"
+            elif insn.base not in (None, RIP) and level < 2:
+                out["base"] = {"register": NAMES64[insn.base], **trace(image, func, i, insn.base, level + 1)}
+            return tagged(out)
         if (insn.op in (0x31, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or 0xB8 <= insn.op <= 0xBF or (
                 insn.op == 0xC7 and insn.mod == 3):
             return tagged({"value": "a constant", "at": insn.rva})
@@ -456,6 +467,40 @@ def rel32_sources(image: Image, targets: set[int], skip):
     return found
 
 
+def global_writers(image: Image, target: int):
+    """Each `mov [rip+x], r` / `mov [rip+x], imm` storing to the global at `target`, with what it stores."""
+    found = []
+    for base, data in image.code.sections:
+        for m in _RIP_STORE.finditer(data):
+            op = data[m.start()]
+            if op in (0xC6, 0xC7) and data[m.start() + 1] != 0x05:
+                continue
+            at = m.end()
+            if at + 4 > len(data):
+                continue
+            end = at + 4 + {0xC6: 1, 0xC7: 4}.get(op, 0)
+            if base + end + struct.unpack_from("<i", data, at)[0] != target:
+                continue
+            for back in (0, 1, 2):                 # the opcode, or a REX / 66 prefix before it
+                rva = base + m.start() - back
+                func = image.function(rva)
+                if func is not None and image.lands_on(func, rva):
+                    found.append((rva, func))
+                    break
+    out = []
+    for rva, func in found[:MAX_STORES]:
+        k = image.flow(func)[1][rva]
+        insn = image.flow(func)[0][k]
+        if insn.op in (0xC6, 0xC7):
+            raw = image.raw(insn)
+            value = immediate(raw, 1 if insn.op == 0xC6 else (2 if width(raw, insn) == 16 else 4))
+            src = {"value": "a constant", "constant": value}
+        else:
+            src = trace(image, func, k, insn.reg)
+        out.append({"at": rva, "function": list(func), "source": src})
+    return {"global": target, "writers": out, "writers_not_read": max(0, len(found) - MAX_STORES)}
+
+
 def argument_sources(image: Image, func, numbers):
     """For each argument number, what each direct call site of the function passes in it."""
     sites = [rva for rva, kind, _ in rel32_sources(image, {func[0]}, func) if kind == "call"]
@@ -494,6 +539,15 @@ def explain(image: Image, seed: int, depth: int, seen: set):
                       if r.get("value") == "argument"})
     if numbers:
         out["arguments"] = argument_sources(image, func, numbers)
+    globals_read = []
+    for g in out["guards"]:
+        for r in g.get("registers", []):
+            while r is not None:
+                if "global" in r and r["global"] not in globals_read:
+                    globals_read.append(r["global"])
+                r = r.get("base")
+    if globals_read:
+        out["globals"] = [global_writers(image, x) for x in globals_read[:4]]
     links = [(rva, kind) for rva, kind, target in rel32_sources(image, doomed, func)
              if kind != "call" or (target == func[0] and out["never_returns"])]
     for rva, kind in links[:MAX_LINKS]:
@@ -536,8 +590,8 @@ def cause(data: bytes, addresses):
 
 # ---- text output ----
 
-def source(r) -> str:
-    """What a traced register holds, as text (without the register's name)."""
+def source(r, where: bool = False) -> str:
+    """What a traced register holds, as text (without the register's name); with `where`, the RVAs too."""
     how = "derived from " if r.get("derived") else ("a copy of " if r.get("copied") else "")
     if "call" in r:
         if "import" in r:
@@ -551,32 +605,46 @@ def source(r) -> str:
             what = f"the function pointer at {r['pointer']:#x}"
         else:
             what = "a call through a register"
-        return f"{how}the result of {what}"
+        return f"{how}the result of {what}" + (f", call at {r['call']:#x}" if where else "")
     if r["value"] == "argument":
         return f"{how}argument {r['argument']} ({r['argument_register']})"
-    src = f" ({r['from']})" if "from" in r else ""
-    return f"{how}{r['value']}{src}"
+    src = f" ({r['from']})" if "from" in r else (f" ({show(r['constant'])})" if "constant" in r else "")
+    at = f" at {r['at']:#x}" if where and "at" in r else ""
+    base = f"; {r['base']['register']}: {source(r['base'], where)}" if "base" in r else ""
+    return f"{how}{r['value']}{src}{at}{base}"
 
 
 def describe_register(r) -> str:
-    where = f", call at {r['call']:#x}" if "call" in r else (f" at {r['at']:#x}" if "at" in r else "")
-    return f"{r['register']}: {source(r)}{where}"
+    return f"{r['register']}: {source(r, True)}"
+
+
+def tally_lines(items, indent: str):
+    tally = {}
+    for what in items:
+        tally[what] = tally.get(what, 0) + 1
+    return [f"{indent}  {count:4}  {what}" for what, count in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def global_lines(globs, indent: str):
+    lines = []
+    for g in globs:
+        n = len(g["writers"]) + g["writers_not_read"]
+        lines.append(f"{indent}global {g['global']:#x} is written at {n} site(s)" + (":" if n else
+                     " this tool reads (none by a direct `mov`: through a pointer or not at all)"))
+        lines += tally_lines([source(w["source"]) for w in g["writers"]], indent)
+        if g["writers_not_read"]:
+            lines.append(f"{indent}  {g['writers_not_read']} more not read")
+    return lines
 
 
 def argument_lines(args, indent: str):
     """A tally of what the call sites pass, most frequent first."""
     sites = args["sites"]
     lines = []
-    for n in sorted({s["passed_as"] for s in sites}):
-        tally = {}
-        for s in sites:
-            if s["passed_as"] == n:
-                what = source(s["source"])
-                tally[what] = tally.get(what, 0) + 1
-        total = sum(tally.values())
-        lines.append(f"{indent}argument {n} at the function's {total} direct call site(s):")
-        for what, count in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0])):
-            lines.append(f"{indent}  {count:4}  {what}")
+    for n in sorted({x["passed_as"] for x in sites}):
+        passed = [source(x["source"]) for x in sites if x["passed_as"] == n]
+        lines.append(f"{indent}argument {n} at the function's {len(passed)} direct call site(s):")
+        lines += tally_lines(passed, indent)
     if args.get("sites_not_read"):
         lines.append(f"{indent}{args['sites_not_read']} more call site(s) not read")
     return lines
@@ -602,6 +670,8 @@ def report_lines(rep, indent: str = "  "):
         lines += guard_lines(g, indent)
     if rep.get("arguments"):
         lines += argument_lines(rep["arguments"], indent)
+    if rep.get("globals"):
+        lines += global_lines(rep["globals"], indent)
     for j in rep["jumps_in"]:
         if j.get("jump") == "jmp":
             f = j["from"]

@@ -54,6 +54,13 @@ CHECK_CALL = 0x1825
 HANDLER2 = 0x1900           # call XMemBar; int3
 HANDLER2_STOP = 0x1905
 USER = 0x1A00               # CHECK(device slot 8 result); CHECK(XMemFoo result)
+FIELD = 0x1B00              # p = XMemFoo(); if (p->field_10 == 0) int3
+FIELD_STOP = 0x1B10
+GLOBAL_PTR = IDATA_RVA + 0x810
+INIT = 0x1C00               # GLOBAL_PTR = XMemFoo()
+RESET = 0x1C20              # GLOBAL_PTR = 0
+USE = 0x1D00                # if (GLOBAL_PTR == 0) int3
+USE_STOP = 0x1D0C
 
 
 def call(at, target):
@@ -110,6 +117,17 @@ def functions():
             + call(a + 0x13, CHECK)                                                 # mov ecx, eax; call CHECK
             + call(a + 0x18, THUNK_FOO) + b"\x8b\xc8" + call(a + 0x1F, CHECK)       # call XMemFoo; mov; call
             + b"\x48\x83\xc4\x28\xc3")
+    a = FIELD
+    f[a] = (b"\x48\x83\xec\x28" + call(a + 4, THUNK_FOO)                         # call XMemFoo
+            + b"\x8b\x48\x10\x85\xc9\x75\x01\xcc"                               # mov ecx, [rax+0x10]; test; jne; int3
+            + b"\x48\x83\xc4\x28\xc3")
+    a = INIT
+    f[a] = (b"\x48\x83\xec\x28" + call(a + 4, THUNK_FOO)
+            + b"\x48\x89\x05" + rip(a + 9, 7, GLOBAL_PTR) + b"\x48\x83\xc4\x28\xc3")   # mov [rip+ptr], rax
+    f[RESET] = b"\x48\xc7\x05" + rip(RESET, 11, GLOBAL_PTR) + b"\x00\x00\x00\x00\xc3"  # mov qword [rip+ptr], 0
+    a = USE
+    f[a] = (b"\x48\x8b\x05" + rip(a, 7, GLOBAL_PTR)                               # mov rax, [rip+ptr]
+            + b"\x48\x85\xc0\x75\x01\xcc\xc3")                                   # test rax, rax; jne; int3; ret
     return {start: (code, start + len(code)) for start, code in f.items()}
 
 
@@ -204,6 +222,33 @@ class Int3CauseTest(unittest.TestCase):
         self.assertIn("argument 1 at the function's 2 direct call site(s):", text)
         self.assertIn(f"1  a copy of the result of vtable slot 8 (this: global {GLOBAL_DEVICE:#x})", text)
         self.assertIn("1  a copy of the result of xmem.dll!XMemFoo", text)
+
+    def test_a_field_of_a_returned_object_names_the_call_behind_the_pointer(self):
+        r = self.one(hex(FIELD_STOP))
+        [g] = r["guards"]
+        self.assertEqual((g["jump"], g["doomed_side"], g["condition"]), ("jne", "fall-through", "ecx == 0"))
+        [reg] = g["registers"]
+        self.assertEqual((reg["value"], reg["from"]), ("loaded from memory", "dword [rax+0x10]"))
+        self.assertEqual((reg["base"]["register"], reg["base"]["import"]), ("rax", "xmem.dll!XMemFoo"))
+        self.assertEqual(int3_cause.describe_register(reg),
+                         f"rcx: loaded from memory (dword [rax+0x10]) at {FIELD + 9:#x}; "
+                         f"rax: the result of xmem.dll!XMemFoo, call at {FIELD + 4:#x}")
+
+    def test_a_global_tested_for_null_is_read_at_its_stores(self):
+        r = self.one(hex(USE_STOP))
+        [g] = r["guards"]
+        self.assertEqual(g["condition"], "rax == 0")
+        self.assertEqual(g["registers"][0]["global"], GLOBAL_PTR)
+        [glob] = r["globals"]
+        self.assertEqual(glob["global"], GLOBAL_PTR)
+        writers = {w["at"]: w["source"] for w in glob["writers"]}
+        self.assertEqual(sorted(writers), [INIT + 9, RESET])
+        self.assertEqual(writers[INIT + 9]["import"], "xmem.dll!XMemFoo")
+        self.assertEqual((writers[RESET]["value"], writers[RESET]["constant"]), ("a constant", 0))
+        text = int3_cause.to_text({"x": {"rva": USE_STOP, "stop": "int3", **r}})
+        self.assertIn(f"global {GLOBAL_PTR:#x} is written at 2 site(s):", text)
+        self.assertIn("1  a constant (0)", text)
+        self.assertIn("1  the result of xmem.dll!XMemFoo", text)
 
     def test_wine_reports_the_address_after_the_int3(self):
         r = self.one(f"exe+{IMPORT_STOP + 1:#x}")

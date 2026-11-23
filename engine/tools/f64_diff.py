@@ -209,15 +209,19 @@ def compare(cond, a, b):
 
 
 def fixup(s0, s1, s2):
+    """v_div_fixup_f64 under the game's MODE (IEEE off), as measured on RDNA2 gfx1036 and recorded in docs/design.md
+    (the v_div_fixup_f16/f64 row, #2477): a NaN in S2 or S1 passes through unchanged (a signalling one is not quieted
+    with IEEE=0); the underflow cutoff is exp(S2) - exp(S1) <= -1076; there is no overflow check; NaN(S0) gives
+    signed infinity."""
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= -1076: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
 
 

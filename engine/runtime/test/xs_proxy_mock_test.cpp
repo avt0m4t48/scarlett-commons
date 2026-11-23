@@ -1963,6 +1963,8 @@ int check_slot70() {
         // No destination, no write.
         raw(device, 70, word(words), word(view), 0);
         EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
+        raw(device, 18, 0, 0x33, destination);
+        EXPECT(mock->calls[18] == 2 && mock->args[18][1] == 0x33 && is_null_view(mock));
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
     return 0;

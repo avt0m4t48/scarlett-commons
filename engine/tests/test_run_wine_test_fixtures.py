@@ -13,13 +13,14 @@ WINDOWS_ROOT = "synthetic-checkout"
 
 class WineFixtureSetupTests(unittest.TestCase):
     def run_fixture(self, setup_status: int, *, fixture: bool = True, disabled: bool = False,
-                    dependent: bool = False,
+                    dependent: bool = False, duplicate_setup: bool = False,
                     ) -> tuple[int, str, list[str]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             trace = root / "launches.txt"
 
-            def entry(name: str, status: int, properties: dict[str, object]) -> dict[str, object]:
+            def entry(name: str, status: int, properties: dict[str, object], *,
+                      test_name: str | None = None) -> dict[str, object]:
                 (root / f"{name}.py").write_text(
                     "from pathlib import Path\n"
                     "with Path(__file__).with_name('launches.txt').open('a', encoding='utf-8', newline='\\n') as f:\n"
@@ -27,7 +28,7 @@ class WineFixtureSetupTests(unittest.TestCase):
                     f"raise SystemExit({status})\n",
                     encoding="utf-8", newline="\n",
                 )
-                return {"name": name, "command": [f"{WINDOWS_ROOT}/{name}.py"],
+                return {"name": test_name or name, "command": [f"{WINDOWS_ROOT}/{name}.py"],
                         "properties": [{"name": key, "value": value} for key, value in properties.items()]}
 
             setup_props: dict[str, object] = {"SKIP_RETURN_CODE": 77, "DISABLED": disabled}
@@ -38,6 +39,8 @@ class WineFixtureSetupTests(unittest.TestCase):
             setup = entry("setup", setup_status, setup_props)
             consumer = entry("consumer", 0, consumer_props)
             tests = [consumer, setup] if fixture else [setup, consumer]
+            if duplicate_setup:
+                tests.append(entry("second_setup", 0, setup_props, test_name="setup"))
             if dependent:
                 tests.append(entry("dependent", 0, {"DEPENDS": ["consumer"]}))
             listing = root / "ctest.json"
@@ -64,6 +67,12 @@ class WineFixtureSetupTests(unittest.TestCase):
         self.assertEqual(status, 1, output)
         self.assertEqual(calls, ["setup"])
         self.assertIn("[FAIL] consumer", output)
+        self.assertIn("failed fixture setup: setup", output)
+
+    def test_passing_setup_with_same_name_does_not_hide_failure(self) -> None:
+        status, output, calls = self.run_fixture(3, duplicate_setup=True)
+        self.assertEqual(status, 1, output)
+        self.assertEqual(calls, ["setup", "second_setup"])
         self.assertIn("failed fixture setup: setup", output)
 
     def test_skipped_or_disabled_setup_does_not_block(self) -> None:

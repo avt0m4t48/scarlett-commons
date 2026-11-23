@@ -273,13 +273,15 @@ def main() -> int:
         return 2
     wine = args.wine
     results = {}
+    results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:
             name = names[index]
-            failed_setups = tuple(names[setup] for setup in setups[index] if results[names[setup]] == "fail")
+            failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
             status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
+            results_by_index[index] = status
             results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":

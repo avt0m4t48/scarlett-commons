@@ -10077,7 +10077,9 @@ class Gen:
             else:
                 # D = S0 * 2^S1, S1 a signed 16-bit integer clamped to [-64, 64] and added to the exponent field;
                 # above 30 the result is +-inf; at 0 or below it is a denormal: the significand shifted right by
-                # 1 - field and rounded to nearest even (a carry into bit 10 gives the smallest normal).
+                # 1 - field and rounded to nearest even (a carry into bit 10 gives the smallest normal). After a
+                # MODE.FP_ROUND[3:2] toward-zero write (%mode_r16 = 3) it rounds like every other VALU f16 result:
+                # overflow gives +-65504 and a denormal is truncated (not measured on hardware for this op).
                 n = self.src_u(a[2])
                 n16 = self.i16_half(n, sel[1])
                 nu, nb, small, neg, lim, nc = (self.tmp() for _ in range(6))
@@ -10099,8 +10101,17 @@ class Gen:
                 self.emit(f"{lo10} = OpBitwiseAnd %uint {sig11} {self.cu(0x3FF)}")
                 self.emit(f"{keep} = OpBitwiseOr %uint {sgn} {lo10}")
                 self.emit(f"{norm} = OpBitwiseOr %uint {keep} {sh}")
-                self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {self.cu(0x7C00)}")
-                # Field 0 or below: shift right by 1 - field (clamped to 1..12; 12 leaves nothing) and round to even.
+                is_z = None
+                if self.round_mode:
+                    m, is_z, big = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{m} = OpLoad %uint %mode_r16")
+                    self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
+                    self.emit(f"{big} = OpSelect %uint {is_z} {self.cu(0x7BFF)} {self.cu(0x7C00)}")
+                    self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {big}")
+                else:
+                    self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {self.cu(0x7C00)}")
+                # Field 0 or below: shift right by 1 - field (clamped to 1..12; 12 leaves nothing) and round to even
+                # (toward zero: truncate).
                 rs, rsc, rsu, q, hm, half, mask, rem, gt, eq, odd, oddb, tie, up, inc, qd, den = \
                     (self.tmp() for _ in range(17))
                 self.emit(f"{rs} = OpISub %int {self.as_int(self.cu(1))} {self.as_int(e2)}")
@@ -10118,6 +10129,11 @@ class Gen:
                 self.emit(f"{oddb} = OpINotEqual %bool {odd} {self.cu(0)}")
                 self.emit(f"{tie} = OpLogicalAnd %bool {eq} {oddb}")
                 self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
+                if is_z is not None:
+                    not_z, upn = self.tmp(), self.tmp()
+                    self.emit(f"{not_z} = OpLogicalNot %bool {is_z}")
+                    self.emit(f"{upn} = OpLogicalAnd %bool {up} {not_z}")
+                    up = upn
                 self.emit(f"{inc} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
                 self.emit(f"{qd} = OpIAdd %uint {q} {inc}")
                 self.emit(f"{den} = OpBitwiseOr %uint {sgn} {qd}")

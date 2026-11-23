@@ -16,10 +16,12 @@
 // at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
 // "signed-zero" checks three direct float stores and all remaining RGBA32 guard words (SHADER-605).
+// LEONIDA_VK_VALIDATION=1 (env): a validation error from VK_LAYER_KHRONOS_validation fails the run (vk_validation.h).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 #include "spirv_capability.h"
 #include "../src/gfx10_descriptors.h"
 
@@ -59,7 +61,7 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
     }
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
     gipa = load_vulkan();
     if (!gipa) return 1;
@@ -70,7 +72,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    CHECK(validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
     LOADI(vkGetPhysicalDeviceMemoryProperties); LOADI(vkGetPhysicalDeviceFeatures);
@@ -559,4 +564,8 @@ int main(int argc, char** argv) {
     std::printf("r32 uint (uint view): %u bad, texel(5,3) = %u\n", bad[1], static_cast<const uint32_t*>(rbp[1])[3 * W + 5]);
     std::printf("r32 sint (sint view): %u bad, texel(5,3) = %d\n", bad[2], static_cast<const int32_t*>(rbp[2])[3 * W + 5]);
     return (bad[0] || bad[1] || bad[2]) ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

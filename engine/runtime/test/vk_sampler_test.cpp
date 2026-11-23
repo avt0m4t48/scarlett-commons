@@ -11,11 +11,13 @@
 // (LOD 1) and image_sample_lz asks for LOD 0. The 64x64 RGBA32F result is written to <out.raw>; check.py judges it.
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
 #define VK_NO_PROTOTYPES
+// LEONIDA_VK_VALIDATION=1 (env): a validation error from VK_LAYER_KHRONOS_validation fails the run (vk_validation.h).
 #include "vulkan_loader.h"
 #include "vk_shader_fma.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_pc_tail.h"
 #include "vk_shader_fma.h"
+#include "vk_validation.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
@@ -51,7 +53,7 @@ std::vector<std::uint32_t> read_spv(const char* path) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc != 8 && argc != 10) {
         std::fprintf(stderr, "usage: vk_sampler_test <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]\n");
         return 2;
@@ -88,7 +90,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    CHECK(validation.attach(gipa, inst));
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkGetPhysicalDeviceFeatures2); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
     std::uint32_t n = 0;
@@ -548,4 +553,8 @@ int main(int argc, char** argv) {
     }
     std::printf("ok -> %s\n", argv[3]);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

@@ -30,10 +30,12 @@
 //                                dwords, default 0x92,0xc00000,0x14500000,0) at sampler index 1.
 //
 #define VK_NO_PROTOTYPES
+// LEONIDA_VK_VALIDATION=1 (env): a validation error from VK_LAYER_KHRONOS_validation fails the run (vk_validation.h).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 #include "spirv_capability.h"
@@ -137,7 +139,7 @@ static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& v
     return bool(f);
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
                              "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");
@@ -250,7 +252,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    CHECK(validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetPhysicalDeviceMemoryProperties);
@@ -1182,4 +1187,8 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "ok %ux%u -> %s\n", W, H, argv[3]);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

@@ -6,15 +6,16 @@ writes the vertices it emits into a buffer, followed by an ordinary draw of that
 by tools/rdna2spirv.py (stage `Geometry`) into a GLCompute module with one invocation per input primitive:
 
 - the per-vertex inputs (`BuiltIn Position`, `Location N`: Input arrays of vec4) are read from the input buffer
-  (set 1, binding 0), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p has its
-  inputs at `data[(p * VERTS_IN + v) * NUM_INPUTS + slot]`;
+  (set 1, binding `base_binding + 0`), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p
+  has its inputs at `data[(p * VERTS_IN + v) * NUM_INPUTS + slot]`;
 - the vec4 outputs become private variables, and every `OpEmitVertex` copies them to the record buffer
-  (set 1, binding 1), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
-- the meta buffer (set 1, binding 2), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the vertices
-  primitive p emitted and `meta[p * (MAX_VERTS + 1) + 1 + n]` = 1 when `OpEndPrimitive` ends a strip after vertex n
-  (0 otherwise).
+  (set 1, binding `base_binding + 1`), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
+- the meta buffer (set 1, binding `base_binding + 2`), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the
+  vertices primitive p emitted and `meta[p * (MAX_VERTS + 1) + 1 + n]` = 1 when `OpEndPrimitive` ends a strip after
+  vertex n (0 otherwise).
 
-Slots are ordered Position first, then by location; `--layout` writes them with the sizes. `PrimitiveId` reads give
+`base_binding` defaults to 0 and shifts past any existing descriptor set 1 bindings in the module (such as
+`--pc-tail-ubo` at binding 0); `--layout` records `base_binding` and the slots with their sizes. `PrimitiveId` reads give
 p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 64x1x1; invocations past
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.

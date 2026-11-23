@@ -80,15 +80,26 @@ class DriveMap:
         if not os.path.isdir(dosdevices):
             self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
             return self
+        already_set = f"drive {drive}: is already set in {dosdevices}: left as it is"
         if os.path.lexists(link):
-            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            self.note = already_set
             return self
         self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
-        parent = os.path.join(self.scratch, *rest[:-1])
-        os.makedirs(parent, exist_ok=True)
-        os.symlink(self.root, os.path.join(parent, rest[-1]))
-        os.symlink(self.scratch, link)
-        self.link = link
+        try:
+            parent = os.path.join(self.scratch, *rest[:-1])
+            os.makedirs(parent, exist_ok=True)
+            os.symlink(self.root, os.path.join(parent, rest[-1]))
+            try:
+                os.symlink(self.scratch, link)
+            except FileExistsError:
+                self.note = already_set
+                return self
+            self.link = link
+        finally:
+            # __exit__ only runs after a successful __enter__.
+            if self.link is None:
+                shutil.rmtree(self.scratch, ignore_errors=True)
+                self.scratch = None
         self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
         return self
 

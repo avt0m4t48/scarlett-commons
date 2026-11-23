@@ -556,6 +556,14 @@ public:
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (dst && dst == src) {
+            // A self-copy on a DEFAULT heap is a no-op, but an UPLOAD/READBACK resource still cannot
+            // be both source and destination: native D3D12 rejects it at Close. Check this before
+            // the no-op is omitted from the recorded command list.
+            D3D12_HEAP_PROPERTIES properties{};
+            if (FAILED(dst->GetHeapProperties(&properties, nullptr)) ||
+                properties.Type != D3D12_HEAP_TYPE_DEFAULT) return check(false);
+        }
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 

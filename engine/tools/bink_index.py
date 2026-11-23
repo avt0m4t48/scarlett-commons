@@ -150,6 +150,10 @@ def scan_file(path, source):
                 hint, trailer_size = struct.unpack_from("<I4xI", data, 4)
                 if HDR <= hint < size:
                     start = hint
+                # +12 as the trailer size is measured on RPF9 only, where it is always a multiple of 16
+                # (docs/rpf.md, "The trailer at EOF"); any other value leaves the tail to the zero/unread split.
+                if bytes(data[0:1]) != b"9" or trailer_size % 16:
+                    trailer_size = 0
             pos = start
             last = start
             zero = unread = 0

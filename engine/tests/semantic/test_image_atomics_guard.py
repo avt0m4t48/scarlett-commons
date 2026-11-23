@@ -75,16 +75,21 @@ def parse_blocks(spv):
 
 def find_guarded_texel_block(spv):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is an OpLoad %bool %active, or the constant %true when the shader has no
+    OpStore to %active, and return that block's instructions."""
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    # A shader that never writes EXEC leaves every lane active, and the translator folds `if (%active)` to
+    # `if (%true)` there (#4473), which guards nothing because nothing can be inactive. Accept that constant, and
+    # only that constant: a shader with an OpStore to %active still needs the real load to protect the access.
+    exec_is_constant_true = not re.search(r"^\s*OpStore %active\b", spv, re.M)
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
                 br = insns[i + 1]
                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
+                if m and (m.group(1) in active_loads or (exec_is_constant_true and m.group(1) == "%true")):
                     guarded_targets.add(m.group(2))
     found = []
     for lbl, insns in blocks.items():

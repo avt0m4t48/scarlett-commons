@@ -2513,9 +2513,6 @@ private:
     bool image_tiles_ = false;
 };
 
-// Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
-// corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
-// first that fits; else the first without bindings; else the first. Null when there is none.
 // The S#s a shader builds from immediates (literal_samplers in its index entry) are named by no heap slot, so
 // nothing else gives them a sampler and a hash-table key: without this their lookup finds the fallback sampler
 // (index 0) and the shader samples with the wrong filter and address modes (docs/design.md, Literal samplers).
@@ -2523,10 +2520,14 @@ private:
 void register_literal_samplers(DeviceState& device, const leonida::ShaderEntry& entry) {
     for (const leonida::gfx10::SamplerWords& words : entry.literal_samplers)
         if (!device.bind_sampler(words))
-            log_once("a shader's literal S# has no sampler (no bindless set, or its sampler array is full); words",
+            log_once("a shader's literal S# got no sampler (no bindless set, or its sampler array is full); "
+                     "literal S#s in that shader:",
                      int(entry.literal_samplers.size()));
 }
 
+// Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
+// corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
+// first that fits; else the first without bindings; else the first. Null when there is none.
 template<typename Fits>
 const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
     const leonida::ShaderEntry* fitting = nullptr;

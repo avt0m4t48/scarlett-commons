@@ -5360,6 +5360,19 @@ class Gen:
             x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
         )
 
+    def f64_source_words(self, src: dict, op: str) -> tuple[str, str]:
+        if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
+            return self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
+        if src.get("f64_literal"):
+            return self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
+        if src["k"] == "fimm":
+            bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
+        elif src["k"] == "imm":
+            bits = src["v"] & 0xFFFFFFFFFFFFFFFF
+        else:
+            raise Unsupported(op + " operand")
+        return self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+
     def src64_data(self, s, op, *, allow_vgpr: bool = False):
         kind = s["k"]
         if s.get("n") == 2 and (kind == "sgpr" or (allow_vgpr and kind == "vgpr")):
@@ -6855,16 +6868,7 @@ class Gen:
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
-                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                    lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                elif sv.get("f64_literal"):
-                    lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
-                elif sv["k"] in ("imm", "fimm"):
-                    bits = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0]
-                            if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-                else:
-                    raise Unsupported(op + " operand")
+                lo, hi = self.f64_source_words(sv, op)
                 v2, d = self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
                 self.emit(f"{d} = OpBitcast %double {v2}")
@@ -9867,14 +9871,7 @@ class Gen:
             #   (-1073..-1022), matching v_frexp_mant_f16 / v_frexp_exp_i16_f16.
             # - Signed zero: +-0 / exp 0. Infinities and NaNs: unchanged / exp 0.
             sv = a[1]
-            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv["k"] in ("imm", "fimm"):
-                bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                        if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            else:
-                raise Unsupported(op + " operand")
+            lo, hi = self.f64_source_words(sv, op)
             if sv.get("abs"):
                 t = self.tmp()
                 self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")

@@ -1625,6 +1625,32 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
+      # vk_bindless_test (the bindless set and its table at the Vulkan level, no D3D12) takes the translated vs_ids,
+      # ps_tex and ps_imgatomic; it was only run by scripts/run_gpu_tests.py and check.py until D3D-314 needed it.
+      set(LEONIDA_BINDLESS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/bindless_shaders)
+      set(LEONIDA_BINDLESS_FILES ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv ${LEONIDA_BINDLESS_DIR}/spirv/ps_tex.spv
+                                 ${LEONIDA_BINDLESS_DIR}/spirv/ps_imgatomic.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_BINDLESS_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_BINDLESS_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_BINDLESS_DIR} vs_ids ps_tex ps_imgatomic
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ids.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_tex.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_imgatomic.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_ids, ps_tex and ps_imgatomic for vk_bindless_test"
+        VERBATIM)
+      add_custom_target(vk_bindless_shaders ALL DEPENDS ${LEONIDA_BINDLESS_FILES})
+      add_dependencies(vk_bindless_test vk_bindless_shaders)
+      add_test(NAME vk_bindless_ps_tex COMMAND vk_bindless_test ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv
+               ${LEONIDA_BINDLESS_DIR}/spirv/ps_tex.spv)
+      add_test(NAME vk_bindless_ps_imgatomic COMMAND vk_bindless_test ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv
+               ${LEONIDA_BINDLESS_DIR}/spirv/ps_imgatomic.spv)
+      set_tests_properties(vk_bindless_ps_tex vk_bindless_ps_imgatomic PROPERTIES SKIP_RETURN_CODE 77)
+
       # M2: a textured quad. vs_m2.asm and ps_m2.asm (the PS samples a T#/S# it loads from two descriptor tables) go
       # through the same build; the test creates the heaps, the SRV, the sampler and the root signature through the
       # D3D12 API only.
@@ -2017,6 +2043,18 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
+      # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
+      add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_CS_SET0_SAMPLE})
+      target_link_libraries(d3d12_bindless_churn_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_bindless_churn_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      target_compile_options(d3d12_bindless_churn_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_bindless_churn COMMAND d3d12_bindless_churn_test)
+      set_tests_properties(d3d12_bindless_churn PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_bindless_churn_validated COMMAND d3d12_bindless_churn_test --validated)
+      set_tests_properties(d3d12_bindless_churn_validated PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
                      ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)

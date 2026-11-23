@@ -1243,9 +1243,22 @@ public:
         bindless_commit_ = std::move(commit);
     }
 
+    // The set 0 the commands of this ExecuteCommandLists bind, read after `prepare` succeeded and under the same
+    // locks (a flush may have made a new set). Without it the pipelines' own set is bound.
+    void set_bindless_current(std::function<VkDescriptorSet()> current) {
+        std::unique_lock lock(resource_mutex_);
+        bindless_current_ = std::move(current);
+    }
+
     void set_bindless_release(DeferredDeletionQueue::BindlessReleaseFn fn, void* user) {
         deletion_queue_.set_bindless_release(fn, user);
     }
+
+    // The ticket of the latest submission: everything submitted so far is at or below it, and a resource that any
+    // of that work may use can be freed once completed_retire_ticket() has reached it. Tickets run over all queues,
+    // each recorded with its queue's timeline value, so this waits for every queue's timeline to pass what was
+    // submitted to it, and never makes a queue wait.
+    std::uint64_t submitted_retire_ticket() const { return submitted_ticket_.load(std::memory_order_acquire); }
 
     template<typename VkHandle>
     void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
@@ -1262,6 +1275,36 @@ public:
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
     }
+
+    // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then
+    // returns the completed ticket. For a caller whose list of retired objects has grown past what it will hold.
+    std::uint64_t wait_retire_ticket(std::uint64_t ticket) {
+        std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (is_device_lost()) return 0;
+            pending = retire_tickets_.pending_through(ticket);
+        }
+        if (!pending.empty()) {
+            std::vector<VkSemaphore> semaphores;
+            std::vector<std::uint64_t> values;
+            for (const auto& [semaphore, value] : pending) {
+                semaphores.push_back(semaphore);
+                values.push_back(value);
+            }
+            VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wait.semaphoreCount = std::uint32_t(semaphores.size());
+            wait.pSemaphores = semaphores.data();
+            wait.pValues = values.data();
+            vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);  // outside submit_mutex_: a signal may need it
+        }
+        return completed_retire_ticket();
+    }
+
+    // The bindless flush of this ExecuteCommandLists started a new set generation, whose table upload is in its
+    // command buffer: called from the `prepare` callback (tracker_mutex_ held), so execute() makes every other
+    // queue's next submission wait for this one, which binds the new set.
+    void note_bindless_upload() { bindless_upload_pending_ = true; }
 
     std::uint64_t completed_retire_ticket() {
         std::lock_guard lock(submit_mutex_);
@@ -1403,6 +1446,13 @@ private:
     std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::function<VkDescriptorSet()> bindless_current_;
+    bool bindless_upload_pending_ = false;  // tracker_mutex_
+    // The last submission that carried a new generation's table upload (its queue's progress semaphore and value), and
+    // a counter that says which one: every other queue's next submission waits for it (storage_mutex_).
+    VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t bindless_upload_value_ = 0;
+    std::uint64_t bindless_upload_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -1932,10 +1982,12 @@ private:
                 context_.scratch_->retire(progress_, 0);
                 scratch_guard.active = false;
             }
-            tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
+            tracker_lock.unlock();
             return ReplayResult::unsupported;
         }
+        replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
+        const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
         auto next_tracker = context_.tracker_;
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
@@ -1954,6 +2006,15 @@ private:
                 wait_values_.push_back(context_.storage_init_value_);
                 storage_init_seen_ = context_.storage_init_version_;
             }
+            // The set this submission binds may be a new generation whose table another queue's submission uploads:
+            // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
+            // every D3D12 queue of the device is made in info.queue_family).
+            if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
+                context_.bindless_upload_version_ != bindless_upload_seen_) {
+                waits_.push_back(context_.bindless_upload_semaphore_);
+                wait_values_.push_back(context_.bindless_upload_value_);
+            }
+            bindless_upload_seen_ = context_.bindless_upload_version_;
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -2035,6 +2096,13 @@ private:
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
+        if (submitted && bindless_uploaded) {
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.bindless_upload_semaphore_ = progress_;
+            context_.bindless_upload_value_ = submitted_;
+            ++context_.bindless_upload_version_;
+            bindless_upload_seen_ = context_.bindless_upload_version_;
+        }
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
             wait_values_.pop_back();
@@ -2057,8 +2125,10 @@ private:
             context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
             scratch_guard.active = false;
         }
-        tracker_lock.unlock();
+        // Under tracker_mutex_, so no other flush comes between this submit and the set's note of whether it reached
+        // the queue (it keeps a single upload obligation).
         if (bindless_commit) bindless_commit(submitted);
+        tracker_lock.unlock();
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
@@ -2470,6 +2540,7 @@ private:
     std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
+    std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;

@@ -900,6 +900,10 @@ struct DeviceState {
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
     std::mutex descriptor_mutex;  // the set and the containers below
+    // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
+    std::atomic<std::uint64_t> bindless_idle_waits{0};
+    bool bindless_legacy_idle = false;
+    std::atomic<bool> bindless_cap_logged{false};
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
@@ -4566,19 +4570,56 @@ public:
             },
             &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
-            std::lock_guard lock(state_.descriptor_mutex);
+            std::unique_lock lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
-            if (state_.bindless->flush_needs_idle()) {
-                // Entries a running shader probes are about to change, or binding 2 is about to name a new buffer:
-                // wait until nothing that uses the set still runs, then free the generations that were retired.
+            auto& context = *state_.context;
+            if (state_.bindless_legacy_idle && state_.bindless->flush_replaces_table()) {
+                // The wait of before D3D-314, kept for comparing frame times: nothing that uses the set still runs
+                // after it, so the generations flush() retires are free at once.
                 {
-                    std::lock_guard submit(state_.context->submit_mutex());
-                    state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                    std::lock_guard submit(context.submit_mutex());
+                    context.vk.vkDeviceWaitIdle(state_.info.device);
                 }
+                state_.bindless_idle_waits.fetch_add(1, std::memory_order_relaxed);
                 state_.bindless->release_retired();
+            } else if (state_.bindless->has_retired()) {
+                // Generations of the table that an earlier flush replaced: free those whose submissions are done.
+                // Nothing waits; the rest stay for a later submit. completed_retire_ticket() takes submit_mutex_,
+                // which comes after the resource, tracker and descriptor locks held here.
+                state_.bindless->release_retired(context.completed_retire_ticket());
+                // A queue whose work is stalled (a fence only the CPU signals, long async work) keeps its ticket from
+                // completing, and each replacing flush adds a generation. Past the cap wait, once the oldest is in the
+                // way, for the submissions up to its ticket (the queues' timelines, not the device), with the
+                // descriptor lock released: the thread that signals such a fence may need it.
+                constexpr std::size_t max_retired = 8;
+                if (state_.bindless->retired_count() > max_retired) {
+                    if (!state_.bindless_cap_logged.exchange(true))
+                        std::fprintf(stderr, "[rt] d3d12: more than %zu retired bindless table generations: waiting "
+                                             "for the queues that still use the oldest\n", max_retired);
+                    const std::uint64_t oldest = state_.bindless->oldest_retired_ticket();
+                    lock.unlock();
+                    const std::uint64_t completed = context.wait_retire_ticket(oldest);
+                    lock.lock();
+                    state_.bindless->release_retired(completed);
+                }
             }
-            return state_.bindless->flush(command_buffer);
+            // Under tracker_mutex_ (held from here to the submit) no other ExecuteCommandLists has recorded work that
+            // is not yet submitted, so every submission that can have bound the set being replaced has a ticket up to
+            // the one read here.
+            const bool flushed = state_.bindless->flush(command_buffer, context.submitted_retire_ticket());
+            if (flushed && state_.bindless->last_flush_replaced()) context.note_bindless_upload();
+            return flushed;
         });
+        state_.context->set_bindless_current([this]() {
+            std::lock_guard lock(state_.descriptor_mutex);
+            return state_.bindless ? state_.bindless->set() : VK_NULL_HANDLE;
+        });
+        {
+            char text[8] = {};
+            size_t length = 0;
+            state_.bindless_legacy_idle = getenv_s(&length, text, "LEONIDA_BINDLESS_IDLE_WAIT") == 0 && length > 1 &&
+                                          text[0] != '0';
+        }
         state_.context->set_bindless_commit([this](bool submitted) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (state_.bindless) state_.bindless->table_upload_result(submitted);
@@ -4654,6 +4695,7 @@ public:
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
+            state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
         state_.staging_queue.reset();  // it uses the context
         if (state_.context && state_.bindless) {
@@ -7829,6 +7871,18 @@ const leonida::BindlessSet* bindless_of(ID3D12Device* device) {
 VkDescriptorSet bindless_set(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->set() : VK_NULL_HANDLE;
+}
+
+BindlessStats bindless_stats(ID3D12Device* device) {
+    BindlessStats stats;
+    if (!device) return stats;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    if (!d || !d->bindless()) return stats;
+    stats.generations_made = d->bindless()->generations_made();
+    stats.retired_pending = d->bindless()->retired_count();
+    stats.device_idle_waits = d->state().bindless_idle_waits.load(std::memory_order_relaxed);
+    return stats;
 }
 
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {

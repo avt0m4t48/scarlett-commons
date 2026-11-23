@@ -1598,6 +1598,7 @@ int main() {
 
         // Set 0 now holds what the views and the sampler named. Four runs of the shader: the view's own slot, its
         // copy, the slot of bytes no view was made for, and the packed RGB view; each with the sampler's S#.
+        // Read again before each use: an ExecuteCommandLists that grows the table makes a new set (D3D-314).
         const VkDescriptorSet set0 = rt::d3d12::bindless_set(device.p);
         const VkDescriptorSetLayout set0_layout = rt::d3d12::bindless_set_layout(device.p);
         EXPECT(set0 && set0_layout);
@@ -1609,7 +1610,7 @@ int main() {
             std::memcpy(keys[k].ssharp, sampler_bytes, sizeof(keys[k].ssharp));
             keys[k].first = k * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, keys, results.data()));
         sampled_through_set = true;
         {
             const UINT slots[] = {line_default, line_mip, line_clamped, unknown};
@@ -1621,7 +1622,7 @@ int main() {
                 line_keys[k].mode = 4;  // Sample from the 1D binding, including on a lookup miss.
             }
             std::array<std::uint8_t, std::size(slots) * bytes> pixels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, line_keys, pixels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, line_keys, pixels.data()));
             UINT matched[std::size(slots)]{};
             for (UINT i = 0; i < texels; ++i) {
                 using Pixel = std::array<std::uint8_t, 4>;
@@ -1642,7 +1643,7 @@ int main() {
             std::memcpy(literal_keys[1].ssharp, unregistered_words.data(), sizeof(literal_keys[1].ssharp));
             literal_keys[1].first = texels;
             std::array<std::uint8_t, 2 * bytes> literal_pixels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, literal_keys, literal_pixels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, literal_keys, literal_pixels.data()));
             UINT wrapped = 0, clamped = 0;
             for (UINT i = 0; i < texels; ++i) {
                 wrapped += std::memcmp(literal_pixels.data() + 4 * i, texel(i % size, i / size).data(), 4) == 0;
@@ -1675,7 +1676,7 @@ int main() {
                 SampleKeys key = keys[0];
                 std::memcpy(key.ssharp, words.data(), sizeof(key.ssharp));
                 std::array<std::uint8_t, bytes> pixels{};
-                EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, {&key, 1}, pixels.data()));
                 UINT matches = 0;
                 for (UINT i = 0; i < texels; ++i) {
                     const auto expected = words == negative_bias ? texel(i % size, i / size) : mip_colors[1];
@@ -1690,7 +1691,7 @@ int main() {
             SampleKeys bc_key = keys[0];
             std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));
             std::array<std::uint8_t, bytes> samples{};
-            EXPECT(sample_through_set(d, set0, set0_layout, {&bc_key, 1}, samples.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, {&bc_key, 1}, samples.data()));
             constexpr std::uint8_t colors[2][2][4] = {{{255, 0, 0, 255}, {0, 255, 0, 255}},
                                                       {{0, 0, 255, 255}, {255, 255, 255, 255}}};
             for (UINT y = 0; y < size; ++y) {
@@ -1712,7 +1713,7 @@ int main() {
             std::memcpy(lod_keys[i].ssharp, sampler_bytes, sizeof(lod_keys[i].ssharp));
             lod_keys[i].first = i * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, lod_keys, lod_pixels.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, lod_keys, lod_pixels.data()));
         // A fractional image-view minimum LOD is not exact on every driver: Vulkan defines the view's minimum as
         // minLodFloat (preferred) or minLodInteger = floor(minLodFloat) (alternative), and an implementation may use
         // either (Vulkan spec, "Image Level(s) Selection" and VkImageViewMinLodCreateInfoEXT). The UHD 770 floors it.
@@ -1767,7 +1768,7 @@ int main() {
             array_keys[i].first = i * texels;
         }
         std::array<std::uint8_t, std::size(array_keys) * bytes> array_pixels{};
-        EXPECT(sample_through_set(d, set0, set0_layout, array_keys, array_pixels.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, array_keys, array_pixels.data()));
         std::array<UINT, std::size(array_clamps)> array_errors{}, array_errors_floored{};
         char array_first[std::size(array_clamps)][160]{};
         for (UINT i = 0; i < texels; ++i) {
@@ -1813,7 +1814,7 @@ int main() {
             cube_keys[i].layer = cube_lods[i].faces;
             cube_keys[i].first = i * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, cube_keys, cube_pixels.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, cube_keys, cube_pixels.data()));
         UINT cube_errors = 0;
         for (UINT view = 0; view < std::size(cube_lods); ++view) {
             const auto& v = cube_lods[view];
@@ -1844,7 +1845,7 @@ int main() {
             std::memcpy(volumes[view].ssharp, sampler_bytes, sizeof(volumes[view].ssharp));
             volumes[view].first = view * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, volumes, volume_pixels.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, volumes, volume_pixels.data()));
         unsigned volume_errors = 0;
         for (UINT view = 0; view < std::size(volume_slots); ++view)
             for (UINT i = 0; i < texels; ++i) {
@@ -1878,7 +1879,7 @@ int main() {
             std::memcpy(volume_lod_keys[i].ssharp, sampler_bytes, sizeof(volume_lod_keys[i].ssharp));
             volume_lod_keys[i].first = i * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, volume_lod_keys, volume_lod_pixels.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, volume_lod_keys, volume_lod_pixels.data()));
         UINT volume_lod_errors = 0;
         UINT volume_clamp_diffs = 0;
         for (UINT i = 0; i < texels; ++i) {
@@ -1913,7 +1914,7 @@ int main() {
             byte_keys[k].first = k * texels;
         }
         std::array<std::uint8_t, byte_view_count * bytes> byte_results{};
-        EXPECT(sample_through_set(d, set0, set0_layout, byte_keys, byte_results.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, byte_keys, byte_results.data()));
         for (UINT i = 0; i < texels; ++i) {
             const auto value = std::uint8_t(1 + 3 * i);
             const std::uint8_t expected[4][4] = {{0, 0, 0, value}, {value, 0, 255, 0},
@@ -1937,7 +1938,7 @@ int main() {
             border_keys[k].first = k * texels;
             border_keys[k].mode = border_views[k] == uint_slot;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, border_keys, borders.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, border_keys, borders.data()));
 
         if (ms_texture.p) {
             EXPECT(seed_ms_images(d, rt::d3d12::vulkan_image(ms_texture.p), rt::d3d12::vulkan_image(ms_array.p)));
@@ -1956,7 +1957,7 @@ int main() {
                 ms_keys[k].layer = ms_reads[k].view_layer;
             }
             std::array<std::uint8_t, std::size(ms_keys) * bytes> ms_results{};
-            EXPECT(sample_through_set(d, set0, set0_layout, ms_keys, ms_results.data(), LEONIDA_TEST_MS_FLOAT_SPV));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, ms_keys, ms_results.data(), LEONIDA_TEST_MS_FLOAT_SPV));
             for (UINT k = 0; k < std::size(ms_keys); ++k)
                 for (UINT i = 0; i < texels; ++i) {
                     const std::uint8_t expected[] = {std::uint8_t(i / 4 % 4), std::uint8_t(i / 16),
@@ -1993,7 +1994,7 @@ int main() {
             std::array<std::uint32_t, 4 * texels> values{};
             for (UINT shape = 0; shape < 2; ++shape)
                 EXPECT(std::memcmp(test.keys[shape].tsharp, view_bytes(test.slots[shape]), sizeof(test.keys[shape].tsharp)) == 0);
-            EXPECT(sample_through_set(d, set0, set0_layout, test.keys, values.data(), test.shader));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, test.keys, values.data(), test.shader));
             for (UINT k = 0; k < 4; ++k) {
                 const auto expected = k < 2 ? test.value + k : 0u;
                 for (UINT i = 0; i < texels; ++i) EXPECT(values[k * texels + i] == expected);
@@ -2119,7 +2120,7 @@ int main() {
                 ++key_count;
             }
             std::array<std::uint8_t, 3 * bytes> last_texels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, {last_keys, key_count}, last_texels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, {last_keys, key_count}, last_texels.data()));
             const char* const names[] = {"the last view through the last sampler", "the refused view",
                                          "the refused sampler"};
             UINT differ = 0;
@@ -2250,7 +2251,7 @@ int main() {
                 rgb96_keys[k].mode = rgb96_view_uint[k] ? 1 : 0;
             }
             std::vector<std::uint8_t> rgb96_pixels(rgb96_views * bytes);
-            EXPECT(sample_through_set(d, set0, set0_layout, rgb96_keys, rgb96_pixels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, rgb96_keys, rgb96_pixels.data()));
             const char* rgb96_names[rgb96_views] = {"FLOAT", "UINT", "TYPELESS as FLOAT", "TYPELESS as UINT"};
             UINT rgb96_differ = 0;
             for (UINT k = 0; k < rgb96_views; ++k)
@@ -2277,7 +2278,7 @@ int main() {
             std::memcpy(bgr_keys[k].ssharp, sampler_bytes, sizeof(bgr_keys[k].ssharp));
             bgr_keys[k].first = k * texels;
         }
-        EXPECT(sample_through_set(d, set0, set0_layout, bgr_keys, bgr_results.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, bgr_keys, bgr_results.data()));
 #endif
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
@@ -2295,7 +2296,7 @@ int main() {
         // The view's bytes are still in the slot, but they find nothing any more: the fallback.
         SampleKeys gone = keys[0];
         gone.first = 0;
-        EXPECT(sample_through_set(d, set0, set0_layout, {&gone, 1}, after_destruction.data()));
+        EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, {&gone, 1}, after_destruction.data()));
 #endif
 
         struct PackedFormat {
@@ -2385,7 +2386,7 @@ int main() {
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
             std::memcpy(packed_keys.ssharp, sampler_bytes, sizeof(packed_keys.ssharp));
             std::vector<std::uint8_t> packed_results(bytes);
-            EXPECT(sample_through_set(d, set0, set0_layout, {&packed_keys, 1}, packed_results.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, {&packed_keys, 1}, packed_results.data()));
             for (UINT i = 0; i < texels; ++i) {
                 const auto& want = expected[i];
                 if (std::memcmp(&packed_results[i * 4], want.data(), 4) != 0) {
@@ -2469,7 +2470,7 @@ int main() {
                 mm_keys[i].first = i * texels;
             }
             std::array<std::uint8_t, 3 * bytes> mm_pixels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, mm_keys, mm_pixels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, mm_keys, mm_pixels.data()));
             const auto get_fmt_props =
                 d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             VkFormatProperties rgba8_props{}, bc1_props{};
@@ -2784,7 +2785,7 @@ int main() {
                 depth_keys[i].first = i * texels;
             }
             std::vector<std::uint8_t> depth_pixels(valid_depth_srvs * bytes);
-            EXPECT(sample_through_set(d, set0, set0_layout, depth_keys, depth_pixels.data()));
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, depth_keys, depth_pixels.data()));
             UINT depth_differ = 0;
             for (UINT k = 0; k < valid_depth_srvs; ++k) {
                 const std::uint8_t want[4] = {depth_clear_u8[valid_cases[k].tex_index], 0, 0, 255};

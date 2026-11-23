@@ -54,6 +54,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -221,7 +222,6 @@ struct PlacedBuffer {
     std::uint64_t size;
     ID3D12Resource* resource;  // not referenced (see above)
     const DeviceProxy* device;
-    std::uint64_t id;
 };
 
 std::mutex& placed_buffer_mutex() {
@@ -229,9 +229,13 @@ std::mutex& placed_buffer_mutex() {
     return *m;
 }
 
-std::vector<PlacedBuffer>& placed_buffers() {
-    static auto* v = new std::vector<PlacedBuffer>;
-    return *v;
+// Keyed by the entry's id. Ids only grow, so the map's order is placement order: a lookup walks it backwards for
+// the newest placement over an address, and a tag removes its own entry in O(log n) instead of scanning them all
+// (a teardown of N buffers was N(N+1)/2 comparisons under the lock slot 70 takes; shdann's measurement on #8304).
+// A tag whose entry is already gone (its device was released first) erases nothing.
+std::map<std::uint64_t, PlacedBuffer>& placed_buffers() {
+    static auto* m = new std::map<std::uint64_t, PlacedBuffer>;
+    return *m;
 }
 
 std::atomic<std::size_t> g_placed_buffer_count{0};  // lets slot 70 skip the lock when nothing was ever placed
@@ -240,7 +244,7 @@ std::uint64_t g_next_placed_buffer_id = 0;          // under placed_buffer_mutex
 void forget_placed_buffer(std::uint64_t id) {
     std::lock_guard lock(placed_buffer_mutex());
     auto& buffers = placed_buffers();
-    std::erase_if(buffers, [id](const PlacedBuffer& buffer) { return buffer.id == id; });
+    buffers.erase(id);
     g_placed_buffer_count.store(buffers.size(), std::memory_order_release);
 }
 
@@ -248,7 +252,7 @@ void forget_placed_buffers_of(const DeviceProxy* device) {
     if (g_placed_buffer_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(placed_buffer_mutex());
     auto& buffers = placed_buffers();
-    std::erase_if(buffers, [device](const PlacedBuffer& buffer) { return buffer.device == device; });
+    std::erase_if(buffers, [device](const auto& entry) { return entry.second.device == device; });
     g_placed_buffer_count.store(buffers.size(), std::memory_order_release);
 }
 
@@ -297,7 +301,7 @@ void remember_placed_buffer(const DeviceProxy* device, std::uint64_t va, std::ui
         tag = new (std::nothrow) PlacedBufferTag(++g_next_placed_buffer_id);
         if (tag) {
             try {
-                placed_buffers().push_back({va, size, resource, device, tag->id});
+                placed_buffers().emplace(tag->id, PlacedBuffer{va, size, resource, device});
                 g_placed_buffer_count.store(placed_buffers().size(), std::memory_order_release);
             } catch (const std::bad_alloc&) {
                 delete tag;  // no entry was made, and its Release would take the lock held here
@@ -321,11 +325,12 @@ ID3D12Resource* add_ref_placed_buffer(const DeviceProxy* device, std::uint64_t v
     std::lock_guard lock(placed_buffer_mutex());
     const auto& buffers = placed_buffers();
     for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
-        if (it->device != device || va < it->va || va - it->va >= it->size) continue;
-        it->resource->AddRef();
-        *start = it->va;
-        *size = it->size;
-        return it->resource;
+        const PlacedBuffer& buffer = it->second;
+        if (buffer.device != device || va < buffer.va || va - buffer.va >= buffer.size) continue;
+        buffer.resource->AddRef();
+        *start = buffer.va;
+        *size = buffer.size;
+        return buffer.resource;
     }
     return nullptr;
 }

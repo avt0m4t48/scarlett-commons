@@ -3153,17 +3153,38 @@ class Gen:
             self.emit(f"{lbl_do} = OpLabel")
             vals = []
             if sub:
-                # 8/16-bit load: read the containing dword and extract (zero- or sign-extended)
+                # 8/16-bit load: read the containing dword and extract (zero- or sign-extended); a 16-bit load at
+                # byte offset 3 within a dword merges byte 0 of the next dword without over-reading non-crossing ones.
                 bits, signed = sub
-                lo32, b3, b64, al, ptr1, w, shb, v = (self.tmp() for _ in range(8))
+                lo32, b3, b64, al, ptr, p0, w, shb, v = (self.tmp() for _ in range(9))
                 self.emit(f"{lo32} = OpUConvert %uint {full}")
                 self.emit(f"{b3} = OpBitwiseAnd %uint {lo32} {self.cu(3)}")
                 self.emit(f"{b64} = OpUConvert %ulong {b3}")
                 self.emit(f"{al} = OpISub %ulong {full} {b64}")
-                self.emit(f"{ptr1} = OpConvertUToPtr %_ptr_PSB_uint {self.host_addr(al)}")
-                self.emit(f"{w} = OpLoad %uint {ptr1} Aligned 4")
+                self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                self.emit(f"{p0} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
+                self.emit(f"{w} = OpLoad %uint {p0} Aligned 4")
                 self.emit(f"{shb} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
-                self.emit(f"{v} = {'OpBitFieldSExtract' if signed else 'OpBitFieldUExtract'} %uint {w} {shb} {self.cu(bits)}")
+                ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+                if bits == 8:
+                    self.emit(f"{v} = {ext} %uint {w} {shb} {self.cu(8)}")
+                else:
+                    lo_part, cross, p1, w1, hi_byte, hi_sh, crossed, raw = (self.tmp() for _ in range(8))
+                    lbl_cross, lbl_cend = self.tmp() + "_cross", self.tmp() + "_cend"
+                    self.emit(f"{lo_part} = OpShiftRightLogical %uint {w} {shb}")
+                    self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
+                    self.emit(f"OpSelectionMerge {lbl_cend} None")
+                    self.emit(f"OpBranchConditional {cross} {lbl_cross} {lbl_cend}")
+                    self.emit(f"{lbl_cross} = OpLabel")
+                    self.emit(f"{p1} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(1)}")
+                    self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
+                    self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
+                    self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
+                    self.emit(f"{crossed} = OpBitwiseOr %uint {lo_part} {hi_sh}")
+                    self.emit(f"OpBranch {lbl_cend}")
+                    self.emit(f"{lbl_cend} = OpLabel")
+                    self.emit(f"{raw} = OpPhi %uint {crossed} {lbl_cross} {lo_part} {lbl_do}")
+                    self.emit(f"{v} = {ext} %uint {raw} {self.cu(0)} {self.cu(16)}")
                 vals.append(v)
             else:
                 ptr = self.tmp()
@@ -3173,12 +3194,13 @@ class Gen:
                     self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
                     vals.append(v)
+            done_lbl = self.current_label_placeholder()
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
             phis = []
             for i in range(n):                 # all OpPhi first: they must open the merge block
                 ph = self.tmp()
-                self.emit(f"{ph} = OpPhi %uint {vals[i]} {lbl_do} {olds[i]} {pre}")
+                self.emit(f"{ph} = OpPhi %uint {vals[i]} {done_lbl} {olds[i]} {pre}")
                 phis.append(ph)
             for i, ph in enumerate(phis):
                 self.store_reg("vgpr", data["r"] + i, ph)

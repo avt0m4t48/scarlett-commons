@@ -177,6 +177,52 @@ class FirstLightTests(unittest.TestCase):
             )
 
 
+class DrawOutputTests(unittest.TestCase):
+    def test_failed_recheck_clears_previous_preview_and_result(self) -> None:
+        manifest = {
+            "width": 2,
+            "height": 1,
+            "min_coverage": 0.5,
+            "max_coverage": 0.99,
+            "files": {"mesh": "mesh.bin"},
+        }
+        first = struct.pack("<8f", 1, 0, 0, 1, 0, 0, 0, 0)
+        blank = bytes(32)
+        retry = struct.pack("<8f", 0, 1, 0, 1, 0, 0, 0, 0)
+        frames = iter((first, blank, retry))
+
+        def write_readback(cmd: list[str], *, check: bool, env: dict[str, str]) -> None:
+            Path(cmd[3]).write_bytes(next(frames))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            manifest_path = out / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            ppm = out / "image.ppm"
+            argv = ["--out", tmp, "--check"]
+            with (
+                patch.object(fl, "find_harness", return_value="stub.exe"),
+                patch.object(fl.subprocess, "run", side_effect=write_readback),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(fl.main(argv), 0)
+                self.assertEqual(ppm.read_bytes(), b"P6\n2 1\n255\n\xff\0\0\0\0\0")
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["result"]["ratio"], 0.5)
+
+                with self.assertRaisesRegex(SystemExit, "coverage 0.0000 outside"):
+                    fl.main(argv)
+                self.assertEqual((out / "image.raw").read_bytes(), blank)
+                self.assertFalse(ppm.exists())
+                self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
+
+                self.assertEqual(fl.main(argv), 0)
+                self.assertEqual((out / "image.raw").read_bytes(), retry)
+                self.assertEqual(ppm.read_bytes(), b"P6\n2 1\n255\n\0\xff\0\0\0\0")
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["result"]["ratio"], 0.5)
+
+
 class PpmTests(unittest.TestCase):
     def test_nonfinite_readback_channels_write_complete_ppm(self) -> None:
         from pathlib import Path

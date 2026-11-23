@@ -1108,6 +1108,9 @@ def main(argv=None):
         if same_report_path(path, a.input):
             ap.error(f"{flag} would overwrite the input {a.input}")
         if os.path.isfile(path) and os.path.isdir(a.input):
+            manifest = os.path.join(a.input, "index.json")
+            if same_report_path(path, manifest):
+                ap.error(f"{flag} would overwrite the carve manifest {manifest}")
             for entry in carved_files(a.input):
                 if same_report_path(path, entry.path):
                     ap.error(f"{flag} would overwrite the input {entry.path}")

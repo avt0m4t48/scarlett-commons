@@ -779,6 +779,28 @@ class NavmeshDecodeTest(unittest.TestCase):
                     with open(source, "rb") as f:
                         self.assertEqual(f.read(), original)
 
+    def test_reports_do_not_replace_the_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            manifest = os.path.join(carve, "index.json")
+            before = b'{"files": []}'
+            with open(manifest, "wb") as f:
+                f.write(before)
+            for tool in ("navmesh_decode.py", "navmesh_index.py"):
+                for flag in ("--out", "--csv"):
+                    with self.subTest(tool=tool, flag=flag):
+                        result = subprocess.run(
+                            [sys.executable, "-I", os.path.join(os.path.dirname(TOOL), tool),
+                             carve, flag, manifest],
+                            cwd=tmp, capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn("would overwrite", result.stderr)
+                        self.assertIn("index.json", result.stderr)
+                        with open(manifest, "rb") as f:
+                            self.assertEqual(f.read(), before)
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")

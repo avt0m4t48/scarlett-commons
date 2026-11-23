@@ -496,6 +496,13 @@ bool reads_within(const volatile std::uint64_t* completed, std::uint64_t value) 
     return *completed == value;
 }
 
+bool fence_armed_for(Mock* fence, std::uint64_t value) {
+    AcquireSRWLockExclusive(&fence->lock);
+    const bool armed = fence->armed_event && fence->armed_value == value;
+    ReleaseSRWLockExclusive(&fence->lock);
+    return armed;
+}
+
 int check_fence_completed_value() {
     for (const bool fence1 : {false, true}) {  // past ID3D12Fence1 either way
         Mock* mock = nullptr;
@@ -527,6 +534,28 @@ int check_fence_completed_value() {
         EXPECT(reads_within(completed, 40));
         fence_signal(other_mock, 8);
         EXPECT(reads_within(other_completed, 8) && *completed == 40);
+        // Wait for the wait thread to arm its next threshold before rewinding.
+        const ULONGLONG until = GetTickCount64() + 1000;
+        while (!fence_armed_for(fence_mock, 41) && GetTickCount64() < until) Sleep(1);
+        EXPECT(fence_armed_for(fence_mock, 41));
+        EXPECT(hr_of(raw(fence, 10, 3)) == S_OK && *completed == 3);
+        fence_signal(fence_mock, 15);
+        EXPECT(fence_completed(fence_mock) == 15);
+        if (!reads_within(completed, 15)) {
+            std::fprintf(stderr, "rewind: underlying fence %llu, slot 12 mirror %llu\n",
+                         static_cast<unsigned long long>(fence_completed(fence_mock)),
+                         static_cast<unsigned long long>(*completed));
+            return 1;
+        }
+        // A rewind by a producer outside the proxy can go straight below its outstanding event.
+        fence_signal(fence_mock, 2);
+        EXPECT(reads_within(completed, 2));
+        fence_signal(fence_mock, 7);
+        EXPECT(reads_within(completed, 7));
+        // The fallback must leave the pending completion event alone.
+        EXPECT(fence_armed_for(fence_mock, 41));
+        fence_signal(fence_mock, 45);
+        EXPECT(reads_within(completed, 45));
         // Device removal: the real fence reports ~0, which the title tests for, and nothing is armed after it.
         fence_signal(fence_mock, ~std::uint64_t{0});
         EXPECT(reads_within(completed, ~std::uint64_t{0}));

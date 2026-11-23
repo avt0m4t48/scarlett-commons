@@ -790,12 +790,9 @@ void reset_child_stats() {
 // removed) and subtracts the value it waits for. Refused with E_NOTIMPL, the title dereferences 0x80004001.
 //
 // A console fence keeps that value in memory the GPU writes. Here each fence gets a mirror that stays live without
-// the title calling anything: a wait-thread callback reads the real fence's completed value into the mirror and
-// re-arms SetEventOnCompletion(value + 1, event) on the real fence, so the mirror follows every completion, from a
-// queue or the CPU. Slot 12 itself and the proxy's CPU Signal (slot 10) also refresh it at once, so a title that
-// signals from the CPU and reads straight away sees its own value. Refreshes take a lock, so the mirror never goes
-// back to a value read before the one already stored. After device removal the real fence reports ~0, which is what
-// the title tests for, and the callback stops re-arming.
+// the title calling anything. A thread-pool wait refreshes on a completion event or a timeout. A timeout can
+// observe a rewind and subsequent values below the outstanding event's threshold. It does not add another
+// completion event. Slot 12 and CPU Signal refresh synchronously. After device removal the callback stops waiting.
 //
 // The descriptor's code pointer is not called: the measured run goes on without it, and its contract (when it runs,
 // on which thread, with what) is not known. The first call is logged with its arguments.
@@ -804,28 +801,41 @@ struct FenceMirror {
     ID3D12Fence* fence = nullptr;  // the real fence; the proxy holds the reference
     SRWLOCK lock = SRWLOCK_INIT;   // orders refreshes
     HANDLE event = nullptr;        // auto-reset; the real fence sets it at the armed value
-    HANDLE wait = nullptr;         // the registered wait on `event`; null when the mirror is not kept live
+    PTP_WAIT wait = nullptr;      // the thread-pool wait on the completion event
+    bool stopping = false;       // guarded by lock
     std::atomic<bool> arm_failed{false};
 };
 
 std::uint64_t refresh_mirror(FenceMirror* m) {
     AcquireSRWLockExclusive(&m->lock);
     const std::uint64_t value = m->fence->GetCompletedValue();
-    m->completed = value;
+    if (m->completed != value) m->completed = value;
     ReleaseSRWLockExclusive(&m->lock);
     return value;
 }
 
-// Runs on the wait thread (WT_EXECUTEINWAITTHREAD): two calls on the real fence, neither of which blocks.
-VOID CALLBACK on_fence_progress(PVOID context, BOOLEAN /*timed_out*/) {
-    auto* m = static_cast<FenceMirror*>(context);
-    const std::uint64_t value = refresh_mirror(m);
-    if (value == ~std::uint64_t{0}) return;  // device removed: the mirror stays ~0
-    const HRESULT hr = m->fence->SetEventOnCompletion(value + 1, m->event);
-    if (FAILED(hr) && !m->arm_failed.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12: SetEventOnCompletion failed (0x%08lX); the completed "
-                     "value at the returned address now moves only on slot 12 and Signal\n",
-                     static_cast<unsigned long>(hr));
+void wait_for_fence_progress(FenceMirror* mirror) {
+    constexpr LONGLONG kRewindPollInterval = -10 * 10'000;  // 10 ms in relative 100 ns units
+    ULARGE_INTEGER due{};
+    due.QuadPart = static_cast<ULONGLONG>(kRewindPollInterval);
+    FILETIME timeout{due.LowPart, due.HighPart};
+    SetThreadpoolWait(mirror->wait, mirror->event, &timeout);
+}
+
+VOID CALLBACK on_fence_progress(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT, TP_WAIT_RESULT result) {
+    auto* mirror = static_cast<FenceMirror*>(context);
+    const std::uint64_t value = refresh_mirror(mirror);
+    if (value == ~std::uint64_t{0}) return;
+    if (result == WAIT_OBJECT_0) {
+        const HRESULT hr = mirror->fence->SetEventOnCompletion(value + 1, mirror->event);
+        if (FAILED(hr) && !mirror->arm_failed.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12: SetEventOnCompletion failed (0x%08lX); the completed "
+                         "value at the returned address now uses periodic refresh\n",
+                         static_cast<unsigned long>(hr));
+    }
+    AcquireSRWLockExclusive(&mirror->lock);
+    if (!mirror->stopping) wait_for_fence_progress(mirror);
+    ReleaseSRWLockExclusive(&mirror->lock);
 }
 
 // The fence's mirror, made on the first slot 12 call. Null only when it cannot be allocated.
@@ -838,8 +848,9 @@ FenceMirror* fence_mirror(ChildProxy* self) {
         m->fence = reinterpret_cast<ID3D12Fence*>(self->real);
         refresh_mirror(m);
         m->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (m->event && RegisterWaitForSingleObject(&m->wait, m->event, &on_fence_progress, m, INFINITE,
-                                                    WT_EXECUTEINWAITTHREAD)) {
+        if (m->event) m->wait = CreateThreadpoolWait(on_fence_progress, m, nullptr);
+        if (m->wait) {
+            wait_for_fence_progress(m);
             SetEvent(m->event);  // the callback makes the first SetEventOnCompletion
         } else {
             std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12: no wait for the completed value (error %lu); it "
@@ -878,7 +889,14 @@ void destroy_child(ChildProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     FenceMirror* mirror = self->mirror.load(std::memory_order_acquire);
-    if (mirror && mirror->wait) UnregisterWaitEx(mirror->wait, INVALID_HANDLE_VALUE);
+    if (mirror && mirror->wait) {
+        AcquireSRWLockExclusive(&mirror->lock);
+        mirror->stopping = true;
+        SetThreadpoolWait(mirror->wait, nullptr, nullptr);
+        ReleaseSRWLockExclusive(&mirror->lock);
+        WaitForThreadpoolWaitCallbacks(mirror->wait, TRUE);
+        CloseThreadpoolWait(mirror->wait);
+    }
     delete self;
     if (real) real->Release();
     if (mirror) {

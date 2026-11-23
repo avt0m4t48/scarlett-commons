@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -411,8 +412,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT:
-    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
     case VK_FORMAT_R16G16B16A16_SNORM:
@@ -1023,9 +1024,37 @@ struct PreparedDraw {
     }
 };
 
+// D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
+// even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
+// step below WARP and AMD. The value is rounded here and handed over as the exact fraction, which no GPU rounds
+// differently. NaN is 0 and values outside 0..1 clamp, as in D3D.
+//
+// Ties go to even whatever the thread's floating-point rounding mode: std::nearbyint follows it, so a game that
+// changes the mode would round differently. floor() does not depend on it, and x + 0.5 is exact here (x is at most
+// a float times 65535, well inside a double's 53 bits).
+inline double round_half_even(double x) {
+    const double r = std::floor(x + 0.5);
+    return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
+inline float quantize_unorm(float value, double maximum) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+}
+
+// The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
+// as -127 and ties go to the even neighbour.
+inline float quantize_snorm(float value, double maximum) {
+    if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+}
+
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
-// already; copying float bits changes the value without a validation error.
+// already; copying float bits changes the value without a validation error. The normalised formats are rounded like
+// D3D (quantize_unorm, quantize_snorm).
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
     // Integer formats convert the float numerically: NaN maps to zero, values below the range clamp to the low
     // end, positive overflow (and +infinity) to the high end, and fractions truncate toward zero. Unsigned uses
@@ -1033,6 +1062,8 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     constexpr double u32_max = 4294967295.0, s32_min = -2147483648.0, s32_max = 2147483647.0;
     double low = 0, high = 0, alpha_high = 0;
     bool is_integer = true, is_signed = false;
+    std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
+    double snorm = 0;               // the largest value of a signed normalised format
     switch (format) {
     case VK_FORMAT_R8_UINT:
     case VK_FORMAT_R8G8_UINT:
@@ -1053,13 +1084,33 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R32_SINT:
     case VK_FORMAT_R32G32_SINT:
     case VK_FORMAT_R32G32B32A32_SINT: low = s32_min; high = s32_max; is_signed = true; break;
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM: is_integer = false; snorm = 127; break;
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM: is_integer = false; snorm = 32767; break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM: is_integer = false; unorm = {255, 255, 255, 255}; break;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
+        is_integer = false;
+        unorm = {0, 0, 0, 255};
+        break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM: is_integer = false; unorm = {65535, 65535, 65535, 65535}; break;
     default: is_integer = false; break;
     }
     if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
-            value.float32[i] = input[i];
+            if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
+            else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
             continue;
         }
         const double maximum = i == 3 ? alpha_high : high;
@@ -3288,7 +3339,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                                           : depth_clear->depth;
+                                : p.binding.format == VK_FORMAT_D16_UNORM
+                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                                    : depth_clear->depth;
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),

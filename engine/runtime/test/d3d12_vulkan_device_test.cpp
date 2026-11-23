@@ -1753,6 +1753,13 @@ bool within_06_ulp(std::uint8_t a, std::uint8_t b, double ideal) {
     return std::abs(double(a) - ideal) <= 0.6 && std::abs(double(b) - ideal) <= 0.6;
 }
 
+// The code nearest to `ideal`, a tie going to the even one: what the layer writes for a normalised clear (#521's
+// quantize_unorm), whichever way the GPU's own driver rounds the tie.
+double nearest_even_code(double ideal) {
+    const double r = std::floor(ideal + 0.5);
+    return r - ideal == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
@@ -7798,6 +7805,9 @@ int main() {
             // WARP and NVIDIA's Vulkan driver give 188, Intel's Vulkan driver 187 (UHD 770 101.7092), both within
             // 0.6 ULP. On the layer's own adapter (same LUID) the comparison stays exact; against another adapter
             // or WARP a byte may differ when both sides are within 0.6 ULP of the ideal value.
+            // The plain clear's normalised values are rounded by the layer itself (nearest even, WARP's and AMD's
+            // code), so on its own NVIDIA adapter the tie byte may be the step above the driver's: accepted only
+            // when it is exactly that nearest-even code and within 0.6 ULP.
             const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
             const auto within_tolerance = [&](std::uint8_t ours_byte, std::uint8_t host_byte, double ideal) {
                 return !same_adapter && within_06_ulp(ours_byte, host_byte, ideal);
@@ -7810,7 +7820,9 @@ int main() {
                     const double plain_ideal = c * 255.0;
                     const double srgb_ideal = (i % 4 == 3 ? c : ideal_srgb(c)) * 255.0;  // alpha stays linear
                     if (ours[b] != host[b]) {
-                        if (within_tolerance(ours[b], host[b], plain_ideal))
+                        const bool layer_tie = double(ours[b]) == nearest_even_code(plain_ideal) &&
+                                               within_06_ulp(ours[b], host[b], plain_ideal);
+                        if (within_tolerance(ours[b], host[b], plain_ideal) || layer_tie)
                             ++plain_within;
                         else if (differences++ < 8)
                             std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,

@@ -68,6 +68,50 @@ class Reference(unittest.TestCase):
         self.assertEqual(run("v_xor_b32_e32 v1, 0x12345678, v2", v={2: 0xFF})[0], 0x12345687)
         self.assertEqual(run("v_lshlrev_b32_e64 v1, s4, -16", s={4: 36})[0], 0xFFFFFF00)    # shift by 36 & 31
 
+    def test_integer_clamp_saturates(self):
+        # unsigned: to [0, 0xffffffff]; without clamp the same sums wrap
+        self.assertEqual(run("v_add_nc_u32_e64 v1, v2, 0x20 clamp", v={2: 0xFFFFFFF0})[0], M)
+        self.assertEqual(run("v_add_nc_u32_e64 v1, v2, 0x20", v={2: 0xFFFFFFF0})[0], 0x10)
+        self.assertEqual(run("v_sub_nc_u32_e64 v1, 5, v2 clamp", v={2: 7})[0], 0)
+        self.assertEqual(run("v_subrev_nc_u32_e64 v1, v2, 3 clamp", v={2: 7})[0], 0)       # 3 - 7
+        self.assertEqual(run("v_subrev_nc_u32_e64 v1, 3, v2 clamp", v={2: 7})[0], 4)
+        # signed: to [0x80000000, 0x7fffffff], the side x - y or x + y overflowed to
+        self.assertEqual(run("v_add_nc_i32 v1, v2, 1 clamp", v={2: 0x7FFFFFFF})[0], 0x7FFFFFFF)
+        self.assertEqual(run("v_add_nc_i32 v1, v2, 1", v={2: 0x7FFFFFFF})[0], 0x80000000)
+        self.assertEqual(run("v_add_nc_i32 v1, v2, -1 clamp", v={2: 0x80000000})[0], 0x80000000)
+        self.assertEqual(run("v_sub_nc_i32 v1, v2, 1 clamp", v={2: 0x80000000})[0], 0x80000000)
+        self.assertEqual(run("v_sub_nc_i32 v1, 5, v2 clamp", v={2: 0x80000001})[0], 0x7FFFFFFF)
+        self.assertEqual(run("v_sub_nc_i32 v1, v2, v3 clamp", v={2: 0xFFFFFFFF, 3: 0x7FFFFFFF})[0], 0x80000000)
+        self.assertEqual(run("v_sub_nc_i32 v1, v2, v3 clamp", v={2: 0xFFFFFFFF, 3: 0x80000000})[0], 0x7FFFFFFF)
+        for line in ("v_xor_b32_e64 v1, v2, v3 clamp", "v_add_nc_u32_e32 v1, v2, v3 clamp", "s_mov_b32 s4, 1 clamp",
+                     "v_cmp_eq_u32_e64 s20, v2, v3 clamp", "v_lshlrev_b64 v[2:3], 1, v[4:5] clamp"):
+            with self.assertRaises(d.RefError):
+                run(line)
+
+    def test_64bit_shifts(self):
+        pair = {4: 0x89ABCDEF, 5: 0x01234567}
+        self.assertEqual(run("v_lshlrev_b64 v[2:3], 4, v[4:5]", v=pair, regs=(2, 3, 4, 5))[:2],
+                         [0x9ABCDEF0, 0x12345678])
+        # S0 & 63: 100 shifts by 36; an SGPR pair as S1
+        self.assertEqual(run("v_lshrrev_b64 v[2:3], v1, s[6:7]", v={1: 100}, s={7: 0x80000000}, regs=(2, 3, 1, 1))[:2],
+                         [0x08000000, 0])
+        self.assertEqual(run("v_lshrrev_b64 v[2:3], s4, v[4:5]", v=pair, s={4: 100}, regs=(2, 3, 1, 1))[:2],
+                         [0x00123456, 0])
+        self.assertEqual(run("v_ashrrev_i64 v[2:3], 36, s[6:7]", s={7: 0x80000000}, regs=(2, 3, 1, 1))[:2],
+                         [0xF8000000, M])
+        # an integer inline constant is sign-extended to 64 bits
+        self.assertEqual(run("v_lshrrev_b64 v[2:3], 32, -2", regs=(2, 3, 1, 1))[:2], [M, 0])
+        self.assertEqual(run("v_lshrrev_b64 v[2:3], 60, 64", regs=(2, 3, 1, 1))[:2], [0, 0])
+        # an odd first register, and a destination that overlaps the source: S1 is read first
+        self.assertEqual(run("v_lshlrev_b64 v[3:4], 32, v[4:5]", v=pair, regs=(3, 4, 5, 5))[:3],
+                         [0, 0x89ABCDEF, 0x01234567])
+        # the 64-bit shifts read one scalar value (GFX10): a second one does not assemble
+        for line in ("v_lshlrev_b64 v[2:3], 1, 0x12345678", "v_lshlrev_b64 v[2:3], 1, 1.0",
+                     "v_lshlrev_b64 v[2:3], 1, v[4:6]", "v_lshrrev_b64 v[2:3], 0x12345678, s[4:5]",
+                     "v_lshrrev_b64 v[2:3], s4, s[6:7]", "v_ashrrev_i64 v[2:3], s9, s[4:5]"):
+            with self.assertRaises(d.RefError):
+                run(line)
+
     def test_compare_and_select(self):
         self.assertEqual(run("v_cmp_lt_i32_e64 s20, v2, v3", "v_cndmask_b32_e64 v1, 1, 2, s20",
                              v={2: 0x80000000, 3: 0})[0], 2)
@@ -95,22 +139,50 @@ class Generator(unittest.TestCase):
         self.assertEqual(set(d.OPS) - seen, set())
         forms = {line.split()[0] for line in lines}
         for name, (enc, _, _) in d.OPS.items():
-            if enc != "vop3":
+            if enc in ("vop1", "vop2"):
                 self.assertTrue({name + "_e32", name + "_e64"} <= forms, name)
         self.assertTrue(any(line.startswith("v_cmp_") for line in lines))
+
+    def test_clamp_only_where_it_is_modelled(self):
+        lines = self.lines()
+        clamped = {line.split()[0] for line in lines if line.endswith(" clamp")}
+        self.assertEqual(clamped, {"v_add_nc_u32_e64", "v_sub_nc_u32_e64", "v_subrev_nc_u32_e64", "v_add_nc_i32",
+                                   "v_sub_nc_i32"})
+        self.assertFalse(any(" clamp" in line[:-len(" clamp")] for line in lines))
+
+    def test_64bit_shifts_take_every_source_kind(self):
+        lines = [line for line in self.lines() if line.split()[0] in d.OPS64]
+        kinds = set()
+        for line in lines:
+            dst, sh, src = (a.strip() for a in line.partition(" ")[2].split(","))
+            m = re.fullmatch(r"v\[(\d+):(\d+)\]", dst)
+            self.assertTrue(m and int(m.group(2)) == int(m.group(1)) + 1, line)
+            self.assertTrue({int(m.group(1)), int(m.group(2))} <= set(d.VREGS), line)
+            if re.fullmatch(r"s\[(\d+):(\d+)\]", src):
+                kinds.add("sgpr pair")
+                self.assertEqual(int(src[2:src.index(":")]) % 2, 0, line)
+            elif src.startswith("v["):
+                kinds.add("odd vgpr pair" if int(src[2:src.index(":")]) % 2 else "even vgpr pair")
+            else:
+                kinds.add("negative constant" if int(src) < 0 else "constant")
+            kinds.add("shift " + ("literal" if sh.startswith("0x") else "sgpr" if sh.startswith("s") else
+                                  "vgpr" if sh.startswith("v") else "float" if sh in d.INLINE_F else "int"))
+        self.assertEqual(kinds, {"sgpr pair", "odd vgpr pair", "even vgpr pair", "negative constant", "constant",
+                                 "shift literal", "shift sgpr", "shift vgpr", "shift float", "shift int"})
 
     def test_sources_respect_the_encoding_rules(self):
         for line in self.lines():
             op, _, rest = line.partition(" ")
-            srcs = [a.strip() for a in rest.split(" op_sel:")[0].split(",")][1:]
+            srcs = [a.strip() for a in rest.split(" op_sel:")[0].removesuffix(" clamp").split(",")][1:]
             if op == "v_cndmask_b32_e64":
                 srcs = srcs[:-1]
             lits = [x for x in srcs if x.startswith("0x")]
-            scalars = set(x for x in srcs if x.startswith("s")) | set(lits)
+            scalars = set(x for x in srcs if x.startswith(("s", "vcc"))) | set(lits)
             if op.endswith("_e32"):
                 self.assertTrue(len(srcs) == 1 or re.fullmatch(r"v\d+", srcs[1]), line)
             self.assertLessEqual(len(lits), 1, line)
-            self.assertLessEqual(len(scalars), 2 if not op.startswith("v_cndmask") else 0, line)
+            limit = 0 if op.startswith("v_cndmask") else 1 if op in d.OPS64 else 2
+            self.assertLessEqual(len(scalars), limit, line)
         self.assertFalse(any("0x" in line.split(",", 1)[1] for line in self.lines(literals=False)))
 
     def test_16bit_sources_take_16bit_literals(self):
@@ -158,6 +230,20 @@ class Translated(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertIsNone(d.check(prefix(seeds, {4: 7, 5: 36}) + [case] + d.observe([1, 2, 3, 4])))
 
+    def test_clamp_and_64bit_shift_cases_match_the_translator(self):
+        seeds = {2: 0x7FFFFFFF, 3: 0x80000000, 4: 0x89ABCDEF, 5: 0x01234567, 6: 1, 7: M}
+        cases = ["v_add_nc_i32 v1, v2, v6 clamp", "v_add_nc_i32 v1, v2, v6", "v_sub_nc_i32 v1, v3, v6 clamp",
+                 "v_sub_nc_i32 v1, v2, v7 clamp", "v_sub_nc_i32 v1, v7, s5 clamp", "v_add_nc_u32_e64 v1, v7, 2 clamp",
+                 "v_sub_nc_u32_e64 v1, v6, v2 clamp", "v_subrev_nc_u32_e64 v1, v2, s4 clamp",
+                 "v_lshlrev_b64 v[2:3], 4, v[4:5]", "v_lshrrev_b64 v[2:3], v4, s[6:7]",
+                 "v_ashrrev_i64 v[2:3], 36, s[6:7]", "v_ashrrev_i64 v[1:2], v4, -16",
+                 "v_lshlrev_b64 v[3:4], 0x21, v[4:5]", "v_lshrrev_b64 v[2:3], 1.0, v[4:5]",
+                 "v_lshrrev_b64 v[2:3], s4, v[4:5]"]
+        for case in cases:
+            with self.subTest(case=case):
+                lines = prefix(seeds, {4: 100, 5: 0x80000000, 7: 0x80000000}) + [case] + d.observe([1, 2, 3, 4])
+                self.assertIsNone(d.check(lines))
+
     def test_a_wrong_translation_is_caught(self):
         lines = prefix({2: 5}) + ["v_add3_u32 v1, v2, 1, 2"] + d.observe([1, 2, 3, 4])
         self.assertIsNone(d.check(lines))
@@ -186,6 +272,20 @@ class Translated(unittest.TestCase):
         self.assertLessEqual(len(kept), 2)                       # the target (and its compare, for a v_cndmask)
 
 
+    def test_shrinking_keeps_the_seeds_of_a_pair(self):
+        lines = prefix(s={6: 0x10, 7: 0x80000000}) + ["v_add_nc_u32_e32 v5, 1, v6", "v_ashrrev_i64 v[2:3], 4, s[6:7]"]
+        lines += d.observe([2, 3, 5, 1])
+        real = d.translated
+        try:
+            d.translated = lambda l: [w ^ (1 if any("_i64" in x for x in l) else 0) for w in d.reference(l)]
+            small = d.shrink(lines)
+        finally:
+            d.translated = real
+        self.assertIn("s_mov_b32 s6, 0x10", small)
+        self.assertIn("s_mov_b32 s7, 0x80000000", small)
+        self.assertNotIn("v_add_nc_u32_e32 v5, 1, v6", small)
+
+
 class Cli(unittest.TestCase):
     def main(self, *argv):
         out = io.StringIO()
@@ -200,6 +300,8 @@ class Cli(unittest.TestCase):
         rc, out = self.main("--list-ops")
         self.assertEqual(rc, 0)
         self.assertIn("v_perm_b32", out)
+        self.assertRegex(out, r"v_ashrrev_i64 +VOP3 only, 64-bit pair")
+        self.assertRegex(out, r"v_sub_nc_i32 +VOP3 only, 2 sources, clamp")
         self.assertEqual(self.main("--ops", "v_nope")[0], 2)
         self.assertEqual(self.main("--oracle", "gpu")[0], 2)
         rc, out = self.main("--programs", "5", "--seed", "1")

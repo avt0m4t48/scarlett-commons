@@ -1487,6 +1487,11 @@ def main():
             if os.path.isfile(os.path.join(folder, config, name)):
                 args.exe = os.path.join(folder, config, name)
                 break
+    # Windows' CreateProcess searches for a relative path written with "/" that doesn't start with "./" or "../"
+    # (runtime/build/x.exe) instead of taking it from the working directory, though os.path.isfile does, so such an
+    # --exe passed the check below and the first GPU run ended in a FileNotFoundError traceback. An absolute path
+    # (abspath also turns "/" into "\" there) runs from anywhere.
+    args.exe = os.path.abspath(args.exe)
     global PERMLANE_FETCH_INACTIVE
     PERMLANE_FETCH_INACTIVE = args.permlane_fetch_inactive
     if args.translator:

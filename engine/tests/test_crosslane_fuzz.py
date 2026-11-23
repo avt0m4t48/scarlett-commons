@@ -414,6 +414,33 @@ class MissingHarness(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
 
+class RelativeHarness(unittest.TestCase):
+    """A relative --exe written with "/" (runtime/build/RelWithDebInfo/vk_compute_test.exe) passes os.path.isfile,
+    but Windows' CreateProcess doesn't resolve it, so the first GPU run ended in a FileNotFoundError traceback. The
+    GPU runs now get an absolute path, also when the configuration subfolder is found for the path given."""
+
+    def test_a_relative_exe_reaches_the_gpu_runs_as_an_absolute_path(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "build", "RelWithDebInfo"))
+            exe = os.path.join(tmp, "build", "RelWithDebInfo", "vk_compute_test.exe")
+            open(exe, "wb").close()
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                for given in ("build/RelWithDebInfo/vk_compute_test.exe", "build/vk_compute_test.exe"):
+                    with self.subTest(exe=given), \
+                            mock.patch.object(X, "run_translator", lambda args, *rest: seen.append(args.exe)), \
+                            mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", given, "--programs", "1"]), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        X.main()
+                        self.assertTrue(os.path.isabs(seen[-1]), seen[-1])
+                        self.assertTrue(os.path.samefile(seen[-1], exe), seen[-1])
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(len(seen), 2)
+
+
 class GpuEnv(unittest.TestCase):
     """FUZZ-13: vk_compute_test is asked for 32-wide subgroups for wave32 and emulated wave64 programs, as lds_fuzz.py
     and valu_fuzz.py do. On AMD the compute default is 64, and a wave32 group over 32 lanes ran as one subgroup."""

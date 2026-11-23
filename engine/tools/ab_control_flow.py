@@ -217,9 +217,19 @@ def main(argv=None):
         ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
     if a.names and not os.path.isfile(a.names):
         ap.error(f"--names {a.names} is not a file")
+    if not isinstance(index, dict) or any(not isinstance(item, dict) for item in index.values()):
+        ap.error(f"{index_path}: expected a JSON object mapping shader names to metadata")
     names = supported_pixel_shaders(index)
     print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
-    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
+    try:
+        picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
+        branches = []
+        for name in picked:
+            with open(os.path.join(disasm, name + ".s"), encoding="utf-8", errors="replace") as f:
+                branches.append(len(BRANCH.findall(f.read())))
+        branches.sort()
+    except (OSError, UnicodeError) as e:
+        ap.error(f"cannot read selected shader inputs: {e}")
     if not picked:
         print("ERROR: no shader candidates for the control-flow comparison", file=sys.stderr)
         return 1
@@ -236,8 +246,6 @@ def main(argv=None):
     except (OSError, subprocess.CalledProcessError) as e:
         ap.error(f"cannot build the test vertex shader (needs spirv-as and spirv-val on PATH): {e}")
 
-    branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, name + ".s"), encoding="utf-8",
-                                                 errors="replace").read())) for name in picked)
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
           f"branches per shader: median {branches[len(branches) // 2]}, max {branches[-1]}")
 

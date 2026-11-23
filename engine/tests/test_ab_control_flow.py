@@ -436,12 +436,37 @@ class CliBadInputTest(unittest.TestCase):
             names = os.path.join(tmp, "names.txt")
             with open(names, "w", encoding="utf-8") as f:
                 f.write("one\n")
+            disasm = os.path.join(shaders, "dxbc", "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
             # an output path under a regular file,
             self.check_one_line(self.run_cli(tmp, shaders, os.path.join(blocker, "out"), "--names", names),
                                 "cannot create")
             # and no SPIR-V tools on PATH.
             self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
                                              path=os.path.join(tmp, "empty-path")), "spirv-as")
+
+
+    def test_bad_index_shape_and_stale_names_leave_no_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            index = os.path.join(shaders, "spirv", "index.json")
+            out = os.path.join(tmp, "out")
+            for payload in ("[]", '{"one": []}'):
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out), "metadata")
+                self.assertFalse(os.path.exists(out))
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            for payload in (b"missing\n", b"\xff"):
+                with open(names, "wb") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot read selected")
+                self.assertFalse(os.path.exists(out))
 
 
 class ResultClassificationTest(unittest.TestCase):

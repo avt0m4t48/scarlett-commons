@@ -14821,9 +14821,12 @@ def interp_ij_analysis(insns, g):
         prev = i["pc"]
         blk.append(cur)
         block_of_pc[i["pc"]] = cur
+    last_of = {}                                # block -> index of its last instruction, in one pass
+    for k, b in enumerate(blk):
+        last_of[b] = k
     preds = defaultdict(set)                    # block -> blocks that can run right before it
-    for b in sorted(set(blk)):
-        last = next((k for k in range(len(insns) - 1, -1, -1) if blk[k] == b), None)
+    for b in sorted(last_of):
+        last = last_of[b]
         op = base_op(insns[last]["op"])
         if op == "s_endpgm":
             continue
@@ -14848,6 +14851,7 @@ def interp_ij_analysis(insns, g):
         b = blk[s["n"]]
         if any(w < s["n"] and blk[w] == b for w in ws):
             return True
+        write_blocks = {blk[w] for w in ws}
         # b itself is not pre-seeded: reached again through a back-edge, a write after the site counts
         # (and index 0 is a valid write, so test membership, not truthiness).
         seen, work = set(), [b]
@@ -14855,7 +14859,7 @@ def interp_ij_analysis(insns, g):
             for p in preds[work.pop()]:
                 if p not in seen:
                     seen.add(p)
-                    if any(blk[w] == p for w in ws):
+                    if p in write_blocks:
                         return True
                     work.append(p)
         return False

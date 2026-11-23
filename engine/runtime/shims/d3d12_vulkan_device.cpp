@@ -432,6 +432,13 @@ leonida::TargetView line_target_view(leonida::ResourceId id, const D3D12_RESOURC
     return {id, mip, first_layer, count};
 }
 
+// ArraySize of a 2D-array RTV or DSV: UINT_MAX is every slice from the first on, as on the host. Any other count
+// is kept, and UINT_MAX with a first slice past the array too, so an out-of-range view is refused as before.
+UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT layer_count) {
+    const bool remaining = layer_count == UINT_MAX && first_layer < resource.DepthOrArraySize;
+    return remaining ? resource.DepthOrArraySize - first_layer : layer_count;
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
@@ -5437,10 +5444,11 @@ public:
                 view = {rid, 0, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
                 view = {rid, desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
-                        desc->Texture2DArray.ArraySize};
+                        view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
                 // Multisample textures have one mip, so only the slice range is chosen (as for the DSV).
-                view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
+                view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice,
+                        view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
             } else if (desc) {
                 log_once("render-target view dimension not supported:", desc->ViewDimension);
                 view = {};
@@ -5545,10 +5553,11 @@ public:
                 view = {r->id(), 0, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
-                        desc->Texture2DArray.ArraySize};
+                        view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) {
                 // Multisample textures have one mip, so only the slice range is chosen.
-                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
+                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice,
+                        view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
             } else if (desc) {
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};

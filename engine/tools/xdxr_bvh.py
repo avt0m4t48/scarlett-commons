@@ -737,15 +737,47 @@ def _case_names(directory):
     return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
 
 
+class CaseError(Exception):
+    """A <case>.json / <case>.bin pair that is missing, unreadable or not a case description."""
+
+
 def _load_case(directory, name):
+    """desc, data for one <name>.json and <name>.bin pair. CaseError names the .json at fault: any *.json in the
+    directory counts as a case (check-build is run on a build folder that may hold other reports), so a stray or
+    half-written file there must say which one it is, not end in a traceback."""
     import json
-    with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
-        desc = json.load(fh)
-    with open(f"{directory}/{name}.bin", "rb") as fh:
-        data = fh.read()
+    js = f"{directory}/{name}.json"
     fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
-    if desc["kind"] == "blas":
-        desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+    try:
+        with open(js, encoding="utf-8") as fh:
+            desc = json.load(fh)
+        with open(f"{directory}/{name}.bin", "rb") as fh:
+            data = fh.read()
+        kind = desc["kind"]
+        if kind == "blas":
+            desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+        elif kind != "tlas":
+            raise CaseError(f"{js}: kind {kind!r} is neither 'blas' nor 'tlas'")
+        # Check the keys check_build needs while the filename is still in scope: a KeyError there would name only the
+        # directory and the missing key, and in a folder of several cases the user cannot tell which file to fix.
+        for key in ("address",) + (("blas", "instances") if kind == "tlas" else ()):
+            if key not in desc:
+                raise CaseError(f"{js}: the case has no {key!r} key")
+        if kind == "tlas":
+            if not isinstance(desc["blas"], list) or not all(isinstance(b, str) and b for b in desc["blas"]):
+                raise CaseError(f"{js}: 'blas' is not a list of case names")
+            if not isinstance(desc["instances"], list):
+                raise CaseError(f"{js}: 'instances' is not a list")
+            for i, inst in enumerate(desc["instances"]):
+                if not isinstance(inst, dict):
+                    raise CaseError(f"{js}: instance {i} is not an object")
+                for key in ("transform", "blas", "mask"):
+                    if key not in inst:
+                        raise CaseError(f"{js}: instance {i} has no {key!r} key")
+    except KeyError as error:
+        raise CaseError(f"{js}: the case has no {error} key") from None
+    except (OSError, ValueError, TypeError, IndexError) as error:
+        raise CaseError(f"{js}: {error}") from None
     return desc, data
 
 
@@ -756,6 +788,19 @@ def check_build(directory, rays=300, seed=1):
         return [f"no cases in {directory}"]
     problems = []
     cases = {n: _load_case(directory, n) for n in names}
+    for n, (desc, _) in cases.items():
+        if desc["kind"] != "tlas":
+            continue
+        js = f"{directory}/{n}.json"
+        for b in desc["blas"]:
+            if b not in cases:
+                raise CaseError(f"{js}: BLAS {b!r} is not a case in this folder")
+            if cases[b][0]["kind"] != "blas":
+                raise CaseError(f"{js}: {b!r} is a {cases[b][0]['kind']}, not a blas")
+        for i, inst in enumerate(desc["instances"]):
+            index = inst["blas"]
+            if not isinstance(index, int) or not 0 <= index < len(desc["blas"]):
+                raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not 0..{len(desc['blas']) - 1}")
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
         # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
@@ -881,7 +926,14 @@ def main(argv=None):
         if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
-        problems = check_build(a.dir, a.rays)
+        try:
+            problems = check_build(a.dir, a.rays)
+        except CaseError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        except (KeyError, ValueError, IndexError, TypeError) as error:
+            print(f"ERROR: a case in {a.dir} does not describe a build: {error}", file=sys.stderr)
+            return 2
         for e in problems:
             print(e)
         print("all cases match" if not problems else f"{len(problems)} problems")

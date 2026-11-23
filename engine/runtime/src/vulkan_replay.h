@@ -72,7 +72,7 @@ struct ResourceBinding {
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
-    const std::uint8_t* host = nullptr;  // mapped bytes of a host-visible buffer, for small CPU-side reads
+    const std::uint8_t* host = nullptr;  // mapped CPU-written bytes (UPLOAD/write-back), for small CPU-side reads
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
@@ -769,6 +769,23 @@ struct ShaderUserData {
 };
 static_assert(sizeof(ShaderUserData) == 144);
 
+// A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
+// capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
+enum class HostReadStatus { ok, absent, not_cpu_written };
+
+enum class ReplayResult {
+    success,
+    list_open,
+    unresolved_resource,
+    invalid_subresource,
+    invalid_clear,
+    invalid_copy,
+    invalid_predication,
+    invalid_query,
+    invalid_indirect_arguments,
+    unsupported
+};
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -820,9 +837,9 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
-    // Host bytes for a whole console VA range; false when it is not in a host-visible buffer. For small CPU-written
-    // inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
-    std::function<bool(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
+    // Host bytes for a whole console VA range; `not_cpu_written` when it names GPU-writable memory. For small
+    // CPU-written inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
+    std::function<HostReadStatus(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
     // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
@@ -853,8 +870,8 @@ struct ReplayFunctions {
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
     // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
-    // its device address. Without it such a build is refused.
-    std::function<bool(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
+    // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
+    std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
@@ -885,19 +902,6 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
-};
-
-enum class ReplayResult {
-    success,
-    list_open,
-    unresolved_resource,
-    invalid_subresource,
-    invalid_clear,
-    invalid_copy,
-    invalid_predication,
-    invalid_query,
-    invalid_indirect_arguments,
-    unsupported
 };
 
 namespace detail {
@@ -2783,7 +2787,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
                 if (build->is_tlas && build->instance_pointers && build->instance_count) {
                     if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
-                    if (!vk.prepare_khr_instances(*build, p.khr_instances)) return ReplayResult::invalid_copy;
+                    return vk.prepare_khr_instances(*build, p.khr_instances);
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {

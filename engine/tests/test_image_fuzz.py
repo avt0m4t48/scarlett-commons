@@ -1,4 +1,4 @@
-﻿"""CPU checks for tools/image_fuzz.py: the oracle, the texel mapping and the generated shader, no GPU.
+"""CPU checks for tools/image_fuzz.py: the oracle, the texel mapping and the generated shader, no GPU.
 
 The GPU side (vk_image_fuzz, rdna2spirv.py) is what the fuzzer compares against; these tests make sure the
 oracle it compares with is right, so a mismatch is the translator's and not the fuzzer's.
@@ -50,6 +50,19 @@ def test_work_under_a_file_is_a_usage_error(tmp_path):
     assert "ERROR: --work is not a folder" in result.stderr
     assert "Traceback" not in result.stderr
     assert blocker.read_text(encoding="utf-8") == "x"
+
+
+def test_work_that_is_a_dangling_symlink_is_a_usage_error(tmp_path):
+    link = tmp_path / "link"
+    try:
+        os.symlink(tmp_path / "missing", link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create a symlink here")
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", "R8G8B8A8_UNORM", "--programs", "1",
+                             "--work", str(link)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "ERROR: --work is not a folder" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_format_codes_match_the_translator_table():
@@ -438,4 +451,3 @@ def test_main_enables_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path)] + argv)
         assert imf.main() == 0
         assert seen == [want], (argv, env_val)
-

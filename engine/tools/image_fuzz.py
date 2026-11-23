@@ -622,12 +622,12 @@ def main() -> int:
         # Reject a --work that is a file, or sits under one, before any fuzz work: os.makedirs would raise a
         # FileExistsError traceback after the cases were built, and nothing here is retryable anyway.
         probe = os.path.abspath(a.work)
-        while not os.path.exists(probe):
+        while not os.path.lexists(probe):
             parent = os.path.dirname(probe)
             if parent == probe:
                 break
             probe = parent
-        if os.path.exists(probe) and not os.path.isdir(probe):
+        if os.path.lexists(probe) and not os.path.isdir(probe):
             print(f"ERROR: --work is not a folder: {a.work}", file=sys.stderr)
             return 2
     hw_oracle = None

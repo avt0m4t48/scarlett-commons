@@ -193,6 +193,15 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
             return "fail", "invalid CTest TIMEOUT"
         if ctest_timeout > 0:
             timeout = min(timeout, ctest_timeout)
+    skip_code = props.get("SKIP_RETURN_CODE")
+    if skip_code is not None:
+        error = "invalid CTest SKIP_RETURN_CODE: expected an integer from 0 to 255"
+        try:
+            skip_code = int(str(skip_code))
+        except ValueError:
+            return "fail", error
+        if not 0 <= skip_code <= 255:
+            return "fail", error
     start = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -209,8 +218,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         # A negative return code is a host-signal termination (e.g. SIGSEGV), not a process exit code:
         # report it as a failure before SKIP_RETURN_CODE or WILL_FAIL can reinterpret it.
         return "fail", f"killed by signal {-code} in {elapsed:.1f} s\n{out}"
-    skip_code = props.get("SKIP_RETURN_CODE")
-    if skip_code is not None and code == int(skip_code):
+    if code == skip_code:
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
     skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))

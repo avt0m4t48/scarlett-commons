@@ -164,6 +164,15 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_invalid_skip_return_codes_fail_before_launch(self):
+        command = self.command_for(self.exiting(0))
+        for value in ("invalid", True, 1.5, -1, 256):
+            with self.subTest(value=value), mock.patch.object(rwt.subprocess, "run") as launch:
+                status, detail = self.run_entry(ctest_entry("invalid", command, {"SKIP_RETURN_CODE": value}))
+                self.assertEqual(status, "fail")
+                self.assertIn("invalid CTest SKIP_RETURN_CODE", detail)
+                launch.assert_not_called()
+
     def test_ctest_environment_is_applied_only_to_its_child(self) -> None:
         exe = self.program("show_environment.py",
                            "import os\n"
@@ -449,6 +458,17 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))])
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
+
+    def test_malformed_skip_return_code_does_not_stop_later_tests(self):
+        entries = [
+            ctest_entry("bad_property", self.command("ok.py"), {"SKIP_RETURN_CODE": "invalid"}),
+            ctest_entry("ok", self.command("ok.py")),
+        ]
+        code, out, err = self.run_main(entries, "--require", "ok")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FAIL] bad_property", out)
+        self.assertIn("invalid CTest SKIP_RETURN_CODE", out)
+        self.assertIn("[PASS] ok", out)
 
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"

@@ -123,6 +123,58 @@ std::vector<std::uint8_t> container(const std::vector<std::uint8_t>& accc) {
     return out;
 }
 
+// The slot-67 description built the way amd_fidelityfx_upscaler_xbox.dll builds it (docs/fspx.md, "How the DLL reads
+// it", pinned from its code):
+//   - its FSPX reader (RVA 0x1a20, and the same loop inline for a container) zeroes four (pointer, size) pairs, walks
+//     the directory with the reader's bounds rules and stores kind 0 in pair 0, kind 1 in pair 1, kind 6 in pair 2 and
+//     kind 7 in pair 3, the last entry of a kind winning; the pointers point into the payload itself;
+//   - it copies kind 6 into an allocation rounded up to 256 bytes (here filled with 0xcc past the program, so a size
+//     taken from the allocation would show) and passes that copy with kind 6's own size;
+//   - it copies the pairs into the description in that order: pair 0 at +0x08, pair 1 at +0x18, the copy at +0x28,
+//     pair 3 at +0x38.
+// So the test does not reuse the layout the proxy reads: it follows the DLL's reader over the payload's own directory.
+struct DllSlot67 {
+    XboxNativeDesc desc{};
+    std::vector<std::uint8_t> copy;  // the kind-6 copy (the DLL's XMemAlloc block)
+};
+
+DllSlot67 dll_slot67(ID3D12RootSignature* root, const std::vector<std::uint8_t>& container_bytes) {
+    DllSlot67 out;
+    out.desc.root_signature = root;
+    const std::span<const std::uint8_t> payload = leonida::dxbc_part(container_bytes, "ACCC");
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v;
+        std::memcpy(&v, payload.data() + at, 4);
+        return v;
+    };
+    if (payload.size() < 16 || std::memcmp(payload.data(), "FSPX", 4) != 0) return out;
+    const std::uint64_t total = std::min<std::uint64_t>(u32(12), payload.size());
+    const std::uint64_t end_dir = 16 + 16 * std::uint64_t(u32(8));
+    if (end_dir > total) return out;
+    const void* pointer[4] = {};
+    std::uint64_t size[4] = {};
+    for (std::uint64_t at = 16; at < end_dir; at += 16) {
+        const std::uint32_t kind = u32(std::size_t(at)), offset = u32(std::size_t(at) + 4),
+                            length = u32(std::size_t(at) + 8);
+        if (offset < end_dir || std::uint64_t(offset) + length > total) continue;
+        const int pair = kind == 0 ? 0 : kind == 1 ? 1 : kind == 6 ? 2 : kind == 7 ? 3 : -1;
+        if (pair < 0) continue;
+        pointer[pair] = payload.data() + offset;
+        size[pair] = length;
+    }
+    out.copy.assign((size[2] + 255) & ~std::uint64_t(255), 0xcc);
+    if (size[2]) std::memcpy(out.copy.data(), pointer[2], std::size_t(size[2]));
+    out.desc.kind0 = pointer[0];
+    out.desc.kind0_size = size[0];
+    out.desc.kind1 = pointer[1];
+    out.desc.kind1_size = size[1];
+    out.desc.kind6 = out.copy.data();
+    out.desc.kind6_size = size[2];
+    out.desc.kind7 = pointer[3];
+    out.desc.kind7_size = size[3];
+    return out;
+}
+
 std::vector<std::uint8_t> serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
@@ -354,6 +406,28 @@ int main() {
                 pipeline->Release();
                 EXPECT(after == before);
             }
+        }
+
+        // Slot 67 with the description built the way the DLL builds it (dll_slot67): each program resolves to its
+        // own translation with its own state. Program A (state 0x11) and program C with states 0x31 and 0x32 create a
+        // pipeline; C with 0x33 finds its own entry, whose module is missing (E_FAIL, not E_INVALIDARG); C with 0x11,
+        // a state nothing was translated for, is refused like any unknown program.
+        {
+            const auto slot67 = reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67));
+            const auto create = [&](const std::vector<std::uint8_t>& box) {
+                const DllSlot67 call = dll_slot67(root.p, box);
+                Ref<ID3D12PipelineState> made;
+                const HRESULT hr = slot67(device.p, &call.desc, &pso_iid, reinterpret_cast<void**>(&made.p));
+                if (FAILED(hr) && made.p) return E_UNEXPECTED;  // a failure must leave no object
+                return hr;
+            };
+            EXPECT(dll_slot67(root.p, container_a).desc.kind0_size == 28);       // the builder found the entries
+            EXPECT(dll_slot67(root.p, container_a).copy.size() % 256 == 0);
+            EXPECT(create(container_a) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x31))) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x32))) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x33))) == E_FAIL);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x11))) == E_INVALIDARG);
         }
 
         // Refused with E_INVALIDARG, and no object: an untranslated program, bare and in a container; directories

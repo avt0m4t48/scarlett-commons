@@ -1102,11 +1102,26 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
         pc_desc.CS.pShaderBytecode = payload.data();
         pc_desc.CS.BytecodeLength = payload.size();
     }
+
     pc_desc.NodeMask = 0;
     pc_desc.CachedPSO = {nullptr, 0};
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
-    return self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+    // Every failed call is logged with its number: the DLL creates its pipelines one after the other, and only the
+    // first call of a slot is announced, so a miss on a later program would otherwise read as the first call's.
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+    if (FAILED(hr))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx (kind 0 %llu B, kind 1 %llu B, kind 6 %llu B, "
+                     "kind 7 %llu B)\n",
+                     static_cast<unsigned long long>(call), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(xbox_desc->kind0_size),
+                     static_cast<unsigned long long>(xbox_desc->kind1_size),
+                     static_cast<unsigned long long>(xbox_desc->kind6_size),
+                     static_cast<unsigned long long>(xbox_desc->kind7_size));
+    return hr;
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,

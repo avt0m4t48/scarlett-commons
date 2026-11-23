@@ -57,7 +57,6 @@ KNOWN_DIVERGENCES = {
     "f64-omod": "SHADER-721: f64 output modifiers; owned by @fiestorra.",
     "double-neg-abs": "TEST-912 (#4172): spirv_mini_interp rounds binary64 OpFNegate/FAbs through binary32, changing values as well as NaN payloads.",
     "fclamp-nan-zero": "FClamp NaN and signed-zero results are driver-dependent after f64 clamp/omod.",
-    "div-fixup-nan-s0": "RDNA2 ISA maps NaN(S0) to signed infinity; current translator preserves the NaN payload.",
 }
 
 
@@ -342,15 +341,8 @@ def ref_program(lines, include_known=False):
             else:
                 d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
         elif op == "v_div_fixup_f64":
-            args = [read_source(t, vgpr, sgpr) for t in a[:3]]
-            s0, s1, s2 = args
-            ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
-            normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
-                               and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
-            if not include_known and is_nan(s0) and normal_division:
-                raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
-            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))
+            # NaN(S0) gives signed infinity, measured on RDNA2 gfx1036 (TEST-983; the translator has it since #2477, 48a1a98b).
+            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*[read_source(t, vgpr, sgpr) for t in a[:3]]))
         elif op == "v_frexp_mant_f64":
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(frexp(read_source(a[0], vgpr, sgpr))[0])
         elif op == "v_frexp_exp_i32_f64":
@@ -545,11 +537,7 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         if known_case == "fclamp-nan-zero": left, right = "0x7ff80001", "1.0"
         body_lines.append(f"{op} v[8:9], {left}, {right}{suffix}")
     elif op == "v_div_fixup_f64":
-        if known_case == "div-fixup-nan-s0":
-            setup_lines += ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x7ff80000"]
-            body_lines.append(f"{op} v[8:9], v[12:13], 1.0, 2.0")
-        else:
-            body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
+        body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
     elif op == "v_div_fmas_f64":
         # VCC is initialized true so the f64 scaled FMA path is exercised deterministically.
         body_lines += ["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
@@ -681,8 +669,7 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
     sequence = [(op, True, None) for op in ops] if sweep else []
     sequence += [(rng.choice(ops), False, None) for _ in range(programs)]
     if known:
-        sequence += [("v_div_fixup_f64" if label == "div-fixup-nan-s0" else "v_add_f64", True, label)
-                     for label in KNOWN_DIVERGENCES]
+        sequence += [("v_add_f64", True, label) for label in KNOWN_DIVERGENCES]
     cases = []
     for idx, (op, is_sweep, known_case) in enumerate(sequence):
         setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)

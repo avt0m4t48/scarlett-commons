@@ -86,16 +86,35 @@ class F64DiffTests(unittest.TestCase):
         self.assertIn("implementation-defined", reason)
         self.assertIsNone(actual)
 
-    def test_div_fixup_nan_s0_is_skipped_by_default_and_runs_with_known(self):
-        setup, body, _, _ = fd.make_case(random.Random(1), "v_div_fixup_f64", known_case="div-fixup-nan-s0")
-        lines = setup + body
+    def test_div_fixup_nan_s0_gives_signed_infinity_in_reference_and_translator(self):
+        # Measured on RDNA2 gfx1036 (TEST-983); the translator has it since #2477 (48a1a98b). Not a known divergence any more.
+        self.assertNotIn("div-fixup-nan-s0", fd.KNOWN_DIVERGENCES)
+        cases = (("v_mov_b32 v13, 0x7ff80000", "1.0", "2.0", fd.EXP),                  # qNaN, +/+
+                 ("v_mov_b32 v13, 0xfff80000", "-1.0", "2.0", fd.EXP | 0x8000000000000000),     # -qNaN, sign_out negative
+                 ("v_mov_b32 v13, 0x7ff00000", "1.0", "-2.0", fd.EXP | 0x8000000000000000))     # low word set below: sNaN
+        for index, (hi, s1, s2, want) in enumerate(cases):
+            lines = ["v_mov_b32 v12, 0x00000001" if index == 2 else "v_mov_b32 v12, 0x00000000", hi,
+                     f"v_div_fixup_f64 v[8:9], v[12:13], {s1}, {s2}"]
+            self.assertEqual(fd.words_to_bits(*fd.ref_program(lines)[:2]), want)
+            with tempfile.TemporaryDirectory() as tmp:
+                status, reason, expected, actual = fd.run_one(lines, f"ps_f64_fixup_nan_s0_{index}", tmp)
+            self.assertEqual(status, "match", (reason, expected, actual))
+            self.assertEqual(fd.words_to_bits(*actual[:2]), want)
+
+    def test_known_divergence_forms_are_excluded_by_default_and_run_with_known(self):
+        forms = {"f64-omod": "v_add_f64 v[8:9], v[10:11], 1.0 mul:2",
+                 "fclamp-nan-zero": "v_add_f64 v[8:9], 0x7ff80001, 1.0 clamp",
+                 "double-neg-abs": "v_add_f64 v[8:9], -|v[8:9]|, 1.0"}
+        self.assertEqual(set(forms), set(fd.KNOWN_DIVERGENCES))
         with tempfile.TemporaryDirectory() as tmp:
-            skipped = fd.run_one(lines, "ps_f64_fixup_default", tmp)
-            self.assertEqual(skipped[0], "skip")
-            self.assertIn("div-fixup-nan-s0", skipped[1])
-            known = fd.run_one(lines, "ps_f64_fixup_known", tmp, include_known=True)
-        self.assertEqual(known[0], "mismatch")
-        self.assertEqual(fd.words_to_bits(*known[2][:2]), fd.EXP)
+            for label, line in forms.items():
+                with self.subTest(label=label):
+                    skipped = fd.run_one([line], "ps_f64_known_default", tmp)
+                    self.assertEqual(skipped[0], "skip")
+                    self.assertIn(f"KNOWN_DIVERGENCE {label}", skipped[1])
+                    self.assertIsNone(skipped[2])
+                    executed = fd.run_one([line], "ps_f64_known_run", tmp, include_known=True)
+                    self.assertIn(executed[0], ("match", "mismatch"))     # really executed, not skipped
 
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
@@ -122,9 +141,22 @@ class F64DiffTests(unittest.TestCase):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")
         self.assertNotIn("KNOWN_DIVERGENCE", normal.stdout)
-        self.assertEqual(known.returncode, 1)
-        self.assertIn("MISMATCH:", known.stdout)
-        self.assertIn("v_div_fixup_f64", known.stdout)  # the known NaN(S0) case is actually executed
+        self.assertIn(f"{len(fd.KNOWN_DIVERGENCES)} total", known.stdout)       # one program per known divergence
+        self.assertNotIn("KNOWN_DIVERGENCE", known.stdout)                       # none of them is skipped
+        # The CPU translator reproduces none of them any more, so the run is clean; a reproduced one exits 1.
+        self.assertEqual(known.returncode, 0, known.stdout + known.stderr)
+        stdout = io.StringIO()
+        original = fd.translate
+
+        def planted(listing, name, temp):     # a translator that gets only the clamp form wrong
+            out = original(listing, name, temp)
+            if any(" clamp" in line for line in listing): out[2] ^= 1   # an exactly compared word (a NaN result is not)
+            return out
+        with mock.patch.object(fd, "translate", planted), contextlib.redirect_stdout(stdout):
+            code = fd.main(["--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures"])
+        self.assertEqual(code, 1)
+        self.assertIn("MISMATCH:", stdout.getvalue())
+        self.assertIn(" clamp", stdout.getvalue())   # the shrunk program of a known form is printed
 
     def test_sabotaged_translator_mismatch_and_shrinking(self):
         lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff80000",

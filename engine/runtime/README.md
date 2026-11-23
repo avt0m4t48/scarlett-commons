@@ -293,6 +293,9 @@ blocks the import-driven work:
 - The device entry point: `D3D12XboxCreateDevice` exists and wraps the PC or the Vulkan-backed device in the
   measured-slot proxy, but its parameter and flag layout is unmeasured and so is the Xbox device vtable beyond
   slots 62, 67 and 76.
+  measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
+  measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
+  console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
 - The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
   them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
   `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
@@ -300,6 +303,8 @@ blocks the import-driven work:
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
   `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` and
   `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
+  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
+  `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
 
 The D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described

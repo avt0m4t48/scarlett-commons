@@ -785,7 +785,7 @@ int run_env_slots(bool valid) {
     const char* frame_interval = valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
-    const char* frame_events = valid ? "101" : "2";
+    const char* frame_events = valid ? "102" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_INTERVAL_SLOT", frame_interval) != FALSE);
@@ -807,8 +807,8 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
         std::uint32_t ev_count = 6;
         leonida::d3d12_xs::XboxFrameEvent ev_buf[6] = {};
-        EXPECT(hr_of(raw(device, 101, token, 0x11100u, word(&ev_count), word(ev_buf))) == S_OK && ev_count == 0 &&
-               mock->calls[101] == 0);
+        EXPECT(hr_of(raw(device, 102, token, 0x11100u, word(&ev_count), word(ev_buf))) == S_OK && ev_count == 0 &&
+               mock->calls[102] == 0);
         void* queue = nullptr;
         EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);

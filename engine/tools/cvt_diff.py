@@ -19,7 +19,8 @@ bit for bit:
       - norm and pknorm: round_even(clamp(x, -1, 1) * 32767) (i16) or round_even(clamp(x, 0, 1) * 65535) (u16),
         rounded once from the exact product, NaN -> 0. f16 denormals are values (the MODE inferred for the game
         keeps them); an f32 denormal is too small to round to anything but 0 either way.
-      - norm writes D[15:0] and keeps D[31:16]. pknorm writes S0's result to D[15:0] and S1's to D[31:16].
+      - norm writes D[15:0] and keeps D[31:16]. pknorm writes S0's result to D[15:0] and S1's to D[31:16]; with
+        the destination op_sel bit of the f16 forms, S0's result to D[31:16] and 0 to D[15:0].
     tests/test_cvt_diff.py pins it to the words measured on RDNA2 that tests/semantic records, and
   * tools/rdna2spirv.py, executing the SPIR-V with tests/semantic/spirv_mini_interp.py.
 
@@ -34,12 +35,15 @@ constants"); an integer inline constant as the low half of its word. VOP3 progra
 one literal and two constant-bus reads.
 
 Modifiers: source `neg`/`abs` on register operands of every _e64/VOP3 form (applied to the f32 word, or to the
-selected f16 half); `op_sel:[a,b,0]` on v_cvt_pknorm_*_f16 register sources (picks the high half); and the measured
-hardware no-ops: VOP3 `clamp`, `mul:2`, `mul:4`, `div:2` on v_cvt_norm_*, and `clamp` on v_cvt_pknorm_*_f32.
+selected f16 half); `op_sel:[a,b,c]` on v_cvt_pknorm_*_f16, where a and b pick the high half of a register source
+and c = 1 writes S0's result to D[31:16] and 0 to D[15:0], dropping S1's (measured on gfx1036, docs/design.md);
+and the measured hardware no-ops: VOP3 `clamp`, `mul:2`, `mul:4`, `div:2` on v_cvt_norm_*, and `clamp` on
+v_cvt_pknorm_* (both widths).
 
-Not generated, on purpose: SDWA and DPP forms (tools/sdwa_diff.py's domain), output modifiers on flr/rpi and on the
-f16 pknorm forms, `op_sel` on norm (GFX10 has no encoding for it) and a destination `op_sel`, and modifiers on
-constants. --self-test pins the forms the translator refuses.
+Not generated, on purpose: SDWA and DPP forms (tools/sdwa_diff.py's domain), output modifiers on flr/rpi,
+`mul:2`/`mul:4`/`div:2` on pknorm (the translator refuses them, and llvm-mc does for the f16 forms), `op_sel` on
+norm (GFX10 has no encoding for it), and modifiers on constants. --self-test pins the forms the translator
+refuses.
 
 Three stages run one after the other:
   * a sweep: every op with every source kind and every modifier setting it takes, values from the edge lists;
@@ -102,12 +106,12 @@ FAMILY = {
 }
 VOP1_OPS = tuple(op for op, (k, _) in FAMILY.items() if k in ("flr", "rpi", "norm"))
 OMOD_OPS = tuple(op for op, (k, _) in FAMILY.items() if k == "norm")     # clamp, mul:2, mul:4, div:2 are no-ops
-CLAMP_OPS = OMOD_OPS + tuple(op for op, (k, _) in FAMILY.items() if k == "pk32")
+CLAMP_OPS = OMOD_OPS + tuple(op for op, (k, _) in FAMILY.items() if k in ("pk32", "pk16"))
 OMODS = ("clamp", "mul:2", "mul:4", "div:2", "clamp mul:2", "clamp div:2")
 OP_FORMS = {
     **{op: f"{op}_e32 d, s0 | {op}_e64 d, [-][|]s0[|]" for op in VOP1_OPS},
     **{op: f"{op} d, [-][|]s0[|], [-][|]s1[|]" for op, (k, _) in FAMILY.items() if k == "pk32"},
-    **{op: f"{op} d, [-][|]s0[|], [-][|]s1[|] [op_sel:[a,b,0]]" for op, (k, _) in FAMILY.items() if k == "pk16"},
+    **{op: f"{op} d, [-][|]s0[|], [-][|]s1[|] [op_sel:[a,b,c]]" for op, (k, _) in FAMILY.items() if k == "pk16"},
 }
 for _op in OMOD_OPS:
     OP_FORMS[_op] += " [clamp] [mul:2|mul:4|div:2]"
@@ -265,7 +269,7 @@ def step(line, vgpr, sgpr, events=None):
     kind, snorm = FAMILY[op]
     d = _dst_index(args[0])
     sel = _opsel(mods)
-    if sel != (0, 0, 0) and (kind != "pk16" or sel[2]):
+    if sel != (0, 0, 0) and kind != "pk16":
         raise HarnessError(f"op_sel outside the modelled forms: {line}")
     if kind in ("flr", "rpi"):
         w, mod, _ = source(args[1], vgpr, sgpr, False)
@@ -293,7 +297,8 @@ def step(line, vgpr, sgpr, events=None):
         if events is not None:
             _count(events, op, val, 32767 if snorm else 65535)
         halves.append(normalize(val, snorm))
-    vgpr[d] = halves[0] | (halves[1] << 16)
+    # op_sel[2] (f16 forms): S0's result in D[31:16], D[15:0] = 0, S1's result dropped (gfx1036, docs/design.md)
+    vgpr[d] = halves[0] << 16 if sel[2] else halves[0] | (halves[1] << 16)
 
 
 TIE_WINDOW = Fraction(1, 256)
@@ -438,14 +443,15 @@ def encodable(op, kinds, form):
 
 def op_line(rng, op, kinds, form="e64", mods=None, sel=(0, 0), omod=""):
     """One instruction. form "e32" or "e64" for the VOP1 ops; the VOP3-only ops always take "e64" (no suffix).
-    mods: one MODS entry per source, applied to register sources only. sel: op_sel bits of a pk16 op's S0/S1."""
+    mods: one MODS entry per source, applied to register sources only. sel: op_sel bits of a pk16 op's S0/S1 and,
+    optionally, its destination."""
     mods = mods or ("",) * len(kinds)
     srcs = [_source(rng, k, m if k in ("vgpr", "sgpr") else "") for k, m in zip(kinds, mods)]
     d = f"v{rng.randrange(8, 12)}"
     name = f"{op}_{form}" if op in VOP1_OPS else op
     line = f"{name} {d}, " + ", ".join(srcs)
     if any(sel):
-        line += f" op_sel:[{sel[0]},{sel[1]},0]"
+        line += f" op_sel:[{sel[0]},{sel[1]},{sel[2] if len(sel) > 2 else 0}]"
     if omod:
         line += " " + omod
     return line
@@ -462,7 +468,7 @@ def _random_op(rng, op):
     mods = tuple(rng.choice(MODS) if form == "e64" else "" for _ in kinds)
     sel = (0, 0)
     if kind == "pk16":
-        sel = tuple(rng.randrange(2) if k in ("vgpr", "sgpr") else 0 for k in kinds)
+        sel = tuple(rng.randrange(2) if k in ("vgpr", "sgpr") else 0 for k in kinds) + (int(rng.random() < 0.25),)
     omod = ""
     if form == "e64" and op in CLAMP_OPS and rng.random() < 0.25:
         omod = rng.choice(OMODS) if op in OMOD_OPS else "clamp"
@@ -503,15 +509,16 @@ def sweep_ops(ops=None):
                     [m for m in _product(MODS, n) if all(r or not x for r, x in zip(reg, m))]
                 sel_sets = [(0, 0)]
                 if kind == "pk16":
-                    sel_sets = [s for s in _product((0, 1), n) if all(r or not x for r, x in zip(reg, s))]
+                    sel_sets = [s + (dhi,) for dhi in (0, 1) for s in _product((0, 1), n)
+                                if all(r or not x for r, x in zip(reg, s))]
                 omods = [""]
                 if form == "e64" and op in CLAMP_OPS:
                     omods += list(OMODS) if op in OMOD_OPS else ["clamp"]
                 for mods in mod_sets:
                     for sel in sel_sets:
                         for omod in omods:
-                            if omod and (any(mods) or any(sel)):
-                                continue     # output modifiers once per source kind, with plain sources
+                            if omod and (any(mods) or any(sel[:2])):
+                                continue     # output modifiers once per source kind and destination half
                             out.append((op, form, kinds, mods, sel, omod))
     return out
 
@@ -726,9 +733,7 @@ def run_suite(programs, seed, max_ops=6, ops=None):
 
 
 REJECTED = (
-    ("clamp on v_cvt_pknorm_i16_f16", "v_cvt_pknorm_i16_f16 v8, v9, v10 clamp"),
     ("mul:2 on v_cvt_pknorm_u16_f16", "v_cvt_pknorm_u16_f16 v8, v9, v10 mul:2"),
-    ("a destination op_sel on v_cvt_pknorm_i16_f16", "v_cvt_pknorm_i16_f16 v8, v9, v10 op_sel:[0,0,1]"),
     ("mul:2 on v_cvt_pknorm_i16_f32", "v_cvt_pknorm_i16_f32 v8, v9, v10 mul:2"),
     ("div:2 on v_cvt_pknorm_u16_f32", "v_cvt_pknorm_u16_f32 v8, v9, v10 div:2"),
 )
@@ -768,6 +773,15 @@ def self_test():
            == 0x1234FFFF, "v_cvt_norm_u16_f16 writes D[15:0] and keeps D[31:16]")
     expect(reference(["v_mov_b32 v9, 0xbc003c00", "v_cvt_pknorm_i16_f16 v8, v9, v9 op_sel:[1,0,0]"])[0]
            == 0x7FFF8001, "v_cvt_pknorm_i16_f16 op_sel:[1,0,0]: S0 from the high half")
+    # The destination op_sel and clamp of the f16 forms, as measured on gfx1036 (tests/semantic/
+    # test_cvt_pknorm_f16_mods.py): clamp changes nothing, op_sel[2] moves S0's result up and zeroes D[15:0].
+    pk = ["v_mov_b32 v8, 0xdeadbeef", "v_mov_b32 v9, 0x3c003400", "v_mov_b32 v10, 0xbc003801"]
+    expect(reference(pk + ["v_cvt_pknorm_i16_f16 v8, v9, v10 clamp"])[0] == 0x400F2000,
+           "v_cvt_pknorm_i16_f16 clamp: a no-op (0.25 -> 0x2000, 0.5 + 2^-11 -> 0x400f)")
+    expect(reference(pk + ["v_cvt_pknorm_i16_f16 v8, v9, v10 op_sel:[0,0,1] clamp"])[0] == 0x20000000,
+           "v_cvt_pknorm_i16_f16 op_sel:[0,0,1]: S0's result in D[31:16], D[15:0] = 0, S1 dropped")
+    expect(reference(pk + ["v_cvt_pknorm_u16_f16 v8, v9, v10 op_sel:[0,1,1]"])[0] == 0x40000000,
+           "v_cvt_pknorm_u16_f16 op_sel:[0,1,1]: the high-half S1 is read but dropped")
     expect(reference(["v_cvt_pknorm_u16_f16 v8, 1.0, 0.5"])[0] == 0x8000FFFF,
            "float inline constants read as f16 values in a 16-bit operand (1.0 -> 0xffff, 0.5 -> 0x8000)")
 

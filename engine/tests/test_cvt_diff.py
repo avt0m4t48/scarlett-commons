@@ -97,6 +97,13 @@ class Reference(unittest.TestCase):
                          0x7FFF8001)
         self.assertEqual(run("v_mov_b32 v9, 0xbc003c00", "v_cvt_pknorm_u16_f16 v8, v9, v9 op_sel:[0,1,0]")[0],
                          0x0000FFFF)
+        # op_sel[2] of the f16 forms: S0's result in D[31:16], D[15:0] = 0, S1's dropped; clamp is a no-op. The
+        # words of tests/semantic/test_cvt_pknorm_f16_mods.py, measured on gfx1036.
+        pk = ("v_mov_b32 v8, 0xdeadbeef", "v_mov_b32 v9, 0x3c003400", "v_mov_b32 v10, 0xbc003801")
+        self.assertEqual(run(*pk, "v_cvt_pknorm_i16_f16 v8, v9, v10")[0], 0x400F2000)
+        self.assertEqual(run(*pk, "v_cvt_pknorm_i16_f16 v8, v9, v10 clamp")[0], 0x400F2000)
+        self.assertEqual(run(*pk, "v_cvt_pknorm_i16_f16 v8, v9, v10 op_sel:[0,0,1]")[0], 0x20000000)
+        self.assertEqual(run(*pk, "v_cvt_pknorm_u16_f16 v8, v9, v10 op_sel:[1,0,1] clamp")[0], 0xFFFF0000)
 
     def test_source_modifiers(self):
         self.assertEqual(c.modify(0x3F800000, "-", 32), 0xBF800000)
@@ -128,7 +135,7 @@ class Reference(unittest.TestCase):
 
     def test_unmodelled_forms_raise(self):
         for bad in ("v_cvt_pknorm_i16_f32 v8, v9, v10 op_sel:[1,0,0]",
-                    "v_cvt_pknorm_i16_f16 v8, v9, v10 op_sel:[0,0,1]",
+                    "v_cvt_pknorm_i16_f32 v8, v9, v10 op_sel:[0,0,1]",
                     "v_cvt_pknorm_u16_f16 v8, 1.0, v10 op_sel:[1,0,0]",
                     "v_cvt_flr_i32_f32_e64 v8, -|v9",
                     "v_cvt_rpi_i32_f32_e64 s8, v9",
@@ -153,8 +160,9 @@ class Generator(unittest.TestCase):
     def test_sweep_size(self):
         # flr/rpi: 5 _e32 kinds + 11 _e64 (4 modifiers on the 2 register kinds, 3 constant kinds);
         # norm adds the 6 output modifier settings per kind (30); pk32: 120 encodable kind/modifier pairs + clamp on
-        # 24 kind pairs; pk16: (2 register kinds x 4 modifiers x 2 halves + 3)^2 - 1 (two literals)
-        self.assertEqual(len(c.sweep_ops()), 2 * 16 + 2 * 46 + 2 * 144 + 2 * 360)
+        # 24 kind pairs; pk16: ((2 register kinds x 4 modifiers x 2 halves + 3)^2 - 1 (two literals)) x 2 destination
+        # halves, + clamp on the 24 kind pairs with each destination half
+        self.assertEqual(len(c.sweep_ops()), 2 * 16 + 2 * 46 + 2 * 144 + 2 * (2 * 360 + 2 * 24))
 
     def test_edge_grid(self):
         self.assertEqual(len(c.F32_TIES), 2 * 24 * 3)
@@ -222,7 +230,7 @@ class Generator(unittest.TestCase):
                 for m in mods:
                     if m.startswith("op_sel"):
                         self.assertEqual(kind, "pk16", line)
-                        self.assertTrue(m.endswith(",0]"), line)
+                        self.assertRegex(m, r"^op_sel:\[[01],[01],[01]\]$", line)
                         sel = c._opsel(mods)
                         for s, bit in zip(srcs, sel):
                             self.assertTrue(not bit or s not in consts, line)

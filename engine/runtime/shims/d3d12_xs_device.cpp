@@ -59,6 +59,9 @@ struct DeviceProxy {
     // The upload-memory arena console list slot 148 (AllocateUploadMemory) carves from; always null until the
     // first call. Opaque: UploadArena is defined with the list proxy.
     void* upload_state = nullptr;
+    // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4): the queue proxy
+    // writes it on detection and every object shares it — the queue/list slot tails shift +2 under the newer one.
+    std::atomic<unsigned char> console_layout{0};  // 0 unknown, 1 older, 2 newer
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -852,20 +855,33 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // layout's Signal/Wait; anything else there is the older layout's frequency/calibration getter. A
             // fence at slot 14 or 15 is the older Signal/Wait; a non-fence argument there is one of the newer
             // layout's two inserted console methods.
+            // A queue made after another one detected the layout inherits it from the device; undetected queues
+            // assume the older layout, whose unshifted slots are also the PC chain.
+            const bool newer = [&] {
+                if (self->queue_layout == ChildProxy::kQueueLayoutNewer) return true;
+                const unsigned char shared =
+                    self->device->console_layout.load(std::memory_order_relaxed);
+                return self->queue_layout == ChildProxy::kQueueLayoutUnknown &&
+                       shared == ChildProxy::kQueueLayoutNewer;
+            }();
             if (Slot == 16 || Slot == 17) {
                 if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
                     self->queue_layout = ChildProxy::kQueueLayoutNewer;
+                    self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
+                                                       std::memory_order_relaxed);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal + (Slot - 16)])(
                         self->real, fence, a2));
                 }
-                if (self->queue_layout == ChildProxy::kQueueLayoutUnknown)
+                if (self->queue_layout == ChildProxy::kQueueLayoutUnknown) {
                     self->queue_layout = ChildProxy::kQueueLayoutOlder;
+                    self->device->console_layout.store(ChildProxy::kQueueLayoutOlder,
+                                                       std::memory_order_relaxed);
+                }
             } else if ((Slot == 14 || Slot == 15) && !proxy_real_object(reinterpret_cast<const void*>(a1)) &&
-                       self->queue_layout == ChildProxy::kQueueLayoutNewer) {
+                       newer) {
                 return hr_to_u64(S_OK);  // the newer layout's two inserted console methods, unmeasured
             }
-            const bool newer = self->queue_layout == ChildProxy::kQueueLayoutNewer;
             if (newer && Slot >= 18 && Slot <= 20) {
                 // Newer layout: frequency 18, calibration 19, GetDesc 20 are the PC slots 16-18 shifted.
                 d3d12_trace::record(child_trace_name<K>(Slot));

@@ -6894,12 +6894,32 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_bfm_b32":
             w, o = self.src_u(a[1]), self.src_u(a[2])
-            wm, om, one, m1, r = (self.tmp() for _ in range(5))
-            self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
-            self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
-            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wm}")
-            self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
-            self.emit(f"{r} = OpShiftLeftLogical %uint {m1} {om}")
+            width = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
+            offset = None if "sdwa_sel" in a[2] else self.imm_val(a[2])
+            if width is not None:
+                bits = (1 << (width & 31)) - 1
+                if offset is not None:
+                    self.dst(a[0], self.cu(bits << (offset & 31)))
+                    return
+                if bits == 0:
+                    self.dst(a[0], self.cu(0))
+                    return
+                mask = self.cu(bits)
+            else:
+                wm, one, mask = (self.tmp() for _ in range(3))
+                self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+                self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wm}")
+                self.emit(f"{mask} = OpISub %uint {one} {self.cu(1)}")
+            if offset is None:
+                shift = self.tmp()
+                self.emit(f"{shift} = OpBitwiseAnd %uint {o} {self.cu(31)}")
+            elif offset & 31:
+                shift = self.cu(offset & 31)
+            else:
+                self.dst(a[0], mask)
+                return
+            r = self.tmp()
+            self.emit(f"{r} = OpShiftLeftLogical %uint {mask} {shift}")
             self.dst(a[0], r)
         elif op in ("s_bcnt1_i32_b64", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt0_i32_b32"):
             if self.holds_lane_mask(a[1]):

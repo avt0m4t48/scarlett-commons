@@ -5,6 +5,7 @@
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/queue_families.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
 #include "vk_device_pick.h"
@@ -92,11 +93,16 @@ public:
     std::vector<VkQueue> queues;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    bool all_queue_types = false;
+    VkQueue compute_queue = VK_NULL_HANDLE, copy_queue = VK_NULL_HANDLE;
+    std::uint32_t compute_family = 0, copy_family = 0;
+    std::vector<VkQueueFamilyProperties> families;
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
@@ -109,6 +115,7 @@ public:
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+    bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -211,6 +218,9 @@ public:
             std::vector<VkExtensionProperties> available(count);
             enumerate_instance(nullptr, &count, available.data());
             bool caps2 = false;
+            for (const auto& e : available)  // lists the HDR10 (ST.2084) surface formats, when the display has them
+                if (std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace") == 0)
+                    instance_extensions.push_back("VK_EXT_swapchain_colorspace");
             for (const auto& e : available) {
                 caps2 = caps2 || std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2") == 0;
                 surface_m1_khr = surface_m1_khr || std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1") == 0;
@@ -286,15 +296,15 @@ public:
             if (!candidate13.usable()) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(family_count);
-            families_of(candidate, &family_count, families.data());
+            std::vector<VkQueueFamilyProperties> candidate_families(family_count);
+            families_of(candidate, &family_count, candidate_families.data());
             for (std::uint32_t i = 0; i < family_count; ++i) {
-                if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+                if (!(candidate_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
                 if (const int rank = leonida::vk_test::device_rank(props.deviceType, props.vendorID);
                     rank > best_rank) {
                     physical = candidate;
                     family = i;
-                    family_queue_count = families[i].queueCount;
+                    family_queue_count = candidate_families[i].queueCount;
                     chosen = props;
                     best_rank = rank;
                     v13_.choose(candidate13);
@@ -386,11 +396,32 @@ public:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
-        const std::vector<float> priority(std::max(1u, std::min(queue_count_wanted, family_queue_count)), 1.0f);
-        VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        queue_info.queueFamilyIndex = family;
-        queue_info.queueCount = std::max(1u, std::min(queue_count_wanted, family_queue_count));
-        queue_info.pQueuePriorities = priority.data();
+        const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
+        const std::vector<float> priority(graphics_count, 1.0f);
+        {
+            std::uint32_t family_count = 0;
+            families_of(physical, &family_count, nullptr);
+            families.resize(family_count);
+            families_of(physical, &family_count, families.data());
+        }
+        compute_family = copy_family = family;
+        if (all_queue_types) {
+            const auto picked = leonida::pick_queue_families(families, family);
+            compute_family = picked.compute;
+            copy_family = picked.copy;
+        }
+        std::vector<VkDeviceQueueCreateInfo> queue_infos;
+        for (std::uint32_t f : {family, compute_family, copy_family}) {
+            bool seen = false;
+            for (const auto& q : queue_infos) seen = seen || q.queueFamilyIndex == f;
+            if (seen) continue;
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = f;
+            q.queueCount = f == family ? graphics_count : 1;
+            q.pQueuePriorities = priority.data();
+            queue_infos.push_back(q);
+            sharing_.push_back(f);
+        }
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
@@ -398,6 +429,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
@@ -418,6 +450,36 @@ public:
             if (image_view_min_lod) {
                 min_lod.pNext = *v13_.next();
                 *v13_.next() = &min_lod;
+            }
+        }
+        const char* divisor_extension = nullptr;
+        for (const char* name :
+             {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+            if (std::any_of(extensions.begin(), extensions.end(),
+                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+                divisor_extension = name;
+                break;
+            }
+        }
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+        if (divisor_extension) {
+            const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                            is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_attribute_divisor = (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor
+                                               : divisor_ext.vertexAttributeInstanceRateDivisor) == VK_TRUE;
+            if (vertex_attribute_divisor) {
+                if (is_khr) {
+                    divisor_khr.pNext = *v13_.next();
+                    *v13_.next() = &divisor_khr;
+                } else {
+                    divisor_ext.pNext = *v13_.next();
+                    *v13_.next() = &divisor_ext;
+                }
             }
         }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
@@ -471,13 +533,18 @@ public:
         }
 
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
-        device_info.queueCreateInfoCount = 1;
-        device_info.pQueueCreateInfos = &queue_info;
+        device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
+        device_info.pQueueCreateInfos = queue_infos.data();
         device_info.pEnabledFeatures = &enable;
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+        });
+        if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+        if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
@@ -514,10 +581,12 @@ public:
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
         if (result != VK_SUCCESS) return failure("vkCreateDevice", result);
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
-        queues.resize(queue_info.queueCount);
-        for (std::uint32_t i = 0; i < queue_info.queueCount; ++i)
+        queues.resize(graphics_count);
+        for (std::uint32_t i = 0; i < graphics_count; ++i)
             fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, i, &queues[i]);
         queue = queues[0];
+        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, compute_family, 0, &compute_queue);
+        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, copy_family, 0, &copy_queue);
         instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical,
                                                                                                     &memory_);
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -547,6 +616,7 @@ public:
         info.arrayLayers = layers;
         info.samples = VkSampleCountFlagBits(samples);
         info.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        share(info);
         VkImage image = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateImage>("vkCreateImage")(device, &info, nullptr, &image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements requirements{};
@@ -563,6 +633,7 @@ public:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = usage | (buffer_device_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+        share(info);
         VkBuffer buffer = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &buffer) != VK_SUCCESS)
             return VK_NULL_HANDLE;
@@ -646,6 +717,16 @@ public:
     }
 
 private:
+    std::vector<std::uint32_t> sharing_;
+
+    template<typename Info>
+    void share(Info& info) const {
+        if (sharing_.size() < 2) return;
+        info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        info.queueFamilyIndexCount = std::uint32_t(sharing_.size());
+        info.pQueueFamilyIndices = sharing_.data();
+    }
+
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags flags) {
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
             if (!(requirements.memoryTypeBits & (1u << i))) continue;

@@ -8,6 +8,8 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "spirv_words.h"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -636,7 +638,10 @@ struct ShaderEntry {
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
-    std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
+    std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
+    std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
+    // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
 };
 
 class ShaderLibrary {
@@ -666,6 +671,9 @@ public:
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
+    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -717,13 +725,8 @@ public:
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary);
-        if (!file) return {};
-        const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 20 || bytes.size() % 4) return {};
-        std::vector<std::uint32_t> words(bytes.size() / 4);
-        std::memcpy(words.data(), bytes.data(), bytes.size());
-        return words[0] == 0x07230203 ? words : std::vector<std::uint32_t>{};
+        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary | std::ios::ate);
+        return read_spirv_words(file, file.tellg());
     }
 
 private:
@@ -758,6 +761,7 @@ private:
             entries_.clear();
             fspx_entries_.clear();
             count_ = 0;
+            fspx_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -796,10 +800,22 @@ private:
                     e.input_signature.push_back(std::move(element));
                 }
             }
+            if (const Json* in = meta.find("inputs"); in && in->kind == Json::Kind::array)
+                for (const Json& item : in->array) e.inputs.push_back(u32(&item));
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
+                for (const auto& [key, val] : fh->object) {
+                    if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
+                    char* end = nullptr;
+                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
+                    if (!end || *end != '\0') continue;
+                    e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
             ++count_;
         }
         return true;
@@ -807,6 +823,7 @@ private:
 
     std::string dir_;
     std::size_t count_ = 0;
+    std::size_t fspx_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

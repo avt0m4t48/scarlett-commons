@@ -116,12 +116,13 @@ def resource_kind(b):
     """Drawable / drawable dictionary / fragment signature on the system page prefix, or None."""
     if len(b) < 192 or u64(b, 0) != 0:
         return None
-    if sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
+    if sys_ptr(u64(b, 8)) and sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
             and u16(b, 56) == u16(b, 58) == u16(b, 40) == u16(b, 42):
         return "dictionary"
-    if all(sys_ptr(u64(b, at)) for at in (8, 16, 24, 32, 40)) \
-            and 0 < u16(b, 48) <= 4096 and u16(b, 48) == u16(b, 50) \
-            and 0 < u16(b, 52) <= 4096 and u16(b, 52) == u16(b, 54):
+    if all(sys_ptr(u64(b, at)) for at in (8, 24, 168)) \
+            and all(p == 0 or sys_ptr(p) for p in (u64(b, 16), u64(b, 32), u64(b, 40))) \
+            and 0 < u16(b, 48) <= 4096 and u16(b, 50) <= 4096 \
+            and u16(b, 52) <= u16(b, 54) <= 4096:
         return "fragment"
     if (sys_ptr(u64(b, 8)) or u64(b, 8) == 0) and sys_ptr(u64(b, 16)) and sys_ptr(u64(b, 80)) \
             and (sys_ptr(u64(b, 168)) or u64(b, 168) == 0):
@@ -205,6 +206,7 @@ def walk_resource(sys, kind):
                     for size, _fmt, offset in slots.values():
                         check(offset <= gfx_len and size * vertices <= gfx_len - offset)
                     gfx_at = u64(sys, vb + 24) - 0x60000000
+                    check(0 <= gfx_at <= MAX_GFX - gfx_len)
                     if any(i in slots for i in WEIGHT_SLOTS + INDEX_SLOTS):
                         meshes.append(Mesh(vertices, bones, slots, gfx_at, gfx_len))
                     check(len(meshes) <= 4096)
@@ -267,9 +269,9 @@ def descriptor_offsets(data, limit):
 
 def validate(mesh, gfx, layout):
     """Check the decoded skin bytes against the model's own bone count; returns a tally dict."""
-    data = gfx[mesh.gfx_at:mesh.gfx_at + mesh.gfx_len]
-    if len(data) < mesh.gfx_len:
+    if mesh.gfx_at < 0 or mesh.gfx_at + mesh.gfx_len > len(gfx):
         return {"buffer-short": 1, "vertices": mesh.vertices}
+    data = gfx[mesh.gfx_at:mesh.gfx_at + mesh.gfx_len]
     n = mesh.vertices
     t = {"vertices": n, "meshes": 1, "weighted-components": 0, "components-out-of-range": 0,
          "weight-sum-255": 0, "weight-sum-247-254": 0, "weight-sum-other": 0,
@@ -289,10 +291,11 @@ def validate(mesh, gfx, layout):
             if offset not in desc:
                 t["descriptor-mismatch"] += 1
     if weight_rows:
-        low = high = 255
+        low = high = None
         for v in range(n):
             total = sum(sum(row[4 * v:4 * v + 4]) for row in weight_rows)
-            low, high = min(low, total), max(high, total)
+            low = total if low is None else min(low, total)
+            high = total if high is None else max(high, total)
             if total == 255:
                 t["weight-sum-255"] += 1
             elif 247 <= total <= 254:
@@ -428,7 +431,7 @@ def scan_archive(path, sample, log):
                     stats["unclassified"] += 1
                     continue
                 acc = stats["validated"].setdefault(layout, {"_meshes": 0})
-                if acc["_meshes"] < sample and mesh.gfx_at + mesh.gfx_len <= len(resource_gfx):
+                if acc["_meshes"] < sample and 0 <= mesh.gfx_at and mesh.gfx_at + mesh.gfx_len <= len(resource_gfx):
                     acc["_meshes"] += 1
                     for key, value in validate(mesh, resource_gfx, layout).items():
                         if key.endswith(("-min", "-max")):
@@ -477,7 +480,11 @@ def main(argv=None):
                 return 2
     report, t0 = {}, time.time()
     for path in a.inputs:
-        stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+        try:
+            stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+        except OSError as error:
+            print(f"error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+            return 2
         report[path] = stats
         print(f"{os.path.basename(path)}: {stats['resources']} resources, {stats['meshes']} skin meshes, "
               f"{stats['vertices']} vertices ({time.time() - t0:.0f}s)")

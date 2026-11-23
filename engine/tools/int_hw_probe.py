@@ -15,7 +15,7 @@ Groups covered (each references its contract row in docs/design.md):
     salu_quad_bitrep    s_quadmask_b32/b64, s_bitreplicate_b64_b32
     salu_64_bitwise     s_and/or/xor/andn2/orn2/nand/nor/xnor/not_b64 on scalar data
     salu_movrels        s_movrels_b32, s_movrels_b64 (M0 indexing, SCC kept)
-    valu_add_nc_clamp   v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16 with clamp
+    valu_add_nc_clamp   v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16/i16 with clamp
     valu_add_co_clamp   v_add/sub/subrev_co[_ci]_u32 with clamp (saturation + carry)
     valu_mad64          v_mad_u64_u32, v_mad_i64_i32 (sdst bit 64 and inactive EXEC lane)
     valu_sad_lerp       v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32, v_msad_u8, v_lerp_u8
@@ -310,7 +310,7 @@ def build_cases():
                      "s_movrels_b64 s[6:7], s[10:11]", 1, "SGPR[12:13], SCC kept"),
     ]
 
-    # 10. Integer clamp on v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16
+    # 10. Integer clamp on v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16, v_add/sub_nc_i16
     cases += [
         _valu4_case("valu_add_nc_clamp", "v_add_sub_nc_u32_clamp", [
             "v_mov_b32 v1, 0xfffffff0", "v_mov_b32 v2, 0x30",
@@ -338,6 +338,18 @@ def build_cases():
             "v_add_nc_u16_e64 v10, v1, v2 op_sel:[0,0,1] clamp",       # write hi saturates 0xffff, lo kept
             "v_sub_nc_u16_e64 v11, v1, v2 op_sel:[1,1,0] clamp",       # 0x1234 - 0x5678 -> 0x0000, hi kept
         ], "u16 nc add/sub with clamp and op_sel (untouched half kept)"),
+        _valu4_case("valu_add_nc_clamp", "v_add_sub_nc_i16_clamp", [
+            "v_mov_b32 v1, 0x12347ff0", "v_mov_b32 v2, 0x56780030",
+            "v_mov_b32 v3, 0x12348000", "v_mov_b32 v4, 0x56780001",
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_add_nc_i16_e64 v8, v1, v2 clamp",                       # 0x7ff0 + 0x0030 = 0x8020 -> saturates 0x7fff, hi kept
+            "v_sub_nc_i16_e64 v9, v3, v4 clamp",                       # -32768 - 1 = -32769 -> saturates 0x8000, hi kept
+            "v_add_nc_i16_e64 v10, v1, v2 op_sel:[0,0,1] clamp",       # write hi saturates 0x7fff, lo kept
+            "v_sub_nc_i16_e64 v11, v1, v2 op_sel:[1,1,0] clamp",       # 0x1234 - 0x5678 = -0x4444 in range -> 0xbbbc, hi kept
+        ], "i16 nc add/sub with clamp and op_sel (untouched half kept)"),
     ]
 
     # 11. v_add/sub/subrev_co[_ci]_u32 with clamp (known divergence: translator ignores clamp)

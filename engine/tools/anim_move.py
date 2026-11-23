@@ -426,7 +426,7 @@ def _collect_move_streams_dir(path):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if os.path.islink(full) or not os.path.isfile(full):
+        if name.lower().endswith((".json", ".csv")) or os.path.islink(full) or not os.path.isfile(full):
             continue
         size = os.path.getsize(full)
         if size == 0 or size > MAX_STANDALONE_FILE_BYTES:

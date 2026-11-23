@@ -6446,8 +6446,10 @@ class Gen:
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
             # Packed 16-bit integer ops (VOP3P, RDNA2 ISA): result half 0 takes each source's half from op_sel[i],
             # result half 1 from op_sel_hi[i] (defaults [0,..] and [1,..]); each half is computed on its own and
-            # wraps to 16 bits. clamp (add/sub/mad) saturates the half to its type's range; the exact value fits in
-            # 32 bits (0xFFFF * 0xFFFF + 0xFFFF < 2^32, and the i16 forms within int32). neg_lo/neg_hi are float-only.
+            # wraps to 16 bits. clamp saturates on add/sub/mad (the exact value fits in 32 bits:
+            # 0xFFFF * 0xFFFF + 0xFFFF < 2^32, and the i16 forms within int32), whereas on mul_lo/max/min
+            # VOP3P clamp is a hardware no-op (measured on gfx1036: v_pk_mul_lo_u16 clamp wraps modulo 2^16
+            # rather than saturating to 0xFFFF, and max/min results are unchanged). neg_lo/neg_hi are float-only.
             # Constant operands are treated as 32-bit dwords: op_sel=0 selects bits [15:0], op_sel=1 selects [31:16]
             # (measured on gfx1036). Positive inlines zero-extend, negative inlines sign-extend, 32-bit literals
             # retain their full dword; OpBitField*Extract at 16*sl[i] lowers this directly.
@@ -6456,13 +6458,13 @@ class Gen:
                 return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
             ns = 3 if "_mad_" in op else 2
             sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
-            if len(sel) != ns or len(selhi) != ns or any(any(bits(n, [0] * ns)) for n in ("neg_lo", "neg_hi")):
+            if (len(sel) != ns or len(selhi) != ns
+                    or any(m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
+                    or any(any(bits(n, [0] * ns)) for n in ("neg_lo", "neg_hi"))):
                 raise Unsupported(op + " modifiers")
             kind = op[len("v_pk_"):].rsplit("_", 1)[0]          # add, sub, mul_lo, mad, max, min
             signed = op.endswith("i16")
-            clamp = "clamp" in mods
-            if clamp and kind not in ("add", "sub", "mad"):
-                raise Unsupported(op + " clamp")
+            clamp = "clamp" in mods and kind in ("add", "sub", "mad")
             srcs = [self.src_u(t) for t in a[1:1 + ns]]
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             halves = []

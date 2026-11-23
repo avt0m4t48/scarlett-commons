@@ -15447,8 +15447,8 @@ def translate(path):
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
                 "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
-        # LDS_SIZE [23:15] in 512-byte units (470 of 486 LDS-using CS stay below it; the rest index past it with
-        # constant offsets, which RDNA2 treats as out of range: bounds-checked below, SHADER-309).
+        # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
+        # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
         for ins in insns:
             if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):

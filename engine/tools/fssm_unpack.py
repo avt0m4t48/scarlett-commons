@@ -165,8 +165,12 @@ def main(argv=None) -> int:
         return 2
     rows, problems = [], Counter()
     for shader in shaders:
-        with open(shader, "rb") as f:
-            d = f.read()
+        try:
+            with open(shader, "rb") as f:
+                d = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {shader}: {e.strerror or e}", file=sys.stderr)
+            return 2
         try:
             fssm, ents = unpack(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001

@@ -531,6 +531,23 @@ class TestMainBadSource(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "fssm")))
 
 
+    def test_unreadable_shader_leaves_completion_index_unchanged(self):
+        with tempfile.TemporaryDirectory() as src:
+            shader = os.path.join(src, "input.dxbc")
+            index = os.path.join(src, "fssm_index.json")
+            with open(shader, "wb") as f:
+                f.write(b"synthetic")
+            with open(index, "wb") as f:
+                f.write(b"previous index")
+            error = PermissionError(errno.EACCES, "input is locked", shader)
+            with mock.patch.object(fssm_unpack, "open", create=True, side_effect=error), \
+                    mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                self.assertEqual(fssm_unpack.main([src]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {shader}: input is locked"])
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b"previous index")
+
+
 class TestMainDirectoryProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

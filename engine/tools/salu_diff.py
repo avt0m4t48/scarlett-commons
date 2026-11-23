@@ -42,6 +42,13 @@ names them explicitly). s_bfe_* control words stay inside offset + width <= 32 u
 that the field stops at bit 31 (width = min(width, 32 - offset), so s_bfe_i32 sign-extends from the top bit
 that exists). gfx1150 hardware and the translator both do that; the ISA pseudocode does not say so, and RDNA2
 itself is unmeasured (#156). s_ff0/ff1_i32_b32 with a constant source diverged until SHADER-46 (#349).
+
+SCC selects: s_cmov_b32, s_cmovk_i32 (SIMM16 sign-extended) and s_cmov_b64 keep D when SCC is 0; they read SCC
+and do not write it, so --branches uses them as consumers too. Relative reads: when the opcodes include
+s_movrels_b32/b64, the program sets M0 to 0..7 once, after the seeds, and every s_movrels reads
+SGPR[S0 + M0] (the b64 form the pair there) inside the seeded SGPRs. With an odd M0 the b64 form is not
+generated (the b32 one takes its place): an odd-aligned pair is unmeasured. These rows rest on the gfx1035
+cases of tools/int_hw_probe.py (docs/shader_validation.md).
 """
 import argparse
 import gc
@@ -266,6 +273,12 @@ def _sop1():
         "s_bitset1_b32": ("sop1_rmw", lambda a, b, c, d: (d | (1 << (a & 31)), None)),
         "s_bitset0_b64": ("sop1_64_rmw", lambda a, b, c, d: (d & ~(1 << (a & 63)) & M64, None)),
         "s_bitset1_b64": ("sop1_64_rmw", lambda a, b, c, d: (d | (1 << (a & 63)), None)),
+        # SCC ? S0 : D. SCC is read, not written.
+        "s_cmov_b32": ("sop1_rmw", lambda a, b, c, d: (a if c else d, None)),
+        "s_cmov_b64": ("sop1_64_rmw64", lambda a, b, c, d: (a if c else d, None)),
+        # SGPR[S0 + M0]: the reference reads the register (or pair) and passes its value as a.
+        "s_movrels_b32": ("movrels", lambda a, b, c: (a, None)),
+        "s_movrels_b64": ("movrels_64", lambda a, b, c: (a, None)),
         "s_mov_b64": ("sop1_64", lambda a, b, c: (a, None)),
         "s_not_b64": ("sop1_64", lambda a, b, c: (~a & M64, int(~a & M64 != 0))),
         "s_brev_b64": ("sop1_64", lambda a, b, c: (int(f"{a:064b}"[::-1], 2), None)),
@@ -299,19 +312,22 @@ def _sopc():
     ops["s_addk_i32"] = ("sopk", lambda d, k, c: ((d + sext16(k)) & M32,
                                                   int(not -2**31 <= s32(d) + sext16(k) < 2**31)))
     ops["s_mulk_i32"] = ("sopk", lambda d, k, c: ((s32(d) * sext16(k)) & M32, None))
+    ops["s_cmovk_i32"] = ("sopk", lambda d, k, c: (sext16(k) & M32 if c else d, None))
     return ops
 
 
 OPS = {**_sop2(), **_sop2_64(), **_sop1(), **_sopc()}
 
-SCC_CONSUMERS = ("s_cselect_b32", "s_addc_u32", "s_subb_u32")
+SCC_CONSUMERS = ("s_cselect_b32", "s_addc_u32", "s_subb_u32", "s_cmov_b32", "s_cmovk_i32", "s_cmov_b64")
+RMW_FORMS = ("sop1_rmw", "sop1_64_rmw", "sop1_64_rmw64")   # fn(a, b, scc, d): D is read too
+MOVREL_FORMS = ("movrels", "movrels_64")
 SCC_BRANCHES = ("s_cbranch_scc0", "s_cbranch_scc1")
 
 
 def writes_scc(name):
     """Whether the opcode writes SCC (each one always does or never does)."""
     form, fn = OPS[name]
-    return (fn(1, 2, 0, 3) if form in ("sop1_rmw", "sop1_64_rmw") else fn(1, 2, 0))[1] is not None
+    return (fn(1, 2, 0, 3) if form in RMW_FORMS else fn(1, 2, 0))[1] is not None
 
 
 def branch_skip(line):
@@ -363,9 +379,16 @@ def _shared_literal_sources(src0: str, src1: str, register: int) -> str:
     return f"{src0}, {src1}"
 
 
-def emit(rng, name):
+def emit(rng, name, m0=0):
+    """One instruction. m0: the program's M0, which keeps an s_movrels source inside the seeded SGPRs."""
     form = OPS[name][0]
     d, p = rng.choice(REGS), rng.choice(PAIRS)
+    if form == "movrels_64" and m0 % 2:
+        name, form = "s_movrels_b32", "movrels"   # an odd-aligned pair is not generated
+    if form == "movrels":
+        return f"{name} s{d}, s{rng.choice([r for r in REGS if r + m0 <= REGS[-1]])}"
+    if form == "movrels_64":
+        return f"{name} {_pair(p)}, {_pair(rng.choice([r for r in PAIRS if r + m0 + 1 <= REGS[-1]]))}"
     if form == "sop2":
         b = _src32(rng) if name.startswith("s_bfe") and BFE_ANY and rng.random() < 0.3 else             _bfe_ctl(rng) if name.startswith("s_bfe") else _src32(rng)
         return f"{name} s{d}, {_shared_literal_sources(_src32(rng), b, d)}"
@@ -377,7 +400,7 @@ def emit(rng, name):
         return f"{name} {_pair(p)}, {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form in ("sop1", "sop1_rmw"):
         return f"{name} s{d}, {_src32(rng)}"
-    if form == "sop1_64":
+    if form in ("sop1_64", "sop1_64_rmw64"):
         return f"{name} {_pair(p)}, {_src64(rng)}"
     if form in ("sop1_32to64", "sop1_64_rmw"):
         return f"{name} {_pair(p)}, {_src32(rng)}"
@@ -395,33 +418,37 @@ def emit(rng, name):
 
 def generate(rng, n_ops, ops, branches=False):
     lines = [f"s_mov_b32 s{r}, 0x{_value(rng):x}" for r in REGS]
+    m0 = 0
+    if any(OPS[o][0] in MOVREL_FORMS for o in ops):
+        m0 = rng.randrange(8)
+        lines.append(f"s_mov_b32 m0, {m0}")   # part of the seeds: shrinking keeps it
     lines.append(f"s_cmp_eq_u32 s{rng.choice(REGS)}, s{rng.choice(REGS)}")   # a known SCC to start with
     if branches:
-        lines += _cf_body(rng, n_ops, ops)
+        lines += _cf_body(rng, n_ops, ops, m0)
     else:
         for _ in range(n_ops):
-            lines.append(emit(rng, rng.choice(ops)))
+            lines.append(emit(rng, rng.choice(ops), m0))
     lines += observe(rng.sample(REGS, 3))
     return lines
 
 
-def _cf_body(rng, n_ops, ops):
+def _cf_body(rng, n_ops, ops, m0=0):
     """n_ops instructions, half of them SCC producers. After a producer: sometimes a chain of SCC consumers,
     sometimes s_cbranch_scc0/1 forward over the next 1..3 instructions (which never branch themselves)."""
     producers = [o for o in ops if writes_scc(o)] or ops
     body = []
     for _ in range(n_ops):
         op = rng.choice(producers if rng.random() < 0.5 else ops)
-        body.append(emit(rng, op))
+        body.append(emit(rng, op, m0))
         if not writes_scc(op):
             continue
         r = rng.random()
         if r < 0.35:
-            body += [emit(rng, rng.choice(SCC_CONSUMERS)) for _ in range(rng.randint(1, 3))]
+            body += [emit(rng, rng.choice(SCC_CONSUMERS), m0) for _ in range(rng.randint(1, 3))]
         elif r < 0.8:
             k = rng.randint(1, 3)
             body.append(f"{rng.choice(SCC_BRANCHES)} +{k}")
-            body += [emit(rng, rng.choice(ops + list(SCC_CONSUMERS))) for _ in range(k)]
+            body += [emit(rng, rng.choice(ops + list(SCC_CONSUMERS)), m0) for _ in range(k)]
     return body
 
 
@@ -466,7 +493,7 @@ def _write(sgpr, tok, value, width):
 
 def reference(lines):
     """Run the scalar program; returns the four exported words."""
-    sgpr, scc, vgpr = {}, 0, {}
+    sgpr, scc, vgpr, m0 = {}, 0, {}, 0
     skip = 0
     for line in lines:
         if skip:
@@ -482,6 +509,9 @@ def reference(lines):
         args = [a.strip() for a in rest.split(", ")] if rest else []
         if op == "v_mov_b32":
             vgpr[int(args[0][1:])] = _parse_src(args[1], sgpr, 32)
+            continue
+        if op == "s_mov_b32" and args[0] == "m0":
+            m0 = _parse_src(args[1], sgpr, 32)
             continue
         if op not in OPS:
             raise RefError(f"{op} is not modelled")
@@ -510,6 +540,16 @@ def reference(lines):
         elif form == "sop1_64_rmw":
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc, _parse_src(args[0], sgpr, 64))
             _write(sgpr, args[0], r, 64)
+        elif form == "sop1_64_rmw64":
+            r, c = fn(_parse_src(args[1], sgpr, 64), None, scc, _parse_src(args[0], sgpr, 64))
+            _write(sgpr, args[0], r, 64)
+        elif form in MOVREL_FORMS:
+            n = 2 if form == "movrels_64" else 1
+            base = int(args[1][2:args[1].index(":")] if n == 2 else args[1][1:]) + m0
+            if base < REGS[0] or base + n - 1 > REGS[-1]:
+                raise RefError(f"{line!r}: SGPR {base} (S0 + M0) is outside the seeded s{REGS[0]}..s{REGS[-1]}")
+            r, c = fn(sum(sgpr.get(base + w, 0) << (32 * w) for w in range(n)), None, scc)
+            _write(sgpr, args[0], r, 32 * n)
         elif form == "sop1_32to64":
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc)
             _write(sgpr, args[0], r, 64)
@@ -660,7 +700,7 @@ def drop(body, i):
 
 def shrink(lines, check_fn=check):
     """Drop instructions (not seeds or the observation) while the program still mismatches."""
-    n_seed = len(REGS)
+    n_seed = len(REGS) + lines[len(REGS)].startswith("s_mov_b32 m0,")   # the seeds, and M0 when set
     body = lines[n_seed:-5]
     changed = True
     while changed:

@@ -118,8 +118,17 @@ def scrub(text, limit=240):
             return "." if rel == "." else rel
         return "<path>"
 
-    line = re.sub(r"(?i)\b[a-z]:[\\/][^\s'\"]*", shown, line)
-    line = re.sub(r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*", shown, line)
+    # Match the known checkout prefix before the generic patterns stop at whitespace.
+    if os.name == "nt":
+        root = r"[\\/]".join(re.escape(part) for part in re.split(r"[\\/]", ROOT))
+        checkout = rf"(?i:(?<![\w/\\]){root})"
+    else:
+        checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
+    # Consume a same-prefix sibling too, so shown() can redact its entire path.
+    checkout_path = rf"{checkout}[^\s'\"]*"
+    drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
+    posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
+    line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
     line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)

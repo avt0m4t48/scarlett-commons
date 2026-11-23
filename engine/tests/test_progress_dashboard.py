@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -223,6 +224,24 @@ class Scrub(unittest.TestCase):
     def test_paths_inside_the_repository_become_relative(self):
         line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
         self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
+
+    def test_checkout_path_with_spaces_becomes_relative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "Checkout with spaces [1]")
+            path = os.path.join(checkout, "tools", "text_tables.py")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "wb"):
+                pass
+            with mock.patch.object(pd, "ROOT", checkout):
+                self.assertEqual(pd.scrub(f"Error: {path} line 3"), "Error: tools/text_tables.py line 3")
+                self.assertEqual(pd.scrub(f'File "{path}", line 3'), 'File "tools/text_tables.py", line 3')
+                self.assertEqual(pd.scrub(f"Checkout: {checkout}"), "Checkout: .")
+                self.assertEqual(pd.scrub(f"Checkout {checkout} is ready"), "Checkout . is ready")
+                sibling = os.path.join(checkout + "x", f"{SENTINEL}.fssm")
+                self.assertEqual(pd.scrub(f"Error: {sibling} line 3"), "Error: <path> line 3")
+                if os.name == "nt":
+                    alternate = os.path.join(checkout.swapcase(), "tools", "text_tables.py").replace("\\", "/")
+                    self.assertEqual(pd.scrub(f"Error: {alternate} line 3"), "Error: tools/text_tables.py line 3")
 
     def test_urls_and_relative_paths_stay(self):
         self.assertEqual(pd.scrub("see https://github.com/ItsNotRexed/Leonida/issues/1"),

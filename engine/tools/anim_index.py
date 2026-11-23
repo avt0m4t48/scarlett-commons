@@ -451,7 +451,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
 
 def scan_dir(path, progress=None):
     """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
-    entries = []
+    rows, span = [], 0
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -460,10 +460,10 @@ def scan_dir(path, progress=None):
         with open(full, "rb") as f:
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(m.group(1), 16) if m else len(entries)
-        entries.append((offset, name, data))
-    rows = [classify(data, offset, len(data)) for offset, _, data in entries]
-    summary = summarise(rows, sum(len(data) for _, _, data in entries), 0, 0)
+        offset = int(m.group(1), 16) if m else len(rows)
+        span += len(data)
+        rows.append(classify(data, offset, len(data)))
+    summary = summarise(rows, span, 0, 0)
     summary["mode"] = "directory"
     summary["directory"] = path
     if progress:

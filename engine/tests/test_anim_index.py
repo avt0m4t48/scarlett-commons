@@ -425,6 +425,29 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_classifies_each_payload_before_opening_the_next(self):
+        folder = os.path.join(self.root, "streamed")
+        os.mkdir(folder)
+        payloads = (move(), page(), names())
+        for name, payload in zip(("00001000.bin", "a.bin", "b.bin"), payloads):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(payload)
+
+        classify = mock.Mock(wraps=anim_index.classify)
+        reads = []
+
+        def tracked_open(path, mode):
+            self.assertEqual(classify.call_count, len(reads))
+            reads.append(os.path.basename(path))
+            return open(path, mode)
+
+        with mock.patch.object(anim_index, "classify", classify), \
+                mock.patch.object(anim_index, "open", tracked_open, create=True):
+            rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual(reads, ["00001000.bin", "a.bin", "b.bin"])
+        self.assertEqual([row["offset"] for row in rows], [0x1000, 1, 2])
+        self.assertEqual(summary["span"], sum(map(len, payloads)))
+
     def test_directory_rejects_start_and_limit(self):
         folder = os.path.join(self.root, "carved")
         os.makedirs(folder)

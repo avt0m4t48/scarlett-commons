@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -261,7 +262,82 @@ std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
-std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
+// A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
+// rather than per page: under Wine each view costs a placeholder split and a section map whose time grows with the
+// number of views, and the retail title maps about 100,000 pages in one call.
+struct View {
+    uint64_t count;
+    std::shared_ptr<Section> section;  // kept for remapping part of the run after its pages are freed
+    uint64_t offset;                   // section offset of the first page
+    DWORD protect;
+};
+std::map<uintptr_t, View> g_views;  // view base -> view
+
+// Splitting a view (unmap_range) unmaps it whole and maps its remainders again, so for that moment pages the caller
+// did not name are unmapped. On the console they stay mapped, and another thread may be reading them. The span being
+// split is published here, and a vectored handler makes a thread that faults inside it wait for the remap, then
+// retries the access. The last finished split stays published too, for a fault the handler sees only after the split
+// is done; any other access violation goes on to the next handler.
+// Only the last finished span is kept, so a fault delivered after two later splits is not retried.
+// A span is one word, so a reader never pairs one split's start with another's end: views are 64 KiB aligned and at
+// most kMaxViewPages long, so the base keeps its low 16 bits for the page count. 0 is no span.
+std::atomic<uint64_t> g_split{0};
+std::atomic<uint64_t> g_last_split{0};
+std::atomic<uint64_t> g_splits{0};  // splits started
+
+uint64_t pack_span(uintptr_t begin, uintptr_t end) { return begin | (end - begin) / kPhysicalPageSize; }
+
+bool span_holds(uint64_t span, uintptr_t address) {
+    const uintptr_t begin = span & ~uint64_t{0xffff};
+    return span && address >= begin && address < begin + (span & 0xffff) * kPhysicalPageSize;
+}
+bool g_split_handler = false;  // with g_phys_mutex held
+
+LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const ULONG_PTR access = record.ExceptionInformation[0];  // 0 read, 1 write, 8 execute
+    const uintptr_t address = record.ExceptionInformation[1];
+    if (access != 0 && access != 1) return EXCEPTION_CONTINUE_SEARCH;
+    for (;;) {
+        const uint64_t splits = g_splits.load(std::memory_order_acquire);
+        bool in_split = false;
+        while (span_holds(g_split.load(std::memory_order_acquire), address)) {
+            in_split = true;
+            SwitchToThread();
+        }
+        in_split = in_split || span_holds(g_last_split.load(std::memory_order_acquire), address);
+        if (!in_split) return EXCEPTION_CONTINUE_SEARCH;
+        // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+            mbi.Type == MEM_MAPPED) {
+            const DWORD protect = mbi.Protect & 0xff;
+            const bool allowed =
+                access == 1 ? protect == PAGE_READWRITE : protect == PAGE_READWRITE || protect == PAGE_READONLY;
+            return allowed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Not mapped. A split that started since the wait ended may have unmapped it again: wait for that one too.
+        if (g_splits.load(std::memory_order_acquire) == splits) return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+// With g_phys_mutex held: publishes [begin, end) as being split until it goes out of scope.
+struct SplitGuard {
+    SplitGuard(uintptr_t begin, uintptr_t end) {
+        if (!g_split_handler) g_split_handler = AddVectoredExceptionHandler(1, &wait_for_split) != nullptr;
+        g_split.store(pack_span(begin, end), std::memory_order_release);
+        g_splits.fetch_add(1, std::memory_order_release);
+    }
+    ~SplitGuard() {
+        g_last_split.store(g_split.load(std::memory_order_relaxed), std::memory_order_release);
+        g_split.store(0, std::memory_order_release);
+    }
+    SplitGuard(const SplitGuard&) = delete;
+    SplitGuard& operator=(const SplitGuard&) = delete;
+};
 
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
@@ -425,17 +501,77 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
-// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
-bool unmap_page(uintptr_t address) {
-    const auto it = g_mapped.find(address);
-    if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
-        return false;
+// With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page. MEM_REPLACE_PLACEHOLDER
+// needs the view to fill one placeholder exactly, and earlier partial unmaps can leave several host placeholders in one
+// run, so the run is mapped as one view per placeholder it spans. Views are capped at kMaxViewPages so that unmapping a
+// page inside a long run only remaps the rest of one capped view, not the whole run.
+constexpr uint64_t kMaxViewPages = 1024;  // 64 MiB
+static_assert(kMaxViewPages < 0x10000, "a split span keeps its page count in 16 bits");
+
+bool map_view(uintptr_t address, const View& view) {
+    for (uint64_t mapped = 0; mapped < view.count;) {
+        const uintptr_t base = address + mapped * kPhysicalPageSize;
+        void* const target = reinterpret_cast<void*>(base);
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_RESERVE ||
+            info.RegionSize < kPhysicalPageSize) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        const uint64_t available = info.RegionSize / kPhysicalPageSize;
+        const uint64_t remaining = view.count - mapped;
+        const uint64_t count = (std::min)({available, remaining, kMaxViewPages});
+        const SIZE_T size = static_cast<SIZE_T>(count * kPhysicalPageSize);
+        const uint64_t offset = view.offset + mapped * kPhysicalPageSize;
+        if (!isolate_placeholder(target, size)) return false;
+        if (!placeholder_api().map_view3(view.section->handle, GetCurrentProcess(), target, offset, size,
+                                         MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
+            return false;
+        }
+        g_views.emplace(base, View{count, view.section, offset, view.protect});
+        mapped += count;
     }
-    g_mapped.erase(it);
     return true;
 }
+
+// With g_phys_mutex held. Unmaps every page in [start, end); the addresses become placeholders again. A view that
+// reaches outside the range is unmapped whole, and its pages outside the range are mapped again, so neighbours keep
+// their pages.
+// There is no rollback: if mapping a remainder again fails, those neighbouring pages stay unmapped and the caller only
+// sees the failure.
+bool unmap_range(uintptr_t start, uintptr_t end) {
+    auto it = g_views.upper_bound(start);
+    if (it != g_views.begin()) {
+        const auto prev = std::prev(it);
+        if (prev->first + prev->second.count * kPhysicalPageSize > start) it = prev;
+    }
+    while (it != g_views.end() && it->first < end) {
+        const uintptr_t base = it->first;
+        const View view = it->second;
+        const uintptr_t view_end = base + view.count * kPhysicalPageSize;
+        const SplitGuard guard(base, view_end);
+        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(base),
+                                           MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+        it = g_views.erase(it);
+        if (base < start) {
+            View left = view;
+            left.count = (start - base) / kPhysicalPageSize;
+            if (!map_view(base, left)) return false;
+        }
+        if (view_end > end) {
+            const uint64_t skipped = (end - base) / kPhysicalPageSize;
+            View right = view;
+            right.count = view.count - skipped;
+            right.offset += skipped * kPhysicalPageSize;
+            return map_view(end, right);  // the last view the range touches
+        }
+    }
+    return true;
+}
+
+bool unmap_page(uintptr_t address) { return unmap_range(address, address + kPhysicalPageSize); }
 
 // With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
 // mapped there. The caller has found the window.
@@ -447,14 +583,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
-                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
-                                                   protect, nullptr, 0);
-    if (!view) return false;
-    g_mapped[address] = page;
-    return true;
+    return map_view(address, View{1, it->second.section, it->second.offset, protect});
 }
 
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
@@ -561,8 +690,9 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
 // success. A page number of 0 in the array unmaps that one page.
 //
-// Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
-// without touching its neighbours. A failure part-way leaves the pages before it mapped.
+// Consecutive pages of one allocation are mapped as one view (MapViewOfFile3 into a placeholder of their size); a
+// page remapped or unmapped later splits its view, and its neighbours stay mapped. The range is unmapped first, so a
+// page number that is not a live page fails with the pages before it mapped and the rest of the range unmapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
@@ -575,20 +705,36 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
-    if (!page_array) {
-        for (uint64_t i = 0; i < page_count; ++i) {
-            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
-        }
-        return address;
-    }
+    const uintptr_t end = start + page_count * kPhysicalPageSize;
+    if (!page_array) return unmap_range(start, end) ? address : nullptr;
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
-    for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+    if (!unmap_range(start, end)) return nullptr;
+    for (uint64_t i = 0; i < page_count;) {
+        if (page_array[i] == 0) {
+            ++i;
+            continue;
+        }
+        const auto it = g_pages.find(page_array[i]);
+        if (it == g_pages.end()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        View view{1, it->second.section, it->second.offset, protect};
+        while (i + view.count < page_count) {
+            const auto next = g_pages.find(page_array[i + view.count]);
+            if (next == g_pages.end() || next->second.section != view.section ||
+                next->second.offset != view.offset + view.count * kPhysicalPageSize) {
+                break;
+            }
+            ++view.count;
+        }
+        if (!map_view(start + i * kPhysicalPageSize, view)) return nullptr;
+        i += view.count;
     }
     return address;
 }

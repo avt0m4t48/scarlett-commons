@@ -1,6 +1,7 @@
 // GameInput shim on SDL3: runtime-side controls and test seams. The GameInput API itself is reached the way a title
 // reaches it, through GameInputCreate in the shim registry (gameinput.dll / xgameruntime.dll). See docs/gameinput.md.
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -8,6 +9,16 @@
 #include "../src/active_input.h"  // leonida::InputFamily (and std::optional) for Config::prompts and active_input()
 
 namespace rt::gameinput {
+
+// Takes a reference on a reference-counted object only while it is alive, that is while its count isn't 0. A thread
+// that finds the object in a shared list (the poll thread and a device's force-feedback effects) then can't revive one
+// whose last Release has already run and whose destructor is waiting for the lock to unlink it. False: leave it be.
+template <class Count>
+bool add_ref_if_live(std::atomic<Count>& refs) {
+    Count n = refs.load();
+    while (n != 0 && !refs.compare_exchange_weak(n, n + 1)) {}
+    return n != 0;
+}
 
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
 enum class DsTriggerMode { Off, Rumble, Resistance };

@@ -13,12 +13,14 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gameinput.h"
@@ -344,6 +346,14 @@ std::vector<uint8_t> raw_bytes(IGameInputRawDeviceReport* r) {
     std::vector<uint8_t> v(r ? r->GetRawDataSize() : 0);
     if (r) r->GetRawData(v.size(), v.data());
     return v;
+}
+
+// RT-262: the poll thread takes a reference on a force-feedback effect only while it is alive.
+void test_add_ref_if_live() {
+    std::atomic<unsigned long> live{1}, dying{0};
+    check(rt::gameinput::add_ref_if_live(live) && live.load() == 2, "add_ref_if_live: a live count goes up by one");
+    check(!rt::gameinput::add_ref_if_live(dying) && dying.load() == 0,
+          "add_ref_if_live: a count of 0 stays 0, so an effect being destroyed isn't revived");
 }
 
 void test_raw_hid(IGameInput* input) {
@@ -1384,6 +1394,28 @@ void test_force_feedback(IGameInput* input) {
     rt::gameinput::poll();
     check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
 
+    // RT-262: the title releases effects while the poll thread applies them. The poll thread used to AddRef an effect
+    // whose count had already reached 0 (its destructor waiting for the lock), use it after it was freed, and free it
+    // a second time with its own Release.
+    {
+        std::atomic<bool> stop{false};
+        std::thread poller([&] {
+            while (!stop.load()) rt::gameinput::poll();
+        });
+        int created = 0;
+        for (int i = 0; i < 20000; ++i) {
+            IGameInputForceFeedbackEffect* e = nullptr;
+            if (dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&e)) == S_OK && e) {
+                ++created;
+                e->Release();
+            }
+        }
+        stop = true;
+        poller.join();
+        rt::gameinput::poll();
+        check(created == 20000, "force feedback: 20,000 effects created and released while the poll thread runs");
+    }
+
     detach(wheel);
     rt::gameinput::poll();
     check(g_fake.closes == 1 && !dev->IsForceFeedbackMotorPoweredOn(0),
@@ -1494,6 +1526,7 @@ int main() {
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);
+    test_add_ref_if_live();
 
     auto create = reinterpret_cast<GameInputCreateFn>(rt::shims::find("gameinput.dll", "GameInputCreate"));
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");

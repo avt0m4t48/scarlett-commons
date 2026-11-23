@@ -779,6 +779,9 @@ public:
     void sync(Device* device, uint64_t now, bool muted);
     // Poll thread, on unplug: the SDL device went with the pad, so forget its effect id without touching SDL.
     void orphan();
+    // Poll thread, under g().mu: a reference unless the title's last Release already ran (the destructor then waits
+    // for g().mu to unlink the effect, so it is still in the device's list but must not be used or revived).
+    bool add_ref_if_live() { return rt::gameinput::add_ref_if_live(refs_); }
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -1490,10 +1493,11 @@ void apply_effects(Device* d, uint64_t now) {
     {
         std::lock_guard lock(s.mu);
         live.reserve(d->effects.size());
-        for (ForceFeedbackEffect* e : d->effects) {  // referenced: the title may release one while this runs
-            e->AddRef();
-            live.push_back(e);
-        }
+        // Referenced: the title may release one while this runs. An effect whose count already reached 0 is being
+        // destroyed (its destructor waits for this lock to unlink it); a plain AddRef revived it, and this loop's own
+        // Release below freed it a second time.
+        for (ForceFeedbackEffect* e : d->effects)
+            if (e->add_ref_if_live()) live.push_back(e);
         retire.swap(d->retired);
         motor_gain = d->motor_gain;
         muted = !s.config.rumble;

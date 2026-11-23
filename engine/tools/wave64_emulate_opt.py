@@ -751,6 +751,11 @@ def _holds_lane_mask(ins, x, lm_map):
     return False
 
 
+def _has_any_lane_mask_word(x, lm_map):
+    """True if `x` is an SGPR operand with at least one register holding a lane mask."""
+    return x.get("k") == "sgpr" and any(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+
+
 def _is_mask_op(ins, x, lm_map):
     """Matches Gen.is_mask_op in tools/rdna2spirv.py (special exec/vcc operands always take the mask path)."""
     if _holds_lane_mask(ins, x, lm_map):
@@ -862,7 +867,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
             else:  # _MASK_CHK_SCMP
                 lm = lane_masks.get(id(ins), {})
-                if any(_holds_lane_mask(ins, x, lm) for x in a):
+                if any(_holds_lane_mask(ins, x, lm) or
+                       (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                       for x in a):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
@@ -1231,7 +1238,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         continue
                 else:  # _MASK_CHK_SCMP
                     lm = lane_masks.get(id(ins), {})
-                    if any(_holds_lane_mask(ins, x, lm) for x in a):
+                    if any(_holds_lane_mask(ins, x, lm) or
+                           (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                           for x in a):
                         clean = False
                         continue
 
@@ -1465,7 +1474,9 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if mask_chk == _MASK_CHK_MBCNT:
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
     lm = lane_masks.get(id(ins), {})
-    return any(_holds_lane_mask(ins, x, lm) for x in a)
+    return any(_holds_lane_mask(ins, x, lm) or
+               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+               for x in a)
 
 
 def _insn_may_barrier(ins, lane_masks, scc_live):

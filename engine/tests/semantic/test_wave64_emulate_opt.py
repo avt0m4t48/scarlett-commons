@@ -528,6 +528,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 elif ext_op == "FindUMsb":
                     v = vals[a[3]] & MASK32
                     vals[res] = v.bit_length() - 1 if v else MASK32
+                elif ext_op == "FindSMsb":
+                    v = _s32(vals[a[3]])
+                    if v in (0, -1):
+                        vals[res] = MASK32
+                    elif v > 0:
+                        vals[res] = v.bit_length() - 1
+                    else:
+                        vals[res] = (~v).bit_length() - 1
                 else:
                     raise NotImplementedError(f"OpExtInst {ext_op}: {line}")
             else:

@@ -336,7 +336,8 @@ int main(int argc, char** argv) {
         {{{4.125,24.125},{24.125,4.125},{4.125,4.125}}},
         {{{3.0625,3.0625},{3.3125,3.0625},{3.0625,3.0625}}}, // Tier 1 permits degenerate triangles to be culled
     };
-    unsigned comparisons = 0, host_comparisons = 0;
+    unsigned comparisons = 0, host_comparisons = 0, host_not_comparable = 0;
+    const auto count = [](const Mask& m) { return unsigned(std::count(m.begin(), m.end(), true)); };
     for (const UINT samples : {1u, 4u}) {
       if (samples == 4 && !msaa4) continue;
       // WARP's 4x path was observed to cover outside the Tier 1 uncertainty bound for the subpixel fixture.
@@ -352,22 +353,40 @@ int main(int argc, char** argv) {
                     !render(a, triangle, true, samples, variant, scissor, conservative_a) ||
                     (compare_host && !render(b, triangle, true, samples, variant, scissor, conservative_b))) return 1;
                 const bool ours_ok = coverage(triangle, scissor, conservative_a);
-                const bool host_ok = !compare_host || coverage(triangle, scissor, conservative_b);
-                if (!ours_ok || !host_ok) {
-                    std::fprintf(stderr, "scene %zu samples %u variant %d scissor-left %ld: Vulkan=%d host=%d\n",
-                                 std::size_t(&triangle - scenes), samples, int(variant), scissor.left, int(ours_ok), int(host_ok));
+                if (!ours_ok) {
+                    std::fprintf(stderr, "scene %zu samples %u variant %d scissor-left %ld: Vulkan fails the oracle\n",
+                                 std::size_t(&triangle - scenes), samples, int(variant), scissor.left);
                     return 1;
                 }
+                // The oracle is geometric, so the layer is judged by it alone. A native D3D12 render that fails it
+                // (TEST-907: an RTX 5060 Ti on Windows 10 drew nothing for scene 4 with conservative raster on) is
+                // reported, with both of its masks, and that scenario is not compared with the host.
+                bool host_ok = compare_host && coverage(triangle, scissor, conservative_b);
+                if (compare_host && !host_ok && compare_warp_msaa4) {
+                    // --warp-msaa4 exists to reproduce WARP's known 4x discrepancy, so there it stays a failure.
+                    std::fprintf(stderr, "scene %zu samples %u variant %d scissor-left %ld: host fails the oracle\n",
+                                 std::size_t(&triangle - scenes), samples, int(variant), scissor.left);
+                    return 1;
+                }
+                if (compare_host && !host_ok) {
+                    unsigned normal_only = 0;
+                    for (unsigned i = 0; i < normal_b.size(); ++i) normal_only += normal_b[i] && !conservative_b[i];
+                    std::printf("host not comparable: scene %zu samples %u variant %d scissor-left %ld: host normal "
+                                "mask %u pixels, conservative %u (%u normal pixels missing), Vulkan conservative %u\n",
+                                std::size_t(&triangle - scenes), samples, int(variant), scissor.left, count(normal_b),
+                                count(conservative_b), normal_only, count(conservative_a));
+                    ++host_not_comparable;
+                }
                 for (unsigned i = 0; i < normal_a.size(); ++i)
-                    if ((normal_a[i] && !conservative_a[i]) || (normal_b[i] && !conservative_b[i])) return 1;
+                    if ((normal_a[i] && !conservative_a[i]) || (host_ok && normal_b[i] && !conservative_b[i])) return 1;
                 if (&triangle == &scenes[0] && samples == 1 && scissor.left == 0) {
                     if (std::any_of(normal_a.begin(), normal_a.end(), [](bool x) { return x; }) ||
-                        std::any_of(normal_b.begin(), normal_b.end(), [](bool x) { return x; }) ||
+                        (host_ok && std::any_of(normal_b.begin(), normal_b.end(), [](bool x) { return x; })) ||
                         !std::any_of(conservative_a.begin(), conservative_a.end(), [](bool x) { return x; }) ||
-                        (compare_host && !std::any_of(conservative_b.begin(), conservative_b.end(), [](bool x) { return x; }))) return 1;
+                        (host_ok && !std::any_of(conservative_b.begin(), conservative_b.end(), [](bool x) { return x; }))) return 1;
                 }
                 ++comparisons;
-                if (compare_host) ++host_comparisons;
+                if (host_ok) ++host_comparisons;
             }
     }
     for (auto* f : {&a, &b}) {
@@ -380,6 +399,9 @@ int main(int argc, char** argv) {
     }
     std::printf("conservative raster: %u Vulkan and %u %s scenario pairs; geometric bounds, culling, scissor, variants, rejections; Vulkan 4x MSAA %s\n",
                 comparisons, host_comparisons, adapter.c_str(), msaa4 ? "checked" : "unavailable");
+    if (host_not_comparable)
+        std::printf("%u scenarios not compared: the %s render fails the geometric oracle there (listed above)\n",
+                    host_not_comparable, adapter.c_str());
     if (software_reference && !compare_warp_msaa4)
         std::puts("WARP comparison is 1x; --warp-msaa4 separately checks its observed 4x coverage discrepancy");
     return vk.validation_errors() ? 1 : 0;

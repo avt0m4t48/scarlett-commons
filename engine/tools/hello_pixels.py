@@ -163,7 +163,14 @@ def shaders_into(out_dir: str) -> None:
     ps_spv = os.path.join(out_dir, "ps.spv")
     assembler = find_spirv_as()
     if assembler is None:
-        if os.path.exists(vs_spv) and os.path.exists(ps_spv):
+        # Check the SPIR-V magic so a stray file does not reach the harness.
+        def spv_ok(path: str) -> bool:
+            if not os.path.isfile(path):
+                return False
+            with open(path, "rb") as f:
+                return f.read(4) == b"\x03\x02\x23\x07"
+
+        if spv_ok(vs_spv) and spv_ok(ps_spv):
             print("spirv-as not found; using the prebuilt vs.spv and ps.spv in the work directory")
             return
         raise SystemExit(

@@ -5151,7 +5151,14 @@ int main() {
             Ref<ID3D12CommandQueue> granted_q;
             EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
             if (granted_q.p) {
-                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                // PC GetDesc shares console slot 18 with the newer layout's GetTimestampFrequency; the proxy
+                // serves the frequency getter while the layout is undetected, so the desc is read on the real
+                // queue instead.
+                if (auto* real_q = rt::d3d12_xs::queue_proxy_real_queue(granted_q.p)) {
+                    EXPECT(real_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                } else {
+                    EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                }
             }
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);

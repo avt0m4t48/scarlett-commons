@@ -247,6 +247,15 @@ class TestMatching(unittest.TestCase):
         with open(report, encoding="utf-8") as f:
             self.assertTrue(json.load(f)["consistent"])
 
+    def test_json_over_an_unwritable_target_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        nested = os.path.join(self.dir, "missing_dir", "report.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]}, ["--json", nested])
+        self.assertEqual(status, 2)
+        self.assertIn("cannot write", err)
+        self.assertNotIn("Traceback", err)
+
     def test_json_to_its_own_path_still_writes_the_report(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         report = os.path.join(self.dir, "report.json")

@@ -279,6 +279,19 @@ def spirv_tools_problem(workflow, gated):
     return "; ".join(problems) or None
 
 
+def spirv_using_stdlib_files(root, files, rules):
+    """Files the standard-library loop runs that call spirv-as / spirv-val only when they are installed."""
+    return [rel for rel in files if job_of(root, rel, rules) == "stdlib"
+            and re.search(r"which\(\s*[\"']spirv-(?:as|val)[\"']", read(root, rel))]
+
+
+def stdlib_loop_jobs_with_spirv_tools(workflow):
+    """Jobs that `apt-get install` spirv-tools and run the standard-library loop (`python -I "$t"`)."""
+    jobs = re.findall(r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S)
+    return [name for name, job in jobs if re.search(r'python\s+-I\s+"\$t"', job)
+            and re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job)]
+
+
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block that runs something.
 
@@ -365,6 +378,16 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertIsNone(problem, "the `semantic-tests` job in ci.yml runs tests that skip without SPIRV-Tools, but " +
                           str(problem) + ".\nInstall spirv-tools on the Linux leg and set LEONIDA_REQUIRE_SPIRV_TOOLS "
                           "to '1' there (see tests/semantic/test_spirv_tools_required.py).")
+
+    def test_a_job_runs_the_spirv_using_stdlib_files_with_spirv_tools(self):
+        # The check job's Windows runner has no SPIRV-Tools, so these files skip their spirv-val checks there.
+        used = spirv_using_stdlib_files(ROOT, self.files, self.rules)
+        self.assertIn("tests/test_split_big_switch.py", used)
+        workflow = read(ROOT, WORKFLOW)
+        self.assertEqual(stdlib_loop_jobs_with_spirv_tools(workflow.replace("spirv-tools", "curl")), [])
+        self.assertTrue(stdlib_loop_jobs_with_spirv_tools(workflow), "no job in ci.yml installs SPIRV-Tools and "
+                        "runs the standard-library loop, so the spirv-val checks of these files never run:\n  " +
+                        "\n  ".join(used))
 
     def test_the_spirv_tools_check_flags_a_job_that_installs_nothing(self):
         workflow = read(ROOT, WORKFLOW)

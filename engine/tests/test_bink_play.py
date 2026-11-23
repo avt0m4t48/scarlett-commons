@@ -1,6 +1,7 @@
 """tools/bink_play.py: name matching and the name-table cache. Synthetic names only, no game files."""
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -89,6 +90,46 @@ class CacheTest(unittest.TestCase):
                 cache.write_text("# " + bink_play.stamp(archive) + "\npath,offset,width,height,frames\n"
                                  "Stinger/STALE.bk2,4096,3840,2160,450\n", encoding="utf-8", newline="\n")
                 self.assertEqual(bink_play.load_names(archive, new)[0][0], "Stinger/NEW.bk2")
+
+    def test_two_lookups_at_once_each_get_their_own_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, first, second = d / "movies.rpf", d / "first.xml", d / "second.xml"
+            archive.write_bytes(b"x" * 16)
+            first.write_bytes(b"<a/>")
+            second.write_bytes(b"<b/>")
+            ready, done = threading.Event(), threading.Event()
+            got = {}
+
+            def fake_names(argv):
+                mount = Path(argv[argv.index("--mount") + 1])
+                Path(argv[argv.index("--out") + 1]).write_text(
+                    "source,offset,size,path,confidence,width,height,frames\n"
+                    f"movies.rpf,4096,10,Stinger/{mount.stem}.bk2,anchored,3840,2160,450\n",
+                    encoding="utf-8", newline="\n")
+                if mount == first:  # hold the first lookup between writing its report and reading it
+                    ready.set()
+                    done.wait(10)
+                return 0
+
+            def look_up(mount):
+                try:
+                    got[mount.stem] = bink_play.load_names(archive, mount)[0][0]
+                except SystemExit as e:
+                    got[mount.stem] = str(e)
+
+            with mock.patch.object(bink_play, "cache_path", return_value=d / "cache" / "bink_names.csv"), \
+                    mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names):
+                worker = threading.Thread(target=look_up, args=(first,))
+                worker.start()
+                self.assertTrue(ready.wait(10))
+                try:
+                    look_up(second)
+                finally:
+                    done.set()
+                    worker.join()
+            self.assertEqual(got, {"first": "Stinger/first.bk2", "second": "Stinger/second.bk2"})
+            self.assertEqual(sorted(p.name for p in (d / "cache").iterdir()), ["bink_names.csv"])
 
 
 if __name__ == "__main__":

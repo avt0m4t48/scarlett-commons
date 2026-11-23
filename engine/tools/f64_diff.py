@@ -371,7 +371,9 @@ def ref_program(lines, include_known=False):
             if any(is_nan(t) or is_inf(t) for t in (x, y, z)):
                 raise SkipCase("non-finite v_div_fmas_f64 operands are not judged")
             exact = to_fraction(x) * to_fraction(y) + to_fraction(z)
-            if vcc: exact *= 1 << 64
+            # With VCC set the result is scaled by 2^+128 when exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise: the
+            # gfx1036 measurement in the docs/design.md v_div_fmas row (the older rule was a fixed 2^64).
+            if vcc: exact *= Fraction(2) ** (128 if ((z >> 52) & 0x7FF) > 1023 else -128)
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(round_fraction(exact))
         else:
             raise HarnessError(f"reference does not implement {op}")

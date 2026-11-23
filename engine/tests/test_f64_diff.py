@@ -262,6 +262,23 @@ class F64DiffTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertEqual(fd.fixup(s0, s1, s2), want)
 
+    def test_div_fmas_scale_follows_exp_of_s2(self):
+        # docs/design.md v_div_fmas row (measured on gfx1036): VCC set scales fma(S0, S1, S2) by 2^128 when
+        # exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise.
+        pair = lambda r, v: [f"v_mov_b32 v{r}, 0x{v & 0xFFFFFFFF:08x}", f"v_mov_b32 v{r + 1}, 0x{v >> 32:08x}"]
+        vcc_set, vcc_clear = "v_cmp_eq_i32_e32 vcc_lo, 0, 0", "v_cmp_eq_i32_e32 vcc_lo, 0, 1"
+        cases = [
+            ("S2 = 1.0 scales down: 2 * 2^-128", self.ONE, vcc_set, 0x38000000),
+            ("S2 = nextbelow(2.0) scales down: (3 - 2^-52) ties to 3, times 2^-128", 0x3FFFFFFFFFFFFFFF, vcc_set, 0x38080000),
+            ("S2 = 2.0 scales up: 3 * 2^128", self.TWO, vcc_set, 0x48080000),
+            ("VCC clear is the plain fma", self.TWO, vcc_clear, 0x40080000),
+        ]
+        for name, s2, vcc, want_hi in cases:
+            with self.subTest(case=name):
+                got = fd.ref_program([*pair(12, self.ONE), *pair(14, self.ONE), *pair(10, s2), vcc,
+                                      "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], v[10:11]"])
+                self.assertEqual(fd.words_to_bits(*got[:2]) >> 32, want_hi)
+
     def test_frexp_table(self):
         half = 0x3FE0000000000000
         table = [

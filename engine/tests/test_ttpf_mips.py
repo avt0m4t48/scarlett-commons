@@ -264,12 +264,17 @@ def solid_chain(layout, fmt=71, color_fn=None):
     return out
 
 
-def write_rds5_pool(path, records, chunks):
-    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks."""
+def write_rds5_pool(path, records, chunks, area=None):
+    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks.
+
+    `area` is the size of the record region in bytes. The default, len(records) * 24, fits
+    every 8-byte asset key after the 16-byte descriptors. A smaller area (at least
+    len(records) * 16) lets the key array continue into the 32-byte ID region, as most
+    retail pools do."""
     count = len(chunks) + 2
     table_end = 24 + (count - 1) * 8
     etpf = ttpf.align(table_end, 256)
-    area = len(records) * 24
+    area = len(records) * 24 if area is None else area
     metadata = 16 + area + len(records) * 32
     padded = ttpf.align(metadata, 4096)
 
@@ -1343,6 +1348,42 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     with open(path, "wb") as f:
         f.write(blob)
     return layout, linear, bytes(payload)
+
+
+class AssetKeyStraddleTest(unittest.TestCase):
+    """The asset-key array follows the 16-byte records and, in most retail pools, is longer
+    than the record area has room for, so it continues into the 32-byte ID region."""
+
+    RECORDS = 3
+
+    def write(self, tmp, name, area=None):
+        path = os.path.join(tmp, name)
+        records = [pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)] * self.RECORDS
+        write_rds5_pool(path, records, [bytes(4096)], area=area)
+        return path
+
+    def keys(self, path):
+        with closing(ttpf.Pool(path)) as pool:
+            return [pool.descriptor(i)["asset_key_at"] for i in range(self.RECORDS)]
+
+    def test_keys_past_the_record_area_come_from_the_id_region(self) -> None:
+        # Room for exactly one key after the descriptors: the other two sit in the ID region.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "straddle.ttpf", area=self.RECORDS * 16 + 8)
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_keys_inside_the_record_area_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "plain.ttpf")
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_a_key_split_by_the_records_ids_boundary_is_refused(self) -> None:
+        # A record area that cuts the first key in half, as TtpfReader refuses it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "split.ttpf", area=self.RECORDS * 16 + 4)
+            with closing(ttpf.Pool(path)) as pool:
+                with self.assertRaises(ValueError):
+                    pool.descriptor(0)
 
 
 class PoolCacheTest(unittest.TestCase):

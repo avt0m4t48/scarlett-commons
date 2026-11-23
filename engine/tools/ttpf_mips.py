@@ -876,15 +876,23 @@ class Pool:
         if self._fh is not None:
             self._fh.close()
 
+    def asset_key(self, index):
+        """The entry's 64-bit native asset key. The key array follows the 16-byte records and
+        is longer than the record area has room for in most pools, so it continues into the
+        32-byte ID region; TtpfReader reads it across that boundary, and so does this."""
+        at = self.textures * 16 + index * 8
+        if at + 8 <= len(self.records):
+            return u64(self.records, at)
+        if at >= len(self.records):
+            return u64(self.ids, at - len(self.records))
+        raise ValueError("ETPF asset key straddles the records/ids boundary")
+
     def descriptor(self, index):
         if not 0 <= index < self.textures:
             raise IndexError(index)
         d = parse_etpf_texture_record(self.records[index * 16:index * 16 + 16])
         d["index"] = index
-        d["asset_key_at"] = (
-            u64(self.records, self.textures * 16 + index * 8)
-            if (self.textures * 16 + index * 8 + 8 <= len(self.records))
-            else None)
+        d["asset_key_at"] = self.asset_key(index)
         return d
 
     def chunks_for(self, start, size):

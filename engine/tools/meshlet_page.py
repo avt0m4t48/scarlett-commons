@@ -697,7 +697,7 @@ def iter_archive(path):
             m.close()
 
 
-def iter_inputs(paths):
+def iter_inputs(paths, existing_report=None):
     for path in paths:
         if os.path.isdir(path):
             for root, _, files in os.walk(path):
@@ -708,6 +708,8 @@ def iter_inputs(paths):
                         if len(head) == 4 and (head in (b"\x63\x30\x00\x00", b"\x42\x40\x00\x00") or head[3] & 0x80):
                             data = head + fh.read()
                             if is_mesh_page(data):
+                                if existing_report and same_output_path(existing_report, full):
+                                    raise PageError(f"--json would overwrite the input {full}")
                                 yield os.path.relpath(full, path), data
         elif path.lower().endswith(".rpf"):
             yield from iter_archive(path)
@@ -927,8 +929,13 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
-             for name, data in iter_inputs(args.inputs)]
+    existing_report = args.json if args.json and os.path.isfile(args.json) else None
+    try:
+        pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
+                 for name, data in iter_inputs(args.inputs, existing_report)]
+    except PageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     total = totals(pages)
     if not args.quiet:
         for p in pages:

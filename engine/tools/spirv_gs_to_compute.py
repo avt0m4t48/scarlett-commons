@@ -117,7 +117,7 @@ def layout_of(text):
 def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
     """Return (compute module text, layout dict for --layout)."""
     lay = layout_of(text)
-    defs, _ = parse(text)
+    defs, deco = parse(text)
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
     uint = find_type(defs, "OpTypeInt", ["32", "0"])
     f32 = find_type(defs, "OpTypeFloat", ["32"])
@@ -128,6 +128,17 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     boolt = find_type(defs, "OpTypeBool", []) or "%gsc_bool"
     float_ptrs = {r for r, (op, ops) in defs.items() if op == "OpTypePointer" and ops[1] == f32}
     nin, nout, mv, vin = len(ins), len(outs), lay["max_verts"], lay["verts_in"]
+    # A GS translated with --pc-tail-ubo that reads the heap base or code base already binds %pc_tail as a Uniform
+    # block at (DescriptorSet 1, Binding 0); shift the capture StorageBuffers past any existing Set 1 bindings so
+    # two variables of different descriptor types never share (set, binding) (VUID-07990).
+    set1_bindings = {
+        int(b.split()[1])
+        for ds in deco.values()
+        if "DescriptorSet 1" in ds
+        for b in ds
+        if b.startswith("Binding ") and len(b.split()) == 2 and b.split()[1].isdigit()
+    }
+    base_binding = (max(set1_bindings) + 1) if set1_bindings else 0
 
     def k(v):
         return f"%gsc_k{v}"
@@ -141,9 +152,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
              "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
              f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
              f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
-             "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
-             "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
-             "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
+             "OpDecorate %gsc_in DescriptorSet 1", f"OpDecorate %gsc_in Binding {base_binding}",
+             "OpDecorate %gsc_in NonWritable",
+             "OpDecorate %gsc_rec DescriptorSet 1", f"OpDecorate %gsc_rec Binding {base_binding + 1}",
+             "OpDecorate %gsc_meta DescriptorSet 1", f"OpDecorate %gsc_meta Binding {base_binding + 2}"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
             ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
     types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
@@ -349,6 +361,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         out.append(s)
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
+    if base_binding:
+        public["base_binding"] = base_binding
     return "\n".join(out) + "\n", public
 
 

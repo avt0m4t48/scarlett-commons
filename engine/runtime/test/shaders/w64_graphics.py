@@ -465,7 +465,10 @@ def main(argv):
     names = requested or sorted(FIXTURES)
     failed = 0
     for name in names:
-        problem = check(os.path.abspath(tools), spirv, name)
+        try:
+            problem = check(os.path.abspath(tools), spirv, name)
+        except subprocess.TimeoutExpired as e:  # a hung draw fails this fixture; the rest still run
+            problem = f"vk_harness timed out after {e.timeout:g} s"
         print(f"{name:28} {FIXTURES[name][0]}  {'ok' if not problem else problem}")
         failed += bool(problem) and not isinstance(problem, Skip)
     return 1 if failed else 0

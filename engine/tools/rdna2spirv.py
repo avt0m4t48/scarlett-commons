@@ -206,6 +206,16 @@ F1 = {"v_rcp_f32": "rcp", "v_rsq_f32": "InverseSqrt", "v_sqrt_f32": "Sqrt", "v_e
 S2 = {"s_and_b32": "OpBitwiseAnd", "s_or_b32": "OpBitwiseOr",
       "s_lshl_b32": "OpShiftLeftLogical", "s_lshr_b32": "OpShiftRightLogical", "s_mul_i32": "OpIMul"}
 
+# Runs of lane-local VALU instructions share one `if (active)` instead of an OpSelect per VGPR write (Gen.insns).
+# VALU ops that are not lane-local: they read other lanes, write a lane mask, SCC or EXEC, or write a carry or
+# other scalar result in every lane (v_add_co_u32's mask goes to inactive lanes too).
+NOT_LANE_LOCAL = ("v_cmp", "v_readlane", "v_readfirstlane", "v_writelane", "v_permlane", "v_mbcnt", "v_interp",
+                  "v_div_scale", "v_mad_u64_u32", "v_mad_i64_i32")
+DPP_MODS = ("quad_perm", "row_", "wave_", "dpp8", "bank_mask", "bound_ctrl", "fi:")
+# A single lane-local instruction keeps its select: on an RX 5700 XT wrapping it bought nothing measurable
+# (64 divergent if/else of 1-4 ops: within 1%), and it adds labels. Long runs are where the time goes.
+MIN_ACTIVE_RUN = 2
+
 
 def base_op(op):
     for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
@@ -278,6 +288,8 @@ class Gen:
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
+        self.active_run = False        # inside insns' `if (active)` around a run of lane-local VALU instructions
+        self.exec_changes = False      # some instruction may write EXEC (may_write_exec): only then are runs worth it
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
@@ -1291,8 +1303,10 @@ class Gen:
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
-            # (lane_masks.py): every lane works out its own bit of it, active or not.
-            if self.write_all_lanes:
+            # (lane_masks.py): every lane works out its own bit of it, active or not. Inside an active run
+            # (insns) the enclosing `if (active)` already leaves inactive lanes out (DPP's row/bank mask never
+            # gets there: DPP instructions aren't lane-local).
+            if self.write_all_lanes or (self.active_run and self.dpp_guard is None):
                 self.store_reg("vgpr", a["r"], val)
                 return
             p, old, r = self.tmp(), self.tmp(), self.tmp()
@@ -1335,6 +1349,78 @@ class Gen:
             self.emit(f"OpStore %scc {val}")
         else:
             raise Unsupported(f"destination {a.get('t', a['k'])}")
+
+    # ---- runs of lane-local VALU instructions under one `if (active)` ----
+    def lane_local(self, ins):
+        """True when ins only reads and writes this invocation's own registers, and its VGPR writes are the only
+        ones EXEC gates. Each invocation is one lane, so skipping it where the lane is inactive is the same as
+        keeping the old value of everything it writes: what dst()'s per-write OpSelect does. A lane mask read as
+        data is this lane's bit (only s_bcnt1, s_ff1 and v_mbcnt gather the whole wave's); a mask on its way
+        through a VGPR (mask_writes) is written in every lane, so it stays out."""
+        op = base_op(ins["op"])
+        a = ins["args"]
+        return (op.startswith("v_") and op not in NOOPS and not op.startswith(NOT_LANE_LOCAL) and "_co_" not in op
+                and not ins["op"].endswith("_dpp") and not any(m.startswith(DPP_MODS) for m in ins["mods"])
+                and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes)
+
+    def insns(self, seq):
+        """Translate seq, a straight run of instructions (no branch among them). A run of at least MIN_ACTIVE_RUN
+        lane-local VALU instructions goes inside one `if (active)` and writes its VGPRs directly: the driver
+        then predicates it with its own EXEC, instead of keeping the old and new value of every register live for
+        an OpSelect per write. Only in a shader that may write EXEC (elsewhere %active stays true and the driver
+        folds the selects away), and not under --wave64-emulate, whose rounds split blocks at instruction
+        boundaries."""
+        local = [self.exec_changes and not self.emulate and self.lane_local(i) for i in seq]
+        i = 0
+        while i < len(seq):
+            j = i
+            while j < len(seq) and local[j]:
+                j += 1
+            if j - i < MIN_ACTIVE_RUN:
+                self.insn(seq[i])
+                i += 1
+                continue
+            act = self.active_b()
+            do, end = self.tmp() + "_run", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {end} None")
+            self.emit(f"OpBranchConditional {act} {do} {end}")
+            self.emit(f"{do} = OpLabel")
+            self.active_run = True
+            for ins in seq[i:j]:
+                start = len(self.body)
+                self.insn(ins)
+                self.check_lane_local(ins, self.body[start:])
+            self.active_run = False
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{end} = OpLabel")
+            i = j
+
+    @staticmethod
+    def may_write_exec(ins):
+        """Whether ins can change EXEC: it names EXEC as an operand, or is a v_cmpx or an s_*_saveexec. A wrong
+        guess either way only costs speed (runs where EXEC never changes, or per-write selects where it does)."""
+        op = base_op(ins["op"])
+        return ("saveexec" in op or op.startswith("v_cmpx")
+                or any(x["k"] == "special" and x.get("t", "").startswith("exec") for x in ins["args"]))
+
+    # What a lane-local instruction may emit inside an active run: anything but these (other lanes, side effects,
+    # control flow out of the run) and stores to registers other than the VGPR file.
+    RUN_FORBIDDEN = ("OpGroup", "OpControlBarrier", "OpMemoryBarrier", "OpImage", "OpDPd", "OpFwidth", "OpAtomic",
+                     "OpKill", "OpTerminateInvocation", "OpDemoteToHelperInvocation", "OpEmit", "OpEndPrimitive",
+                     "OpReturn", "OpFunctionCall", "OpLoopMerge")
+
+    def check_lane_local(self, ins, lines):
+        """Fail loudly if ins, judged lane-local, emitted something an active run can't hold."""
+        vgpr_ptrs = set()
+        for line in lines:
+            s = line.strip()
+            words = s.split()
+            if len(words) > 4 and words[2] == "OpAccessChain" and words[4] == "%vgpr":
+                vgpr_ptrs.add(words[0])
+            bad = (s.split(" = ")[-1].startswith(self.RUN_FORBIDDEN)
+                   or (s.startswith("OpStore ") and words[1] not in vgpr_ptrs))
+            if bad:
+                raise AssertionError(f"{ins['op']} is not lane-local inside an active run: {s}")
 
     def mov64(self, d, s):
         """64-bit scalar move, including EXEC save/restore (EXEC = this lane's active bit)."""
@@ -15266,10 +15352,9 @@ def translate(path):
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
         g.fit_shared_memory()
-        for ins in insns:
-            if base_op(ins["op"]) == "s_endpgm":
-                break
-            g.insn(ins)
+        end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
+        g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
+        g.insns(insns[:end])
         translate.last_gen = g
         out = assemble(g)
         if OPT_SPIRV:
@@ -15350,6 +15435,7 @@ def translate(path):
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
                 blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
     g.fit_shared_memory()
+    g.exec_changes = any(g.may_write_exec(ins) for blk in blocks for ins in blk)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
 
     def emit_folded_region(fd):
@@ -15496,16 +15582,16 @@ def translate(path):
         g.sgpr_imm.clear()
         cur = n
         while True:
-            term = None
-            for ins in blocks[cur]:
+            term, body = None, blocks[cur]
+            for k, ins in enumerate(blocks[cur]):
                 op = base_op(ins["op"])
                 if op == "s_endpgm":
-                    term = ("end",)
+                    term, body = ("end",), blocks[cur][:k]
                     break
                 if op in BRANCHES:
-                    term = ("br", op, index[target(ins)])
+                    term, body = ("br", op, index[target(ins)]), blocks[cur][:k]
                     break
-                g.insn(ins)
+            g.insns(body)
             if cur in folds:
                 emit_folded_region(folds[cur])
                 if cur in fold_chain:

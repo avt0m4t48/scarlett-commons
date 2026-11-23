@@ -230,6 +230,61 @@ int main() {
               "and cannot be used");
     }
 
+    // WinHttpSendRequest's dwContext of 0 leaves the context set with WINHTTP_OPTION_CONTEXT_VALUE in place. The
+    // host's winhttp.dll (Windows 11, asynchronous session, loopback) kept it for WinHttpQueryOption, for the
+    // REQUEST_ERROR callback and for HANDLE_CLOSING.
+    {
+        static std::atomic<DWORD_PTR> error_context{0};
+        static std::atomic<DWORD_PTR> closing_context{0};
+        static HANDLE error_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        static HANDLE closing_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const WINHTTP_STATUS_CALLBACK record = [](HINTERNET, DWORD_PTR context, DWORD status, LPVOID, DWORD) {
+            if (status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR) {
+                error_context = context;
+                SetEvent(error_event);
+            } else if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
+                closing_context = context;
+                SetEvent(closing_event);
+            }
+        };
+        const auto context_of = [&](HINTERNET handle) -> DWORD_PTR {
+            DWORD_PTR value = ~DWORD_PTR{0};
+            DWORD size = sizeof(value);
+            return query_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, &size) ? value : ~DWORD_PTR{0};
+        };
+
+        // Synchronous: the send fails at once, and the context is still the one the option set.
+        const HINTERNET sync_session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const HINTERNET sync_connection = connect(sync_session, L"example.invalid", 80, 0);
+        const HINTERNET sync_request = open_request(sync_connection, L"GET", L"/c", nullptr, WINHTTP_NO_REFERER,
+                                                    WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        DWORD_PTR value = 0xBBB;
+        set_option(sync_request, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value));
+        send(sync_request, nullptr, 0, nullptr, 0, 0, 0);
+        check(context_of(sync_request) == 0xBBB, "a synchronous send with context 0 keeps the option's context");
+        close(sync_request);
+        close(sync_connection);
+        close(sync_session);
+
+        // Asynchronous: the error callback and HANDLE_CLOSING carry it too.
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, WINHTTP_FLAG_ASYNC);
+        const HINTERNET connection = connect(session, L"example.invalid", 80, 0);
+        const HINTERNET request = open_request(connection, L"GET", L"/c", nullptr, WINHTTP_NO_REFERER,
+                                               WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        set_callback(request, record, WINHTTP_CALLBACK_FLAG_REQUEST_ERROR | WINHTTP_CALLBACK_FLAG_HANDLES, 0);
+        value = 0xCCC;
+        set_option(request, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value));
+        check(send(request, nullptr, 0, nullptr, 0, 0, 0) != FALSE &&
+                  WaitForSingleObject(error_event, 2000) == WAIT_OBJECT_0 && error_context.load() == 0xCCC,
+              "an asynchronous send with context 0 reports its error with the option's context");
+        check(context_of(request) == 0xCCC, "and WinHttpQueryOption still returns it");
+        close(request);
+        check(WaitForSingleObject(closing_event, 2000) == WAIT_OBJECT_0 && closing_context.load() == 0xCCC,
+              "HANDLE_CLOSING carries it as well");
+        close(connection);
+        close(session);
+    }
+
     // Asynchronous: the send returns TRUE, the failure arrives through the inherited callback on another thread with
     // the request's context, and HANDLE_CLOSING comes last.
     Seen seen;

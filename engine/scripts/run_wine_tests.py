@@ -297,22 +297,29 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
-    dependencies = fixture_dependencies(tests)
+    names = [test.get("name", "?") for test in tests]
+    indices = {name: index for index, name in enumerate(names)}
+    setups = fixture_dependencies(tests)
+    sorter = TopologicalSorter(setups)
+    for index, test in enumerate(tests):
+        # DEPENDS controls order. Only failed fixture setups block a consumer.
+        sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))
     try:
-        order = list(TopologicalSorter(dependencies).static_order())
+        order = list(sorter.static_order())
     except CycleError:
-        print("ERROR: CTest fixture setup dependencies form a cycle", file=sys.stderr)
+        print("ERROR: CTest test dependencies form a cycle", file=sys.stderr)
         return 2
     wine = args.wine
     results = {}
+    results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
-    names = [test.get("name", "?") for test in tests]
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:
             name = names[index]
-            failed_setups = tuple(names[setup] for setup in dependencies[index] if results[names[setup]] == "fail")
+            failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
             status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
+            results_by_index[index] = status
             results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":

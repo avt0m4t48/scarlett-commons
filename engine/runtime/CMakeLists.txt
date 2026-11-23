@@ -740,6 +740,23 @@ if(BUILD_TESTING)
     add_test(NAME bink_decode COMMAND bink_decode_test)
     set_tests_properties(bink_decode PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_BINK_INDEX are set. Measures the HBINK/BINKSUMMARY
+    # offsets and the decode return values over every stream of movies.rpf (docs/movies.md section 5).
+    add_executable(bink_abi_test
+      test/bink_abi_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_compile_definitions(bink_abi_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bink_abi_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(bink_abi_test PRIVATE /OPT:NOREF)
+    target_link_libraries(bink_abi_test PRIVATE psapi)
+    add_dependencies(bink_abi_test gta6rt_tls_host)
+    add_test(NAME bink_abi COMMAND bink_abi_test)
+    set_tests_properties(bink_abi PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
     # Optional local viewer: plays a .bk2 in a window through the package's Bink2Scarlett.dll (test/bink_play.cpp).
     # The CTest entry is the headless smoke run; it skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_play

@@ -1172,6 +1172,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
+    // The runtime's device (create_vulkan_device_standalone) never enables these three, and a driver makes them part
+    // of a pipeline's cache key: with any of them on here, the cache this tool saves does not hit in gta6rt
+    // (pipeline_cache_seed_test; docs/pipeline_check.md, "The cache and the runtime's device").
+    f2.features.robustBufferAccess = VK_FALSE;
+    f12.scalarBlockLayout = VK_FALSE;
+    f13.robustImageAccess = VK_FALSE;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     if (ext_mesh && mesh.meshShader) {
         VkPhysicalDeviceProperties2 mesh_device_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};

@@ -1857,6 +1857,20 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_indirect_dispatch_count_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_indirect_dispatch_count COMMAND d3d12_indirect_dispatch_count_test)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
+      # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the checker
+      # compiles that shader, then the test creates the same pipeline on the runtime's device from the cache.
+      add_executable(pipeline_cache_seed_test test/pipeline_cache_seed_test.cpp)
+      target_link_libraries(pipeline_cache_seed_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(pipeline_cache_seed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(pipeline_cache_seed_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME pipeline_cache_seed COMMAND "${CMAKE_COMMAND}"
+               "-DCHECKER=$<TARGET_FILE:vk_pipeline_check>"
+               "-DTEST=$<TARGET_FILE:pipeline_cache_seed_test>"
+               "-DSHADER=${_indirect_count_spv}"
+               "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_seed"
+               "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_cache_seed.cmake")
+      set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: ")
     endif()
 
     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.

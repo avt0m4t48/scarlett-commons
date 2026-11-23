@@ -57,8 +57,9 @@ struct DeviceProxy {
     // under LEONIDA_VULKAN_DEVICE; always null elsewhere. Opaque: PresentState is defined with the queue proxy.
     void* present_state = nullptr;
     // The upload-memory arena console list slot 148 (AllocateUploadMemory) carves from; always null until the
-    // first call. Opaque: UploadArena is defined with the list proxy.
-    void* upload_state = nullptr;
+    // first call. Opaque: UploadArena is defined with the list proxy. Atomic: lists record on several threads
+    // at once, so the first AllocateUploadMemory installs the arena by compare-exchange.
+    std::atomic<void*> upload_state{nullptr};
     // The console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4): the queue proxy
     // writes it on detection and every object shares it — the queue/list slot tails shift +2 under the newer one.
     std::atomic<unsigned char> console_layout{0};  // 0 unknown, 1 older, 2 newer
@@ -174,7 +175,7 @@ unsigned long proxy_release(DeviceProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         destroy_present_state(self->present_state);
-        destroy_upload_state(self->upload_state);
+        destroy_upload_state(self->upload_state.load(std::memory_order_relaxed));
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -382,14 +383,16 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 //
 // Device slots 8 (CreateCommandQueue), 75 (CreateCommandQueue1), 36 (CreateFence) and 32 (OpenSharedHandle, for a
 // fence) wrap what they create, so a title never holds a PC or Vulkan-layer queue or fence. The proxies forward
-// the public chain in PC order, exactly like the device proxy, and a slot past the PC vtable is logged and refused
-// with E_NOTIMPL. PresentX, SuspendX and ResumeX are queue methods past the public chain
+// the public chain in PC order, exactly like the device proxy; on a fence a slot past the PC vtable is logged and
+// refused with E_NOTIMPL. PresentX, SuspendX and ResumeX are queue methods past the public chain
 // (docs/d3d12_command_objects.md §5.3). A sibling layer measured two queue layouts on retail titles
 // (docs/d3d12_xs_console_abi.md §4, unverified here): the older has Signal 14, Wait 15,
 // GetTimestampFrequency 16, GetClockCalibration 17, GetDesc 18, SignalX 23, PresentX 30; a newer game
 // OS inserts two methods before Signal, shifting to Signal 16, Wait 17, frequency 18, SignalX 25,
-// PresentX 32 — a fence passed to slot 16 or 17 marks the newer layout. The slots are still refused
-// (E_NOTIMPL) until wired to the presenter; the first run of the executable confirms which layout.
+// PresentX 32 — a fence passed to slot 16 or 17 marks the newer layout, and the detection is shared
+// across queues through the device. PresentX is wired to the Vulkan layer's Xbox presentation,
+// SignalX forwards as Signal, and the unmodelled console-only slots answer S_OK (the PresentX
+// section below); the first run of the executable confirms which layout.
 //
 // Slot numbers are those of the Windows SDK 10.0.26100 d3d12.h: ID3D12CommandQueue has 19, ID3D12Fence 11 and
 // ID3D12Fence1 12. That the console keeps these public slots, and keeps device slots 8/32/36/75, is an assumption
@@ -873,6 +876,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal + (Slot - 16)])(
                         self->real, fence, a2));
                 }
+                if (newer) return hr_to_u64(S_OK);  // proven newer: a non-fence Signal/Wait arg is malformed,
+                // not evidence of the older layout — do not downgrade the shared detection on it
                 if (self->queue_layout == ChildProxy::kQueueLayoutUnknown) {
                     self->queue_layout = ChildProxy::kQueueLayoutOlder;
                     self->device->console_layout.store(ChildProxy::kQueueLayoutOlder,
@@ -1125,10 +1130,18 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
 std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_t alignment) {
     if (!device || !size) return 0;
     alignment = alignment < 16 ? 16 : alignment;  // every measured call asked for 16
-    auto*& state = device->upload_state;
-    if (!state) state = new (std::nothrow) UploadArena;
-    auto* arena = static_cast<UploadArena*>(state);
-    if (!arena) return 0;
+    auto* arena = static_cast<UploadArena*>(device->upload_state.load(std::memory_order_acquire));
+    if (!arena) {
+        auto* fresh = new (std::nothrow) UploadArena;
+        if (!fresh) return 0;
+        void* expected = nullptr;  // a concurrent first call loses its arena but keeps the winner's chunks
+        if (device->upload_state.compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
+            arena = fresh;
+        else {
+            delete fresh;
+            arena = static_cast<UploadArena*>(expected);
+        }
+    }
     std::lock_guard<std::mutex> lock(arena->lock);
     const std::size_t need = static_cast<std::size_t>(size);
     for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
@@ -1155,7 +1168,8 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
 // real resource VA the title already holds — passes through.
 std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
-    auto* arena = static_cast<UploadArena*>(device ? device->upload_state : nullptr);
+    auto* arena = static_cast<UploadArena*>(
+        device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
     if (!arena) return va;
     std::lock_guard<std::mutex> lock(arena->lock);
     for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {

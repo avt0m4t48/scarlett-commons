@@ -600,6 +600,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
+    phi_new = {}
     back_edges = 0
     while pc < len(body):
         if step:
@@ -663,14 +664,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         if op == "OpPhi":
             # The OpPhi of a block all read the values from before the block (a later one that names an earlier
             # one, as in a swap in a loop header, gets its old value), so the first evaluates the whole run.
-            if body[pc - 2][1] != "OpPhi":
-                phi_new, k = {}, pc - 1
+            if not phi_new:
+                k = pc - 1
                 while k < len(body) and body[k][1] == "OpPhi":
-                    b = body[k][2]
+                    phi, _, b, _ = body[k]
+                    if phi in phi_new:
+                        raise UnsupportedConstruct(f"duplicate OpPhi result {phi}")
                     incoming = [b[i] for i in range(1, len(b) - 1, 2) if b[i + 1] == prev_label]
                     if len(incoming) != 1:
-                        raise UnsupportedConstruct("OpPhi with an unknown predecessor")
-                    phi_new[body[k][0]] = val(incoming[0])
+                        raise UnsupportedConstruct(f"OpPhi {phi} needs one input from predecessor {prev_label}")
+                    phi_new[phi] = val(incoming[0])
                     k += 1
             values[res] = phi_new.pop(res)
             continue

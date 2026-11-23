@@ -499,6 +499,22 @@ class InterpreterTests(unittest.TestCase):
             with self.subTest(cond=cond):
                 self.assertEqual(si.run_fragment(text)["%out"][0], want)
 
+    def test_phi_without_a_matching_predecessor_names_the_result_and_edge(self):
+        body = "OpBranch %next\n%next = OpLabel\n%answer = OpPhi %uint %c1 %other\n"
+        with self.assertRaisesRegex(si.UnsupportedConstruct, r"%answer.*%entry"):
+            si.run_fragment(HEADER + body + FOOTER)
+
+    def test_phi_before_the_first_label(self):
+        text = HEADER.replace("%entry = OpLabel\n", "") + "%answer = OpPhi %uint %c1 %other\nOpFunctionEnd\n"
+        with self.assertRaisesRegex(si.InvalidModule, r"%answer.*start of the function"):
+            si.run_fragment(text)
+
+    def test_duplicate_phi_result_is_rejected(self):
+        body = ("OpBranch %next\n%next = OpLabel\n%a = OpPhi %uint %c1 %entry\n"
+                "%a = OpPhi %uint %c2 %entry\n")
+        with self.assertRaisesRegex(si.UnsupportedConstruct, r"duplicate.*%a"):
+            si.run_fragment(HEADER + body + FOOTER)
+
     def test_phis_of_a_block_take_their_values_together(self):
         # A loop header that swaps %a and %b on every back edge: each OpPhi reads the other's value from before
         # the block. Three iterations from (1, 2) leave (2, 1); assigning %a first would give %b the new %a, (2, 2).

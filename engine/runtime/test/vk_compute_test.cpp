@@ -21,10 +21,14 @@
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // LEONIDA_PC_TAIL_UBO=1 (modules from rdna2spirv.py --pc-tail-ubo): s0..s31 only, the rest at set 1 (vk_pc_tail.h).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
+// LEONIDA_VK_VALIDATION=1 (env): run under VK_LAYER_KHRONOS_validation; a validation error fails the run (exit 1),
+// so scripts/run_gpu_tests.py reports it. The layer's own variables still apply, for example
+// VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1 for GPU-assisted validation of what the translated shader does.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 #include "cs_wave_probe_spv.h"
 
 #include <cctype>
@@ -105,7 +109,7 @@ static bool parse_user_sgprs(const char* s, uint32_t* pc) {
     return true;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
@@ -199,7 +203,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    CHECK(validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
@@ -223,7 +230,8 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
-    std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    std::fprintf(stderr, "device: %s (subgroup %u..%u)%s\n", props.deviceName, sgProps.minSubgroupSize,
+                 sgProps.maxSubgroupSize, validation.enabled() ? " (validation on)" : "");
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -630,4 +638,9 @@ int main(int argc, char** argv) {
     if (bad) std::printf(" (first at %u: got 0x%08x)", first_bad, out[first_bad]);
     std::printf("\nout[0..7] = %u %u %u %u %u %u %u %u\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
     return bad ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

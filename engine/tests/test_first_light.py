@@ -71,6 +71,36 @@ class MeshOutputTests(unittest.TestCase):
         self.assertEqual(encoded[-12:], struct.pack("<3I", 0, 1, 2))
 
 
+class ProbeDepthTests(unittest.TestCase):
+    @staticmethod
+    def triangle(depths, uv):
+        return [(x, y, z, *uv) for (x, y), z in zip(((-1, -1), (1, -1), (-1, 1)), depths)]
+
+    def test_only_visible_fragments_replace_an_earlier_triangle(self):
+        first, last = (0.125, 0.75), (0.75, 0.125)
+        back = self.triangle((0.25,) * 3, first)
+        for depths, left, right in (
+            ((-1, -1, -1), first, first),
+            ((2, 2, 2), first, first),
+            ((-1, 1, -1), first, last),
+            ((2, 0, 2), first, last),
+            ((0, 0, 0), last, last),
+            ((1, 1, 1), last, last),
+            ((1 + 2**-25,) * 3, last, last),  # Stored as exactly 1 in mesh.bin.
+        ):
+            with self.subTest(depths=depths):
+                vertices = back + self.triangle(depths, last)
+                self.assertEqual(fl.uv_at(vertices, range(6), 0, 0, 8, 8), left)
+                self.assertEqual(fl.uv_at(vertices, range(6), 5, 0, 8, 8), right)
+
+    def test_clipped_region_can_be_clear_and_supplies_no_uv_probes(self):
+        vertices = self.triangle((-1, 1, -1), (0.75, 0.125))
+        self.assertEqual(fl.clear_pixel(vertices, range(3), 8, 8), [0, 0])
+        probes = fl.uv_probes(vertices, range(3), 8, 8)
+        self.assertTrue(probes)
+        self.assertTrue(all(p["pixel"][0] >= 4 for p in probes), probes)
+
+
 class FirstLightTests(unittest.TestCase):
     def setUp(self):
         self.out = os.environ.get("LEONIDA_FIRST_LIGHT_DIR")

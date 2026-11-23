@@ -534,6 +534,12 @@ def uv_at(vertices, indices, px: int, py: int, width: int, height: int):
             q = (weights[0] / a[5], weights[1] / b[5], weights[2] / c[5])
             weights = tuple(w / sum(q) for w in q)
         if weights:
+            if not (0 <= a[2] <= 1 and 0 <= b[2] <= 1 and 0 <= c[2] <= 1):
+                # The passthrough VS has w=1. Use the float32 depths written to mesh.bin.
+                za, zb, zc = struct.unpack("<3f", struct.pack("<3f", a[2], b[2], c[2]))
+                z = za + weights[1] * (zb - za) + weights[2] * (zc - za)
+                if not 0 <= z <= 1:
+                    continue
             found = (
                 weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                 weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],

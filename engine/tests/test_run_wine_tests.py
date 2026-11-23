@@ -430,10 +430,10 @@ class MainTest(unittest.TestCase):
     def command(self, name):
         return [WINDOWS_ROOT + "/artifact/" + name]
 
-    def run_main(self, entries, *extra, stderr=False):
+    def run_main(self, entries, *extra, stderr=False, root=None):
         listing = self.list_tests(entries)
         argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
+                "--root", str(self.root if root is None else root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -443,6 +443,16 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def test_relative_root_launches_the_artifact_from_its_working_directory(self):
+        (self.artifact / "check_cwd.py").write_text(
+            "from pathlib import Path\nassert Path.cwd() == Path(__file__).resolve().parent\n",
+            encoding="utf-8", newline="\n")
+        entry = ctest_entry("ok", self.command("check_cwd.py"))
+        with contextlib.chdir(self.root):
+            code, out, _ = self.run_main([entry], "--require", "ok", root=".")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
 
     def test_a_required_test_that_fails_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")

@@ -303,7 +303,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
     ap.add_argument("--windows-root", required=True, help="the Windows checkout the tests were listed in")
-    ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
+    ap.add_argument("--root", type=os.path.abspath, default=ROOT, help="the Linux checkout (default: this repository)")
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")

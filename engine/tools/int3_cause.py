@@ -2,6 +2,7 @@
 
 Usage:
     python -I tools/int3_cause.py <image> <address> [<address> ...] [--json]
+    python -I tools/int3_cause.py <image> --any <address> ...      # any instruction, e.g. a `return 0` path
 
 A boot that stops on a title assertion reports where it stopped. LEONIDA_SKIP_ASSERTS, LEONIDA_SKIP_INT3 and the
 fault log give the `int3` as `exe+0x...`, `game+0x...`, an RVA or a virtual address. What failed is the call whose
@@ -37,6 +38,9 @@ function, so the test is not in sight of the stop. This finds it, with nothing r
    stores, each `mov [rip+x], r` or `mov [rip+x], imm` to it, with what it stores (the call that set it, or 0).
 6. A function whose start is doomed never returns. Each of its direct call sites is then read the same way, as if
    the call were the stop. Steps 3 and 6 go at most 3 functions away from the stop.
+
+With `--any` the address may be any instruction, for example the `xor eax, eax` of a `return 0` path or the start of
+a fallback. Steps 2 to 5 then name the branches that decide whether it runs, and step 6 is skipped.
 
 What it does not see:
 - a stop reached through a jump table or a function pointer;
@@ -417,9 +421,18 @@ def trace(image: Image, func, k: int, reg: int, level: int = 0):
             elif insn.base not in (None, RIP) and level < 2:
                 out["base"] = {"register": NAMES64[insn.base], **trace(image, func, i, insn.base, level + 1)}
             return tagged(out)
-        if (insn.op in (0x31, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or 0xB8 <= insn.op <= 0xBF or (
-                insn.op == 0xC7 and insn.mod == 3):
-            return tagged({"value": "a constant", "at": insn.rva})
+        if (insn.op in (0x30, 0x31, 0x32, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or (
+                0xB0 <= insn.op <= 0xBF) or (insn.op in (0xC6, 0xC7) and insn.mod == 3):
+            raw = image.raw(insn)
+            if insn.op in (0x30, 0x31, 0x32, 0x33):
+                value = 0
+            elif insn.op < 0xB8 or insn.op == 0xC6:
+                value = struct.unpack_from("<b", raw, len(raw) - 1)[0]
+            elif 0xB8 <= insn.op <= 0xBF and insn.wide:
+                value = struct.unpack_from("<q", raw, len(raw) - 8)[0]
+            else:
+                value = immediate(raw, 2 if width(raw, insn) == 16 else 4)
+            return tagged({"value": "a constant", "constant": value, "at": insn.rva})
         return tagged({"value": "computed", "at": insn.rva})
     return {"value": "not found within the instructions read"}
 
@@ -516,8 +529,9 @@ def argument_sources(image: Image, func, numbers):
     return {"sites": out, "sites_not_read": max(0, len(sites) - MAX_SITES)}
 
 
-def explain(image: Image, seed: int, depth: int, seen: set):
-    """Report for a stop (or a call that does not return, or a jump into doomed code) at `seed`."""
+def explain(image: Image, seed: int, depth: int, seen: set, stop: bool = True):
+    """Report for a stop (or a call that does not return, or a jump into doomed code) at `seed`. With stop False,
+    seed is any instruction (`--any`): the guards decide whether it runs, and callers are not followed."""
     func = image.function(seed)
     if func is None:
         return {"at": seed, "function": None, "note": "no .pdata entry holds it"}
@@ -531,7 +545,9 @@ def explain(image: Image, seed: int, depth: int, seen: set):
             t, f = insn.target in doomed, insn.end in doomed
             if t != f:
                 out["guards"].append(guard(image, func, k, t))
-    out["never_returns"] = func[0] in doomed
+    out["never_returns"] = stop and func[0] in doomed
+    if not stop:
+        out["reached_from_start"] = func[0] in doomed
     if depth <= 0 or func in seen:
         return out
     seen = seen | {func}
@@ -573,12 +589,18 @@ def parse_address(text: str, image_base: int) -> int:
     return value - image_base if value >= image_base else value
 
 
-def cause(data: bytes, addresses):
-    """{address text: report} for each address."""
+def cause(data: bytes, addresses, any_instruction: bool = False):
+    """{address text: report} for each address. With any_instruction, an address may be any instruction."""
     image = Image(data)
     out = {}
     for text in addresses:
         rva = parse_address(text, image.img.image_base)
+        if any_instruction:
+            if image.code.decode(rva) is None:
+                out[text] = {"rva": rva, "stop": None, "note": "no instruction decodes there"}
+                continue
+            out[text] = {"rva": rva, "stop": "instruction", **explain(image, rva, DEPTH, set(), stop=False)}
+            continue
         stop = stop_at(image, rva)
         if stop is None:
             out[text] = {"rva": rva, "stop": None, "note": "not an int3, ud2 or int 29h (nor one byte past an int3)"}
@@ -689,8 +711,11 @@ def report_lines(rep, indent: str = "  "):
             lines.append(f"{indent}  call at {c['at']:#x} in {span}:")
             lines += report_lines(c, indent + "    ")
     if not lines:
-        lines.append(f"{indent}no guard found: the stop is reached unconditionally from the function start, "
-                     f"and nothing calls or jumps to it directly (a jump table or a pointer, if anything)")
+        if rep.get("reached_from_start"):
+            lines.append(f"{indent}no guard: every path from the function start reaches it")
+        else:
+            lines.append(f"{indent}no guard found: the stop is reached unconditionally from the function start, "
+                         f"and nothing calls or jumps to it directly (a jump table or a pointer, if anything)")
     if rep.get("links_not_followed"):
         lines.append(f"{indent}{rep['links_not_followed']} more jump(s) or call(s) into it not followed")
     return lines
@@ -718,12 +743,15 @@ def main(argv=None) -> int:
     ap.add_argument("image")
     ap.add_argument("addresses", nargs="+", metavar="address",
                     help="the stop: exe+0x..., an RVA or a virtual address (hex)")
+    ap.add_argument("--any", action="store_true",
+                    help="an address may be any instruction (a `return 0` path, a fallback): print the branches "
+                         "that decide whether it runs")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     args = ap.parse_args(argv)
     try:
         with open(args.image, "rb") as f:
             data = f.read()
-        results = cause(data, args.addresses)
+        results = cause(data, args.addresses, args.any)
     except (OSError, pe_inspect.PeFormatError, ValueError) as e:
         print(f"{os.path.basename(sys.argv[0])}: {e}", file=sys.stderr)
         return 2

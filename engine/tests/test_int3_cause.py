@@ -208,7 +208,7 @@ class Int3CauseTest(unittest.TestCase):
         self.assertEqual((g["branch"], g["doomed_side"], g["condition"]),
                          (CHECK_JAE, "fall-through", "bit eax of ecx is set"))
         regs = {x["register"]: x for x in g["registers"]}
-        self.assertEqual(regs["rcx"]["value"], "a constant")
+        self.assertEqual((regs["rcx"]["value"], regs["rcx"]["constant"]), ("a constant", 5))
         # eax = esi + 0x10, esi = ecx at entry; the lea's block is reached only by the js.
         self.assertEqual((regs["rax"]["value"], regs["rax"]["argument"], regs["rax"].get("derived")),
                          ("argument", 1, True))
@@ -250,6 +250,19 @@ class Int3CauseTest(unittest.TestCase):
         self.assertIn("1  a constant (0)", text)
         self.assertIn("1  the result of xmem.dll!XMemFoo", text)
 
+    def test_any_instruction_names_the_branches_that_decide_it_runs(self):
+        out = int3_cause.cause(self.data, [hex(IMPORT_CHECK + 0x11), hex(IMPORT_CHECK)], any_instruction=True)
+        ok = out[hex(IMPORT_CHECK + 0x11)]                  # add rsp, 0x28 on the success path
+        [g] = ok["guards"]
+        self.assertEqual((g["jump"], g["doomed_side"], g["condition"]), ("js", "fall-through", "eax >= 0"))
+        self.assertEqual(g["registers"][0]["import"], "xmem.dll!XMemFoo")
+        self.assertEqual((ok["stop"], ok["never_returns"], ok["reached_from_start"], ok["callers"]),
+                         ("instruction", False, False, []))
+        start = out[hex(IMPORT_CHECK)]                      # the function's first instruction
+        self.assertEqual((start["guards"], start["reached_from_start"]), ([], True))
+        self.assertIn("no guard: every path from the function start reaches it",
+                      int3_cause.to_text({"x": start}))
+
     def test_wine_reports_the_address_after_the_int3(self):
         r = self.one(f"exe+{IMPORT_STOP + 1:#x}")
         self.assertEqual((r["rva"], r["at"]), (IMPORT_STOP + 1, IMPORT_STOP))
@@ -269,6 +282,22 @@ class Int3CauseTest(unittest.TestCase):
         self.assertEqual(cond(b"\x0f\xa3\xc1", 0x3), "bit eax of ecx is clear")   # bt ecx, eax; jae
         self.assertEqual(cond(b"\x0f\xba\xe0\x05", 0x2), "bit 5 of eax is set")   # bt eax, 5; jb
         self.assertEqual(cond(b"\x85\xc0", 0x2), None)                          # test; jb: never taken
+
+    def test_constants_keep_their_value(self):
+        class OneInstruction:                    # the instruction, then a nop to trace back from
+            def __init__(self, code):
+                self.code = code
+
+            def flow(self, func):
+                return [decode(self.code, 0, 0), decode(b"\x90", 0, len(self.code))], None, {}
+
+            def raw(self, insn):
+                return self.code[:insn.size] if insn.rva == 0 else b"\x90"
+
+        for code, reg, value in ((b"\xb0\x01", 0, 1), (b"\xb8\x07\x00\x00\x00", 0, 7), (b"\x33\xc9", 1, 0),
+                                 (b"\xc6\xc0\xff", 0, -1), (b"\x48\xc7\xc0\xfb\xff\xff\xff", 0, -5)):
+            r = int3_cause.trace(OneInstruction(code), (0, 0), 1, reg)
+            self.assertEqual((r["value"], r["constant"]), ("a constant", value), code.hex())
 
     def test_text_and_exit_status(self):
         with tempfile.TemporaryDirectory() as tmp:

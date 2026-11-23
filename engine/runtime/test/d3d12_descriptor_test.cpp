@@ -1295,6 +1295,27 @@ int main() {
                 device->CreateShaderResourceView(denied.p, &plane_view, view_slot(null_slot));
                 EXPECT(null_at(null_slot));
             }
+
+            // The family without ALLOW_DEPTH_STENCIL, as a copy of a depth buffer kept for sampling, has the same
+            // two planes.
+            depth_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            Ref<ID3D12Resource> plain;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&plain.p))));
+            plane_view.Format = depth_view_format;
+            plane_view.Texture2D.PlaneSlice = 0;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(plain.p, &plane_view, view_slot(null_slot));
+            g::Image plain_depth{};
+            EXPECT(image_at(null_slot, plain_depth) && plain_depth.format == g::format_from_vulkan(depth_vk));
+            plane_view.Format = stencil_view_format;
+            plane_view.Texture2D.PlaneSlice = 1;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(plain.p, &plane_view, view_slot(null_slot));
+            g::Image plain_stencil{};
+            EXPECT(image_at(null_slot, plain_stencil) && plain_stencil.format == g::stencil_format);
+            EXPECT(plain_depth.address == plain_stencil.address);
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC colour_plane{};
         colour_plane.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;

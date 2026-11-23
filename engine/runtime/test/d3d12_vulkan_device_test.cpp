@@ -1428,6 +1428,8 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
         DXGI_FORMAT_D16_UNORM,
         DXGI_FORMAT_D24_UNORM_S8_UINT,
         DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS,
+        DXGI_FORMAT_R32G8X24_TYPELESS,
     };
     constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
     unsigned compared = 0, skipped = 0;

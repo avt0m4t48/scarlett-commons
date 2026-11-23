@@ -209,8 +209,9 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
     return format;
 }
 
-// DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
-// become depth formats when the resource allows depth-stencil.
+// DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. R32 and R16 typeless become
+// depth formats when the resource allows depth-stencil; R32G8X24 and R24G8 always do, as Vulkan has no colour format
+// with their layout.
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
     constexpr VkImageAspectFlags color = VK_IMAGE_ASPECT_COLOR_BIT, d = VK_IMAGE_ASPECT_DEPTH_BIT,
                                  ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -316,10 +317,8 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
         return depth ? Format{VK_FORMAT_D32_SFLOAT, d, true} : Format{VK_FORMAT_R32_SFLOAT, color, true};
     case DXGI_FORMAT_R16_TYPELESS:
         return depth ? Format{VK_FORMAT_D16_UNORM, d, true} : Format{VK_FORMAT_R16_UNORM, color, true};
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-        return depth ? Format{VK_FORMAT_D32_SFLOAT_S8_UINT, ds, true} : Format{};
-    case DXGI_FORMAT_R24G8_TYPELESS:
-        return depth ? Format{VK_FORMAT_D24_UNORM_S8_UINT, ds, true} : Format{};
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds, true};
+    case DXGI_FORMAT_R24G8_TYPELESS: return {VK_FORMAT_D24_UNORM_S8_UINT, ds, true};
     default: return {};
     }
 }
@@ -870,6 +869,8 @@ struct DeviceState {
             return {};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+            return {};
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
@@ -7051,11 +7052,7 @@ public:
             if (alpha_only && levels->SampleCount != 1) return d3d12_trace::result(method, S_OK);
             if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
                 return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
-            // A typeless format that is only a texture as depth (R24G8_TYPELESS, R32G8X24_TYPELESS) has no colour
-            // format; creation makes it a depth image, so ask the same.
-            const bool depth_only_typeless = format.format == VK_FORMAT_UNDEFINED &&
-                                             (texture_storage_format(levels->Format, true).aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
-            if ((format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) || depth_only_typeless) {
+            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 D3D12_RESOURCE_DESC depth_desc{};
                 depth_desc.Format = levels->Format;
                 depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;

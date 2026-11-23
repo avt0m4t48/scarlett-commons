@@ -2487,7 +2487,16 @@ public:
         }
     }
 
-    D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    // As the host reports it (measured against the PC runtime, d3d12_vulkan_device_test compare_heap_descs): the
+    // alignment the heap was placed with (64 KiB for an Alignment of 0) and the one node for a node mask of 0, as the
+    // layer's resources, descriptor heaps and queues already answer.
+    D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
+        D3D12_HEAP_DESC desc = desc_;
+        desc.Alignment = alignment();
+        desc.Properties.CreationNodeMask = 1;
+        desc.Properties.VisibleNodeMask = 1;
+        return desc;
+    }
 
     bool reserved() const { return bool(allocation_); }
     VkDeviceSize offset() const { return allocation_->offset; }

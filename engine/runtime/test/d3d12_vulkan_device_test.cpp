@@ -4321,6 +4321,67 @@ int compare_heap_neighbours(ID3D12Device* ours) {
     return mismatches;
 }
 
+// ID3D12Heap::GetDesc reads back as the host's for heaps of each type with each node-mask pair, on a device with the
+// GPU address arena: a node mask of 0 reads back as the one node (1), as the layer's resources, descriptor heaps and
+// queues already answer (d3d12_node_mask_test). Returns the number of mismatches, or -1 without a host.
+int compare_heap_descs(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    struct HeapCase {
+        D3D12_HEAP_PROPERTIES properties;
+        UINT64 alignment;  // 0: the default
+    };
+    const HeapCase heaps[] = {
+        {{D3D12_HEAP_TYPE_DEFAULT}, 0},
+        {{D3D12_HEAP_TYPE_DEFAULT}, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT},
+        {{D3D12_HEAP_TYPE_UPLOAD}, 0},
+        {{D3D12_HEAP_TYPE_READBACK}, 0},
+        {{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0}, 0},
+    };
+    const UINT masks[][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+    int mismatches = 0;
+    for (const HeapCase& heap : heaps) {
+        for (const auto& mask : masks) {
+            D3D12_HEAP_PROPERTIES props = heap.properties;
+            props.CreationNodeMask = mask[0];
+            props.VisibleNodeMask = mask[1];
+            const D3D12_HEAP_DESC desc = heap_desc_of(heap.alignment, props, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                                                      heap.alignment ? heap.alignment : 64 * 1024);
+            Ref<ID3D12Heap> a, e;
+            const HRESULT ha = ours->CreateHeap(&desc, IID_PPV_ARGS(&a.p));
+            const HRESULT he = host->CreateHeap(&desc, IID_PPV_ARGS(&e.p));
+            if (FAILED(he) || !e.p) continue;  // nothing to compare
+            if (FAILED(ha) || !a.p) {
+                ++mismatches;
+                std::fprintf(stderr, "heap GetDesc type %d align %llu masks %u/%u: the layer refused it (0x%08lx)\n",
+                             int(props.Type), heap.alignment, mask[0], mask[1], ha);
+                continue;
+            }
+            const D3D12_HEAP_DESC x = a->GetDesc(), y = e->GetDesc();
+            if (x.SizeInBytes == y.SizeInBytes && x.Alignment == y.Alignment && x.Flags == y.Flags &&
+                x.Properties.Type == y.Properties.Type &&
+                x.Properties.CPUPageProperty == y.Properties.CPUPageProperty &&
+                x.Properties.MemoryPoolPreference == y.Properties.MemoryPoolPreference &&
+                x.Properties.CreationNodeMask == y.Properties.CreationNodeMask &&
+                x.Properties.VisibleNodeMask == y.Properties.VisibleNodeMask)
+                continue;
+            ++mismatches;
+            std::fprintf(stderr,
+                         "heap GetDesc type %d align %llu masks %u/%u: ours size %llu align %llu flags 0x%x cpu %d "
+                         "pool %d masks %u/%u, host size %llu align %llu flags 0x%x cpu %d pool %d masks %u/%u\n",
+                         int(props.Type), heap.alignment, mask[0], mask[1], x.SizeInBytes, x.Alignment,
+                         unsigned(x.Flags), int(x.Properties.CPUPageProperty),
+                         int(x.Properties.MemoryPoolPreference), x.Properties.CreationNodeMask,
+                         x.Properties.VisibleNodeMask, y.SizeInBytes, y.Alignment, unsigned(y.Flags),
+                         int(y.Properties.CPUPageProperty), int(y.Properties.MemoryPoolPreference),
+                         y.Properties.CreationNodeMask, y.Properties.VisibleNodeMask);
+        }
+    }
+    std::printf("ID3D12Heap::GetDesc against the host: %zu heaps, %d differ\n", std::size(heaps) * std::size(masks),
+                mismatches);
+    return mismatches;
+}
+
 // CreatePlacedResource and CreateReservedResource answer their arguments as the host runtime does: the placement
 // (offset, alignment, room in the heap), the heap's type and DENY flags against the resource, the description and
 // initial state rules CreateCommittedResource shares, and the output and interface. Run on a device with the GPU
@@ -7116,6 +7177,10 @@ int main() {
             if (heap_mismatches < 0)
                 std::printf("CreateHeap valid neighbours: no host D3D12 device to compare with, skipped\n");
             EXPECT(heap_mismatches <= 0);
+            const int heap_desc_mismatches = compare_heap_descs(standalone.p);
+            if (heap_desc_mismatches < 0)
+                std::printf("ID3D12Heap::GetDesc: no host D3D12 device to compare with, skipped\n");
+            EXPECT(heap_desc_mismatches <= 0);
             const int placed_mismatches = compare_placed_reserved(standalone.p);
             if (placed_mismatches < 0)
                 std::printf("CreatePlacedResource/CreateReservedResource arguments: no host D3D12 device to compare "

@@ -554,7 +554,10 @@ bool install_physical_page_fault_handler() {
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
 // GPU memory, which the D3D12 layer reads on the CPU.
 DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+    // A view takes no cache modifier: MapViewOfFile3 refuses PAGE_WRITECOMBINE (0x400, which three of the measured
+    // windows carry next to PAGE_READWRITE) and PAGE_NOCACHE with ERROR_INVALID_PARAMETER.
+    const DWORD protect = window.protect & ~static_cast<DWORD>(PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD);
+    return protect == PAGE_NOACCESS ? PAGE_READWRITE : protect;
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }

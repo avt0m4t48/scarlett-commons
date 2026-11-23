@@ -239,6 +239,36 @@ int main() {
     // mip >= 32 must clamp height/depth to 1 without shifting uint32_t by >= 32.
     CHECK(resource_tiling({TiledKind::texture2d, 1024, 1024, 1, 33, 4, 1}, t));
     CHECK(t.standard_mips == 4 && t.packed_mips == 29 && t.packed_tiles == 1 && t.total_tiles == 86);
+
+    // Unknown TiledKind must fail cleanly (not fall through as texture2d) and clear `out`.
+    CHECK(!resource_tiling({static_cast<TiledKind>(99), 128, 128, 1, 1, 4, 1}, t));
+    CHECK(t.total_tiles == 0 && t.subresources.empty());
+    CHECK(!resource_tiling({static_cast<TiledKind>(-1), 128, 128, 1, 1, 4, 1}, t));
+
+    // D3D12_PACKED_MIP_INFO mip counters are UINT8 (max 255), D3D12_RESOURCE_DESC::DepthOrArraySize is UINT16
+    // (max 65535), and D3D12_SUBRESOURCE_TILING::HeightInTiles / DepthInTiles are UINT16 (max 65535).
+    CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 256, 4, 1}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 65536, 1, 4, 1}, t));
+    CHECK(!resource_tiling({TiledKind::texture3d, 32, 32, 65536, 1, 4, 1}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 128, 128u * 65536u, 1, 1, 4, 1}, t));
+    // per_slice * layers overflow with valid UINT16 height-in-tiles (4096) and array size (16).
+    CHECK(!resource_tiling({TiledKind::texture2d, 128ULL * (1ULL << 18), 128u * 4096u, 16, 1, 4, 1}, t));
+    // Hostile uint32_t mip/layer counts must fail before allocating vectors.
+    CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 0xffffffffu, 4, 1}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 0xffffffffu, 1, 4, 1}, t));
+    CHECK(!resource_tiling({TiledKind::texture3d, 32, 32, 0xffffffffu, 1, 4, 1}, t));
+
+    // Exact D3D12 field maxima remain accepted.
+    CHECK(resource_tiling({TiledKind::texture2d, 64, 64, 1, 255, 4, 1}, t));
+    CHECK(t.standard_mips == 0 && t.packed_mips == 255 && t.packed_tiles == 1 && t.total_tiles == 1 &&
+          t.subresources.size() == 255);
+    CHECK(resource_tiling({TiledKind::texture2d, 64, 64, 65535, 1, 4, 1}, t));
+    CHECK(t.total_tiles == 65535 && t.subresources.size() == 65535);
+    CHECK(resource_tiling({TiledKind::texture3d, 32, 32, 65535, 1, 4, 1}, t));
+    CHECK(t.standard_mips == 1 && t.packed_mips == 0 && t.total_tiles == 4096 && same(t.subresources[0], 1, 1, 4096, 0));
+    CHECK(resource_tiling({TiledKind::texture2d, 128, 128u * 65535u, 1, 1, 4, 1}, t));
+    CHECK(t.standard_mips == 1 && t.total_tiles == 65535 && same(t.subresources[0], 1, 65535, 1, 0));
+
     std::printf("resource tiling: buffer, 2D, array, block-compressed and volume layouts match\n");
     return 0;
 }

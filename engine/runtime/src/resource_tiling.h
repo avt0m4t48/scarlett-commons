@@ -107,11 +107,14 @@ constexpr TileShape small_tile_shape(bool volume, std::uint32_t element_bytes) {
     }
 }
 
-// False when the resource cannot be tiled: an untileable element size, no mips, or more than 2^32 tiles.
+// False when the resource cannot be tiled: an unknown kind, an untileable element size, out-of-range mips/layers/extents, or more than 2^32 tiles.
 inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     out = {};
     constexpr std::uint64_t max_tiles = 0xffffffffu;
     constexpr std::uint64_t max_packed_bytes = max_tiles * tile_size_in_bytes;
+    constexpr std::uint32_t max_mips = 0xffu;                     // D3D12_PACKED_MIP_INFO mip counters are UINT8
+    constexpr std::uint32_t max_depth_or_layers = 0xffffu;        // D3D12_RESOURCE_DESC::DepthOrArraySize is UINT16
+    constexpr std::uint64_t max_subresource_extent_16 = 0xffffu;  // D3D12_SUBRESOURCE_TILING HeightInTiles / DepthInTiles are UINT16
     const auto up = [](std::uint64_t value, std::uint64_t by) -> std::uint64_t {
         return value ? 1 + (value - 1) / by : 0;
     };
@@ -123,10 +126,12 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
         out.subresources = {{out.total_tiles, 1, 1, 0}};
         return true;
     }
+    if (desc.kind != TiledKind::texture2d && desc.kind != TiledKind::texture3d) return false;
     const bool volume = desc.kind == TiledKind::texture3d;
     if (desc.samples != 1 && (desc.samples != 4 || volume || desc.mips != 1 || desc.block != 1)) return false;
     const TileShape elements = element_tile_shape(volume, desc.element_bytes, desc.samples);
-    if (!elements.width || !desc.mips || !desc.block || !desc.width || !desc.height || !desc.depth_or_layers)
+    if (!elements.width || !desc.mips || desc.mips > max_mips || !desc.block || !desc.width || !desc.height ||
+        !desc.depth_or_layers || desc.depth_or_layers > max_depth_or_layers)
         return false;
     const std::uint64_t shape_w = std::uint64_t(elements.width) * desc.block;
     const std::uint64_t shape_h = std::uint64_t(elements.height) * desc.block;
@@ -149,7 +154,7 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
             const std::uint64_t tw = up(w, result.shape.width);
             const std::uint64_t th = up(h, result.shape.height);
             const std::uint64_t td = up(d, result.shape.depth);
-            if (tw > max_tiles || th > max_tiles || td > max_tiles) return false;
+            if (tw > max_tiles || th > max_subresource_extent_16 || td > max_subresource_extent_16) return false;
             const std::uint64_t xy = tw * th;
             if (xy > max_tiles || xy > max_tiles / td) return false;
             const std::uint64_t mip_tiles = xy * td;

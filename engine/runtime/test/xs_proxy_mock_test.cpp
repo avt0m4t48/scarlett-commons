@@ -2338,7 +2338,7 @@ int check_slot70_placed_buffer() {
         Mock* const mock_a = reinterpret_cast<Mock*>(a);
         Mock* const mock_b = reinterpret_cast<Mock*>(b);
         // The title's reference is the only one: the proxy remembers the buffer without holding it.
-        EXPECT(mock_a->refs == 1 && mock_b->refs == 1 && mock_a->private_data && mock_b->private_data);
+        EXPECT(mock_a->refs == 1 && mock_b->refs == 1 && mock_a->held && mock_b->held);
 
         // 0x800 bytes at +0x1000 of A: a raw view of A from element 0x400, 0x200 elements, and no reference left.
         unsigned views = mock->calls[18];
@@ -2376,7 +2376,7 @@ int check_slot70_placed_buffer() {
         void* placed_texture = nullptr;
         EXPECT(hr_of(raw6(device, 133, kVaTexture, word(&texture), 6, 0, word(&kResourceIid),
                           word(&placed_texture))) == S_OK && placed_texture);
-        EXPECT(!reinterpret_cast<Mock*>(placed_texture)->private_data);
+        EXPECT(!reinterpret_cast<Mock*>(placed_texture)->held);
         shape = raw_shape(kVaTexture, 0x100);
         raw(device, 70, word(&shape.resource), word(&shape.view), destination);
         EXPECT(mock->calls[18] == ++views && is_null_view(mock));

@@ -2121,6 +2121,16 @@ void ForceFeedbackEffect::orphan() {
     applied_ = 0;
 }
 
+// What SDL said about the effect, for output_state (gameinput_probe and the tests): the id it returned, whether it is
+// running, and its error text when it is not. SDL_GetError is read here, on the poll thread that made the call.
+void note_effect(Device* d, int id, bool ran) {
+    const char* error = ran ? "" : SDL_GetError();
+    std::lock_guard lock(g().mu);
+    d->sent.effect_id = id;
+    d->sent.effect_ran = ran;
+    std::snprintf(d->sent.effect_error, sizeof d->sent.effect_error, "%s", error ? error : "");
+}
+
 void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     GameInputForceFeedbackParams params;
     float gain;
@@ -2169,13 +2179,21 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     }
     if (sdl_effect_ < 0) {
         sdl_effect_ = haptics().create_effect(d->haptic, &fx);  // SDL refused: nothing to drive this effect
-        if (sdl_effect_ < 0) return;
+        if (sdl_effect_ < 0) {
+            note_effect(d, -1, false);
+            return;
+        }
     } else if (!haptics().update_effect(d->haptic, sdl_effect_, &fx)) {
+        note_effect(d, sdl_effect_, false);
         return;
     }
     // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
     const uint32_t iterations = endless ? 0 : play_count(params);
-    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) return;
+    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
+        note_effect(d, sdl_effect_, false);
+        return;
+    }
+    note_effect(d, sdl_effect_, true);
     sdl_running_ = true;
     applied_ = version;
     endless_ = endless;

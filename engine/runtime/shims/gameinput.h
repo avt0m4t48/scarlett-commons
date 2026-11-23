@@ -86,6 +86,12 @@ struct OutputState {
     bool trigger_rumble = false;          // the pad takes SDL_RumbleGamepadTriggers
     bool force_feedback = false;          // SDL opened the pad as a haptic device
     uint32_t haptic_motors = 0;           // haptic motors the pad reports (0 or 2)
+    // The last force-feedback effect the shim asked SDL for: SDL_CreateHapticEffect's id (-1 when SDL refused),
+    // whether SDL_RunHapticEffect then returned true, and SDL's error text when a call failed. `force_feedback` only
+    // says a haptic device was opened; an effect SDL creates but will not run, or refuses outright, shows up here.
+    int effect_id = -1;
+    bool effect_ran = false;
+    char effect_error[128] = {};
 };
 bool output_state(int i, OutputState* out);
 

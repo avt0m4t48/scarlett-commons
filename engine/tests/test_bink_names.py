@@ -282,6 +282,20 @@ class TestLoadPins(unittest.TestCase):
         self.assertEqual(rows[0]["confidence"], "verified")
         self.assertEqual(unmatched, ["f/c.bk2"])
 
+    def test_a_windows_source_from_before_slashes_still_matches(self):
+        # bink_index wrote "movies\x.bk2" on Windows before it used "/"; older pins and index files keep working.
+        with tempfile.TemporaryDirectory() as tmp:
+            pins_csv = os.path.join(tmp, "pins.csv")
+            index_csv = os.path.join(tmp, "index.csv")
+            with open(pins_csv, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("offset,path,source\n0,f/a.bk2,movies\\x.bk2\n")
+            with open(index_csv, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("source,offset,size,width,height,frames\nmovies\\x.bk2,0,64,16,16,1\n")
+            pins = names_mod.load_pins(pins_csv)
+            streams = names_mod.load_streams(index_csv)
+        self.assertEqual(pins, {("movies/x.bk2", 0): {"f/a.bk2"}})
+        self.assertEqual([s["source"] for s in streams], ["movies/x.bk2"])
+
     def test_rejects_empty_and_invalid_pin_rows(self):
         bad_rows = [
             "0,\n",

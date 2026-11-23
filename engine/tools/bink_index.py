@@ -195,9 +195,10 @@ def scan_target(target, skip_report=None):
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
                     continue
-                paths.append(path)
-        for path in sorted(paths):
-            got, stats = scan_file(path, os.path.relpath(path, base))
+                # "/" in the source and the sort key, so the report is the same on every platform
+                paths.append((os.path.relpath(path, base).replace(os.sep, "/"), path))
+        for source, path in sorted(paths):
+            got, stats = scan_file(path, source)
             rows.extend(got)
             for key in total:
                 total[key] += stats[key]

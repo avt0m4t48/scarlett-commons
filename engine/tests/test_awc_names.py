@@ -372,6 +372,27 @@ class TestCli(unittest.TestCase):
             self.assertIn("cannot read", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
 
+    def test_scalar_json_words_report_rc_2_without_traceback(self):
+        # A JSON scalar is neither a hashdict object nor a word list: one error line, exit 2. A string
+        # must not be read as one word per character.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "o.csv")
+            for doc in ("42", "null", "true", '"abc"'):
+                with self.subTest(doc=doc):
+                    words = write(os.path.join(tmp, "words.json"), doc)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        rc = A.main([tmp, "--words", words, "--out", out])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertIn("awc_names: error: cannot read", err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_json_word_list_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
+            self.assertEqual(A.read_words(path), ["a_word", "2"])
+
 
 if __name__ == "__main__":
     unittest.main()

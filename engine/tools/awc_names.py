@@ -159,13 +159,17 @@ def _files(path: str):
 
 
 def read_words(path: str) -> list:
-    """Words from a text file (one per line) or a hashdict.py JSON object."""
+    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
     with open(path, "rb") as fh:
         head = fh.read(1).lstrip()
     if path.lower().endswith(".json") or head == b"{":
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]
+        if isinstance(doc, dict):
+            return [str(v) for v in doc.values()]
+        if isinstance(doc, list):
+            return [str(v) for v in doc]
+        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
     with open(path, encoding="utf-8", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
 

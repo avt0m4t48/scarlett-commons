@@ -250,6 +250,17 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_invalid_test_filter_is_an_argument_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            result = subprocess.run([sys.executable, "-I", TOOL, "--out", out, "--run-tests", "--tests", "["],
+                                    capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--tests", result.stderr)
+            self.assertIn(b"unterminated character set", result.stderr)
+            self.assertNotIn(b"Traceback", result.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_out_inside_the_repository_is_refused(self):
         r = subprocess.run([sys.executable, "-I", TOOL, "--out", os.path.join(ROOT, "progress_out_test")],
                            capture_output=True, cwd=ROOT, timeout=120)

@@ -938,6 +938,11 @@ def main(argv=None):
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)
+    if args.run_tests and args.tests:
+        try:
+            args.tests = re.compile(args.tests)
+        except (re.error, OverflowError, RecursionError) as exc:
+            ap.error(f"--tests: invalid regular expression: {exc}")
     out_dir = os.path.abspath(args.out)
     if inside(out_dir, ROOT):
         print(f"--out must be outside the repository ({ROOT}): the outputs are never meant to be committed", file=sys.stderr)

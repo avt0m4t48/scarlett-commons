@@ -229,6 +229,7 @@ static_assert(std::size(kThreadingVtable) == 31, "IUnknown + IXThreadingImpl's 2
 using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* context);
 std::atomic<XErrorCallback> g_error_callback{nullptr};
 std::atomic<void*> g_error_context{nullptr};
+std::mutex g_error_mutex{};   // guards g_error_callback + g_error_context as one consistent pair
 
 // HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
 HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
@@ -236,10 +237,12 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;
     g_error_callback = callback;
 }

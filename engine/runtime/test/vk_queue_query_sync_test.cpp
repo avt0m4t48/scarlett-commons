@@ -291,6 +291,73 @@ int main() {
             std::printf("queue/query sync: pending Wait() preserved across failed vkQueueSubmit ok\n");
         }
 
+        // 3b. The same for a batch held behind a Wait with no submitted Signal (queue_holds.h): its submission
+        //     fails when the CPU Signal releases it, the failure is reported through take_held_failure(), and its
+        //     waits stay for the next submission, as when the call is not held. A Signal queued behind the failed
+        //     batch still runs.
+        {
+            VulkanFence gate(context, 0), after(context, 0);
+            EXPECT(gate.semaphore() != VK_NULL_HANDLE && after.semaphore() != VK_NULL_HANDLE);
+            const std::uint64_t pattern = 0x0badf00dcafe1234ULL;
+            std::memcpy(src_ptr, &pattern, sizeof(pattern));
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            CommandList copy_list;
+            EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(pattern)}));
+            EXPECT(copy_list.close());
+            const CommandList* ptr = &copy_list;
+
+            queue_a.wait(gate.semaphore(), 1);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);   // held: the Signal is not submitted yet
+            EXPECT(queue_a.signal(after.semaphore(), 1));                  // held behind it
+            EXPECT(after.completed() == 0 && queue_a.take_held_failure() == ReplayResult::success);
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(gate.signal(1));                                        // releases the batch on this thread
+            EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
+            EXPECT(queue_a.take_held_failure() == ReplayResult::success);  // reported once
+            EXPECT(queue_a.idle() && after.completed() == 1);              // the Signal behind it still signaled
+
+            driver::captured_wait_count.store(0);
+            driver::captured_wait_sem.store(0);
+            driver::captured_wait_val.store(0);
+            driver::capture_next_waits.store(true);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(queue_a.idle());
+            EXPECT(driver::captured_wait_count.load() == 1);   // the failed batch's wait on (gate, 1) came along
+            EXPECT(driver::captured_wait_sem.load() == reinterpret_cast<std::uintptr_t>(gate.semaphore()));
+            EXPECT(driver::captured_wait_val.load() == 1);
+            std::uint64_t got = 0;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+            std::printf("queue/query sync: failed held batch reported, its wait kept for the retry, Signal behind it ran\n");
+        }
+
+        // 3c. A Signal whose vkQueueSubmit fails signals nothing: a queue waiting for it stays held (the value is not
+        //     counted as submitted), and the application's retry of the Signal goes through and releases it.
+        {
+            VulkanFence fence(context, 0);
+            EXPECT(fence.semaphore() != VK_NULL_HANDLE);
+            const std::uint64_t pattern = 0x5ca1ab1e0ddba11ULL;
+            std::memcpy(src_ptr, &pattern, sizeof(pattern));
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            CommandList copy_list;
+            EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(pattern)}));
+            EXPECT(copy_list.close());
+            const CommandList* ptr = &copy_list;
+            queue_b.wait(fence.semaphore(), 1);
+            EXPECT(queue_b.execute({&ptr, 1}) == ReplayResult::success);  // held for the Signal
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(!queue_a.signal(fence.semaphore(), 1));                     // the submit fails
+            EXPECT(queue_b.idle() && fence.completed() == 0);
+            std::uint64_t got = 1;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == 0);                                                  // the waiter did not run
+            EXPECT(queue_a.signal(fence.semaphore(), 1));                      // the retry signals, and releases it
+            EXPECT(queue_b.idle() && queue_a.idle() && fence.completed() == 1);
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+            std::printf("queue/query sync: a failed Signal does not release its waiters; the retry does\n");
+        }
+
         // 4. Concurrent multi-queue EndQuery + ResolveQueries + temporary query pool add/remove stress.
         //    Each iteration uses a distinct query slot so no slot is reset while another submission resolves it.
         {

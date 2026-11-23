@@ -17,7 +17,8 @@
 //                  CopyTextureRegion) to a READBACK buffer, Signal(copy fence, 2). The CPU waits for that with
 //                  SetEventOnCompletion and an event.
 // When the Vulkan family has two queues, the copy and the compute D3D12 queue get their own VkQueue (so the fences are
-// real cross-queue semaphores); with one, they share it. Either way the readback batch is submitted before the compute batch it waits for (the layer holds it until that Signal has been submitted).
+// real cross-queue semaphores); with one, they share it. Either way the compute batch is submitted before the copy that feeds it: the layer holds it until that Signal
+// has been submitted, with the PSOs and root signature the application released in between.
 // Compared with a CPU reference, word by word, error 0: the input after the round trip, the structured buffer, the
 // argument buffer, the image and the indirect dispatch's output (which also shows that exactly the 3 groups the
 // first dispatch asked for ran).
@@ -331,11 +332,17 @@ int main() {
             return SUCCEEDED(compute_queue->Wait(copy_fence.p, 1)) && execute(compute_queue.p, compute_list.p) &&
                    SUCCEEDED(compute_queue->Signal(compute_fence.p, 1));
         };
-        // The compute list goes last, after the copy-queue list that reads its results (the copy queue keeps its own
-        // order): a list that waits for a Signal submitted later is held by the layer
-        // until it has been, so its layouts follow the dependency order (docs section 4.4; d3d12_queue_handover_test
-        // covers every order).
-        EXPECT(submit_copy() && submit_readback() && submit_compute());
+        // The compute list goes first, before the copy that feeds it: it waits for a Signal not yet submitted, so the
+        // layer holds it until the copy has been submitted, and its layouts follow the dependency order (docs section
+        // 4.4; d3d12_queue_handover_test covers every order). The application may release what the list uses as soon
+        // as ExecuteCommandLists returns: the pipeline states and the root signature go and the list is Reset, all
+        // while the batch is still held, so the layer has to keep them until it runs.
+        EXPECT(submit_compute());
+        pso_fill.reset();
+        pso_indirect.reset();
+        root.reset();
+        EXPECT(compute_list->Reset(compute_alloc.p, nullptr) == S_OK && compute_list->Close() == S_OK);
+        EXPECT(submit_copy() && submit_readback());
 
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         EXPECT(event != nullptr);

@@ -197,6 +197,8 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
+    const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
 
@@ -1263,6 +1265,30 @@ public:
     // {e1a85d76-0b3f-4c29-a7d4-58f2c6e0b913}
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
+    // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
+    // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
+    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
+        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
+            for (IUnknown* object : *held) object->Release();
+            delete held;
+        });
+        for (const GraphicsCommandList* list : lists)
+            for (IUnknown* object : list->pinned()) {
+                object->AddRef();
+                objects->push_back(object);
+            }
+        return objects;
+    }
+
+    // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
+    static leonida::VulkanQueue::PinFn fence_pin(ID3D12Fence* fence) {
+        return [fence]() -> std::shared_ptr<void> {
+            fence->AddRef();
+            return std::shared_ptr<void>(fence, [](void* held) { static_cast<ID3D12Fence*>(held)->Release(); });
+        };
+    }
+
     static leonida::VulkanQueue::QueueKind queue_kind_for(D3D12_COMMAND_LIST_TYPE type) {
         if (type == D3D12_COMMAND_LIST_TYPE_COPY) return leonida::VulkanQueue::QueueKind::copy;
         if (type == D3D12_COMMAND_LIST_TYPE_COMPUTE) return leonida::VulkanQueue::QueueKind::compute;
@@ -1283,7 +1309,11 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
-    leonida::ReplayResult last_result() const { return last_result_; }
+    leonida::ReplayResult last_result() {
+        // A batch the queue held fails when it is released, after the call returned: the failure is the result.
+        if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
+        return last_result_;
+    }
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
@@ -1296,6 +1326,7 @@ public:
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
         std::vector<const leonida::CommandList*> recorded;
+        std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
             const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
             if (!list || list->type() == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
@@ -1310,8 +1341,9 @@ public:
                 return;
             }
             recorded.push_back(&list->commands());
+            graphics.push_back(list);
         }
-        last_result_ = queue_.execute(recorded);
+        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
@@ -1369,7 +1401,7 @@ public:
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
         if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, fence_pin(fence)) ? S_OK : E_FAIL);
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
@@ -1377,7 +1409,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value);
+        queue_.wait(f->semaphore(), value, fence_pin(fence));
         return d3d12_trace::result(method, S_OK);
     }
 
@@ -1713,7 +1745,7 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
-    const CommandQueue* q = CommandQueue::from(queue);
+    CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
 }
 

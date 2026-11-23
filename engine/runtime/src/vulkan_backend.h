@@ -1572,6 +1572,7 @@ public:
         auto& vk = context_.vk;
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
+        context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1678,10 +1679,17 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
     // earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
     // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
-    // Signal), which is also where its errors are reported.
-    ReplayResult execute(std::span<const CommandList* const> lists) {
+    // Signal), which is also where its errors are reported (stderr, and take_held_failure()).
+    //
+    // `pin`, called only when the batch is held, returns what has to stay alive until the batch has run: the COM layer
+    // passes the pipeline states and root signatures the lists named (the application may release them and Reset
+    // the lists as soon as the call returns).
+    using PinFn = std::function<std::shared_ptr<void>()>;
+
+    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
         ReplayResult result = ReplayResult::success;
         bool held = false;
+        std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
@@ -1693,18 +1701,23 @@ public:
                 op.kind = Deferred::Kind::batch;
                 op.lists.reserve(lists.size());
                 for (const CommandList* list : lists) op.lists.push_back(*list);
+                if (pin) op.pins.push_back(pin());
                 hold(std::move(op));
                 held = true;
             }
+            drain_pins(retired);
         }
+        retired.clear();
         if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
         return result;
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
-    // held operations, so the fence does not run ahead of the work it follows.
-    bool signal(VkSemaphore fence, std::uint64_t value) {
+    // held operations, so the fence does not run ahead of the work it follows. `pin` (called only when the Signal is
+    // held) keeps the fence object alive until it has been submitted, as D3D12 does.
+    bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
         bool ok = true;
+        std::vector<std::shared_ptr<void>> retired;
         {
             std::lock_guard state(state_mutex_);
             if (must_hold()) {
@@ -1712,27 +1725,45 @@ public:
                 op.kind = Deferred::Kind::signal;
                 op.fence = fence;
                 op.value = value;
+                if (pin) op.pins.push_back(pin());
                 hold(std::move(op));
             } else {
                 ok = submit(VK_NULL_HANDLE, fence, value);
             }
+            drain_pins(retired);
         }
+        retired.clear();
         context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready
         return ok;
     }
 
     // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
     // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
-    void wait(VkSemaphore fence, std::uint64_t value) {
-        std::lock_guard state(state_mutex_);
-        waits_.push_back(fence);
-        wait_values_.push_back(value);
+    // `pin` returns what keeps the fence object alive until then (a D3D12 queue holds its fences).
+    void wait(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
+        std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
+        {
+            std::lock_guard state(state_mutex_);
+            waits_.push_back(fence);
+            wait_values_.push_back(value);
+            if (pin) wait_pins_.push_back(pin());
+            drain_pins(retired);
+        }
+    }
+
+    // The first failure of a held ExecuteCommandLists since the last call (what the call would have returned had it
+    // not been held), or success. A Signal behind a failed batch still signals, as when the failure is not held: the
+    // work did not run, the application is told here and on stderr, and nothing waits forever.
+    ReplayResult take_held_failure() {
+        return static_cast<ReplayResult>(held_failure_.exchange(static_cast<int>(ReplayResult::success)));
     }
 
     // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
     // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
     void marker(DebugMarker::Kind kind, const char* label) {
+        std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
+        drain_pins(retired);  // destroyed after the lock (reverse declaration order)
         if (!held_.empty()) {  // behind the held work, so behind it in the queue's labels too
             Deferred op;
             op.kind = Deferred::Kind::marker;
@@ -2156,6 +2187,7 @@ private:
     struct Deferred {
         enum class Kind : std::uint8_t { batch, signal, marker };
         Kind kind = Kind::batch;
+        std::uint64_t seq = 0;  // QueueHolds::next_seq(): the order operations were held in, across queues
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
         std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
@@ -2163,6 +2195,10 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        // Alive until the operation has run: the fences it waits on and signals, the pipeline states and root
+        // signatures of the lists (the application may release them right after the call).
+        std::vector<std::shared_ptr<void>> pins;
+        std::vector<std::shared_ptr<void>> wait_pins;  // the fences of `waits`
     };
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
@@ -2175,32 +2211,75 @@ private:
     // has no submitted Signal yet. Called with state_mutex_ held.
     bool must_hold() const { return !held_.empty() || waits_pending(waits_, wait_values_); }
 
+    // The waits are consumed: submitted as `ticket` (0: dropped on device loss). What the application may release
+    // (the fences they named) is kept until that submission has completed on the GPU, as a D3D12 queue does:
+    // destroying a semaphore a pending submission uses is a validation error. Retired pins are destroyed by the
+    // caller after state_mutex_ is released (drain_pins): the last release of a fence waits for a running release,
+    // which must not be waiting for this lock.
+    void clear_waits(std::uint64_t ticket = 0) {
+        waits_.clear();
+        wait_values_.clear();
+        retire_pins(wait_pins_, ticket);
+    }
+
+    void retire_pins(std::vector<std::shared_ptr<void>>& pins, std::uint64_t ticket) {
+        for (auto& pin : pins) {
+            if (ticket) pin_queue_.push_back({ticket, std::move(pin)});
+            else retired_pins_.push_back(std::move(pin));
+        }
+        pins.clear();
+    }
+
+    // Moves the pins whose submission has completed (and the ones retired outright) to `out`. state_mutex_ held.
+    void drain_pins(std::vector<std::shared_ptr<void>>& out) {
+        out.swap(retired_pins_);
+        if (pin_queue_.empty()) return;
+        const std::uint64_t done = completed();
+        while (!pin_queue_.empty() && pin_queue_.front().ticket <= done) {
+            out.push_back(std::move(pin_queue_.front().pin));
+            pin_queue_.pop_front();
+        }
+    }
+
     // Appends `op`, which takes the pending waits with it (a marker has none). Called with state_mutex_ held.
     void hold(Deferred&& op) {
+        op.seq = context_.holds().next_seq();
         if (op.kind != Deferred::Kind::marker) {
             op.waits = std::move(waits_);
             op.wait_values = std::move(wait_values_);
+            op.wait_pins = std::move(wait_pins_);
             waits_.clear();
             wait_values_.clear();
+            wait_pins_.clear();
         }
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
     }
 
     // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
+    // A submission that fails leaves its waits for the next one, as when the call is not held (a transient
+    // vkQueueSubmit failure is retried by the application's next call), ahead of the waits asked for since.
     void run(Deferred& op) {
         auto later_waits = std::move(waits_);
         auto later_values = std::move(wait_values_);
+        auto later_pins = std::move(wait_pins_);
         waits_ = std::move(op.waits);
         wait_values_ = std::move(op.wait_values);
+        wait_pins_ = std::move(op.wait_pins);  // the fences stay alive until the submission has consumed their waits
         switch (op.kind) {
         case Deferred::Kind::batch: {
             std::vector<const CommandList*> lists;
             for (const CommandList& list : op.lists) lists.push_back(&list);
+            // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
+            // the batch has been recorded and then, with the fences, until its submission has completed (below).
             const ReplayResult result = execute_now(lists);
-            if (result != ReplayResult::success)
+            if (result != ReplayResult::success) {
+                int none = static_cast<int>(ReplayResult::success);
+                held_failure_.compare_exchange_strong(none, static_cast<int>(result));
                 std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "
-                                     "nothing was submitted\n", static_cast<int>(result));
+                                     "nothing was submitted for it, and a Signal behind it still signals\n",
+                             static_cast<int>(result));
+            }
             break;
         }
         case Deferred::Kind::signal:
@@ -2211,55 +2290,83 @@ private:
             marker_now(op.marker_kind, op.label.c_str());
             break;
         }
-        waits_ = std::move(later_waits);  // a failed submission leaves its waits behind: drop them with the batch
-        wait_values_ = std::move(later_values);
+        retire_pins(op.pins, submitted_);  // the fence it signals, the pipeline states: until its submission is done
+        waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
+        wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
+        for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
     }
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
-        std::lock_guard state(state_mutex_);
+        std::vector<std::shared_ptr<void>> retired;
         bool released = false;
-        while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
-            Deferred op = std::move(held_.front());
-            held_.pop_front();
-            context_.holds().held_changed(-1);
-            if (!context_.is_device_lost()) run(op);
-            released = true;
+        {
+            std::lock_guard state(state_mutex_);
+            while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
+                Deferred op = std::move(held_.front());
+                held_.pop_front();
+                context_.holds().held_changed(-1);
+                if (!context_.is_device_lost()) run(op);
+                released = true;
+            }
+            drain_pins(retired);
         }
         return released;
     }
 
     // Holder: the fence is released, so what waits on it can never run.
     void discard_waiting_on(VkSemaphore semaphore) override {
-        std::lock_guard state(state_mutex_);
-        for (auto it = held_.begin(); it != held_.end();) {
-            if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
-                ++it;
-                continue;
+        std::vector<Deferred> dropped;
+        {
+            std::lock_guard state(state_mutex_);
+            for (auto it = held_.begin(); it != held_.end();) {
+                if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end() &&
+                    !(it->kind == Deferred::Kind::signal && it->fence == semaphore)) {
+                    ++it;
+                    continue;
+                }
+                std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work that names it; "
+                                     "that work is dropped\n");
+                dropped.push_back(std::move(*it));
+                it = held_.erase(it);
+                context_.holds().held_changed(-1);
             }
-            std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
-                                 "that work is dropped\n");
-            it = held_.erase(it);
-            context_.holds().held_changed(-1);
         }
     }
 
-    // A queue destroyed with held work: the fence it waits on was never signaled. Reported, not waited for; nothing
-    // was submitted for it, so the VkQueue is idle and the destructor goes on.
-    void report_held_at_teardown() {
+    // Holder: the sequence number of the oldest held operation.
+    std::uint64_t oldest_held_seq() override {
         std::lock_guard state(state_mutex_);
-        if (held_.empty()) return;
-        std::uint64_t value = 0;
-        for (const Deferred& op : held_)
-            for (std::size_t i = 0; i < op.waits.size() && !value; ++i)
-                if (context_.holds().pending(op.waits[i], op.wait_values[i])) value = op.wait_values[i];
-        std::fprintf(stderr, "[rt] d3d12: queue destroyed with %zu held operation(s) never submitted: waits for a "
-                             "fence value (%llu) that no Signal reached; the fence was never signaled\n",
-                     held_.size(), static_cast<unsigned long long>(value));
-        context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
-        held_.clear();
+        return held_.empty() ? 0 : held_.front().seq;
+    }
+
+    // A queue destroyed with held work. Reported, not waited for: nothing was submitted for it, so the VkQueue is
+    // idle and the destructor goes on. The fences of held Signals will never reach their values, so what is waiting
+    // for them on the CPU (SetEventOnCompletion, as a released fence completes them) is woken, and the batches
+    // that wait for them on other queues stay held (and are reported when those queues are destroyed).
+    void report_held_at_teardown() {
+        std::deque<Deferred> dropped;
+        {
+            std::lock_guard state(state_mutex_);
+            if (held_.empty()) return;
+            std::uint64_t value = 0;
+            for (const Deferred& op : held_)
+                for (std::size_t i = 0; i < op.waits.size() && !value; ++i)
+                    if (context_.holds().pending(op.waits[i], op.wait_values[i])) value = op.wait_values[i];
+            std::size_t signals = 0;
+            for (const Deferred& op : held_) signals += op.kind == Deferred::Kind::signal;
+            std::fprintf(stderr, "[rt] d3d12: queue destroyed with %zu held operation(s) never submitted: waits for a "
+                                 "fence value (%llu) that no Signal reached; the fence was never signaled%s\n",
+                         held_.size(), static_cast<unsigned long long>(value),
+                         signals ? "; CPU waits on the fences of its held Signals are completed" : "");
+            for (const Deferred& op : held_)
+                if (op.kind == Deferred::Kind::signal) context_.cancel_fence_waits(op.fence);
+            context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
+            dropped.swap(held_);
+        }
+        // The pins (fences, pipeline states) are released here, outside the lock.
     }
 
     struct CommandSlot {
@@ -2396,8 +2503,7 @@ private:
             context_.record_submit_locked(progress_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
-        waits_.clear();
-        wait_values_.clear();
+        clear_waits(ticket);
         for (auto it = changes.begin(); it != changes.end();) {
             resource->mapped.erase(it->first);
             if (it->second.heap) ++it;
@@ -2490,7 +2596,12 @@ private:
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
-            if (fence) {
+            // Decided under the submit lock, so the order of the checks is the order of the submissions. A Signal
+            // that is not above what was already submitted for this fence (a held Signal(F, 2) released after an
+            // unheld Signal(F, 3)) leaves the Vulkan signal out: the timeline cannot go down, and waits for 2 pass.
+            // The value counts as submitted only after the submit succeeded (below).
+            const bool signals_fence = fence && context_.holds().would_signal(fence, value);
+            if (signals_fence) {
                 signals[signal_count] = fence;
                 signal_values[signal_count] = value;
                 ++signal_count;
@@ -2509,20 +2620,20 @@ private:
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
-            if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
+            if (res == VK_SUCCESS) {
+                context_.record_submit_locked(progress_, ticket);
+                if (signals_fence) context_.holds().signaled(fence, value);
+            }
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();
-            waits_.clear();
-            wait_values_.clear();
+            clear_waits();
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {
-            if (fence) context_.holds().signaled(fence, value);  // held batches waiting for it: the caller pumps
             submitted_ = ticket;
-            waits_.clear();
-            wait_values_.clear();
+            clear_waits(ticket);
             for (auto& slot : buffers_)
                 if (slot.buffer == command_buffer) slot.ticket = ticket;
         }
@@ -2554,6 +2665,14 @@ private:
     // guards the members above that execute, signal, wait and marker touch.
     std::mutex state_mutex_;
     std::deque<Deferred> held_;
+    std::vector<std::shared_ptr<void>> wait_pins_;     // keep the fences of waits_ alive
+    std::vector<std::shared_ptr<void>> retired_pins_;  // released by the caller once state_mutex_ is dropped
+    struct TicketedPin {
+        std::uint64_t ticket;
+        std::shared_ptr<void> pin;
+    };
+    std::deque<TicketedPin> pin_queue_;  // released once progress_ reaches the ticket
+    std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
 };
 
 } // namespace leonida

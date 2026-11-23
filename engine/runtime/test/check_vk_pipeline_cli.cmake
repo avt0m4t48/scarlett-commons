@@ -35,9 +35,24 @@ function(check_protected_input name)
 endfunction()
 
 file(WRITE "${TEST_DIR}/skip.txt" "example\n")
+file(SHA256 "${TEST_DIR}/index.json" index_before)
+file(SHA256 "${TEST_DIR}/skip.txt" skip_before)
 check_protected_input("index.json" "${TEST_DIR}/index.json")
 check_protected_input("index.json" --stats "${TEST_DIR}/./index.json")
 check_protected_input("--skip-file" --skip-file "${TEST_DIR}/skip.txt" --inflight-file "${TEST_DIR}/skip.txt")
+
+# A hard link has a distinct path even after normalization. Some filesystems cannot create one.
+file(CREATE_LINK "${TEST_DIR}/skip.txt" "${TEST_DIR}/skip-link.txt" RESULT hard_link)
+if(hard_link STREQUAL "0")
+  check_protected_input("--skip-file" --skip-file "${TEST_DIR}/skip.txt" --inflight-file "${TEST_DIR}/skip-link.txt")
+  file(REMOVE "${TEST_DIR}/skip-link.txt")
+endif()
+
+file(SHA256 "${TEST_DIR}/index.json" index_after)
+file(SHA256 "${TEST_DIR}/skip.txt" skip_after)
+if(NOT index_before STREQUAL index_after OR NOT skip_before STREQUAL skip_after)
+  message(FATAL_ERROR "Input/output conflicts modified the index or the skip file")
+endif()
 
 execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
                 --jobs 2 --start 3 --count 0 --max-bytes 0 --large-module-bytes 0

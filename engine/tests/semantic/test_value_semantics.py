@@ -46,6 +46,13 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
     into EXEC or VCC
+  v_add_lshl_u32        D = (S0 + S1) << (S2 & 31).   v_and_or_b32  D = (S0 & S1) | S2.   v_xor3_b32  D = S0 ^ S1 ^ S2.
+  v_bfi_b32             D = (S0 & S1) | (~S0 & S2).   v_bfm_b32  D = ((1 << (S0 & 31)) - 1) << (S1 & 31).
+  v_bfrev_b32           D = S0 with its 32 bits in reverse order.
+  v_mad_i32_i24         D = sext24(S0) * sext24(S1) + S2 (low 32 bits); bits 24-31 of S0/S1 are ignored.
+  v_mul_hi_u32_u24      D = (zext24(S0) * zext24(S1)) >> 32.
+  v_min/max_i32/u32,    the smallest / largest operand, compared signed (_i32) or unsigned (_u32).
+  v_min3/max3_i32/u32
   v_cmp(x)_*_f32        GE/LG/O and the other ordered compares are false when either source is NaN; the N forms
                           (NGE = !(S0 >= S1), NGT, NLE, NLT, NEQ) are their negations, so true on NaN; F = 0, TRU = 1.
   v_cmp(x)_*_u64/_i64   the whole 64-bit values compared unsigned / signed (the low word is never signed).
@@ -92,6 +99,13 @@ EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 # ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
 EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
+# ps_vint_*: 32-bit integer VALU ops on the heap VINT_HEAP (h0..h7, the words check.py's VINT_ENV seeds).
+VINT_HEAP = (0xAB800000, 0x12FFFFFE, 0x00000021, 0x80000001, 0x7FFFFFFE, 0xF0F0F0F0, 0x12345678, 0xFFFFFFFF)
+EXPECTED_VINT = {"ps_vint_logic3": [0xFFFFFFFE, 0xBBB05070, 0x1D3B5977, 0x123F5F7E],
+                 "ps_vint_bits": [0xFFFFFFFE, 0x40000000, 0x1E6A2C48, 0x000001D5],
+                 "ps_vint_mul24": [0x13345678, 0xFFFFFFFD, 0x00007FFF, 0x0000FFFF],
+                 "ps_vint_minmax": [0x7FFFFFFE, 0x80000001, 0x80000001, 0x7FFFFFFE],
+                 "ps_vint_minmax3": [0xF0F0F0F0, 0xAB800000, 0xF0F0F0F0, 0xAB800000]}
 EXPECTED_VCMP_F32_NAN = [0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7]   # derivation in ps_vcmp_f32_nan.asm
 EXPECTED_VCMP_64 = [0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93]        # derivation in ps_vcmp_64.asm
 EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # derivation in cs_w32_andn2_exec.asm
@@ -353,6 +367,28 @@ def reference_sdwa_f16_const():
     return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
 
 
+def reference_vint():
+    """The ps_vint_* words from the ISA definitions, on the operands each .asm passes (hN = VINT_HEAP[N])."""
+    h = VINT_HEAP
+    m = 0xFFFFFFFF
+    def i32(x):
+        return x - (1 << 32) if x & 0x80000000 else x
+    def s24(x):
+        x &= 0xFFFFFF
+        return x - (1 << 24) if x & 0x800000 else x
+    def bfm(size, offset):
+        return (((1 << (size & 31)) - 1) << (offset & 31)) & m
+    def bfrev(x):
+        return int(f"{x:032b}"[::-1], 2)
+    return {"ps_vint_logic3": [((h[3] + h[4]) << (h[2] & 31)) & m, (h[6] & h[5]) | h[0], h[5] ^ h[6] ^ h[7],
+                               (h[5] & h[6]) | (~h[5] & h[1] & m)],
+            "ps_vint_bits": [bfm(h[7], h[2]), bfm(h[2], h[1]), bfrev(h[6]), bfrev(h[0])],
+            "ps_vint_mul24": [(s24(h[0]) * s24(h[1]) + h[6]) & m, (s24(h[4]) * s24(h[3]) + h[7]) & m,
+                              ((h[0] & 0xFFFFFF) * (h[1] & 0xFFFFFF)) >> 32,
+                              ((h[7] & 0xFFFFFF) * (h[7] & 0xFFFFFF)) >> 32],
+            "ps_vint_minmax": [max(h[3], h[4], key=i32), min(h[3], h[4], key=i32), max(h[3], h[4]), min(h[3], h[4])],
+            "ps_vint_minmax3": [max(h[4], h[3], h[5]), max(h[0], h[6], h[3]), min(h[5], h[4], h[6], key=i32),
+                                min(h[7], h[6], h[0], key=i32)]}
 def _pack_nibbles(ops, pairs, test):
     """Bit 4*k + i of the word: op k on pair i."""
     return sum(int(test(op, *pair)) << (4 * k + i) for k, op in enumerate(ops) for i, pair in enumerate(pairs))
@@ -456,6 +492,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
         self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
+        self.assertEqual(reference_vint(), EXPECTED_VINT)
         self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
         self.assertEqual(reference_vcmp_64(), EXPECTED_VCMP_64)
         self.assertEqual(reference_andn2_exec(), EXPECTED_ANDN2_EXEC)
@@ -673,6 +710,15 @@ class TranslatorValueSemantics(unittest.TestCase):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+    def test_int_valu_sign_extension_shift_masks_and_min_max_signedness(self):
+        # The ps_vint_* GPU fixtures, inputs from memory: 24-bit operands with bit 23 set and garbage in bits
+        # 24-31, shift amounts and field sizes of 32 and more (taken mod 32), and the same operand pair compared
+        # signed and unsigned. The operand choices and the wrong answers they catch are in the .asm headers.
+        push = [0x1000, 0, 32, 0] + [0] * 28
+        for name, want in EXPECTED_VINT.items():
+            self.check(name, want, push_constants=push,
+                       memory={0x1000 + 4 * i: w for i, w in enumerate(VINT_HEAP)})
 
     def test_vcmp_f32_ordered_and_unordered_with_nan(self):
         # ge/lg/o (ordered) are false with a NaN source, nge/ngt/nle/nlt/neq (unordered) true; v_cmp e32 into VCC,

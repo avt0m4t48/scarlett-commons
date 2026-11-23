@@ -387,6 +387,13 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # f32 VOPC ordered/unordered with a NaN, 64-bit integer VOPC (derivations in the .asm headers)
               "ps_vcmp_f32_nan": (0x0000376c, 0x0000fd5b, 0x0000d36c, 0x00000fe7),
               "ps_vcmp_64": (0x0000b3c4, 0x000091e6, 0x00006787, 0x00007c93),
+              # 32-bit integer VALU ops on the VINT_ENV heap: 24-bit sign extension, shifts of 32+, signed vs unsigned
+              # min/max (derivations in the .asm headers)
+              "ps_vint_logic3": (0xfffffffe, 0xbbb05070, 0x1d3b5977, 0x123f5f7e),
+              "ps_vint_bits": (0xfffffffe, 0x40000000, 0x1e6a2c48, 0x000001d5),
+              "ps_vint_mul24": (0x13345678, 0xfffffffd, 0x00007fff, 0x0000ffff),
+              "ps_vint_minmax": (0x7ffffffe, 0x80000001, 0x80000001, 0x7ffffffe),
+              "ps_vint_minmax3": (0xf0f0f0f0, 0xab800000, 0xf0f0f0f0, 0xab800000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
@@ -394,6 +401,11 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
 # not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot
 # require 64 there (NVIDIA: 32 only; llvmpipe: 8) has no frame to judge: the test is skipped, not failed.
 WIDE_PIXEL_TESTS = {"ps_w64x_readlane": 64}
+# h0..h7 of the ps_vint_* fixtures: 24-bit fields with bit 23 set and garbage above, 33 (a shift of 32+), a
+# negative i32 that is a large u32, and plain bit patterns.
+VINT_ENV = {"VKH_SGPRS": "0x1000,0,32,0",
+            "VKH_HEAP": "0x1000=0xab800000,0x1004=0x12fffffe,0x1008=0x00000021,0x100c=0x80000001,"
+                        "0x1010=0x7ffffffe,0x1014=0xf0f0f0f0,0x1018=0x12345678,0x101c=0xffffffff"}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -416,7 +428,13 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
              "ps_vcmp_64": {"VKH_SGPRS": "0x1000,0,64,0",
                             "VKH_HEAP": "0x1000=0x80000000,0x1004=0,0x1008=1,0x100c=0,0x1010=0xffffffff,"
                                         "0x1014=0xffffffff,0x1018=1,0x101c=0,0x1020=1,0x1024=0,0x1028=0x80000000,"
-                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"}}
+                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 TEXTURE_CONSTANTS = {

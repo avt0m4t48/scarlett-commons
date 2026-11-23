@@ -42,7 +42,7 @@ from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
-from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
+from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
@@ -424,7 +424,13 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
              "ps_vcmp_64": {"VKH_SGPRS": "0x1000,0,64,0",
                             "VKH_HEAP": "0x1000=0x80000000,0x1004=0,0x1008=1,0x100c=0,0x1010=0xffffffff,"
                                         "0x1014=0xffffffff,0x1018=1,0x101c=0,0x1020=1,0x1024=0,0x1028=0x80000000,"
-                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"}}
+                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
@@ -1285,6 +1291,12 @@ def run_suite(a, work: str) -> int:
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
                 "ps_vcmp_f32_nan": (0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7),   # from the .asm headers
                 "ps_vcmp_64": (0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93),
+                # 32-bit integer VALU ops on VINT_ENV's heap (derivations in the .asm headers)
+                "ps_vint_logic3": (0xFFFFFFFE, 0xBBB05070, 0x1D3B5977, 0x123F5F7E),
+                "ps_vint_bits": (0xFFFFFFFE, 0x40000000, 0x1E6A2C48, 0x000001D5),
+                "ps_vint_mul24": (0x13345678, 0xFFFFFFFD, 0x00007FFF, 0x0000FFFF),
+                "ps_vint_minmax": (0x7FFFFFFE, 0x80000001, 0x80000001, 0x7FFFFFFE),
+                "ps_vint_minmax3": (0xF0F0F0F0, 0xAB800000, 0xF0F0F0F0, 0xAB800000),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge

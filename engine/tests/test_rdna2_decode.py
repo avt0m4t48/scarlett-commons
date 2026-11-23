@@ -47,6 +47,49 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_image_atomic_data_width(self):
+        for opcode, name, mask, data in (
+            (0x17, "umax", 1, "v16"), (0x17, "umax", 3, "v[16:17]"),
+            (0x10, "cmpswap", 3, "v[16:17]"), (0x10, "cmpswap", 15, "v[16:19]"),
+        ):
+            for glc in (0, 1):
+                with self.subTest(name=name, mask=mask, glc=glc):
+                    code = words(0xf0001008 | opcode << 18 | mask << 8 | glc << 13, 0x00021004)
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    asm = (f"image_atomic_{name} {data}, v[4:5], s[8:15] "
+                           f"dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D unorm" + (" glc" if glc else ""))
+                    expected = shader_ir.parse_line(asm)
+                    for field in ("op", "args", "mods"):
+                        self.assertEqual(ins[field], expected[field])
+
+    def test_image_slc_is_independent_of_sampler(self):
+        for sampler in (0, 64):
+            for slc in (0, 1):
+                with self.subTest(sampler=sampler, slc=slc):
+                    code = words(0xF0800108 | (slc << 25), 0x0004090A | ((sampler // 4) << 21))
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    self.assertEqual(ins["args"][-1]["r"], sampler)
+                    self.assertEqual("slc" in ins["mods"], bool(slc))
+
+    def test_mix_source_modifiers(self):
+        # LLVM gfx1013: v17, -v19, |v21|, -|v23| across all three mix variants.
+        for opcode, name in enumerate(("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16")):
+            with self.subTest(name=name):
+                code = words(0xCC200611 + (opcode << 16), 0xA45E2B13)
+                ins, = rdna2_decode.decode_bytes(code)["insns"]
+                expected = shader_ir.parse_line(f"{name} v17, -v19, |v21|, -|v23|")
+                self.assertEqual((ins["op"], ins["args"], ins["mods"]),
+                                 (name, expected["args"], expected["mods"]))
+
+    def test_vop3_legacy_mad_fma_target(self):
+        code = words(0xD5400001, 0x04120702)
+        self.assertEqual(rdna2_decode.decode_bytes(code)["insns"][0]["op"], "v_mad_legacy_f32")
+        for cpu, op in (("gfx1013", "v_mad_legacy_f32"), ("gfx1030", "v_fma_legacy_f32")):
+            with self.subTest(cpu=cpu):
+                asm, invalid, _ = shader_disasm.disasm(code, cpu, backend="python")
+                self.assertEqual(invalid, 0)
+                self.assertIn(op + " v1, v2, v3, v4", asm)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000

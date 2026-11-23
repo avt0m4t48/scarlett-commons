@@ -70,7 +70,7 @@ def probe(mcpu: str) -> None:
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
     if backend == "python":
-        asm, bad = rdna2_decode.disasm_bytes(code, wave32=wave32)
+        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:

@@ -205,11 +205,19 @@ class InterpreterTests(unittest.TestCase):
                                       "OpStore %out %res\n" + FOOTER)
                 self.assertEqual(out["%out"], (1,))
 
+    def test_glsl_integer_operations_reject_mixed_component_widths(self):
+        for inst in ("SAbs %cl_1", "SMin %c0 %cl_1", "SMax %cl_1 %c0",
+                     "SClamp %c0 %c0 %cl_1", "FindILsb %cl_1", "FindSMsb %cl_1", "FindUMsb %cl_1"):
+            with self.subTest(inst=inst):
+                body = f"%res = OpExtInst %uint %glsl {inst}\n"
+                with self.assertRaisesRegex(si.UnsupportedConstruct, "64-bit.*32-bit"):
+                    si.run_fragment(self.WIDE + body + "OpStore %out %res\n" + FOOTER)
+
     def test_find_bit_of_a_64bit_operand_is_rejected(self):
         # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
         for name in ("FindILsb", "FindSMsb", "FindUMsb"):
             with self.subTest(name=name):
-                with self.assertRaises(si.UnsupportedConstruct):
+                with self.assertRaisesRegex(si.UnsupportedConstruct, "64-bit"):
                     si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n"
                                     "%res = OpUConvert %uint %r\nOpStore %out %res\n" + FOOTER)
 

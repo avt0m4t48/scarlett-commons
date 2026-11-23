@@ -452,11 +452,12 @@ struct ChildProxy {
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
     // Queues only: the console runtime layout this title was built against (docs/d3d12_xs_console_abi.md §4),
-    // detected by a fence reaching slot 16/17. Unused on fences and allocators.
+    // detected by a fence reaching slot 16/17. Unused on fences and allocators. Concurrent Signal/Wait calls
+    // on the same queue can race the detection write, so it is atomic like the shared device flag.
     static constexpr unsigned char kQueueLayoutUnknown = 0;
     static constexpr unsigned char kQueueLayoutOlder = 1;   // PC order; PresentX 30, SignalX 23
     static constexpr unsigned char kQueueLayoutNewer = 2;   // +2 shift; PresentX 32, SignalX 25
-    unsigned char queue_layout = kQueueLayoutUnknown;
+    std::atomic<unsigned char> queue_layout{kQueueLayoutUnknown};
 };
 
 template <ChildKind K>

@@ -43,7 +43,8 @@ function, so the test is not in sight of the stop. This finds it, with nothing r
 With `--any` the address may be any instruction, for example the `xor eax, eax` of a `return 0` path or the start of
 a fallback. Steps 2 to 5 then name the branches that decide whether it runs, and step 6 is skipped. With
 `--returns` the address may be anywhere in a function. Each value the function can return in rax (a constant with
-its value, a call's result, an argument, a load) is found over every path into each `ret`, through register copies.
+its value, a call's result, an argument, a load) is found over the paths into each `ret` that the bounded search
+recovers (up to a step and source limit; the report says when it stopped there), through register copies.
 For each value, the instruction that sets it is read as with `--any`. A function that returns through a tail jump
 is not read past the jump.
 
@@ -521,8 +522,8 @@ def trace(image: Image, func, k: int, reg: int, level: int = 0):
 
 
 def trace_paths(image: Image, func, k: int, reg: int, budget: int = 4000, limit: int = 64):
-    """Every source of `reg` before the instruction at index k, over all the paths into it (each instruction and
-    register visited once, up to `budget` steps and `limit` sources)."""
+    """The sources of `reg` before the instruction at index k, over the paths into it the search recovers (each
+    instruction and register visited once, up to `budget` steps and `limit` sources)."""
     insns, _, into = image.flow(func)
     found, seen, stack, steps = [], set(), [(k, reg, False, False)], 0
     while stack and steps < budget and len(found) < limit:
@@ -679,8 +680,8 @@ def explain(image: Image, seed: int, depth: int, seen: set, stop: bool = True):
 
 
 def returns(image: Image, rva: int):
-    """What the function holding rva returns in rax: every source over every path into each `ret`, each with the
-    branches that decide whether its instruction runs."""
+    """What the function holding rva returns in rax: the sources over the paths into each `ret` that the bounded
+    search recovers, each with the branches that decide whether its instruction runs."""
     func = image.function(rva)
     if func is None:
         return {"at": rva, "function": None, "note": "no .pdata entry holds it"}

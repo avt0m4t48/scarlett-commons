@@ -47,6 +47,11 @@
 #include "../src/shader_library.h"
 #endif
 
+#ifdef LEONIDA_GUEST_SCENE
+#include "guest_scene_state.h"
+#include <cstdlib>
+#endif
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -286,56 +291,85 @@ int main() {
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
         list->ResourceBarrier(2, barriers);
-        const FLOAT clear[4] = {0.5f, 0.125f, 0.25f, 0.5f};
-        list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        // The first command list already contains the vertex upload. Reuse it for subsequent frames
+        // after the preceding submission's fence has completed and its readback is available.
+        const auto render_frame = [&](UINT64 frame, float x_offset, float bias) -> int {
+            if (frame > 1) {
+                EXPECT(SUCCEEDED(allocator->Reset()));
+                EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
+                auto to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                list->ResourceBarrier(1, &to_target);
+            }
+            const FLOAT clear[4] = {0.5f, 0.125f, 0.25f, 0.5f};
+            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
 
-        list->SetGraphicsRootSignature(root.p);
-        ID3D12DescriptorHeap* heaps[] = {srv_heap.p};
-        list->SetDescriptorHeaps(1, heaps);
-        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VIEWPORT viewport{0, 0, float(target_extent), float(target_extent), 0, 1};
-        const D3D12_RECT scissor{0, 0, LONG(target_extent), LONG(target_extent)};
-        list->RSSetViewports(1, &viewport);
-        list->RSSetScissorRects(1, &scissor);
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            ID3D12DescriptorHeap* heaps[] = {srv_heap.p};
+            list->SetDescriptorHeaps(1, heaps);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const D3D12_VIEWPORT viewport{0, 0, float(target_extent), float(target_extent), 0, 1};
+            const D3D12_RECT scissor{0, 0, LONG(target_extent), LONG(target_extent)};
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-        struct Draw {
-            unsigned slot;
-            float constants[4];  // s2, s3: offset; s4: bias; s5: unused
-            UINT vertices;
-        };
-        const Draw draws[3] = {{0, {0, 0, 0.0f, 0}, 6},     // top left
-                               {0, {1, -1, 0.125f, 0}, 6},  // bottom right: same V#, other constants
-                               {1, {0, 0, 0.25f, 0}, 3}};   // bottom left: the second V#
-        for (const Draw& draw : draws) {
-            list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + std::uint64_t(draw.slot) * step});
-            list->SetGraphicsRoot32BitConstants(1, 4, draw.constants, 0);
-            list->DrawInstanced(draw.vertices, 1, 0, 0);
-        }
+            struct Draw {
+                unsigned slot;
+                float constants[4];  // s2, s3: offset; s4: bias; s5: unused
+                UINT vertices;
+            };
+            const Draw draws[3] = {{0, {x_offset, 0, bias, 0}, 6},     // top left
+                                   {0, {1, -1, 0.125f + bias, 0}, 6},  // bottom right: same V#, other constants
+                                   {1, {0, 0, 0.25f + bias, 0}, 3}};   // bottom left: the second V#
+            for (const Draw& draw : draws) {
+                list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + std::uint64_t(draw.slot) * step});
+                list->SetGraphicsRoot32BitConstants(1, 4, draw.constants, 0);
+                list->DrawInstanced(draw.vertices, 1, 0, 0);
+            }
 
-        D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->ResourceBarrier(1, &to_copy);
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = readback.p;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, target_extent, target_extent, 1, pitch}};
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = target.p;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        EXPECT(list->Close() == S_OK);
-        ID3D12CommandList* lists[] = {list.p};
-        queue->ExecuteCommandLists(1, lists);
+            D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_copy);
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, target_extent, target_extent, 1, pitch}};
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            ID3D12CommandList* lists[] = {list.p};
+            queue->ExecuteCommandLists(1, lists);
 #ifndef LEONIDA_M15_GUEST
-        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
 #endif
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
-        void* mapped = nullptr;
-        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
-        std::memcpy(pixels.data(), mapped, pixels.size() * sizeof(Pixel));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, frame)));
+            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(frame, nullptr)));
+            void* mapped = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+            std::memcpy(pixels.data(), mapped, pixels.size() * sizeof(Pixel));
+            readback->Unmap(0, nullptr);
+            return 0;
+        };
 
+#ifdef LEONIDA_GUEST_SCENE
+        if (std::getenv("LEONIDA_SCENE_MODE")) {
+            guestscene::Session scene;
+            EXPECT(scene.begin());
+            UINT64 count = 0;
+            while (!scene.done()) {
+                EXPECT(scene.step());
+                EXPECT(render_frame(++count, scene.x_offset(), scene.bias()) == 0);
+                EXPECT(scene.finish_frame(pixels.front().data(), target_extent));
+            }
+            EXPECT(scene.finish());
+            std::printf("GUEST_SCENE_PASS frames=%llu\n", static_cast<unsigned long long>(count));
+            return 0;
+        }
+#endif
+        EXPECT(render_frame(1, 0.0f, 0.0f) == 0);
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
         root.reset();

@@ -482,3 +482,30 @@ LEONIDA_D3D12=vulkan LEONIDA_SHADERS="$shaders" wine ./gta6rt.exe --run "$guest"
 
 A passing run exits zero and prints `M1.5 guest: PASS, 4064 of 4096 pixels exact, 32 edge pixels the clear colour`.
 The 32 diagonal pixels must all match the clear colour exactly. The fixture does not create a window.
+
+### A 600-frame headless guest scene
+
+Configure a Windows Vulkan build with `-DLEONIDA_GUEST_SCENE=ON` and static SDL3
+(`SDL3_DIR` or `-DLEONIDA_SDL3_FETCH=ON`). Build `gta6rt` and `tiny_guest_draw`.
+With the shader tools and Python available at configure time, CTest runs the existing
+one-frame test and the scene with `ctest -R "^(d3d12_translated_draw_guest|d3d12_guest_scene)$" -V`.
+For an externally generated M1.5 shader fixture, use the runner directly:
+
+```sh
+python -I scripts/run_guest_scene.py --loader path/to/gta6rt.exe --guest path/to/tiny_guest_draw.exe \
+    --shaders path/to/m15_shaders --out new-scene-run --negative-controls
+```
+
+For Wine, add `--wine path/to/wine`. The runner launches the mapped guest for an
+uninterrupted 600-frame run, a 300-frame save, and a fresh process that restores the
+checkpoint. This opt-in build links a fixture input source into the loader. Scripted keyboard changes feed the SDL virtual pad. GameInput readings
+drive the position of one quad. The guest streams ten 16-byte synthetic palette pages from
+`GAME:\scene.bin` and changes its shader constants. A software reference independently
+predicts the GPU pixel digest for each frame and checks six captured images.
+
+Each run writes frame records, a state file, selected PPM readbacks, and a checkpoint
+where applicable. At the first A-button edge the guest generates a quarter-second PCM
+WAV. Playback is off by default. `--play-audio` requests playback through host WinMM
+and records its result. The runner uses a fresh output directory, or a temporary one
+when `--out` is omitted. The negative controls independently corrupt a scene byte and
+a saved-state byte and require the expected guest errors. This fixture renders offscreen.

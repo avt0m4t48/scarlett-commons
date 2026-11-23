@@ -2328,7 +2328,8 @@ if(TARGET Vulkan::Headers)
     # Opt-in: it needs a Vulkan GPU and the guest cannot tell a missing one from a bug, so default runs are unchanged.
     option(LEONIDA_TEST_GUEST_DRAW
            "Build tiny_guest_draw.exe and run the M1.5 draw through gta6rt --run (needs a Vulkan GPU)" OFF)
-    if(LEONIDA_TEST_GUEST_DRAW)
+    option(LEONIDA_GUEST_SCENE "Build the headless 600-frame synthetic guest test (requires static SDL3)" OFF)
+    if(LEONIDA_TEST_GUEST_DRAW OR LEONIDA_GUEST_SCENE)
       # Share the import stub with the tiny_frame clear/readback guest from PR #3488.
       if(NOT TARGET d3d12_xs_stub)
         add_library(d3d12_xs_stub SHARED test/fixtures/d3d12_xs_stub.cpp test/fixtures/d3d12_xs_stub.def)
@@ -2349,6 +2350,13 @@ if(TARGET Vulkan::Headers)
         OUTPUT_NAME tiny_guest_draw
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/guest_draw/$<CONFIG>"
       )
+      if(LEONIDA_GUEST_SCENE)
+        if(NOT TARGET gta6rt OR NOT TARGET SDL3::SDL3-static OR NOT LEONIDA_SDL3)
+          message(FATAL_ERROR "LEONIDA_GUEST_SCENE requires static SDL3; configure SDL3_DIR or LEONIDA_SDL3_FETCH")
+        endif()
+        target_compile_definitions(tiny_guest_draw PRIVATE LEONIDA_GUEST_SCENE)
+        target_sources(gta6rt PRIVATE test/scene_input_driver.cpp)
+      endif()
       # This guest can use a synthetic fixture produced on another machine. Register the automated test
       # if the tools to generate the fixture are available locally.
       if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING AND TARGET d3d12_translated_draw_test AND TARGET gta6rt)
@@ -2357,6 +2365,13 @@ if(TARGET Vulkan::Headers)
                  COMMAND ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt> -DGUEST=$<TARGET_FILE:tiny_guest_draw>
                          -DFIXTURE=${LEONIDA_M15_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_draw.cmake)
         set_tests_properties(d3d12_translated_draw_guest PROPERTIES TIMEOUT 180)
+        if(LEONIDA_GUEST_SCENE AND Python3_Interpreter_FOUND)
+          add_test(NAME d3d12_guest_scene
+                   COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/run_guest_scene.py"
+                           --loader $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:tiny_guest_draw>
+                           --shaders "${LEONIDA_M15_DIR}" --negative-controls)
+          set_tests_properties(d3d12_guest_scene PROPERTIES TIMEOUT 900)
+        endif()
       else()
         message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
       endif()

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -649,7 +650,29 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="third_party/rpf9-explorer is missing. Download the project with:")
+                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+
+    def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_repo = subprocess.CompletedProcess([], 128)
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", return_value=not_a_repo):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                self.assertNotIn("Install Git", err)
+
+    def test_ensure_submodule_failed_fetch_in_clone_names_the_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", side_effect=results), \
+                 mock.patch.object(make_game, "log"):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="fetching third_party/rpf9-explorer failed")
+                self.assertIn("git submodule update --init --recursive", err)
+                self.assertNotIn("Download ZIP", err)
 
 
 class GameDiscoveryTest(unittest.TestCase):
@@ -867,6 +890,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.write_markers(work, xma=None)  # stopped before the XMA2 step
             self.assertFalse(make_game.assets_exported(work))
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_stopped_export_counts_what_it_already_wrote(self):
+        # Before: a stopped export that had written 277 GB still asked for all 300 GB free, so it couldn't resume.
+        with tempfile.TemporaryDirectory() as work:
+            with mock.patch("make_game.tree_bytes", return_value=277 * 2**30):
+                self.run_preflight(work, free_gb=60)  # 30 for the shaders + 300 - 277
+                self.assert_fails(self.run_preflight, work, free_gb=40, match="about 53 GB is needed")
+
+    def test_tree_bytes_sums_files_under_the_folder(self):
+        with tempfile.TemporaryDirectory() as work:
+            sub = os.path.join(work, "a", "b")
+            os.makedirs(sub)
+            for p, n in ((os.path.join(work, "x"), 3), (os.path.join(sub, "y"), 5)):
+                with open(p, "wb") as f:
+                    f.write(b"\0" * n)
+            self.assertEqual(make_game.tree_bytes(work), 8)
+            self.assertEqual(make_game.tree_bytes(os.path.join(work, "missing")), 0)
 
     def test_marker_with_other_contents_does_not_count(self):
         for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):

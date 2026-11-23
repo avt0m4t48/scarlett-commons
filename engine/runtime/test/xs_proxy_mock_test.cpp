@@ -701,6 +701,15 @@ int check_lists() {
     // Console 43 -> PC 39 (SetComputeRootShaderResourceView): the arena pointer crosses as a GPU VA (the mock
     // device cannot map a real buffer, so the fallback arena translates to the same address).
     EXPECT(hr_of(raw(list, 43, 0, p1)) == S_OK && real->calls[39] == 1 && real->args[39][1] == p1);
+    // The view-struct paths (IASetIndexBuffer console 47 -> PC 43, IASetVertexBuffers console 48 -> PC 44) reach
+    // the real list; the arena VAs inside the views are rewritten in the proxy's copies.
+    D3D12_INDEX_BUFFER_VIEW ib_view{};
+    ib_view.BufferLocation = p1;
+    EXPECT(hr_of(raw(list, 47, word(&ib_view))) == S_OK && real->calls[43] == 1);
+    D3D12_VERTEX_BUFFER_VIEW vb_views[2]{};
+    vb_views[0].BufferLocation = p1;
+    vb_views[1].BufferLocation = 0xDEAD0000;  // a VA outside the arena passes through
+    EXPECT(hr_of(raw(list, 48, 0, 2, word(vb_views))) == S_OK && real->calls[44] == 1);
     // The console tail past the PC chain is refused with E_NOTIMPL only when the mapped PC slot is missing.
     EXPECT(hr_of(raw(list, 146, word(list), 0)) == S_OK && real->calls[80] == 1);  // enhanced Barrier -> GCL7 80
     EXPECT(release(list) == 0 && real->refs == 0);

@@ -432,6 +432,12 @@ int main() {
         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
         std::atomic<bool> stop{false};
         std::atomic<bool> worker_failed{false};
+        // The worker is paced: VulkanQueue::execute() has no back-pressure (it allocates a new command buffer whenever
+        // none has finished), so an unthrottled loop queues thousands of submissions on the shared VkQueue and
+        // present()'s frame fence is signalled only after all of them drain, while the worker keeps contending for
+        // submit_mutex_ and tracker_mutex_ at full CPU. A slow GPU (an iGPU, or several processes sharing one) then
+        // leaves present() stuck for tens of seconds. Draining every few rounds keeps the interleaving, not the backlog.
+        constexpr std::uint64_t drain_every = 8;
         std::thread worker([&] {
             std::uint64_t round = 0;
             while (!stop.load(std::memory_order_relaxed)) {
@@ -450,7 +456,10 @@ int main() {
                 }
                 (void)context.layout(base, 0);
                 for (ResourceId i = 0; i < 32; ++i) context.remove_resource(base + i);
-                ++round;
+                if (++round % drain_every == 0 && !worker_queue.idle()) {
+                    worker_failed.store(true);
+                    break;
+                }
             }
         });
 

@@ -5450,6 +5450,17 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def dst_f64(self, d, value, mods, op):
+        if d["k"] != "vgpr" or d.get("n") != 2:
+            raise Unsupported(op + " destination")
+        result = self.clamp_mods_f64(value, mods)
+        pair = self.tmp()
+        self.emit(f"{pair} = OpBitcast %v2uint_d {result}")
+        for i in range(2):
+            word = self.tmp()
+            self.emit(f"{word} = OpCompositeExtract %uint {pair} {i}")
+            self.dst({"k": "vgpr", "r": d["r"] + i, "n": 1}, word)
+
     def flush_f32_mods(self, v, mods):
         """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
         v = self.flush_f32(v)
@@ -6789,6 +6800,15 @@ class Gen:
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
+        elif op in ("v_cvt_f64_i32", "v_cvt_f64_u32"):
+            self.uses_f64 = True
+            src = self.src_u(a[1])
+            result = self.tmp()
+            if op == "v_cvt_f64_i32":
+                self.emit(f"{result} = OpConvertSToF %double {self.as_int(src)}")
+            else:
+                self.emit(f"{result} = OpConvertUToF %double {src}")
+            self.dst_f64(a[0], result, mods, op)
         elif op in ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64"):
             if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
@@ -6891,16 +6911,7 @@ class Gen:
                     r = self.tmp()
                     self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
                 # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
-                r = self.clamp_mods_f64(r, mods)
-                v2, lo, hi = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
-                self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
-                self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
-                d = a[0]
-                if d["k"] != "vgpr":
-                    raise Unsupported(op + " destination")
-                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
-                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
+                self.dst_f64(a[0], r, mods, op)
         elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
             self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):

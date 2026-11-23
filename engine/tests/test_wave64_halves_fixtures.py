@@ -35,6 +35,8 @@ EXPECT = {
     "ps_w64_a_permlane": ("A", [], []),
     "ps_w64_a_swizzle": ("A", [], []),
     "ps_w64_a_bpermute": ("A", [], []),
+    "ps_w64_a_uniform_vote": ("A", [], []),
+
     "ps_w64_a_discard": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),

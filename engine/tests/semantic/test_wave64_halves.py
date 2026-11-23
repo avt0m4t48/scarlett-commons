@@ -806,6 +806,129 @@ class SccVotePolarity(unittest.TestCase):
             "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
 
 
+UNIFORM = [[0, 0, 0, 0, 9], [0, 0, 0, 0, 1]]     # s4 = 9: the compare 5 < s4 says yes; s4 = 1: no
+VCCZ_SIDES = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+              "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+
+
+class UniformVote(unittest.TestCase):
+    """A vote on a compare of a wave-uniform value made while EXEC is the launch mask is no lane vote: the mask is every
+    launch lane or none, so each half votes as the wave does, and both sides may have code (scalars included) of their
+    own. The near misses vote differently in the two halves and must stay tier C."""
+    run_both = Execution.run_both
+
+    def invariant(self, name, body, tier, idioms, want):
+        for push in UNIFORM:
+            t, whole, halves = self.run_both(name, vs(body), push)
+            (_, reasons, got_idioms), _ = meta_of(name, vs(body))
+            self.assertEqual((t, reasons, got_idioms), (tier, [], idioms), name)
+            self.assertEqual(whole, halves, (name, push))
+            self.assertEqual([w[:2] for w in whole], [want(push[4], k) for k in range(64)], (name, push))
+
+    def differs(self, name, body, reason, push=UNIFORM[0]):
+        t, whole, halves = self.run_both(name, vs(body), push)
+        (_, reasons, _), _ = meta_of(name, vs(body))
+        self.assertEqual(t, "C", name)
+        self.assertIn(reason, reasons, name)
+        self.assertNotEqual(whole, halves, name)
+        return whole, halves
+
+    def test_a_vccz_if_else_with_scalars_read_after_the_join(self):
+        self.invariant("vs_uv_vccz", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES, "A", [],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_llvm_and_exec_vccnz(self):
+        self.invariant("vs_uv_and_exec", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccnz 3", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_branch 2", "v_mov_b32_e32 v6, 7",
+            "s_mov_b32 s20, 1", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_uniform_loop_back_edge(self):
+        # s20 counts the trips in an SGPR across the back edge: every half runs s4 of them, as the wave does
+        self.invariant("vs_uv_loop", [
+            "s_mov_b32 s20, 0", "s_add_u32 s20, s20, 1", "v_add_nc_u32_e32 v6, 3, v6", "v_mov_b32_e32 v1, s20",
+            "v_cmp_gt_u32_e32 vcc, s4, v1", "s_cbranch_vccnz -5", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (3 * s4, s4 + k))
+
+    def test_b_readfirstlane_of_a_uniform_value_feeds_the_vote(self):
+        self.invariant("vs_uv_rfl", ["v_mov_b32_e32 v1, s4", "v_readfirstlane_b32 s21, v1", "v_mov_b32_e32 v2, s21",
+                                     "v_cmp_lt_u32_e32 vcc, 5, v2"] + VCCZ_SIDES, "B", ["readfirstlane-uniform"],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_c_compare_under_a_narrowed_exec(self):
+        # EXEC narrowed to lanes 0..31: the second half has no active lane, votes no and sets s20 = 2, which the lanes
+        # of that half read once EXEC is restored; the wave voted yes (s20 = 1)
+        whole, halves = self.differs("vs_uv_narrowed", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1",
+            "s_branch 2", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_mov_b64 exec, s[12:13]",
+            "v_add_nc_u32_e32 v7, s20, v0"], "unsafe-vote-branch")
+        self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
+        self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
+
+    def test_c_half_of_a_uniform_mask_rewritten(self):
+        # s15 (the high half of the uniform mask) is rewritten before the mask becomes VCC: the wave still sees the low
+        # half's bits and votes yes, the second half sees s15 = 0 and votes no
+        name = "vs_uv_half_rewritten"
+        body = vs(["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_mov_b32 s15, 0",
+                   "s_mov_b64 vcc, s[14:15]"] + VCCZ_SIDES)
+        (t, reasons, _), _ = meta_of(name, body)
+        self.assertEqual(t, "C", name)
+        self.assertIn("unsafe-vote-branch", reasons, name)
+
+    def test_c_readfirstlane_of_a_varying_value(self):
+        # the first lane is vertex 0 in the wave and vertex 32 in the second half
+        self.differs("vs_uv_rfl_varying", ["v_readfirstlane_b32 s21, v0", "v_mov_b32_e32 v1, s21",
+                                           "v_cmp_eq_u32_e32 vcc, 0, v1"] + VCCZ_SIDES, "tainted-branch")
+
+    def test_c_compare_on_a_lane_count(self):
+        # 64 lanes in the wave, 32 in a half: 40 < count is yes for the wave, no for each half
+        self.differs("vs_uv_bcnt", ["s_bcnt1_i32_b64 s21, exec", "v_mov_b32_e32 v1, s21",
+                                    "v_cmp_lt_u32_e32 vcc, 40, v1"] + VCCZ_SIDES, "lane-count")
+
+    def test_c_scc_of_a_lane_mask_with_a_uniform_vcc_written_after_it(self):
+        # SCC is the vote of the AND (vertex 1 on: the wave and the first half say yes); the uniform v_cmp after it
+        # writes VCC but not SCC, so the branch still votes on the lane mask
+        self.differs("vs_uv_scc_stale", ["v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, exec, s[16:17]",
+                                         "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_scc0 3"]
+                     + VCCZ_SIDES[1:], "unsafe-vote-branch")
+
+    def test_c_uniform_mask_anded_with_a_lane_mask(self):
+        # only vertex 1 survives the AND: the wave and the first half vote yes, the second half no
+        self.differs("vs_uv_and_lane", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1",
+                                        "v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, vcc, s[16:17]"]
+                     + VCCZ_SIDES, "unsafe-vote-branch")
+
+    def test_c_partial_write_keeps_varying_bits(self):
+        # v1 = lane << 8, then its low byte (SDWA, UNUSED_PRESERVE) or low half (16-bit add) from s4: the sources are
+        # uniform but bits the write keeps are not, so 0x2000 > v1 is yes for lanes 0..31 only (found by @shdann)
+        sides = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+                 "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+        self.differs("vs_uv_sdwa_partial", [
+            "v_lshlrev_b32_e32 v1, 8, v0",
+            "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_gt_u32_e32 vcc, 0x2000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+        self.differs("vs_uv_u16_partial", [
+            "v_lshlrev_b32_e32 v1, 16, v0", "v_add_u16_e64 v1, 1, s4",
+            "v_cmp_gt_u32_e32 vcc, 0x200000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+
+    def test_a_whole_register_16_bit_forms_stay_uniform(self):
+        # a packed convert, a SAD and a VOP2 16-bit integer op write the whole VGPR: uniform sources, uniform result
+        for name, op in (("vs_uv_pkrtz", "v_cvt_pkrtz_f16_f32_e32 v1, s4, v2"), ("vs_uv_sad", "v_sad_u16 v1, s4, 0, v2"),
+                         ("vs_uv_add_u16_e32", "v_add_u16_e32 v1, s4, v2")):
+            (t, reasons, _), _ = meta_of(name, vs(["v_mov_b32_e32 v2, s4", op, "v_cmp_lt_u32_e32 vcc, 5, v1"]
+                                                  + VCCZ_SIDES))
+            self.assertEqual((t, reasons), ("A", []), name)
+
+    def test_a_partial_write_over_a_uniform_register(self):
+        # the kept bits come from s4 too, so the register stays uniform
+        name = "vs_uv_sdwa_uniform"
+        (t, reasons, _), _ = meta_of(name, vs([
+            "v_mov_b32_e32 v1, s4", "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES))
+        self.assertEqual((t, reasons), ("A", []), name)
+
 class KillExit(unittest.TestCase):
     """The early exit of a pixel kill (`s_andn2_b64 live, live, exec/vcc`, `s_cbranch_scc0` to a block that only
     empties EXEC from that mask, exports and ends): a half whose live mask is empty writes nothing there, and in the

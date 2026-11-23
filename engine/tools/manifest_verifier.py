@@ -67,15 +67,22 @@ def _file_stamp(st: os.stat_result) -> tuple[int, int, int]:
 
 def sha256_file(path: str, chunk_size: int = CHUNK, *, expected_size: int | None = None) -> str:
     """Hash a stable open file, refusing a resize, rewrite or path replacement during the read."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
     h = hashlib.sha256()
     with open(path, "rb", buffering=0) as f:
         before = os.fstat(f.fileno())
         if expected_size is not None and before.st_size != expected_size:
             raise OSError(f"{path}: file size changed before hashing")
         remaining = before.st_size
-        while remaining and (chunk := f.read(min(chunk_size, remaining))):
-            h.update(chunk)
-            remaining -= len(chunk)
+        if remaining:
+            with memoryview(bytearray(min(chunk_size, remaining))) as buf:
+                while remaining:
+                    count = f.readinto(buf[:remaining])
+                    if not count:
+                        break
+                    h.update(buf[:count])
+                    remaining -= count
         # Compare handle timestamps to each other; Windows may report different times by path.
         # The final path stat checks that the name still refers to the same open file.
         if (remaining or f.read(1) or _file_stamp(os.fstat(f.fileno())) != _file_stamp(before)
@@ -113,6 +120,8 @@ def load_manifest(path: str) -> dict[str, dict]:
       {"files": {<rel_path>: {"size": <int>, "sha256": <str>}, ...}}
       or flat:
       {<rel_path>: {"size": <int>, "sha256": <str>}, ...}
+    In a flat manifest, `created`, `title`, `version` and `note` are metadata unless
+    their value is an explicit file object with a `sha256` field.
 
     Rejects repeated JSON keys and normalizes relative paths to forward
     slashes and hashes to lowercase hex.
@@ -155,7 +164,8 @@ def load_manifest(path: str) -> dict[str, dict]:
 
     entries: dict[str, dict] = {}
     for raw_rel, info in raw_files.items():
-        if not nested and raw_rel in ("created", "title", "version", "note"):
+        if (not nested and raw_rel in ("created", "title", "version", "note")
+                and not (isinstance(info, dict) and "sha256" in info)):
             continue
         rel = str(raw_rel).replace("\\", "/")
         if rel in entries:

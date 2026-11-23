@@ -104,7 +104,18 @@ imports by name or ordinal, parses the export table, sets section protections, a
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
 first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
-are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+are deduped by basename, so an import graph that reaches the same DLL twice maps it once. The identity
+key uses the filesystem's native path representation with ASCII case folded; it does not require a
+Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
+bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
+and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
+`LoadLibrary`/`GetModuleHandle` API conversions.
+
+`module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
+reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
+`run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
+and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
+trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
 
 MSVC C++ exceptions need one more piece. `_CxxThrowException` stores the throwing image's base in the
 exception record, from `RtlPcToFileHeader`, and the catch side adds the throw's RVAs to it; Windows' own
@@ -341,13 +352,16 @@ from the ANSI code page.
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
 | `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
+| `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
 
 Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
 `host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
-so the process behaves the same with or without the trace. It works with any `LEONIDA_UNIMPLEMENTED` policy.
+so the process behaves the same with or without the trace (except under the diagnostic `LEONIDA_SKIP_INT3`, which
+steps over int3). It works with any `LEONIDA_UNIMPLEMENTED` policy.
 
 The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
 lines from synthetic fixtures only.

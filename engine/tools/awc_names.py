@@ -33,6 +33,7 @@ A JSON inventory from ``awc_manifest.py`` can also supply the bank names and str
 
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
+Usage: `python -I tools/awc_names.py --help` lists the options.
 """
 import argparse
 import collections
@@ -391,7 +392,7 @@ def main(argv=None) -> int:
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,
                          "rule": rule})
-        print(f"{label}: {stats['banks']} banks, {stats['streams']} streams, {stats['named']} named "
+        print(f"{label}: {stats['banks']} banks, {stats['streams']} distinct bank/ID pairs, {stats['named']} named "
               f"({stats['dialogue']} dialogue, {stats['family']} family, family size >= {stats['family_min_size']}); "
               f"control {stats['control_dialogue']} dialogue, {stats['control_family']} family", flush=True)
     if a.out:

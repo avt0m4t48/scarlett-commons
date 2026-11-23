@@ -91,6 +91,8 @@ def _hash(value, digits: int):
         text = text[2:]
     if not text or len(text) > digits:
         return None
+    if any(ch not in "0123456789abcdefABCDEF" for ch in text):
+        return None
     try:
         number = int(text, 16)
     except ValueError:

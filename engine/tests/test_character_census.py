@@ -400,6 +400,34 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(data["summary"]["models"], 1)
         self.assertEqual(data["models"][0]["name"], "synthetic_static")
 
+    def test_signed_and_underscore_hashes_are_not_hashes(self):
+        # Python's int(text, 16) accepts a sign and underscores; the documented grammar is hex digits only.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "models"
+            model = {
+                "name": "synthetic_bad_hashes",
+                "type": "dr",
+                "vertex_count": 0,
+                "triangle_count": 0,
+                "materials": [
+                    {"shader_name_hash": "-1", "textures": [{"hash32": "+1"}]},
+                    {"shader_name_hash": "+1", "textures": [{"hash32": "12_34"}]},
+                    {"shader_name_hash": "12_34", "textures": [{"hash32": "-1"}]},
+                ],
+            }
+            write_json(root / "bad" / "model.json", model)
+            out = pathlib.Path(tmp) / "report.json"
+            result = self.run_tool(root, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            row = self.by_name(data)["synthetic_bad_hashes"]
+            self.assertEqual(row["shaders"], [])
+            self.assertEqual(row["textures"], [])
+            shader_issues = [i for i in row["issues"] if "is not an 8-digit shader hash" in i]
+            texture_issues = [i for i in row["issues"] if "is not a hexadecimal texture key" in i]
+            self.assertEqual(len(shader_issues), 3, row["issues"])
+            self.assertEqual(len(texture_issues), 3, row["issues"])
+
     def test_missing_target_is_a_clean_error(self):
         result = self.run_tool(pathlib.Path(self.temp.name) / "absent")
         self.assertEqual(result.returncode, 2)

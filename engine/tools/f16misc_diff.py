@@ -24,6 +24,9 @@ Seeded straight-line programs run through two independent oracles, and the four 
         Zero gives a signed zero (exponent 0); inf and NaN pass through unchanged (exponent 0).
       - clamp: to [0, 1] after the operation, before the rounding. On frexp_mant / ldexp a negative result and a
         NaN give +0 (measured on gfx1036).
+      - output multipliers (mul:2, mul:4, div:2) change nothing: the hardware ignores them on an f16 result with
+        f16 denormals kept, and clamp still acts; on frexp_exp's integer result clamp changes nothing either
+        (measured on gfx1036, docs/design.md's f16 output modifier and v_frexp/ldexp_f16 rows).
       - destinations: an f16 result goes to the half op_sel's last bit names (the low half for VOP1/VOP2 and
         v_fma_mixlo_f16, the high half for v_fma_mixhi_f16) and the other half is kept; v_pk_fmac_f16 writes both
         halves; v_fma_mix_f32 writes the word.
@@ -48,9 +51,9 @@ its f32 value. Every program is encodable on GFX10: at most one literal, at most
 or VOP3P op, and a VOP2 literal or SGPR only in src0.
 
 Modifiers: neg/abs on the register sources of the VOP3/VOP3P forms (not on ldexp's exponent); op_sel on register
-sources and the destination bit; clamp on min3/max3, frexp_mant, ldexp and the fma_mix ops. Not generated, on
-purpose: output multipliers (whether they apply to f16 results is SHADER-297, open), clamp on v_frexp_exp_i16_f16
-and the modifiers the translator refuses (--self-test pins those as expected rejections), SDWA and DPP forms
+sources and the destination bit; clamp on min3/max3, frexp_mant, frexp_exp, ldexp and the fma_mix ops; an output
+multiplier on the VOP3 forms of min3/max3, frexp_mant, frexp_exp and ldexp. Not generated, on purpose: the
+modifiers the translator refuses (--self-test pins those as expected rejections), SDWA and DPP forms
 (tools/sdwa_diff.py's domain), and op_sel on a constant (only measured for some ops).
 
 Stages:
@@ -137,6 +140,8 @@ FLOAT_INLINE = {  # token -> (f32 word, f16 half)
     "4.0": (0x40800000, 0x4400), "-4.0": (0xC0800000, 0xC400), "0.15915494": (0x3E22F983, 0x3118),
 }
 INT_INLINE = tuple(range(0, 65)) + tuple(range(-16, 0))
+OMODS = ("mul:2", "mul:4", "div:2")
+OMOD_KINDS = ("min3", "max3", "mant", "exp", "ldexp")     # the VOP3 forms that have an omod field
 
 # Half states in the reference's register file: None (known bits), "nan" (an f16 NaN whose payload the reference
 # does not model) and "w32" (half of an f32 NaN whose payload it does not model).
@@ -300,7 +305,7 @@ def clamp01(v, nan_to_zero=False):
 
 _REG = re.compile(r"([sv])(\d+)$")
 _SRC = re.compile(r"(-?)(\|?)([sv]\d+)\|?$")
-_MOD = re.compile(r"\s+(op_sel:\[[01](?:,[01])*\]|op_sel_hi:\[[01],[01],[01]\]|clamp)$")
+_MOD = re.compile(r"\s+(op_sel:\[[01](?:,[01])*\]|op_sel_hi:\[[01],[01],[01]\]|clamp|mul:[24]|div:2)$")
 
 
 def split_line(line):
@@ -467,6 +472,9 @@ def step(line, mc, events=None):
     ev = None if events is None else events.setdefault(op, Counter())
     d = mc.dst(args[0])
     clamp = "clamp" in mods
+    # An output multiplier is a no-op on these f16 (and i16) results in the game's MODE (gfx1036): nothing to apply.
+    if any(m in OMODS for m in mods) and (kind not in OMOD_KINDS or op_full.endswith("_e32")):
+        raise HarnessError(f"output modifier on a form without one: {line}")
     if kind in ("min3", "max3"):
         sel = _bits(mods, "op_sel", 4)
         vals = [mc.f16(t, sel[i])[0] for i, t in enumerate(args[1:4])]
@@ -484,9 +492,7 @@ def step(line, mc, events=None):
         sel = _bits(mods, "op_sel", 2)
         v, h = mc.f16(args[1], sel[0])
         _count_in(events, op, v)
-        if kind == "exp":
-            if clamp:
-                raise HarnessError("clamp on v_frexp_exp_i16_f16")
+        if kind == "exp":                     # clamp (and an omod) leave the integer result as it is (gfx1036)
             e = _ilog2(v[2]) + 1 if v[0] == "num" and v[2] != 0 else 0
             mc.write_half(d, sel[1], e & M16)
             return
@@ -694,6 +700,8 @@ def op_line(rng, op, kinds=None, form=None, mods=True, values=None):
             extra = f" op_sel:[{','.join(map(str, sel))}] op_sel_hi:[{','.join(map(str, shi))}]"
         if mods and rng.random() < 0.25:
             extra += " clamp"
+        if kind in ("min3", "max3") and mods and rng.random() < 0.2:
+            extra += " " + rng.choice(OMODS)
         return f"{op} {d}, {', '.join(srcs)}{extra}", ks
     if kind in ("mant", "exp"):
         form = form or rng.choice(("e32", "e64"))
@@ -704,8 +712,10 @@ def op_line(rng, op, kinds=None, form=None, mods=True, values=None):
         src = _reg_mod(rng, tok, ks[0]) if mods else tok
         sel = [rng.getrandbits(1) if ks[0] in ("vgpr", "sgpr") else 0, rng.getrandbits(1)]
         extra = f" op_sel:[{sel[0]},{sel[1]}]" if any(sel) or rng.random() < 0.2 else ""
-        if kind == "mant" and mods and rng.random() < 0.25:
+        if mods and rng.random() < 0.25:
             extra += " clamp"
+        if mods and rng.random() < 0.2:
+            extra += " " + rng.choice(OMODS)
         return f"{op}_e64 {d}, {src}{extra}", ks
     if kind == "ldexp":
         form = form or rng.choice(("e32", "e64"))
@@ -728,6 +738,8 @@ def op_line(rng, op, kinds=None, form=None, mods=True, values=None):
         extra = f" op_sel:[{','.join(map(str, sel))}]" if any(sel) or rng.random() < 0.2 else ""
         if mods and rng.random() < 0.25:
             extra += " clamp"
+        if mods and rng.random() < 0.2:
+            extra += " " + rng.choice(OMODS)
         return f"{op}_e64 {d}, {src0}, {toks[1]}{extra}", ks
     if kind in ("fmamk", "fmaak"):
         k0 = kinds[0] if kinds else rng.choice(("vgpr", "sgpr", "int", "float"))
@@ -1115,9 +1127,6 @@ def run_suite(programs, seed, max_ops=6, ops=None):
 
 
 REJECTED = (
-    ("clamp on v_frexp_exp_i16_f16", "v_frexp_exp_i16_f16_e64 v8, v9 clamp"),
-    ("mul:2 on v_frexp_mant_f16", "v_frexp_mant_f16_e64 v8, v9 mul:2"),
-    ("div:2 on v_ldexp_f16", "v_ldexp_f16_e64 v8, v9, v10 div:2"),
     ("neg on v_pk_fmac_f16", "v_pk_fmac_f16 v8, -v9, v10"),
     ("clamp on v_pk_fmac_f16", "v_pk_fmac_f16 v8, v9, v10 clamp"),
 )
@@ -1153,6 +1162,16 @@ def self_test():
         mc.write_word(8, 0xDEADBEEF)
         step("v_min3_f16 v8, v9, v10, v11", mc)
         report(mc.v[8] == 0xDEAD0000 | want, f"min3{tuple(hex(w) for w in words)} = 0xdead{want:04x}")
+    # output multipliers are no-ops on f16 results and clamp still acts; frexp_exp ignores both (gfx1036)
+    mc.write_word(9, 0x12343A00)
+    mc.write_word(11, 0x9ABC4100)
+    mc.write_word(12, 3)
+    for line, want in (("v_frexp_mant_f16_e64 v8, v11 mul:4", 0x3900),
+                       ("v_frexp_exp_i16_f16_e64 v8, v11 clamp mul:2", 2),
+                       ("v_ldexp_f16_e64 v8, v9, v12 div:2", 0x4600),
+                       ("v_ldexp_f16_e64 v8, v11, v12 clamp mul:2", 0x3C00)):
+        step(line, mc)
+        report(mc.v[8] & M16 == want, f"{line} = 0x{want:04x}")
     # the translator rejects the forms the generator leaves out
     for what, line in REJECTED:
         try:

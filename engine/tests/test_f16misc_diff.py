@@ -166,6 +166,18 @@ class Reference(unittest.TestCase):
         w, st = one("v_min3_f16 v8, v9, v10, v11 op_sel:[0,0,0,1]", v9=0x7E00, v10=0x7D00, v11=0xFE00)
         self.assertEqual((w & M16, st), (0x5A5A, [None, "nan"]))      # every operand NaN: any NaN
 
+    def test_output_modifiers(self):
+        # mul:2/mul:4/div:2 leave an f16 result as it is and clamp still acts; frexp_exp ignores both. The words
+        # main's translator gives, as measured on gfx1036 (docs/design.md).
+        for line, want in (("v_min3_f16 v8, v9, v10, v11 mul:2", 0xB800),
+                           ("v_max3_f16 v8, v9, v10, v11 clamp div:2", 0x3C00),
+                           ("v_frexp_mant_f16_e64 v8, v11 mul:4", 0x3900),
+                           ("v_frexp_exp_i16_f16_e64 v8, v11 clamp mul:2", 0x0002),
+                           ("v_ldexp_f16_e64 v8, v9, v12 div:2", 0x4600),
+                           ("v_ldexp_f16_e64 v8, v11, v12 clamp mul:2", 0x3C00)):
+            w, st = one(line, v9=0x12343A00, v10=0x5678B800, v11=0x9ABC4100, v12=3)
+            self.assertEqual((w, st), (0x5A5A0000 | want, [None, None]), line)
+
     def test_clamp(self):
         for line, v9, want in (("v_frexp_mant_f16_e64 v8, v9 clamp", 0x7E00, 0x0000),
                                ("v_frexp_mant_f16_e64 v8, v9 clamp", 0xC400, 0x0000),
@@ -203,7 +215,8 @@ class Reference(unittest.TestCase):
         self.assertIn("f32 NaN", f.compare([0, 0, 0, 0], [["w32", "w32"], none, none, none], [0x7F800000, 0, 0, 0]))
 
     def test_harness_errors(self):
-        for line in ("v_add_f16 v8, v9, v10", "v_frexp_exp_i16_f16_e64 v8, v9 clamp", "v_ldexp_f16_e64 v8, v9, -v9"):
+        for line in ("v_add_f16 v8, v9, v10", "v_fmamk_f16 v8, v9, 0x3c00, v10 mul:2",
+                     "v_frexp_mant_f16_e32 v8, v9 div:2", "v_ldexp_f16_e64 v8, v9, -v9"):
             with self.assertRaises(f.HarnessError, msg=line):
                 one(line, v9=0x3C00, v10=0x3C00)
 

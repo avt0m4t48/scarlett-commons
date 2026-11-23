@@ -228,6 +228,7 @@ def decode_literal_string(words):
 class Module:
     def __init__(self, data):
         words = parse_words(data)
+        self.version = words[1]
         self.bound = words[3]
         self.types = {}
         self.constants = {}
@@ -285,7 +286,10 @@ class Module:
             ids = tuple(rest[words_used:])
             for identifier in ids:
                 self.require_id(identifier)
-            if len(set(ids)) != len(ids):
+            if self.version < 0x00010400:
+                # OpEntryPoint permits repeated interface IDs before SPIR-V 1.4.
+                ids = tuple(dict.fromkeys(ids))
+            elif len(set(ids)) != len(ids):
                 raise InterfaceError(f"duplicate entry-point interface ID in {name!r}")
             self.entry_points.append(EntryPoint(model, name, ids))
         elif opcode in (OP_DECORATE, OP_MEMBER_DECORATE):

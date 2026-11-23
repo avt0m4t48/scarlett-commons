@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -166,6 +167,15 @@ void __cdecl game_c_exit() {}
 void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }
 void __cdecl game_abort() {
     std::fprintf(stderr, "[rt] process: the game called abort()\n");
+    // The game's signal() import is not shimmed: its handler goes into the host CRT's process-wide table, which
+    // std::signal here reads too. UCRT's abort() raises SIGABRT before it terminates; do the same only when a
+    // handler is installed, because raising it with the default action would terminate the host process. A handler
+    // that exits ends the run itself; one that returns falls through to the CRT's abort code below.
+    const auto previous = std::signal(SIGABRT, SIG_DFL);
+    if (previous != SIG_ERR) {
+        std::signal(SIGABRT, previous);
+        if (previous != SIG_DFL && previous != SIG_IGN) std::raise(SIGABRT);
+    }
     end_run(3);  // the CRT's abort exit code
 }
 

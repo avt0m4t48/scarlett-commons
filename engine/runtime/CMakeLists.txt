@@ -513,6 +513,11 @@ if(BUILD_TESTING)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_exit_code_test gta6rt tiny_game tiny_game_fixed)
+    # abort() must reach the guest's SIGABRT handler before the run ends with the CRT's abort code (3).
+    add_executable(tiny_game_abort_test test/tiny_game_abort_test.cpp)
+    target_compile_definitions(tiny_game_abort_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_game_abort_test PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(tiny_game_abort_test gta6rt tiny_game)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -860,6 +865,8 @@ if(BUILD_TESTING)
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_console_paths.cmake")
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
+             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+    add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     # Without relocations it can only run at 0x140000000 (base_reservation.h), so passing means it got there; the
     # game's exact exit code comes back through the relaunch.

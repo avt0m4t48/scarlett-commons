@@ -62,9 +62,17 @@ class Reference(unittest.TestCase):
         self.assertEqual(out[0], (0xFFFFFFFF, 1, 0, 1))
         self.assertEqual(out[4], (0xFFFFFFFF, 1, 0, 1))
         for line in ("v_add_co_u32_e32 v1, vcc_lo, v0, v2 clamp", "v_xor_b32_e64 v1, v0, v2 clamp",
-                     "v_add_nc_u16 v1, v0, v2 clamp"):
+                     "v_add_nc_u16 v1, v0, v2 clamp", "s_mov_b32 s20, 1 clamp", "v_writelane_b32 v1, s20, 3 clamp",
+                     "v_mbcnt_lo_u32_b32 v0, -1, 0 clamp", "v_xor_b32_e64 v1, v0, v2 op_sel:[1,0,0]",
+                     "s_mov_b32 s20, 1 op_sel:[1,0]"):
             with self.subTest(line=line), self.assertRaises(d.RefError):
                 run([line])
+        # rejected before it runs: EXEC keeps its value (it used to become 1)
+        st = d.State(32)
+        before = st.exec
+        with self.assertRaises(d.RefError):
+            d.step(st, "s_mov_b32 exec_lo, 1 clamp")
+        self.assertEqual(st.exec, before)
 
     def test_inactive_lanes_get_a_zero_mask_bit(self):
         # s20 starts as lanes 0..3; a compare that is true everywhere but runs on lanes 2..31 clears lanes 0 and 1

@@ -500,6 +500,12 @@ def step(st, line):
         osel = [int(x) for x in m.group(1).split(",")]
         rest = rest[:m.start()]
     args = [a.strip() for a in rest.split(",")]
+    base = op[:-4] if op.endswith(("_e32", "_e64")) else op
+    # the modifiers first: s_mov_b32, v_mbcnt and v_writelane return early below and would run with them
+    if clamp and not (base in CARRY and op.endswith("_e64")):
+        raise RefError(f"{op}: clamp is modelled only on the e64 carry ops")
+    if osel is not None and base not in OPS16:
+        raise RefError(f"{op}: op_sel is modelled only on the 16-bit ops")
     if op == "s_mov_b32":
         v = st.val(args[1], 0)
         if args[0] == "exec_lo":
@@ -518,9 +524,6 @@ def step(st, line):
     if op == "v_writelane_b32":
         st.vget(int(args[0][1:]))[int(args[2])] = st.sget(args[1])
         return
-    base = op[:-4] if op.endswith(("_e32", "_e64")) else op
-    if clamp and not (base in CARRY and op.endswith("_e64")):
-        raise RefError(f"{op}: clamp is modelled only on the e64 carry ops")
     if base.startswith(("v_cmp_", "v_cmpx_")):
         cmpx = base.startswith("v_cmpx_")
         c = base[len("v_cmpx_" if cmpx else "v_cmp_"):]

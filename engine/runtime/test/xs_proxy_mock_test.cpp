@@ -1225,7 +1225,7 @@ int check_placed_resource_x() {
     EXPECT(device && xs::device_slot_overridden(133));
     xs::reset_device_proxy_stats();
     constexpr std::uint64_t kVa = 0x7f0000000000ull;  // any address: the stand-in does not touch it
-    constexpr auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // a bit above every PC flag
+    const auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // not constexpr: outside the enum's range for clang  // a bit above every PC flag
 
     // The fourth word is a D3D12_BARRIER_LAYOUT. On this device (no ID3D12Device10) it becomes the legacy state.
     // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones layout (UNDEFINED): PC flags only,

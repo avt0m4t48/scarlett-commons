@@ -453,6 +453,21 @@ class Gen:
             v = self.sdwa_src(v, a)
         return self.modify(v, a)
 
+    def src_u_sign_mods(self, a):
+        """A 32-bit source with its VOP3 abs/neg applied as sign-bit moves on the raw bits (abs clears bit 31, neg
+        flips it), for an op that only moves bits: SPIR-V FAbs/OpFNegate may quiet a signalling NaN or flush a
+        denormal, which hardware doesn't do to a bit move."""
+        u = self.src_u({k: v for k, v in a.items() if k not in ("abs", "neg")})
+        if a.get("abs"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+            u = g
+        if a.get("neg"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
+            u = g
+        return u
+
     def modify(self, v, a):
         if a.get("abs") or a.get("neg"):
             f = self.tof(v)
@@ -10936,8 +10951,9 @@ class Gen:
             self.emit(f"{r} = OpIAdd %uint {p} {z}")
             self.dst(a[0], r)
         elif op == "v_cndmask_b32":
-            # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc
-            x, y = self.src_u(a[1]), self.src_u(a[2])
+            # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc. A bit move: the e64 abs/neg source
+            # modifiers are sign-bit moves, never float ops (see src_u_sign_mods).
+            x, y = self.src_u_sign_mods(a[1]), self.src_u_sign_mods(a[2])
             c = self.mask_src(a[3]) if len(a) > 3 else self.mask_src({"k": "special", "t": "vcc"})
             b, r = self.tmp(), self.tmp()
             self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")

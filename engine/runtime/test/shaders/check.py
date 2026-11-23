@@ -430,6 +430,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
+              "ps_cndmask_sign_mods": (0xff800001, 0x7f800001, 0x80000001, 0x7f800001),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
               "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
               # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)

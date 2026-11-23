@@ -1313,6 +1313,7 @@ def run_suite(a, work: str) -> int:
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
                 "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
+                "ps_cndmask_sign_mods": (0xFF800001, 0x7F800001, 0x80000001, 0x7F800001),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)

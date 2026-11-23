@@ -1096,11 +1096,13 @@ int main(int argc, char** argv) {
             return "no VK_KHR_maintenance8";
 #endif
         }
-        // Execution modes the translator declares (SignedZeroInfNanPreserve 32, DenormPreserve 16) need a device
-        // property, not a feature.
+        // Execution modes the translator declares (SignedZeroInfNanPreserve 32, and 64 with Float64;
+        // DenormPreserve 16) need a device property, not a feature.
         for (const auto& fc : meta.float_controls) {
             if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
                 if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+            } else if (fc == "shaderSignedZeroInfNanPreserveFloat64") {
+                if (!fcProps.shaderSignedZeroInfNanPreserveFloat64) return "no " + fc;
             } else if (fc == "shaderDenormPreserveFloat16") {
                 if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
             } else {

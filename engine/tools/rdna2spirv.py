@@ -13108,7 +13108,8 @@ def assemble(gen):
         # -0 product to +0 and lost a NaN result narrowed to f16 with integer ops (RX 9070 XT), and NVIDIA flushed
         # an f16 denormal on its way into f32 (SHADER-526: the 0x0040 that _sdwa src0_sel:BYTE_1 selects read as
         # +0, RTX 3090 and RTX 4070 SUPER; docs/design.md, "Float controls").
-        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls".
+        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls"
+        # (shaderSignedZeroInfNanPreserveFloat64 too for a module that uses Float64, SHADER-597).
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
@@ -13146,8 +13147,12 @@ def assemble(gen):
         if gen.writes_depth:
             hdr.append("OpExecutionMode %main DepthReplacing")
     if FLOAT_CONTROLS:
-        hdr += ["OpExecutionMode %main SignedZeroInfNanPreserve 32",
-                "OpExecutionMode %main DenormPreserve 16"]
+        hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 32")
+        if gen.uses_f64:
+            # SHADER-597: the same for doubles (Vulkan guarantees neither -0 nor NaN/inf for f64 without it), only
+            # in modules that declare Float64; --no-float-controls leaves it out with the other modes.
+            hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
+        hdr.append("OpExecutionMode %main DenormPreserve 16")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -15879,9 +15884,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:
-        # Properties, not features: VkPhysicalDeviceFloatControlsProperties members the device must report true.
-        # DenormPreserve 16 is the second: the driver may otherwise flush an f16 denormal (SHADER-526).
-        m["float_controls"] = ["shaderSignedZeroInfNanPreserveFloat32"]
+        # Properties, not features: VkPhysicalDeviceFloatControlsProperties members the device must report true,
+        # one per width the module declares SignedZeroInfNanPreserve for (32 always, 64 with Float64; SHADER-597).
+        # DenormPreserve 16 comes after them: the driver may otherwise flush an f16 denormal (SHADER-526).
+        widths = sorted({int(w) for w in re.findall(r"OpExecutionMode %main SignedZeroInfNanPreserve (\d+)", asm)})
+        m["float_controls"] = [f"shaderSignedZeroInfNanPreserveFloat{w}" for w in widths]
         if "DenormPreserve" in caps:
             m["float_controls"].append("shaderDenormPreserveFloat16")
     if g.uses_codebase:

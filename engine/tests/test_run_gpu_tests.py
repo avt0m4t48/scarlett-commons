@@ -495,6 +495,61 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
 
 
+class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
+    """The rows whose test program judges itself show its last output line. A program that died first (a driver
+    crash while it creates a pipeline: exit -11 on Linux, 0xC0000005 on Windows) has only printed its device or
+    extension line, or nothing, so the FAIL line must carry the exit status to say what happened."""
+    DIED = {   # one row each: what its program had printed when it died
+        "cs_lds": "device: X\n", "cs_exec64": "device: X\n", "cs_bvh": "device: X\n", "cs_wavemask": "device: X\n",
+        "cs_imgstore": "device: X\n", "cs_imgload": "device: X\n", "cs_sample_lz_int_d16": "device: X\n",
+        "ps_texture_sample": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
+        "ps_tex": "", "ps_imgatomic": "",
+    }
+
+    def run_one(self, name, code, printed):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)   # one row
+
+            def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=code, stdout="", stderr=printed)
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        rows = [ln.split(None, 2) for ln in output.getvalue().splitlines() if ln.startswith("  FAIL")]
+        return rc, rows, output.getvalue()
+
+    def test_the_fail_line_says_the_program_died(self):
+        for code in (-11, 0xC0000005):
+            for name, printed in self.DIED.items():
+                with self.subTest(name=name, code=code):
+                    rc, rows, out = self.run_one(name, code, printed)
+                    self.assertEqual(rc, 1, out)
+                    self.assertEqual(len(rows), 1, out)
+                    last = printed.splitlines()[-1] if printed else "no test output"
+                    self.assertEqual(rows[0][1:], [name, f"exit {code}: {last}"], out)
+
+    def test_no_pixel_count_for_a_frame_that_was_never_read(self):
+        _rc, rows, out = self.run_one("ps_gather_wrap", -11, "device: X\n")
+        self.assertNotIn("pixels differ", rows[0][2], out)
+
+    def test_a_verdict_keeps_its_line(self):
+        self.assertEqual(rgt.verdict_line(0, "device: X\ncs_lds: 64 lanes mirrored"), "cs_lds: 64 lanes mirrored")
+        self.assertEqual(rgt.verdict_line(0, ""), "")
+        self.assertEqual(rgt.verdict_line(1, "device: X\ncs_lds: lane 3 differs"), "exit 1: cs_lds: lane 3 differs")
+        rc, rows, out = self.run_one("cs_imgstore", 0, "device: X\ncs_imgstore: 64 texels match\n")
+        self.assertEqual((rc, rows), (0, []), out)
+        self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
+
+
 class FmaFusedSuite(unittest.TestCase):
     """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]

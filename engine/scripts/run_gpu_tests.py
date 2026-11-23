@@ -38,6 +38,7 @@ from check import judged_words, words_match   # dump words not judged on some de
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
+from check import failure   # "exit <status>: <last lines>", check.py's detail for a program that exited non-zero
 from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
@@ -245,6 +246,14 @@ def unsupported_skip(msg: str) -> str:
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
+def verdict_line(rc: int, msg: str) -> str:
+    """The detail of a row whose test program judges itself and prints its verdict last: that line. A program that
+    exited non-zero gets its exit status in front, as in check.py, so one that died before its verdict (exit -11 on
+    Linux, 3221225477 = 0xC0000005 on Windows) does not read as a FAIL with only its device or extension line, or
+    with no detail at all."""
+    return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
+
+
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
             cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
@@ -315,7 +324,7 @@ def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) 
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
-    return rc == 0, msg.splitlines()[-1] if msg else ""
+    return rc == 0, verdict_line(rc, msg)
 def dump_words(msg: str) -> list[int] | None:
     """The eight words of vk_compute_test's "out[0..7] = ..." line, or None unless it is eight decimal words (as in
     check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
@@ -859,13 +868,13 @@ def run_suite(a, work: str) -> int:
             results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
             # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
@@ -1144,10 +1153,10 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
@@ -1175,7 +1184,7 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_d16_texture(raw)
                 results.append((name, ok, detail))
             else:
-                results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+                results.append((name, rc == 0 and "PASSED" in msg, verdict_line(rc, msg)))
         elif name in TEXTURE_CONSTANTS:
             expected = TEXTURE_CONSTANTS[name]
             tool = os.path.join(a.build, "vk_texture_test" + ext)
@@ -1189,8 +1198,10 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             else:
-                results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
-                                f"{bad} pixels differ from {expected}: {msg.splitlines()[-1] if msg else ''}"))
+                detail = ("4096/4096 pixels exact" if bad == 0 else
+                          f"{bad} pixels differ from {expected}: {verdict_line(0, msg)}")
+                # After a non-zero exit no frame was compared: the exit status, not a pixel count.
+                results.append((name, rc == 0 and bad == 0, verdict_line(rc, msg) if rc else detail))
         elif name in ("ps_tex", "ps_imgatomic"):
             # A texture through the descriptor hash table and the bindless set (ps_tex), or image atomics in a pixel
             # shader through the set's r32ui storage arrays (ps_imgatomic, drawn with vs_ids). vk_bindless_test
@@ -1202,7 +1213,7 @@ def run_suite(a, work: str) -> int:
                 reason = next((ln for ln in lines if ln.startswith("unsupported:")), "unsupported device")
                 results.append((name, None, f"SKIP ({reason})"))
             else:
-                results.append((name, rc == 0, lines[-1] if lines else ""))
+                results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name == "ps_ssharp":
             # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
             problem = sampler_test(a.build, spirv_dir)

@@ -120,10 +120,14 @@ void builder_set_64bit_morton_codes(void* self, bool enable) {
     if (it != g_builders.end()) it->second.morton64 = enable;
 }
 
+// The builder's device with a reference of the caller's own, taken under the lock, so a destructor on another
+// thread can't release it during the call. The caller releases it.
 ID3D12Device5* builder_device(void* self) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_builders.find(self);
-    return it == g_builders.end() ? nullptr : it->second.device;
+    if (it == g_builders.end() || !it->second.device) return nullptr;
+    it->second.device->AddRef();
+    return it->second.device;
 }
 
 void note_stream(const xdxr::StreamDesc& stream) {
@@ -148,6 +152,7 @@ void builder_prebuild_info(void* self, const D3D12_BUILD_RAYTRACING_ACCELERATION
         return;
     }
     device->GetRaytracingAccelerationStructurePrebuildInfo(inputs, info);
+    device->Release();
 }
 
 // ?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_

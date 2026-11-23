@@ -12,6 +12,7 @@
 //
 // Exit 77 without a Vulkan device. No game files.
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
 #include "../shims/shims.h"
 #include "../src/xdxr_descs.h"
 
@@ -214,6 +215,25 @@ int main(int argc, char** argv) {
     if (!blas_info.ResultDataMaxSizeInBytes) {
         std::puts("SKIP: the device does not build XDXR acceleration structures (no bufferDeviceAddress)");
         return 77;
+    }
+    // The title's device is a d3d12_xs device proxy (D3D12XboxCreateDevice): a builder constructed on one reaches the
+    // real device behind it.
+    {
+        Ref<ID3D12Device> proxy;
+        alignas(16) unsigned char proxied[64];
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO through_proxy{};
+        device->AddRef();   // create_device_proxy takes one reference to the real device on success
+        const bool wrapped = SUCCEEDED(rt::d3d12_xs::create_device_proxy(device.p, IID_PPV_ARGS(proxy.put())));
+        if (!wrapped) device->Release();
+        const bool made = wrapped && rt::d3d12_xs::device_proxy_real_device(proxy.p) != nullptr;
+        if (made) {
+            construct(proxied, proxy.p, true);
+            prebuild(proxied, &blas_inputs, nullptr, &through_proxy);
+            destruct(proxied);
+        }
+        check(made && through_proxy.ResultDataMaxSizeInBytes == layer_info.ResultDataMaxSizeInBytes &&
+                  through_proxy.ScratchDataSizeInBytes == layer_info.ScratchDataSizeInBytes,
+              "a builder constructed on a d3d12_xs device proxy uses the real device behind it");
     }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_inputs{};
     tlas_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;

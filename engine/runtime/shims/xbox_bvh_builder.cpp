@@ -79,13 +79,21 @@ ID3D12Device5* device5_of(void* device) {
     return out;
 }
 
-// The command list a title passes. Command lists are not wrapped by d3d12_xs yet (d3d12_xs_device.cpp), so the
-// pointer is the backend's own list and answers ID3D12GraphicsCommandList4 itself. When a console list proxy lands
-// (docs/d3d12_command_objects.md §3.5a), this is where its real list is taken.
-ID3D12GraphicsCommandList4* list4_of(void* list) {
+// The command list a title passes, as the backend's own list: a d3d12_xs proxy is unwrapped first, so the PC
+// interfaces below are asked of the real list and never of a console-shaped proxy (whose vtable is not the PC one;
+// docs/d3d12_command_objects.md §3.5a). Lists aren't wrapped on main yet; a console list proxy joins
+// proxy_real_object, which real_object_behind_proxy follows.
+IUnknown* real_list(void* list) {
     if (!list) return nullptr;
+    IUnknown* real = rt::d3d12_xs::real_object_behind_proxy(list);
+    return real ? real : static_cast<IUnknown*>(list);
+}
+
+ID3D12GraphicsCommandList4* list4_of(void* list) {
+    IUnknown* real = real_list(list);
+    if (!real) return nullptr;
     ID3D12GraphicsCommandList4* out = nullptr;
-    if (FAILED(static_cast<IUnknown*>(list)->QueryInterface(IID_PPV_ARGS(&out)))) return nullptr;
+    if (FAILED(real->QueryInterface(IID_PPV_ARGS(&out)))) return nullptr;
     return out;
 }
 

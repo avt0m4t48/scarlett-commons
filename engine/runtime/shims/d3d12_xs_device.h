@@ -89,6 +89,11 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// The real object behind any of the child proxies (heap, queue, fence, allocator, and a kind added later, such as a
+// console command-list proxy, which joins proxy_real_object), or null when `object` is none of them. For code outside
+// this file that is handed a title's object, like the XboxBvhBuilder shim's command lists.
+IUnknown* real_object_behind_proxy(const void* object);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the

@@ -540,7 +540,12 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         vg[r], vg[r + 1] = lo, hi
         setup_lines += [f"v_mov_b32 v{r}, 0x{lo:08x}", f"v_mov_b32 v{r+1}, 0x{hi:08x}"]
     if op == "v_add_f64": body_lines.append(f"s_round_mode {0 if known_case else rng.choice((0, 4, 8, 12))}")
-    high_literal = op in ROUND or op in ("v_add_f64", "v_cvt_f32_f64") or "cmp" in op or "class" in op
+    # Literal width in the printed listing: forms whose translator reads a 32-bit literal as the upper half of the f64 operand
+    # (the ISA rule, measured on gfx1036) get 32-bit literals; the others get a full-width one. v_frexp_*, v_rsq_f64 and
+    # v_sqrt_f64 and v_rcp_f64 moved to the first group when main's translator started reading their literal as the upper half
+    # only (the CPU run skips v_rcp, so only --oracle gpu shows it).
+    high_literal = (op in ROUND or op in ("v_add_f64", "v_cvt_f32_f64", "v_frexp_mant_f64", "v_frexp_exp_i32_f64",
+                                          "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64") or "cmp" in op or "class" in op)
     bus = [set(), False, 32 if high_literal else 64]
     if op in ROUND:
         src = maybe_word_modifier(rng, gen_source(rng, 0, allow_literal, bus))

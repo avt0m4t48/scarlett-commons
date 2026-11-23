@@ -437,6 +437,23 @@ class F64DiffTests(unittest.TestCase):
         matches = int(out.split("hw: ")[1].split(" match")[0])
         self.assertGreater(matches, 60)
 
+    def test_literal_width_follows_how_main_reads_each_form(self):
+        # main's translator reads a printed 32-bit literal of these forms as the upper half of the f64 operand (the ISA rule);
+        # a full-width text literal there is read as its low 32 bits (CPU seeds 1-3 then mismatch on v_frexp_*, v_rsq, v_sqrt).
+        def literals(op, count=300):
+            found = []
+            for seed in range(count):
+                setup, body, _, _ = fd.make_case(random.Random(seed), op)
+                found += [t for line in body for t in line.replace(",", " ").split() if t.startswith("0x")]
+            return found
+        for op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_add_f64", "v_trunc_f64"):
+            with self.subTest(op=op):
+                found = literals(op)
+                self.assertTrue(found)
+                self.assertTrue(all(len(t) <= 10 for t in found), [t for t in found if len(t) > 10][:3])
+        self.assertTrue(any(len(t) == 18 for t in literals("v_div_fixup_f64")))        # still full-width here
+        self.assertTrue(any(len(t) == 18 for t in literals("v_div_fmas_f64")))
+
     def test_hw_oracle_models_the_single_lane_exec_mask_of_v_cmpx(self):
         # Reported on gfx1036 at 7bd5f01d: "word 1: expected 00000001 ffffffff, actual 00000001 00000001". The hardware kernel
         # runs one thread of a wave32, so a v_cmpx result read back through exec_lo is 1 (hit) or 0, never 0xffffffff.

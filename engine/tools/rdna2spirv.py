@@ -15336,6 +15336,21 @@ def cs_dispatch_state(path, name):
     return (m["rsrc2"], *m["threads"])
 
 
+def fspx_wave_size(path, name):
+    """32 or 64 from an FSPX program's dispatch state, or None: the `wave32` field tools/fspx_unpack.py writes to
+    fspx/<name>.json from kind 0's word 4 bit 20 (set = wave32; docs/fspx.md, "Kind 0: dispatch state"). None when
+    the program has an FSSM blob, no fspx/<name>.json, or a kind 0 too short to hold word 4."""
+    fssm, _, meta = native_paths(path, name)
+    if os.path.isfile(fssm) or not os.path.isfile(meta):
+        return None
+    try:
+        with open(meta, encoding="utf-8") as f:
+            wave32 = _json.load(f).get("wave32")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -15390,9 +15405,9 @@ def translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
-    code_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
-                   (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
-                   for i in insns)
+    strict_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) for i in insns)
+    code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
+                                                                            for x in i["args"]) for i in insns)
     code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
@@ -15405,12 +15420,22 @@ def translate(path):
             fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
     except OSError:
         pass
+    # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
+    # instead (word 4 bit 20 = wave32, docs/fspx.md). Only the strict markers count against it: a _b64 op on vcc or
+    # exec is not one, since these programs move vcc as an ordinary SGPR pair (s_mov_b64 vcc, s[..]) in wave32 code.
+    fspx_ws = fspx_wave_size(path, info["name"]) if fssm_ws is None else None
     if fssm_ws is not None:
         if fssm_ws == 32 and code_w64:
             raise Unsupported("FSSM wave32 header contradicts wave64 code")
         if fssm_ws == 64 and code_w32:
             raise Unsupported("FSSM wave64 header contradicts wave32 code")
         g.wave64 = fssm_ws == 64
+    elif fspx_ws is not None:
+        if fspx_ws == 32 and strict_w64:
+            raise Unsupported("FSPX wave32 dispatch state contradicts wave64 code")
+        if fspx_ws == 64 and code_w32:
+            raise Unsupported("FSPX wave64 dispatch state contradicts wave32 code")
+        g.wave64 = fspx_ws == 64
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":

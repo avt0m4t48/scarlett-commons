@@ -283,15 +283,17 @@ def parse_source_args(line):
     return bits[0], bits[1].rstrip(","), [x.strip() for x in args]
 
 
-FMA_FOLD_ZERO_SIGN = ("NVIDIA's Vulkan driver folds a Fma whose operands are all constants with the sign of the zero from an "
-                      "underflowing product lost (measured on an RTX 4070: the same Fma on runtime operands gives the IEEE "
-                      "sign), so a flipped zero sign is not judged")
+FMA_FOLD_ZERO_SIGN = ("a Vulkan driver may fold an all-constant Fma without keeping the sign of a zero that comes from an "
+                      "underflowing product (observed on an NVIDIA RTX 4070, where the same Fma on runtime operands gives the "
+                      "IEEE sign), so a GPU zero with the opposite sign is not judged")
 
 
-def ref_program(lines, include_known=False, notes=None):
+def ref_program(lines, include_known=False, notes=None, lane_mask=M32):
     """The four exported words. ``notes`` (a list) receives (kind, destination register) for results a GPU oracle may
-    legitimately get wrong in a known way (see FMA_FOLD_ZERO_SIGN)."""
-    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, M32
+    legitimately get wrong in a known way (see FMA_FOLD_ZERO_SIGN). ``lane_mask`` is the EXEC mask the program starts
+    with: all 32 lanes of a wave32 for the translator and Vulkan oracles (the translator exposes a full mask), the single
+    lane the hardware kernel runs for --oracle hw (a v_cmpx result is read back through exec_lo)."""
+    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, lane_mask & M32
     for line in lines:
         s = line.strip()
         if not s or s.startswith((";", "exp ", "s_endpgm")): continue
@@ -474,6 +476,7 @@ def run_gpu(lines, name, tmpdir, gpu):
 # tools/fmisc_diff.py): IEEE off so output modifiers apply, DX10_CLAMP on. Directives an architecture cannot set make
 # the program a counted skip (runner.Oracle.run returns the reason).
 HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
+HW_LANE_MASK = 0x1      # hw_kernel runs one thread of a wave32: exec_lo is 1, so v_cmpx leaves 1 or 0, not 0xffffffff
 
 
 def hw_kernel(lines):
@@ -633,7 +636,7 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
     notes = []
-    try: expected = ref_program(lines, include_known, notes)
+    try: expected = ref_program(lines, include_known, notes, HW_LANE_MASK if oracle == "hw" else M32)
     except SkipCase as exc: return "skip", str(exc), None, None
     except (ArithmeticError, IndexError, KeyError, ValueError) as exc:
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None

@@ -301,6 +301,20 @@ class F64DiffTests(unittest.TestCase):
                         "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], -0.0"], notes=notes)
         self.assertEqual(notes, [("fma-fold-zero-sign", 8)])
 
+    def test_fma_zero_sign_skip_is_vendor_neutral_and_gpu_only(self):
+        for vendor in ("NVIDIA", "AMD", "Intel"):
+            self.assertNotIn(vendor, fd.FMA_FOLD_ZERO_SIGN.replace("an NVIDIA RTX 4070", ""))     # only the observation names a device
+        self.assertIn("RTX 4070", fd.FMA_FOLD_ZERO_SIGN)
+        lines = self.fmas("0")
+        expected = fd.ref_program(lines)
+        flipped = [expected[0], expected[1] ^ 0x80000000, expected[2], expected[3]]
+        with tempfile.TemporaryDirectory() as tmp:
+            hw = mock.Mock()
+            hw.run.return_value = [flipped]
+            status, reason, _, _ = fd.run_one(lines, "ps_f64_fold_hw", tmp, "hw", hw)
+        self.assertEqual(status, "mismatch")                          # real hardware zero signs are always judged
+        self.assertNotEqual(reason, fd.FMA_FOLD_ZERO_SIGN)
+
     def test_gpu_zero_sign_difference_of_a_folded_fma_is_a_counted_skip(self):
         lines = self.fmas("0")
         with tempfile.TemporaryDirectory() as tmp:
@@ -375,8 +389,8 @@ class F64DiffTests(unittest.TestCase):
         """Answers each raw kernel with the reference's own result, as a hardware stand-in; flip corrupts v_trunc_f64."""
         device = "fake gfx1036"
 
-        def __init__(self, flip=False, reason=None):
-            self.flip, self.reason, self.calls, self.closed = flip, reason, [], False
+        def __init__(self, flip=False, reason=None, lane_mask=fd.HW_LANE_MASK):
+            self.flip, self.reason, self.lane_mask, self.calls, self.closed = flip, reason, lane_mask, [], False
 
         def run(self, kernels):
             self.calls.append(list(kernels))
@@ -386,7 +400,7 @@ class F64DiffTests(unittest.TestCase):
                     out.append(self.reason)
                     continue
                 try:
-                    words = fd.ref_program(kernel.lines[:-3], True)   # drop the store epilogue
+                    words = fd.ref_program(kernel.lines[:-3], True, None, self.lane_mask)   # drop the store epilogue
                 except (fd.SkipCase, ArithmeticError, IndexError, KeyError, ValueError):
                     out.append("assembler rejected: fake")
                     continue
@@ -422,6 +436,32 @@ class F64DiffTests(unittest.TestCase):
         self.assertGreater(len(fake.calls[0]), 40)           # sweep + programs
         matches = int(out.split("hw: ")[1].split(" match")[0])
         self.assertGreater(matches, 60)
+
+    def test_hw_oracle_models_the_single_lane_exec_mask_of_v_cmpx(self):
+        # Reported on gfx1036 at 7bd5f01d: "word 1: expected 00000001 ffffffff, actual 00000001 00000001". The hardware kernel
+        # runs one thread of a wave32, so a v_cmpx result read back through exec_lo is 1 (hit) or 0, never 0xffffffff.
+        lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff00000", "v_mov_b32 v14, 0x00000000",
+                 "v_mov_b32 v15, 0x3ff00000", "s_mov_b32 s10, exec_lo", "v_cmpx_eq_f64_e64 v[12:13], v[14:15]",
+                 "s_mov_b32 s22, exec_lo", "s_mov_b32 exec_lo, s10", "v_mov_b32 v9, s22"]
+        self.assertEqual(fd.ref_program(lines, True)[1], 0xFFFFFFFF)                 # the translator-side model: all 32 lanes
+        self.assertEqual(fd.ref_program(lines, True, None, fd.HW_LANE_MASK)[1], 1)   # one lane
+        with tempfile.TemporaryDirectory() as tmp:
+            one_lane = self.FakeHW()
+            status = fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", one_lane)
+            self.assertEqual(status[0], "match", status)
+            self.assertEqual(status[2][1], 1)                                        # the reference expects the one-lane mask
+            full_wave = self.FakeHW(lane_mask=0xFFFFFFFF)                            # the old assumption is now a mismatch
+            self.assertEqual(fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", full_wave)[0], "mismatch")
+            self.assertEqual(fd.run_one(lines, "ps_f64_hw_exec", tmp)[0], "match")     # the translator oracle still sees 0xffffffff
+
+    def test_hw_oracle_campaign_with_v_cmpx_forms_matches_a_one_lane_machine(self):
+        fake = self.FakeHW()
+        code, out, _, _ = self.run_main(fake, "--ops", "v_cmpx_lt_f64,v_cmpx_eq_f64,v_cmpx_class_f64", "--programs", "60", "--seed", "3")
+        self.assertEqual(code, 0, out)
+        self.assertIn(" 0 mismatch", out)
+        wrong = self.FakeHW(lane_mask=0xFFFFFFFF)
+        code, out, _, _ = self.run_main(wrong, "--ops", "v_cmpx_lt_f64,v_cmpx_eq_f64,v_cmpx_class_f64", "--programs", "10", "--seed", "3")
+        self.assertEqual(code, 1, out)
 
     def test_hw_oracle_with_known_runs_known_cases_against_the_reference(self):
         fake = self.FakeHW()

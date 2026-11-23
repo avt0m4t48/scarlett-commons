@@ -294,6 +294,8 @@ class Gen:
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
+        self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
+        self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
         self.uses_clock = set()
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
@@ -512,6 +514,16 @@ class Gen:
             self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
             u = g
         return u
+
+    def src_f_sign_mods(self, a):
+        """Read a float source with VOP3 abs/neg applied as raw sign-bit moves.
+
+        Min/max-family instructions preserve NaN payload and signaling state
+        when their source modifiers are applied. OpFNegate/OpFAbs can quiet a
+        signaling NaN before the min/max operation sees it, so these operations
+        must bitcast the integer sign-bit result instead.
+        """
+        return self.tof(self.src_u_sign_mods(a))
 
     def modify(self, v, a):
         if a.get("abs") or a.get("neg"):
@@ -1140,12 +1152,23 @@ class Gen:
         driver may round twice. With --fma khr it is OpFmaKHR instead: "correctly rounded" (SPV_KHR_fma), which needs
         VK_KHR_shader_fma + shaderFmaFloat32 and is recorded in the index as capability FMAKHR."""
         if FMA_KHR:
-            self.uses_fma_khr = True
+            self.uses_fma_khr = self.uses_fma_khr32 = True
             self.emit(f"{r} = OpFmaKHR %float {x} {y} {z}")
         elif FMA_EXACT:
             self.fma_exact(r, x, y, z)
         else:
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+
+    def emit_fma64(self, r, x, y, z):
+        """r = x * y + z on doubles with ONE rounding, as RDNA2's f64 multiply-adds do. GLSL.std.450 Fma may round
+        twice here as for f32, and NVIDIA's driver does (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
+        a = 1 + 2^-30 gives 0, not 2^-60). With --fma khr it is OpFmaKHR on doubles, which needs VK_KHR_shader_fma +
+        shaderFmaFloat64 (feature shaderFmaFloat64 in the index). --fma exact has no f64 form and keeps Fma."""
+        if FMA_KHR:
+            self.uses_fma_khr = self.uses_fma_khr64 = True
+            self.emit(f"{r} = OpFmaKHR %double {x} {y} {z}")
+        else:
+            self.emit(f"{r} = OpExtInst %double %glsl Fma {x} {y} {z}")
 
     def fma_exact(self, r, x, y, z):
         """r = x * y + z rounded once to f32, built from single-rounded NoContraction f32 operations (--fma exact,
@@ -4496,9 +4519,12 @@ class Gen:
         return v
 
     def lds_load(self, addr, byte_off, bound=None):
+        # Volatile: another lane's ds_write may come between two accesses of this lane, and the Vulkan memory model
+        # orders nothing between invocations without a barrier, so a driver may otherwise move this read ahead of
+        # the wave's earlier writes or merge it with another read (docs/design.md, "LDS access order within a wave").
         def f(p):
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint {p}")
+            self.emit(f"{v} = OpLoad %uint {p} Volatile")
             return v
         return self.lds_access(addr, byte_off, f, bound)
 
@@ -4510,7 +4536,7 @@ class Gen:
         return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
-        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
+        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val} Volatile"))   # as lds_load
 
     def lds_next_in_bounds(self, addr, byte_off):
         """Bool: the dword after the one at (addr + byte_off) is inside the allocation (lds_cross_bound)."""
@@ -4585,10 +4611,10 @@ class Gen:
             ptr = self.lds_ptr(addr, off)
             if op == "ds_read_addtid_b32":
                 value = self.tmp()
-                self.emit(f"{value} = OpLoad %uint {ptr}")
+                self.emit(f"{value} = OpLoad %uint {ptr} Volatile")       # as lds_load
                 self.dst(a[0], value)
             else:
-                self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
+                self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
@@ -6764,7 +6790,7 @@ class Gen:
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = (self.src_f_sign_mods(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
             m = self.nminmax_f32(f, x, y, y_src=a[2])
             r = self.nminmax_f32(f, m, z, y_src=a[3])
@@ -9689,7 +9715,7 @@ class Gen:
                 self.emit(f"{ax} = OpExtInst %double %glsl FAbs {x}")
                 self.emit(f"{ay} = OpExtInst %double %glsl FAbs {y}")
                 self.emit(f"{az} = OpExtInst %double %glsl FAbs {z}")
-                self.emit(f"{f_plain} = OpExtInst %double %glsl Fma {x} {y} {z}")
+                self.emit_fma64(f_plain, x, y, z)
                 self.emit(f"{scale_up} = OpFOrdGreaterThanEqual %bool {az} {self.dconst(2.0)}")
                 self.emit(f"{f_up} = OpFMul %double {f_plain} {self.dconst(2.0 ** 128)}")
                 gx128, gy1, bx, gy128, gx1, by, gx64, gy64, bxy, b1, big = (self.tmp() for _ in range(11))
@@ -9732,7 +9758,7 @@ class Gen:
                 self.emit(f"{z_sc} = OpFMul %double {z} {self.dconst(2.0 ** -128)}")
                 self.emit(f"{zs} = OpSelect %double {ztiny} {zst} {z_sc}")
                 f_pre = self.tmp()
-                self.emit(f"{f_pre} = OpExtInst %double %glsl Fma {xs} {ys} {zs}")
+                self.emit_fma64(f_pre, xs, ys, zs)
                 # Subnormal-output single-rounding tie adjustment when |f_plain| in [2^-947, 2^-894).
                 pv2, plo, phi, pe_shift, pe_exp, e_ge, e_le, in_rng = (self.tmp() for _ in range(8))
                 self.emit(f"{pv2} = OpBitcast %v2uint_d {f_plain}")
@@ -9777,7 +9803,7 @@ class Gen:
                 pmul, np, pe_raw, p_z, x_nz, y_nz, xy_nz, p_uf = (self.tmp() for _ in range(8))
                 self.emit(f"{pmul} = OpFMul %double {x} {y}")
                 self.emit(f"{np} = OpFNegate %double {pmul}")
-                self.emit(f"{pe_raw} = OpExtInst %double %glsl Fma {x} {y} {np}")
+                self.emit_fma64(pe_raw, x, y, np)
                 self.emit(f"{p_z} = OpFOrdEqual %bool {pmul} {d0}")
                 self.emit(f"{x_nz} = OpFOrdNotEqual %bool {x} {d0}")
                 self.emit(f"{y_nz} = OpFOrdNotEqual %bool {y} {d0}")
@@ -10716,7 +10742,8 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
+            x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
@@ -10737,7 +10764,7 @@ class Gen:
             elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
-                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
+                r = self.med3_f([self.src_f_sign_mods(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
@@ -17544,7 +17571,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "DrawParameters": "shaderDrawParameters",
-             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
          # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
@@ -17552,7 +17579,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
-                             for k in getattr(g, "uses_clock", ())}),
+                             for k in getattr(g, "uses_clock", ())} |
+                            {f for f, used in (("shaderFmaFloat32", getattr(g, "uses_fma_khr32", False)),
+                                               ("shaderFmaFloat64", getattr(g, "uses_fma_khr64", False))) if used}),
          "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
          "subgroup_size": 64 if g.wave64 else 32,
          # Which stages can ask for a 64-wide subgroup is the driver's requiredSubgroupSizeStages, not a fixed rule:
@@ -17970,8 +17999,8 @@ def main():
     ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
-                         "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
-                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32), exact = a single "
+                         "(guaranteed single rounding, f32 and f64; needs VK_KHR_shader_fma + shaderFmaFloat32/64, listed in the "
+                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32/64), exact = a single "
                          "rounding built from NoContraction f32 ops, for a device that splits Fma and has no "
                          "VK_KHR_shader_fma (about 110 instructions, 31 NoContraction decorations and 13 constants per multiply-add; no extension needed)")
     ap.add_argument("--f16-interp-fallback", action="store_true",

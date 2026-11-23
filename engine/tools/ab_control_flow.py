@@ -36,7 +36,7 @@ CLEAR = struct.pack("<4f", -1, -1, -1, -1)      # what vk_texture_test clears th
 READBACK_BYTES = 64 * 64 * len(CLEAR)  # vk_texture_test writes a 64x64 RGBA32F image
 LOCATIONS = 32      # every pixel-shader input location gets a defined value
 SUPPORTED_BINDINGS = {0, 1, 2}
-HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}
+HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64", "shaderSampledImageArrayDynamicIndexing"}
 
 
 def is_backward_branch(disassembly):

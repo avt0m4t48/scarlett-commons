@@ -15,6 +15,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class ModuleFeatureGateTest(unittest.TestCase):
+    def test_sampled_indexing_is_gated_before_module_creation(self):
+        # Check the worker's ordering without sending a module to an unsupported Vulkan device.
+        source = (ROOT / "runtime" / "test" / "vk_pipeline_check.cpp").read_text(encoding="utf-8")
+        before_worker, _, worker = source.partition("auto worker = [&] {")
+        self.assertIn("auto check_missing_module_feature", before_worker)
+        module_check = before_worker.split("auto check_missing_module_feature", 1)[1].split("};", 1)[0]
+        self.assertIn("!f2.features.shaderSampledImageArrayDynamicIndexing", module_check)
+        before_create, create, _ = worker.partition("mod_ok = vkCreateShaderModule(")
+        self.assertTrue(create, "expected the worker's Vulkan module creation call")
+        self.assertRegex(before_create,
+                         r"check_missing_module_feature\(meta\); !miss\.empty\(\)\) \{\s*"
+                         r"(?://[^\n]*\s+)?record_skip\(name, stage, miss\);\s*\+\+done;\s*continue;")
+
+
 def find_binary():
     env = os.environ.get("LEONIDA_VK_PIPELINE_CHECK")
     if env:

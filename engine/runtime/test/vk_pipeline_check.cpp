@@ -1,6 +1,6 @@
 // Driver-level check of the translated corpus: vk_pipeline_check <spirv dir> [pipeline_cache.bin]
-// Reads <spirv dir>/index.json (written by tools/rdna2spirv.py), creates a VkShaderModule for every entry and a real
-// pipeline with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
+// Reads <spirv dir>/index.json (written by tools/rdna2spirv.py) and checks module and pipeline creation for compatible
+// entries with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
 // table 2; storage images 4, 7 and 8..19; set 1 binding 0 dynamic UBO for --pc-tail-ubo shaders; push constants
 // sized from push_constant_bytes, default 144 or 128 with pc_tail):
 //   - cs: compute pipeline via vkCreateComputePipelines, using the runtime layout and subgroup request for
@@ -1067,7 +1067,16 @@ int main(int argc, char** argv) {
     LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
     const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
-    // Map enabled device features for per-shader compatibility checks.
+    // These capability requirements apply as soon as the module is passed to Vulkan.
+    auto check_missing_module_feature = [&](const ShaderMeta& meta) -> std::string {
+        for (const auto& feat : meta.features) {
+            if (feat == "shaderSampledImageArrayDynamicIndexing" && !f2.features.shaderSampledImageArrayDynamicIndexing)
+                return "no " + feat;
+        }
+        return {};
+    };
+
+    // Keep the remaining pipeline compatibility checks after module creation.
     auto check_missing_feature = [&](const ShaderMeta& meta) -> std::string {
         const uint32_t need_pc = required_push_bytes(meta.push_constant_bytes, meta.pc_tail_bytes);
         if (need_pc > props.limits.maxPushConstantsSize) {
@@ -1411,6 +1420,12 @@ int main(int argc, char** argv) {
                 modules_bad[stage]++;
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
                             name.c_str(), meta.lds_bytes, limit_name, shared_memory_limit);
+                ++done;
+                continue;
+            }
+            if (const std::string miss = check_missing_module_feature(meta); !miss.empty()) {
+                // No module was attempted, so only the pipeline skip is counted.
+                record_skip(name, stage, miss);
                 ++done;
                 continue;
             }

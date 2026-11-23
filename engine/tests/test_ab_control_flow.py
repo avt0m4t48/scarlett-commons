@@ -520,7 +520,7 @@ class BackwardBranchAndDisasmTest(unittest.TestCase):
         self.assertEqual(AB.SUPPORTED_BINDINGS, {0, 1, 2})
         self.assertEqual(
             AB.HOSTED_FEATURES,
-            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"},
+            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64", "shaderSampledImageArrayDynamicIndexing"},
         )
 
 

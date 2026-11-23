@@ -3,6 +3,7 @@
 Usage:
     python -I tools/int3_cause.py <image> <address> [<address> ...] [--json]
     python -I tools/int3_cause.py <image> --any <address> ...      # any instruction, e.g. a `return 0` path
+    python -I tools/int3_cause.py <image> --returns <address> ...  # what the function holding it returns
 
 A boot that stops on a title assertion reports where it stopped. LEONIDA_SKIP_ASSERTS, LEONIDA_SKIP_INT3 and the
 fault log give the `int3` as `exe+0x...`, `game+0x...`, an RVA or a virtual address. What failed is the call whose
@@ -40,7 +41,11 @@ function, so the test is not in sight of the stop. This finds it, with nothing r
    the call were the stop. Steps 3 and 6 go at most 3 functions away from the stop.
 
 With `--any` the address may be any instruction, for example the `xor eax, eax` of a `return 0` path or the start of
-a fallback. Steps 2 to 5 then name the branches that decide whether it runs, and step 6 is skipped.
+a fallback. Steps 2 to 5 then name the branches that decide whether it runs, and step 6 is skipped. With
+`--returns` the address may be anywhere in a function. Each value the function can return in rax (a constant with
+its value, a call's result, an argument, a load) is found over every path into each `ret`, through register copies.
+For each value, the instruction that sets it is read as with `--any`. A function that returns through a tail jump
+is not read past the jump.
 
 What it does not see:
 - a stop reached through a jump table or a function pointer;
@@ -361,6 +366,71 @@ def flags_setter(insns, k):
     return None
 
 
+def step(image: Image, func, i: int, reg: int, level: int):
+    """What instruction i of the function does to `reg`, walking back: None when it leaves it alone,
+    ("follow", register, how) for a copy (how "copied") or an offset (how "derived"), ("result", report, tag) when
+    it is where the value comes from (tag False for a report that is not about the value)."""
+    insns = image.flow(func)[0]
+    insn = insns[i]
+    if insn.is_call():
+        if reg == RAX:
+            return "result", {"call": insn.rva, **image.call_name(insns, i)}, True
+        if reg in VOLATILE:
+            return "result", {"value": "clobbered by a call", "at": insn.rva}, False
+        return None
+    if reg not in writes(insn):
+        return None
+    if insn.mod == 3 and insn.op in COPY_OPS:
+        return "follow", insn.rm, "copied" if insn.rm != reg else None
+    if insn.mod == 3 and insn.op in (0x88, 0x89):
+        return "follow", insn.reg, "copied" if insn.reg != reg else None
+    if insn.op == 0x8D and insn.base not in (None, RIP) and insn.index is None:
+        return "follow", insn.base, "derived"
+    if insn.op in (0x81, 0x83) and insn.mod == 3 and insn.reg & 7 in (0, 5) and insn.rm == reg:
+        return "follow", reg, "derived"
+    if insn.op in LOAD_OPS and insn.mod != 3:
+        out = {"value": "loaded from memory", "at": insn.rva, "from": memory_name(insn, 64 if insn.wide else 32)}
+        if insn.base == RIP:
+            out["global"] = insn.target
+        elif insn.base == RSP:
+            out["value"] = "loaded from a stack slot"
+        elif insn.base not in (None, RIP) and level < 2:
+            out["base"] = {"register": NAMES64[insn.base], **trace(image, func, i, insn.base, level + 1)}
+        return "result", out, True
+    if (insn.op in (0x30, 0x31, 0x32, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or (
+            0xB0 <= insn.op <= 0xBF) or (insn.op in (0xC6, 0xC7) and insn.mod == 3):
+        raw = image.raw(insn)
+        if insn.op in (0x30, 0x31, 0x32, 0x33):
+            value = 0
+        elif insn.op < 0xB8 or insn.op == 0xC6:
+            value = struct.unpack_from("<b", raw, len(raw) - 1)[0]
+        elif 0xB8 <= insn.op <= 0xBF and insn.wide:
+            value = struct.unpack_from("<q", raw, len(raw) - 8)[0]
+        else:
+            value = immediate(raw, 2 if width(raw, insn) == 16 else 4)
+        return "result", {"value": "a constant", "constant": value, "at": insn.rva}, True
+    return "result", {"value": "computed", "at": insn.rva}, True
+
+
+def entry_value(reg: int):
+    if reg in ARGUMENTS:
+        return {"value": "argument", "argument": ARGUMENTS[reg], "argument_register": NAMES64[reg]}
+    return {"value": "set before the function is entered"}
+
+
+def with_how(out, copied: bool, derived: bool):
+    if derived:
+        out["derived"] = True
+    elif copied:
+        out["copied"] = True
+    return out
+
+
+def falls_into(insns, i: int) -> bool:
+    """Whether instruction i - 1 falls through to instruction i."""
+    return i > 0 and not (insns[i - 1].ends_flow() or insns[i - 1].op in (0xCC, 0x10B))
+
+
 def trace(image: Image, func, k: int, reg: int, level: int = 0):
     """What wrote `reg` before the instruction at index k of the function. Followed back through register copies,
     `lea r, [r2+disp]` and adding a constant (marked derived), and into a block through the one jump that reaches
@@ -369,21 +439,10 @@ def trace(image: Image, func, k: int, reg: int, level: int = 0):
     insns, _, into = image.flow(func)
     copied = derived = False
     i = k
-
-    def tagged(out):
-        if derived:
-            out["derived"] = True
-        elif copied:
-            out["copied"] = True
-        return out
-
     for _ in range(TRACE_BACK):
         if i == 0:
-            if reg in ARGUMENTS:
-                return tagged({"value": "argument", "argument": ARGUMENTS[reg], "argument_register": NAMES64[reg]})
-            return tagged({"value": "set before the function is entered"})
-        before = insns[i - 1]
-        if before.ends_flow() or before.op in (0xCC, 0x10B):
+            return with_how(entry_value(reg), copied, derived)
+        if not falls_into(insns, i):
             ways = into.get(insns[i].rva, [])
             if len(ways) != 1:
                 return {"value": "not found: the block it is in is reached by "
@@ -391,50 +450,48 @@ def trace(image: Image, func, k: int, reg: int, level: int = 0):
             i = ways[0]                        # the jump writes nothing; go on before it
             continue
         i -= 1
-        insn = insns[i]
-        if insn.is_call():
-            if reg == RAX:
-                return tagged({"call": insn.rva, **image.call_name(insns, i)})
-            if reg in VOLATILE:
-                return {"value": "clobbered by a call", "at": insn.rva}
+        r = step(image, func, i, reg, level)
+        if r is None:
             continue
-        if reg not in writes(insn):
+        if r[0] == "follow":
+            reg = r[1]
+            copied, derived = copied or r[2] == "copied", derived or r[2] == "derived"
             continue
-        if insn.mod == 3 and insn.op in COPY_OPS:
-            copied, reg = copied or insn.rm != reg, insn.rm
-            continue
-        if insn.mod == 3 and insn.op in (0x88, 0x89):
-            copied, reg = copied or insn.reg != reg, insn.reg
-            continue
-        if insn.op == 0x8D and insn.base not in (None, RIP) and insn.index is None:
-            derived, reg = True, insn.base
-            continue
-        if insn.op in (0x81, 0x83) and insn.mod == 3 and insn.reg & 7 in (0, 5) and insn.rm == reg:
-            derived = True
-            continue
-        if insn.op in LOAD_OPS and insn.mod != 3:
-            out = {"value": "loaded from memory", "at": insn.rva, "from": memory_name(insn, 64 if insn.wide else 32)}
-            if insn.base == RIP:
-                out["global"] = insn.target
-            elif insn.base == RSP:
-                out["value"] = "loaded from a stack slot"
-            elif insn.base not in (None, RIP) and level < 2:
-                out["base"] = {"register": NAMES64[insn.base], **trace(image, func, i, insn.base, level + 1)}
-            return tagged(out)
-        if (insn.op in (0x30, 0x31, 0x32, 0x33) and insn.mod == 3 and insn.reg == insn.rm) or (
-                0xB0 <= insn.op <= 0xBF) or (insn.op in (0xC6, 0xC7) and insn.mod == 3):
-            raw = image.raw(insn)
-            if insn.op in (0x30, 0x31, 0x32, 0x33):
-                value = 0
-            elif insn.op < 0xB8 or insn.op == 0xC6:
-                value = struct.unpack_from("<b", raw, len(raw) - 1)[0]
-            elif 0xB8 <= insn.op <= 0xBF and insn.wide:
-                value = struct.unpack_from("<q", raw, len(raw) - 8)[0]
-            else:
-                value = immediate(raw, 2 if width(raw, insn) == 16 else 4)
-            return tagged({"value": "a constant", "constant": value, "at": insn.rva})
-        return tagged({"value": "computed", "at": insn.rva})
+        return with_how(r[1], copied, derived) if r[2] else r[1]
     return {"value": "not found within the instructions read"}
+
+
+def trace_paths(image: Image, func, k: int, reg: int, budget: int = 4000, limit: int = 64):
+    """Every source of `reg` before the instruction at index k, over all the paths into it (each instruction and
+    register visited once, up to `budget` steps and `limit` sources)."""
+    insns, _, into = image.flow(func)
+    found, seen, stack, steps = [], set(), [(k, reg, False, False)], 0
+    while stack and steps < budget and len(found) < limit:
+        i, reg, copied, derived = stack.pop()
+        steps += 1
+        ways = ([i - 1] if falls_into(insns, i) else []) + into.get(insns[i].rva, [])
+        if i == 0:
+            found.append(with_how(entry_value(reg), copied, derived))
+        elif not ways:
+            found.append({"value": "not found: no way into this block was read"})
+        for p in ways:
+            if (p, reg) in seen:
+                continue
+            seen.add((p, reg))
+            r = step(image, func, p, reg, 0)
+            if r is None:
+                stack.append((p, reg, copied, derived))
+            elif r[0] == "follow":
+                stack.append((p, r[1], copied or r[2] == "copied", derived or r[2] == "derived"))
+            else:
+                found.append(with_how(r[1], copied, derived) if r[2] else r[1])
+    out, keys = [], set()
+    for r in found:
+        key = (r.get("at", r.get("call")), r["value"] if "value" in r else "call")
+        if key not in keys:
+            keys.add(key)
+            out.append(r)
+    return {"sources": out, "complete": not stack}
 
 
 def guard(image: Image, func, k: int, taken: bool):
@@ -547,6 +604,7 @@ def explain(image: Image, seed: int, depth: int, seen: set, stop: bool = True):
                 out["guards"].append(guard(image, func, k, t))
     out["never_returns"] = stop and func[0] in doomed
     if not stop:
+        out["any"] = True
         out["reached_from_start"] = func[0] in doomed
     if depth <= 0 or func in seen:
         return out
@@ -581,6 +639,31 @@ def explain(image: Image, seed: int, depth: int, seen: set, stop: bool = True):
     return out
 
 
+def returns(image: Image, rva: int):
+    """What the function holding rva returns in rax: every source over every path into each `ret`, each with the
+    branches that decide whether its instruction runs."""
+    func = image.function(rva)
+    if func is None:
+        return {"at": rva, "function": None, "note": "no .pdata entry holds it"}
+    insns = image.run(func)
+    rets = [k for k, i in enumerate(insns) if i.op in (0xC3, 0xC2)]
+    out, keys, complete = [], set(), True
+    for k in rets:
+        paths = trace_paths(image, func, k, RAX)
+        complete = complete and paths["complete"]
+        for x in paths["sources"]:
+            key = (x.get("at", x.get("call")), x.get("value", "call"))
+            if key in keys:
+                continue
+            keys.add(key)
+            at = x.get("call", x.get("at"))
+            if at is not None:
+                e = explain(image, at, 0, set(), stop=False)
+                x["guards"], x["reached_from_start"] = e.get("guards", []), e.get("reached_from_start", False)
+            out.append(x)
+    return {"at": rva, "function": list(func), "rets": len(rets), "returns": out, "complete": complete}
+
+
 def parse_address(text: str, image_base: int) -> int:
     m = re.fullmatch(r"(?:[\w.\-]+\+)?(?:0x)?([0-9a-fA-F]+)", text.strip())
     if not m:
@@ -589,12 +672,16 @@ def parse_address(text: str, image_base: int) -> int:
     return value - image_base if value >= image_base else value
 
 
-def cause(data: bytes, addresses, any_instruction: bool = False):
-    """{address text: report} for each address. With any_instruction, an address may be any instruction."""
+def cause(data: bytes, addresses, any_instruction: bool = False, returned: bool = False):
+    """{address text: report} for each address. With any_instruction, an address may be any instruction; with
+    returned, the report is what the function holding the address returns."""
     image = Image(data)
     out = {}
     for text in addresses:
         rva = parse_address(text, image.img.image_base)
+        if returned:
+            out[text] = {"rva": rva, "stop": "returns", **returns(image, rva)}
+            continue
         if any_instruction:
             if image.code.decode(rva) is None:
                 out[text] = {"rva": rva, "stop": None, "note": "no instruction decodes there"}
@@ -672,10 +759,10 @@ def argument_lines(args, indent: str):
     return lines
 
 
-def guard_lines(g, indent: str):
+def guard_lines(g, indent: str, verb: str = "stops when"):
     head = f"{indent}{g['jump']} at {g['branch']:#x}, {g['doomed_side']} side: "
     if g.get("condition"):
-        lines = [head + f"stops when {g['condition']}"]
+        lines = [head + f"{verb} {g['condition']}"]
     else:
         where = f" (at {g['flags_at']:#x})" if "flags_at" in g else ""
         lines = [head + g.get("note", "condition not read") + where]
@@ -689,7 +776,7 @@ def report_lines(rep, indent: str = "  "):
         return [f"{indent}{rep.get('note')}"]
     lines = []
     for g in rep["guards"]:
-        lines += guard_lines(g, indent)
+        lines += guard_lines(g, indent, "runs when" if rep.get("any") else "stops when")
     if rep.get("arguments"):
         lines += argument_lines(rep["arguments"], indent)
     if rep.get("globals"):
@@ -721,6 +808,22 @@ def report_lines(rep, indent: str = "  "):
     return lines
 
 
+def returns_lines(rep, indent: str = "  "):
+    lines = []
+    for x in rep["returns"]:
+        lines.append(f"{indent}{source(x, True)}:")
+        if x.get("reached_from_start"):
+            lines.append(f"{indent}  on every path from the function start (unless set again later)")
+        elif x.get("guards"):
+            for g in x["guards"]:
+                lines += guard_lines(g, indent + "  ", "runs when")
+        elif "guards" in x:
+            lines.append(f"{indent}  no guard read (reached through a loop, a jump table or another function)")
+    if not rep["complete"]:
+        lines.append(f"{indent}(not every path was read: the search stopped at its limit)")
+    return lines
+
+
 def to_text(results) -> str:
     lines = []
     for text, rep in results.items():
@@ -729,13 +832,19 @@ def to_text(results) -> str:
             continue
         span = (f"function {rep['function'][0]:#x}-{rep['function'][1]:#x}" if rep.get("function")
                 else "no function")
+        if rep["stop"] == "returns":
+            lines.append(f"{text}: {span}, {rep['rets']} ret(s); it returns:" if rep.get("function") else
+                         f"{text}: {rep.get('note')}")
+            lines += returns_lines(rep) if rep.get("function") else []
+            continue
         lines.append(f"{text}: {rep['stop']} at {rep['at']:#x}, {span}")
         lines += report_lines(rep)
     return "\n".join(lines) + "\n"
 
 
 def readable(results) -> bool:
-    return all(r["stop"] is not None and r.get("function") is not None and "guards" in r for r in results.values())
+    return all(r["stop"] is not None and r.get("function") is not None and ("guards" in r or "returns" in r)
+               for r in results.values())
 
 
 def main(argv=None) -> int:
@@ -746,12 +855,15 @@ def main(argv=None) -> int:
     ap.add_argument("--any", action="store_true",
                     help="an address may be any instruction (a `return 0` path, a fallback): print the branches "
                          "that decide whether it runs")
+    ap.add_argument("--returns", action="store_true",
+                    help="an address may be anywhere in a function: print what the function returns in rax, each "
+                         "value with where it is set and the branches that decide that")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     args = ap.parse_args(argv)
     try:
         with open(args.image, "rb") as f:
             data = f.read()
-        results = cause(data, args.addresses, args.any)
+        results = cause(data, args.addresses, args.any, args.returns)
     except (OSError, pe_inspect.PeFormatError, ValueError) as e:
         print(f"{os.path.basename(sys.argv[0])}: {e}", file=sys.stderr)
         return 2

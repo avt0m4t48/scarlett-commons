@@ -61,6 +61,7 @@ INIT = 0x1C00               # GLOBAL_PTR = XMemFoo()
 RESET = 0x1C20              # GLOBAL_PTR = 0
 USE = 0x1D00                # if (GLOBAL_PTR == 0) int3
 USE_STOP = 0x1D0C
+BOOL = 0x1E00               # ok = 0; if (XMemFoo() >= 0) ok = 1; return ok
 
 
 def call(at, target):
@@ -128,6 +129,10 @@ def functions():
     a = USE
     f[a] = (b"\x48\x8b\x05" + rip(a, 7, GLOBAL_PTR)                               # mov rax, [rip+ptr]
             + b"\x48\x85\xc0\x75\x01\xcc\xc3")                                   # test rax, rax; jne; int3; ret
+    a = BOOL
+    f[a] = (b"\x53\x48\x83\xec\x20\x33\xdb" + call(a + 7, THUNK_FOO)            # push; sub; xor ebx, ebx; call
+            + b"\x85\xc0\x78\x02\xb3\x01"                                         # test eax, eax; js done; mov bl, 1
+            + b"\x8b\xc3\x48\x83\xc4\x20\x5b\xc3")                               # done: mov eax, ebx; ...; ret
     return {start: (code, start + len(code)) for start, code in f.items()}
 
 
@@ -262,6 +267,22 @@ class Int3CauseTest(unittest.TestCase):
         self.assertEqual((start["guards"], start["reached_from_start"]), ([], True))
         self.assertIn("no guard: every path from the function start reaches it",
                       int3_cause.to_text({"x": start}))
+
+    def test_returns_lists_each_value_with_the_branches_that_set_it(self):
+        out = int3_cause.cause(self.data, [hex(BOOL + 0x13)], returned=True)[hex(BOOL + 0x13)]
+        self.assertEqual((out["stop"], out["function"][0], out["rets"], out["complete"]), ("returns", BOOL, 1, True))
+        by_value = {x["constant"]: x for x in out["returns"]}
+        self.assertEqual(sorted(by_value), [0, 1])
+        one, zero = by_value[1], by_value[0]
+        self.assertEqual((one["at"], one["copied"], zero["at"]), (BOOL + 0x10, True, BOOL + 5))
+        [g] = one["guards"]
+        self.assertEqual((g["jump"], g["condition"]), ("js", "eax >= 0"))
+        self.assertEqual(g["registers"][0]["import"], "xmem.dll!XMemFoo")
+        self.assertTrue(zero["reached_from_start"])
+        text = int3_cause.to_text({"x": out})
+        self.assertIn(f"a copy of a constant (1) at {BOOL + 0x10:#x}:", text)
+        self.assertIn(f"js at {BOOL + 0xE:#x}, fall-through side: runs when eax >= 0", text)
+        self.assertIn("on every path from the function start", text)
 
     def test_wine_reports_the_address_after_the_int3(self):
         r = self.one(f"exe+{IMPORT_STOP + 1:#x}")

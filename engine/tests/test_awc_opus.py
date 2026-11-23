@@ -353,6 +353,20 @@ class ExportBankTest(unittest.TestCase):
         self.assertIn("Permission denied", err.getvalue())
         export.assert_not_called()
 
+    def test_colliding_bank_output_directories_are_refused_before_export(self):
+        src = Path(self.tmp.name) / "banks"
+        src.mkdir()
+        listing = [(str(src), [], ["fixture.awc", "fixture.AWC"])]
+        with mock.patch.object(awc.os, "walk", return_value=listing), \
+                mock.patch.object(awc, "export_bank") as export, \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
+            awc.main([str(src), self.out, "--jobs", "1"])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn("fixture.awc", err.getvalue())
+        self.assertIn("fixture.AWC", err.getvalue())
+        self.assertIn("would both export to", err.getvalue())
+        export.assert_not_called()
+
     def test_cli_bank_limits(self):
         src = Path(self.tmp.name) / "banks"
         src.mkdir()

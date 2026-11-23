@@ -37,6 +37,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -325,12 +326,16 @@ def export_stems(ids):
     return out
 
 
+def bank_output_dir(path, out_dir):
+    name = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(out_dir, name)
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    name = os.path.splitext(os.path.basename(path))[0]
-    od = os.path.join(out_dir, name)
+    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for mus, data in music:
@@ -408,6 +413,13 @@ def main(argv=None) -> int:
         banks = [(a.src, a.out)]
     if a.limit is not None:
         banks = banks[:a.limit]
+    destinations = {}
+    for bank, parent in banks:
+        target = bank_output_dir(bank, parent)
+        key = path_key(target)
+        if key in destinations:
+            ap.error(f"{destinations[key]} and {bank} would both export to {target}")
+        destinations[key] = bank
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
 

@@ -228,12 +228,12 @@ bool owned_device_caps() {
     if (available) properties.pNext = &conservative;
     reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(info->get_instance_proc(info->instance,
         "vkGetPhysicalDeviceProperties2"))(info->physical, &properties);
-    const bool expected = leonida::conservative_raster::tier1(available,
-        properties.properties.limits.subPixelPrecisionBits, conservative.primitiveOverestimationSize);
+    const auto expected = leonida::conservative_raster::tier(available,
+        properties.properties.limits.subPixelPrecisionBits, conservative.primitiveOverestimationSize,
+        conservative.degenerateTrianglesRasterized == VK_TRUE);
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     CHECK(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
-    CHECK(options.ConservativeRasterizationTier == (expected ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1
-                                                            : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED));
+    CHECK(unsigned(options.ConservativeRasterizationTier) == expected);
     return true;
 }
 } // namespace
@@ -280,13 +280,14 @@ int main(int argc, char** argv) {
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)))) return 1;
-    const bool expected_tier1 = leonida::conservative_raster::tier1(vk.conservative_rasterization,
-        properties.properties.limits.subPixelPrecisionBits, conservative_properties.primitiveOverestimationSize);
-    if ((options.ConservativeRasterizationTier == D3D12_CONSERVATIVE_RASTERIZATION_TIER_1) != expected_tier1) return 1;
+    const auto expected_tier = leonida::conservative_raster::tier(vk.conservative_rasterization,
+        properties.properties.limits.subPixelPrecisionBits, conservative_properties.primitiveOverestimationSize,
+        conservative_properties.degenerateTrianglesRasterized == VK_TRUE);
+    if (unsigned(options.ConservativeRasterizationTier) != expected_tier) return 1;
     if (options.ConservativeRasterizationTier == D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED) {
         std::puts("SKIP: Vulkan device does not meet conservative raster Tier 1 requirements"); return 77;
     }
-    if (options.ConservativeRasterizationTier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_1) return 1;
+    if (options.ConservativeRasterizationTier > D3D12_CONSERVATIVE_RASTERIZATION_TIER_2) return 1;
     if (!owned_device_caps()) return 1;
     std::string adapter;
     if (!copycmp::create_host(host, adapter)) return 1;

@@ -507,16 +507,19 @@ class MeshletCentreTests(unittest.TestCase):
         self.assertEqual([mp.centre_step(e << 28 | 0x007FF7FF) for e in range(5)], [0.0625, 0.125, 0.25, 0.5, 1.0])
         self.assertEqual(mp.meshlet_centre(0x2080F7EF, 0x7FF), (-4.0, 4.0, 0.0))
 
-    def grid_page(self, steps):
-        """A 4x4 grid in one meshlet whose stored centre is the vertex-box centre moved by `steps` (x, y, z)."""
+    def grid_parts(self, steps, bias=BIAS):
+        """A 4x4 grid block and one meshlet over it whose stored centre is the vertex-box centre moved by `steps`."""
         packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
-        blk = other_block(16, packed=packed, bias=self.BIAS, scale=self.SCALE)
+        blk = other_block(16, packed=packed, bias=bias, scale=self.SCALE)
         pos = mp.positions_4240(page(blk), mp.parse_page(page(blk))[0])
         centre = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
         f = [round(c * 16) + 2047 + s for c, s in zip(centre, steps)]
         grp = bytearray(grid_group(4, 4))
         struct.pack_into("<2I", grp, 12 + 8, f[0] | f[1] << 12, f[2])
-        return page(blk, bytes(grp))
+        return blk, bytes(grp)
+
+    def grid_page(self, steps):
+        return page(*self.grid_parts(steps))
 
     def test_centre_agreement(self):
         data = self.grid_page((0, 0, 0))
@@ -528,6 +531,30 @@ class MeshletCentreTests(unittest.TestCase):
         checks = mp.summarise_page(data, "p", centres=True)["checks"]
         self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (1, 2))
         self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
+
+    def test_block_chosen_by_centres(self):
+        """Two blocks with the group's vertex count: the one its stored centres fit, wherever it is."""
+        blk, grp = self.grid_parts((0, 0, 0))
+        moved = self.grid_parts((0, 0, 0), bias=(48.5, 2.25, 0.5))[0]                      # same grid, 50 m away
+        for data, by_centres in ((page(blk, moved, grp), 1), (page(moved, blk, grp), 0), (page(moved, grp, blk), 1)):
+            checks = mp.summarise_page(data, "p", centres=True)["checks"]
+            self.assertEqual((checks["centres_4240_axes_exact"], checks["groups_4240_several_blocks"],
+                              checks.get("groups_4240_block_by_centres", 0)), (3, 1, by_centres))
+        checks = mp.summarise_page(page(moved, moved, grp), "p", centres=True)["checks"]  # a tie keeps the nearest
+        self.assertEqual((checks["centres_4240_axes_exact"], checks.get("groups_4240_block_by_centres", 0)), (2, 0))
+        self.assertNotIn("groups_4240_several_blocks", mp.summarise_page(page(blk, grp), "p", centres=True)["checks"])
+
+    def test_non_finite_block_does_not_win(self):
+        """A block with NaN positions scores None: the finite block wins in either order, and with no finite block
+        the old choice stays (as before this rule)."""
+        blk, grp = self.grid_parts((0, 0, 0))
+        nan = bytearray(blk)
+        struct.pack_into("<f", nan, 0x60, float("nan"))                               # bias x
+        for data in (page(bytes(nan), blk, grp), page(blk, bytes(nan), grp)):
+            self.assertEqual(mp.summarise_page(data, "p", centres=True)["checks"]["centres_4240_axes_exact"], 3)
+        checks = mp.summarise_page(page(bytes(nan), bytes(nan), grp), "p", faces=True)["checks"]
+        self.assertEqual((checks["groups_4240_several_blocks"], checks.get("groups_4240_block_by_centres", 0)), (1, 0))
+        self.assertIsNone(mp.centre_distance(page(grp), mp.parse_page(page(grp))[0], [(math.nan, 0.0, 0.0)] * 16))
 
     def test_coarse_centre_agreement(self):
         # the grid page with its stored centre written at 2^e / 16 m steps and the exponent e in w2 bits 28-31

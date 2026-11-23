@@ -551,6 +551,9 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
                                                const IID* riid, void** out) {
     g_committed3 = {g_committed3.calls + 1, self, heap, flags, *desc, layout, clear, session, castable_count,
                     castable_formats, riid, out};
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+        return E_INVALIDARG;
     ++g_committed3_133.calls;
     if (heap) g_committed3_133.heap = *heap;
     if (desc) g_committed3_133.desc = *desc;
@@ -2785,17 +2788,42 @@ int check_committed_resource3_x() {
     EXPECT(texture.Layout == static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled));  // the title's description is read only
     EXPECT(release(resource) == 0);  // the title's one reference is the only one: nothing leaked, nothing extra
 
+    // The measured texture form is issued twice in succession.
+    D3D12_RESOURCE_DESC1 measured = texture;
+    measured.Width = 3840;
+    measured.Height = 2160;
+    measured.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    measured.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x40005);
+    words[1] = D3D12_HEAP_FLAG_ALLOW_DISPLAY;
+    words[2] = word(&measured);
+    for (unsigned i = 0; i < 2; ++i) {
+        resource = nullptr;
+        EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+        EXPECT(g_committed3.calls == 2 + i && xs::device_slot_hits(127) == 2 + i);
+        EXPECT(g_committed3.heap_flags == D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+        EXPECT(g_committed3.desc.Width == 3840 && g_committed3.desc.Height == 2160 &&
+               g_committed3.desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+        EXPECT(g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+               static_cast<std::uint32_t>(g_committed3.desc.Flags) == 0x5);
+        EXPECT(measured.Flags == static_cast<D3D12_RESOURCE_FLAGS>(0x40005));
+        EXPECT(release(resource) == 0);
+    }
+
     // A buffer takes the row-major layout.
     D3D12_RESOURCE_DESC1 buffer = texture;
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Height = 1;
     buffer.Format = DXGI_FORMAT_UNKNOWN;
     words[2] = word(&buffer);
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == E_INVALIDARG && !resource);
+    buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     words[6] = 0;
     words[7] = 0;
     resource = nullptr;
     EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
-    EXPECT(g_committed3.calls == 2 && g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(g_committed3.calls == 5 && g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_NONE &&
+           g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
     EXPECT(release(resource) == 0);
 
     // The PC device's own refusal reaches the title with a null object.

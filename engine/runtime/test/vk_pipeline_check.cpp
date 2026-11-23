@@ -1058,11 +1058,10 @@ int main(int argc, char** argv) {
         return failed ? 1 : 0;
     }
 
-    // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_clock = false;
+    // Collect optional features requested by the selected shaders.
+    bool want_mesh = false, want_bary = false, want_lock = false, want_fma = false, want_clock = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
-        if (meta->needs_maintenance8) want_m8 = true;
         for (const auto& feat : meta->features) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
@@ -1114,7 +1113,7 @@ int main(int argc, char** argv) {
     auto has = [&](const char* e) { for (auto& x : exts) if (!std::strcmp(x.extensionName, e)) return true; return false; };
     std::vector<const char*> enable;
 
-    // Query what the GPU supports for core 1.2/1.3 and any optional extensions requested by `work`.
+    // Query the core and optional device features used by the checker.
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
@@ -1141,9 +1140,9 @@ int main(int argc, char** argv) {
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
-    const bool ext_m8 = link(&m8, reinterpret_cast<VkBaseOutStructure*>(&m8), VK_KHR_MAINTENANCE_8_EXTENSION_NAME, want_m8);
-#else
-    (void)want_m8;
+    // The runtime enables maintenance8 whenever supported. The NVIDIA driver keys cached pipelines on this
+    // device feature even for shaders that do not use it, so match the runtime for every batch.
+    const bool ext_m8 = link(&m8, reinterpret_cast<VkBaseOutStructure*>(&m8), VK_KHR_MAINTENANCE_8_EXTENSION_NAME, true);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     VkPhysicalDeviceShaderFmaFeaturesKHR fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};

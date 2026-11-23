@@ -1268,9 +1268,11 @@ def _exclusive_output(out_dir: str):
     OS file lock automatically.
     """
     # Keep the lock outside the output: a failed build must still leave no output directory,
-    # and a successful one must contain only chunks/ and world.json.
+    # and a successful one must contain only chunks/ and world.json.  Key it on the resolved
+    # path so every spelling of one folder (8.3 names, junctions, symlinks) shares a lock; for
+    # a folder that does not exist yet, realpath resolves the part that does and appends the rest.
     key = hashlib.sha256(
-        os.path.normcase(os.path.abspath(out_dir)).encode("utf-8", "surrogatepass")
+        os.path.normcase(os.path.realpath(out_dir)).encode("utf-8", "surrogatepass")
     ).hexdigest()[:20]
     lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
     with open(lock_path, "a+b") as fh:

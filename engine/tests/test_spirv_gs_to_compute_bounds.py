@@ -504,7 +504,8 @@ class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
             src = os.path.join(d, "disasm", "gs_pctail.s")
             with open(os.path.join(d, "gs_pctail.dxbc"), "wb") as f:
                 f.write(gs_dxbc)
-            raw = open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8").read()
+            with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+                raw = f.read()
             lines = ["\t" + ln.strip() for ln in raw.splitlines()
                      if ln.strip() and not ln.strip().startswith((";", "."))]
             lines.insert(-1, "\ts_load_dword s10, s[0:1], 0x0")

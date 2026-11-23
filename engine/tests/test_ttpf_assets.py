@@ -1,5 +1,7 @@
 """Exercise the assets stage, existing C# catalogs and downstream texture lookup."""
+import contextlib
 from contextlib import ExitStack
+import io
 import json
 import os
 from pathlib import Path
@@ -72,8 +74,129 @@ class TextureAssets(unittest.TestCase):
         self.assertEqual((row["Mips"], row["BaseMipLevel"]), (5, 0))
         self.assertEqual(path.read_bytes()[148:], b"".join(linear.values()))
         self.assertEqual(world_build.index_ttpf_textures(self.work / "assets")[row["AssetKey"]], str(path))
+        # The lower-mip file the row named is gone once the manifest names the full chain: it was kept through
+        # the failed run above, and it is not stored a second time after the successful one.
+        self.assertFalse(partial.exists())
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted([row["File"], "manifest.json"]))
         with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("unexpected reopen")):
             self.build()
+
+    def upgrade(self, other_rows=(), file="partial.dds"):
+        """A pool whose one BCPack texture has a lower-mip export in `file`; returns that file's path."""
+        build_bc1_bcpack_pool(self.pool)
+        first = self.row | dict(File=file, BaseMipLevel=2, Mips=3, Limitation=None)
+        self.catalog.write_text(json.dumps({"Count": 1 + len(other_rows), "Textures": [first, *other_rows]}),
+                                encoding="utf-8")
+        old = self.folder / file
+        old.write_bytes(b"previous mip chain")
+        return old
+
+    def test_superseded_file_another_row_names_is_kept(self):
+        # Not a block-compressed format, so the pass leaves this row alone; it names the same file.
+        other = dict(Index=1, AssetKey="0123456789ABCDEF", SourceMips=1, BaseMipLevel=0, Mips=1,
+                     File="partial.dds", DxgiFormat=28, Limitation=None)
+        old = self.upgrade(other_rows=[other])
+        self.build()
+        rows = json.loads(self.catalog.read_bytes())["Textures"]
+        self.assertTrue(rows[0]["File"].startswith("000000_bcpack_"))
+        self.assertEqual(rows[1]["File"], "partial.dds")
+        self.assertEqual(old.read_bytes(), b"previous mip chain")
+
+    def test_superseded_file_that_cannot_be_removed_does_not_fail_the_export(self):
+        old = self.upgrade()
+        unlink = Path.unlink
+
+        def in_use(path, *args, **kwargs):
+            if path.name == "partial.dds":
+                raise PermissionError(13, "The process cannot access the file because it is being used")
+            return unlink(path, *args, **kwargs)
+
+        stderr = io.StringIO()
+        with mock.patch.object(Path, "unlink", in_use), contextlib.redirect_stderr(stderr):
+            self.build()
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+        self.assertTrue(old.exists())
+        # Not hidden: a folder that stays double-sized has its reason on screen.
+        self.assertIn("pool: 1 replaced DDS file(s) could not be removed", stderr.getvalue())
+        # And not forever: the manifest lists it, so the next build removes it once nothing holds it, although
+        # that build finds the pass stamped and writes nothing else.
+        self.assertEqual(json.loads(self.catalog.read_bytes())[ttpf_assets.PENDING], ["partial.dds"])
+        with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("unexpected reopen")):
+            self.build()
+        self.assertFalse(old.exists())
+        self.assertNotIn(ttpf_assets.PENDING, json.loads(self.catalog.read_bytes()))
+        self.build()                                      # nothing left to do: no further write, no error
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+
+    def test_a_run_stopped_after_the_switch_is_finished_by_the_next(self):
+        # The manifest that switches the rows already lists the file to remove, so a build stopped between that
+        # write and the removal leaves nothing behind for good.
+        old = self.upgrade()
+        with mock.patch.object(ttpf_assets, "finish_replaced"):
+            self.build()
+        self.assertTrue(old.exists())
+        self.assertEqual(json.loads(self.catalog.read_bytes())[ttpf_assets.PENDING], ["partial.dds"])
+        self.build()
+        self.assertFalse(old.exists())
+        self.assertNotIn(ttpf_assets.PENDING, json.loads(self.catalog.read_bytes()))
+
+    def complete_with_row_file(self, file):
+        """Run the pass on a manifest whose row names `file`; returns the folder's file names afterwards."""
+        self.upgrade()
+        manifest = json.loads(self.catalog.read_bytes())
+        manifest["Textures"][0]["File"] = file
+        self.assertEqual(ttpf_assets.complete_pool(self.pool, self.folder, manifest, ("v1-strict", None)), (1, 0))
+        return sorted(p.name for p in self.folder.iterdir())
+
+    def test_a_row_that_named_the_new_file_in_other_letter_case_keeps_it(self):
+        # On Windows and macOS that name is the file the pass has just published; removing it removed the export.
+        names = self.complete_with_row_file("000000_BCPACK_V1-STRICT.DDS")
+        row = self.row_after_export()
+        self.assertEqual(row["File"], "000000_bcpack_v1-strict.dds")
+        self.assertTrue((self.folder / row["File"]).is_file(), names)
+        self.assertGreater((self.folder / row["File"]).stat().st_size, 148)
+
+    def test_a_row_that_named_the_manifest_does_not_remove_it(self):
+        names = self.complete_with_row_file("manifest.json")
+        self.assertIn("manifest.json", names)
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+
+    def test_only_dds_files_are_removed(self):
+        (self.folder / "notes.txt").write_text("mine", encoding="utf-8")
+        names = self.complete_with_row_file("notes.txt")
+        self.assertIn("notes.txt", names)
+
+    def test_removal_looks_at_each_file_once_not_once_per_pair(self):
+        # 50 rows and 50 replaced files: 100 files to look at, not 2,500 pairs. A pool completes most of its
+        # textures in one pass, so a per-pair check takes minutes to hours on a real one.
+        rows = [dict(File=f"{i:06d}_bcpack_v1-strict.dds") for i in range(50)]
+        replaced = {f"{i:06d}.dds" for i in range(50)}
+        for name in [row["File"] for row in rows] + sorted(replaced):
+            (self.folder / name).write_bytes(b"dds")
+        stat, calls = os.stat, []
+
+        def counted(path, *args, **kwargs):
+            calls.append(path)
+            return stat(path, *args, **kwargs)
+
+        with mock.patch.object(ttpf_assets.os, "stat", counted), \
+                mock.patch.object(ttpf_assets.os.path, "samefile", side_effect=AssertionError("per-pair check")):
+            self.assertEqual(ttpf_assets.remove_replaced(self.folder, replaced, rows), [])
+        self.assertLessEqual(len(calls), 100, len(calls))
+        # The replaced files are gone and the rows' files stay.
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted(row["File"] for row in rows))
+
+    def test_only_a_file_in_the_pool_folder_is_removed(self):
+        # A row is trusted for a file name, not for a path: nothing outside the pool's folder is touched.
+        outside = self.folder.parent / "outside.dds"
+        outside.write_bytes(b"not this pool's")
+        self.upgrade()
+        manifest = json.loads(self.catalog.read_bytes())
+        manifest["Textures"][0]["File"] = "../outside.dds"
+        written, blocked = ttpf_assets.complete_pool(self.pool, self.folder, manifest, ("v1-strict", None))
+        self.assertEqual((written, blocked), (1, 0))
+        self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
+        self.assertEqual(outside.read_bytes(), b"not this pool's")
 
     def test_profile_added_after_strict_rejection(self):
         build_bc1_bcpack_pool(self.pool, ref_dists=[250] + [0] * 1023)

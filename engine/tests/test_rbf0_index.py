@@ -324,6 +324,34 @@ class ArgumentTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_directory_report_cannot_replace_a_carve_input(self):
+        manifest = os.path.join(self.root, "index.json")
+        stream = os.path.join(self.root, "00000001.bin")
+        for path, original in ((manifest, b'{"files": []}'), (stream, b"synthetic stream")):
+            with self.subTest(path=path):
+                with open(path, "wb") as f:
+                    f.write(original)
+                result = self.run_tool(self.root, path)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_directory_report_cannot_replace_a_stream_via_a_hard_link(self):
+        stream = os.path.join(self.root, "00000001.bin")
+        out = os.path.join(self.root, "report.csv")
+        with open(stream, "wb") as f:
+            f.write(b"synthetic stream")
+        try:
+            os.link(stream, out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(str(e))
+        result = self.run_tool(self.root, out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), b"synthetic stream")
+
     def test_unwritable_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):
             p = self.run_tool(self.rpf, out)

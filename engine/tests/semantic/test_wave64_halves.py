@@ -767,6 +767,14 @@ class UniformVote(unittest.TestCase):
             "v_lshlrev_b32_e32 v1, 16, v0", "v_add_u16_e64 v1, 1, s4",
             "v_cmp_gt_u32_e32 vcc, 0x200000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
 
+    def test_a_whole_register_16_bit_forms_stay_uniform(self):
+        # a packed convert, a SAD and a VOP2 16-bit integer op write the whole VGPR: uniform sources, uniform result
+        for name, op in (("vs_uv_pkrtz", "v_cvt_pkrtz_f16_f32_e32 v1, s4, v2"), ("vs_uv_sad", "v_sad_u16 v1, s4, 0, v2"),
+                         ("vs_uv_add_u16_e32", "v_add_u16_e32 v1, s4, v2")):
+            (t, reasons, _), _ = meta_of(name, vs(["v_mov_b32_e32 v2, s4", op, "v_cmp_lt_u32_e32 vcc, 5, v1"]
+                                                  + VCCZ_SIDES))
+            self.assertEqual((t, reasons), ("A", []), name)
+
     def test_a_partial_write_over_a_uniform_register(self):
         # the kept bits come from s4 too, so the register stays uniform
         name = "vs_uv_sdwa_uniform"

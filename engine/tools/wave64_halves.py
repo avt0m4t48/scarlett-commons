@@ -101,20 +101,30 @@ UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none i
 
 _TYPE16 = re.compile(r"^[biuf]16$")
 _TYPE = re.compile(r"^[biuf](8|16|24|32|64)$")
+# GFX10 VOP2 16-bit integer ops: in their VOP2 (_e32) encoding they define the whole register (design.md, "16-bit
+# results"); their _e64 forms are opsel-capable and keep the high half
+VOP2_INT16 = {"v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlrev_b16", "v_lshrrev_b16",
+              "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16"}
 
 
 def partial_write(ins, op):
-    """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest: SDWA with a byte or
-    word dst_sel and UNUSED_PRESERVE, or a 16-bit result (the first type in the name, e.g. v_add_u16, v_cvt_f16_f32;
-    not v_pk_*, which writes both halves, nor v_cvt_f32_f16 or v_mad_u32_u16, whose result is 32 bits)."""
+    """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest (design.md, "16-bit
+    results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
+    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
+    integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
+    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
     mods = ins.get("mods") or []
-    if "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods):
-        return True
-    name = op.split("_e32")[0].split("_e64")[0].split("_sdwa")[0].split("_dpp")[0]
-    if name.startswith("v_pk_"):
+    op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
+    if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
+        return "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_"))
+                                                             for m in mods)
+    name = op.split("_e32")[0].split("_e64")[0].split("_dpp")[0]
+    if name.startswith(("v_pk_", "v_cvt_pk", "v_sad_")):
         return False
     first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
-    return bool(first and _TYPE16.match(first))
+    if not (first and _TYPE16.match(first)):
+        return False
+    return not (name in VOP2_INT16 and "_e64" not in op)
 
 
 def base_op(op):

@@ -1497,6 +1497,7 @@ public:
     bool lists_castable_format(DXGI_FORMAT format) const {
         return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
     }
+    bool has_castable_formats() const { return !castable_formats_.empty(); }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
@@ -5068,6 +5069,10 @@ public:
             const DXGI_FORMAT asked = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
             const bool cast_listed = r && asked != rd.Format && rgba8_any_order(rd.Format) && rgba8_any_order(asked) &&
                                      r->lists_castable_format(asked);
+            // A typed BGRA8 or B8G8R8X8 texture with a castable list refuses an RTV in another format the list
+            // doesn't name, as a typed RGBA8 texture does. Without a list it keeps the image's format, as before.
+            const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
+                                            r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
@@ -5075,7 +5080,7 @@ public:
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                     (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
                     view = {};
-            } else if (typeless_color || typed_rgba8 || cast_listed) {
+            } else if (typeless_color || typed_rgba8 || cast_listed || typed_bgra8_listed) {
                 const DXGI_FORMAT requested = asked;
                 // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
                 // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view

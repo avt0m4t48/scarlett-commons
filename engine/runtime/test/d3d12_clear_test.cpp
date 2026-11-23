@@ -303,48 +303,69 @@ bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
     return true;
 }
 
-// An R8G8B8A8 texture whose castable list names B8G8R8A8_UNORM takes an RTV in it, and none in a format the list
-// doesn't name (the descriptor stays empty), in the other channel order or its own family.
+// A texture with a castable list takes an RTV in its own format and in the listed one, and none in a format the
+// list doesn't name (the descriptor stays empty): in the other channel order, across B8G8R8X8 and B8G8R8A8, or the
+// texture's own sRGB format. Typed R8G8B8A8, B8G8R8A8 and B8G8R8X8 textures refuse alike.
 bool check_unlisted_rtvs(ID3D12Device* device) {
     Ref<ID3D12Device10> device10;
     CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
     const D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC1 texture{};
-    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture.Width = texture.Height = 4;
-    texture.DepthOrArraySize = 1;
-    texture.MipLevels = 1;
-    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texture.SampleDesc.Count = 1;
-    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    const DXGI_FORMAT listed = DXGI_FORMAT_B8G8R8A8_UNORM;
-    Ref<ID3D12Resource> image;
-    CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
-        D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &listed, IID_PPV_ARGS(&image.p))));
     Ref<ID3D12DescriptorHeap> heap;
     const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
     CHECK(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
-    const auto rtv = [&](DXGI_FORMAT format) {
-        D3D12_RENDER_TARGET_VIEW_DESC desc{};
-        desc.Format = format;
-        desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        std::memset(reinterpret_cast<void*>(handle.ptr), 0x55, sizeof(leonida::TargetView));
-        device->CreateRenderTargetView(image.p, &desc, handle);
-        leonida::TargetView view{};
-        std::memcpy(&view, reinterpret_cast<const void*>(handle.ptr), sizeof(view));
-        return view;
+    struct Listed {
+        DXGI_FORMAT resource, listed;
+        VkFormat listed_view;
+        std::array<DXGI_FORMAT, 3> unlisted;
     };
-    const leonida::TargetView listed_view = rtv(listed);
-    CHECK(listed_view.resource &&
-          listed_view.format == static_cast<leonida::ColorViewFormat>(VK_FORMAT_B8G8R8A8_UNORM));
+    const Listed textures[] = {
+        {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM}},
+    };
     const leonida::TargetView none{};
-    for (const DXGI_FORMAT unlisted : {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM,
-                                       DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}) {
-        const leonida::TargetView view = rtv(unlisted);
-        CHECK(std::memcmp(&view, &none, sizeof(view)) == 0);
+    unsigned refused = 0;
+    for (const Listed& t : textures) {
+        D3D12_RESOURCE_DESC1 texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = texture.Height = 4;
+        texture.DepthOrArraySize = 1;
+        texture.MipLevels = 1;
+        texture.Format = t.resource;
+        texture.SampleDesc.Count = 1;
+        texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        Ref<ID3D12Resource> image;
+        CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &t.listed, IID_PPV_ARGS(&image.p))));
+        const auto rtv = [&](DXGI_FORMAT format) {
+            D3D12_RENDER_TARGET_VIEW_DESC desc{};
+            desc.Format = format;
+            desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            std::memset(reinterpret_cast<void*>(handle.ptr), 0x55, sizeof(leonida::TargetView));
+            device->CreateRenderTargetView(image.p, &desc, handle);
+            leonida::TargetView view{};
+            std::memcpy(&view, reinterpret_cast<const void*>(handle.ptr), sizeof(view));
+            return view;
+        };
+        CHECK(rtv(t.resource).resource);
+        const leonida::TargetView listed_view = rtv(t.listed);
+        CHECK(listed_view.resource && listed_view.format == static_cast<leonida::ColorViewFormat>(t.listed_view));
+        for (const DXGI_FORMAT unlisted : t.unlisted) {
+            const leonida::TargetView view = rtv(unlisted);
+            if (std::memcmp(&view, &none, sizeof(view)) != 0) {
+                std::fprintf(stderr, "castable RTVs: format %d {%d} took an RTV in unlisted format %d\n",
+                             int(t.resource), int(t.listed), int(unlisted));
+                return false;
+            }
+            ++refused;
+        }
     }
-    std::puts("castable RTVs: the listed format is taken, 3 formats the list doesn't name are refused");
+    std::printf("castable RTVs: %zu textures take their own and the listed format, and refuse %u formats their "
+                "lists don't name\n", std::size(textures), refused);
     return true;
 }
 } // namespace

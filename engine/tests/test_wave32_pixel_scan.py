@@ -123,6 +123,15 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(r["occurrences"]["vote"], 1)
         self.assertEqual((r["crossing"], r["only_family"]["vote"]), (1, 0))
 
+    def test_scc_overwritten_by_a_scalar_op_is_not_a_vote(self):
+        head = ["v_cmp_gt_f32_e32 vcc_lo, v0, v1", "s_and_saveexec_b32 s0, vcc_lo"]
+        tail = ["s_cselect_b32 s1, 1, 0", "s_endpgm"]
+        for middle, votes in (([], 1), (["s_mov_b32 s2, 0"], 1), (["s_mov_b32 s2, 0", "s_addk_i32 s2, 1"], 0),
+                              (["s_add_i32 s2, 0, 1"], 0), (["s_cmpk_eq_i32 s2, 1"], 0)):
+            with self.subTest(middle=middle):
+                r = self.scan(fixture("ps_probe.s", head + middle + tail))
+                self.assertEqual((r["occurrences"]["vote"], r["crossing"]), (votes, votes))
+
     def test_only_wave32_pixel_shaders(self):
         r = self.scan(PS_LANE_ID, PS_W64, VS_W32)
         self.assertEqual((r["ps"], r["ps_wave32"], r["crossing"]), (2, 1, 1))

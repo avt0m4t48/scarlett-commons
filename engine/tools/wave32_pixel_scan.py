@@ -71,9 +71,9 @@ DPP_ROW = re.compile(r"^(row_(shl|shr|ror|share|xmask):|row_mirror$|row_half_mir
 MASK_BRANCHES = {"s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz"}
 SCC_READERS = ("s_cbranch_scc0", "s_cbranch_scc1", "s_cselect_", "s_cmov_", "s_cmovk_", "s_addc_", "s_subb_")
 SCC_WRITERS = ("s_and_", "s_or_", "s_xor_", "s_andn1_", "s_andn2_", "s_orn1_", "s_orn2_", "s_nand_", "s_nor_",
-               "s_xnor_", "s_not_", "s_wqm_", "s_quadmask_", "s_bcnt", "s_cmp_", "s_bitcmp", "s_add_", "s_sub_",
-               "s_addc_", "s_subb_", "s_lshl", "s_lshr", "s_ashr", "s_bfe_", "s_min_", "s_max_", "s_abs_",
-               "s_absdiff_", "s_ff0_", "s_ff1_", "s_flbit_", "s_bitset", "s_brev_", "s_bfm_")
+               "s_xnor_", "s_not_", "s_wqm_", "s_quadmask_", "s_bcnt", "s_cmp_", "s_cmpk_", "s_bitcmp", "s_add_",
+               "s_addk_", "s_sub_", "s_addc_", "s_subb_", "s_lshl", "s_lshr", "s_ashr", "s_bfe_", "s_min_", "s_max_",
+               "s_abs_", "s_absdiff_", "s_ff0_", "s_ff1_", "s_flbit_", "s_bitset", "s_brev_", "s_bfm_")
 MASK_SOP = ("s_and_", "s_or_", "s_xor_", "s_andn1_", "s_andn2_", "s_orn1_", "s_orn2_", "s_nand_", "s_nor_",
             "s_xnor_", "s_not_")
 

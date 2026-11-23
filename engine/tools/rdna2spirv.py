@@ -299,6 +299,7 @@ class Gen:
         self.ms_params = set()     # MS: param export indices used
         self.ms_alloc = False      # MS: s_sendmsg GS_ALLOC_REQ seen
         self.pos_map = {}          # VS/MS: pos index (1..3) -> {comp: ("clip"|"cull", idx)} from OSG1
+        self.mrt_targets = []      # PS: the declared SV_Target indices in order (OSG1); export k goes to the k-th
         self.pos_misc = set()      # VS: misc system values in pos1 (4=Layer, 5=ViewportIndex) from OSG1
         self.clip_count = 0        # ClipDistance array length (1..8)
         self.cull_count = 0        # CullDistance array length (1..8)
@@ -13311,7 +13312,14 @@ class Gen:
             if tgt.startswith("param") and self.stage == "vs":
                 name = f"%out_param{int(tgt[5:])}"
             elif tgt.startswith("mrt") and tgt != "mrtz" and self.stage == "ps":
-                name = f"%out_mrt{int(tgt[3:])}"
+                # Colour exports are packed: exp mrtK writes the K-th declared SV_Target, not render target K
+                # (docs/design.md, "Pixel colour exports"). Without an OSG1 the index is the render target.
+                k = int(tgt[3:])
+                if self.mrt_targets and k >= len(self.mrt_targets):
+                    raise Unsupported(f"export mrt{k} past the {len(self.mrt_targets)} declared SV_Target outputs")
+                rt = self.mrt_targets[k] if self.mrt_targets else k
+                name = f"%out_mrt{rt}"
+                tgt = f"mrt{rt}"
             elif tgt.startswith("pos"):
                 return  # pos1+ (clip/cull/point size): ignored in v0
             else:
@@ -15579,6 +15587,9 @@ def translate(path):
             g.pixel_flat = [n for n, m in enumerate(methods) if m == fssm_header.READ_MOV]
             for n in range(count):
                 g.inputs.setdefault(f"%in_attr{n}", n)
+    if stage == "ps":
+        # D3D_NAME_TARGET (64); OSG1 keeps SV_Target n in register n, so the semantic index is the render target.
+        g.mrt_targets = sorted({sem for _, sem, sysv, _, _ in output_signature_full(path, info["name"]) if sysv == 64})
     if stage in ("vs", "ms"):
         g.pos_map, g.pos_misc, g.clip_count, g.cull_count = pos_export_layout(
             output_signature_full(path, info["name"]), insns)

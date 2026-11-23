@@ -378,5 +378,132 @@ OpFunctionEnd
             self.assertFalse(os.path.exists(dst))
 
 
+_INT_HEAD = (
+    "OpCapability Shader\nOpCapability Int64\nOpCapability Int16\nOpCapability Int8\n"
+    "OpMemoryModel Logical GLSL450\n"
+    "%i8 = OpTypeInt 8 1\n%u8 = OpTypeInt 8 0\n%i16 = OpTypeInt 16 1\n%u16 = OpTypeInt 16 0\n"
+    "%i32 = OpTypeInt 32 1\n%u32 = OpTypeInt 32 0\n%i64 = OpTypeInt 64 1\n%u64 = OpTypeInt 64 0\n"
+)
+
+
+def _switch(sel_type, literal):
+    return (_INT_HEAD + "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n"
+            f"%k = OpConstant %{sel_type} 0\n%f = OpFunction %void None %fn\n%l0 = OpLabel\n"
+            f"OpSelectionMerge %m None\nOpSwitch %k %m {literal} %l1\n%l1 = OpLabel\nOpBranch %m\n"
+            "%m = OpLabel\nOpReturn\nOpFunctionEnd\n")
+
+
+# (SPIR-V text, words spirv-as gives for the literal, or None where spirv-as refuses it). Measured with the
+# Vulkan SDK 1.4.363.1 spirv-as (BUILD-1012).
+_INT_LITERAL_CASES = []
+for _t, _lit, _words in (
+    ("u32", "4294967295", [0xFFFFFFFF]), ("u32", "4294967296", None), ("u32", "0x100000000", None),
+    ("u32", "-1", None), ("u32", "-0", None), ("u32", "+5", [5]),
+    ("i32", "-1", [0xFFFFFFFF]), ("i32", "2147483647", [0x7FFFFFFF]), ("i32", "2147483648", None),
+    ("i32", "-2147483648", [0x80000000]), ("i32", "-2147483649", None), ("i32", "0xFFFFFFFF", [0xFFFFFFFF]),
+    ("i32", "0x80000000", [0x80000000]), ("i32", "0x100000000", None), ("i32", "-0x1", [0xFFFFFFFF]),
+    ("u16", "65535", [0xFFFF]), ("u16", "65536", None), ("u16", "-1", None), ("u16", "0x10000", None),
+    ("i16", "-1", [0xFFFFFFFF]), ("i16", "32767", [0x7FFF]), ("i16", "32768", None),
+    ("i16", "-32768", [0xFFFF8000]), ("i16", "-32769", None), ("i16", "-0x8001", None),
+    ("i16", "0xFFFF", [0xFFFFFFFF]), ("i16", "0x8000", [0xFFFF8000]), ("i16", "0x10000", None),
+    ("u8", "255", [0xFF]), ("u8", "256", None), ("u8", "-1", None),
+    ("i8", "127", [0x7F]), ("i8", "128", None), ("i8", "-128", [0xFFFFFF80]), ("i8", "-129", None),
+    ("i8", "0xFF", [0xFFFFFFFF]), ("i8", "0x80", [0xFFFFFF80]),
+    # A signed hex literal (+0x...) is a value, not a bit pattern: it must fit the signed range (@mrbean56, #3931).
+    ("i16", "+0xFFFF", None), ("i16", "+0x8000", None), ("i16", "+0x7FFF", [0x7FFF]), ("i8", "+0x80", None),
+    ("i32", "+0xFFFFFFFF", None), ("i32", "+0x7FFFFFFF", [0x7FFFFFFF]), ("i64", "+0xFFFFFFFFFFFFFFFF", None),
+    ("u16", "+0xFFFF", [0xFFFF]), ("u32", "+0xFFFFFFFF", [0xFFFFFFFF]),
+    ("u64", "18446744073709551615", [0xFFFFFFFF, 0xFFFFFFFF]), ("u64", "18446744073709551616", None),
+    ("u64", "-1", None),
+    ("i64", "-1", [0xFFFFFFFF, 0xFFFFFFFF]), ("i64", "9223372036854775807", [0xFFFFFFFF, 0x7FFFFFFF]),
+    ("i64", "9223372036854775808", None), ("i64", "-9223372036854775809", None),
+    ("i64", "0xFFFFFFFFFFFFFFFF", [0xFFFFFFFF, 0xFFFFFFFF]),
+):
+    _INT_LITERAL_CASES.append((f"OpConstant %{_t} {_lit}", _INT_HEAD + f"%c = OpConstant %{_t} {_lit}\n", _words))
+for _lit, _words in (("4294967295", [0xFFFFFFFF]), ("4294967296", None), ("-1", None)):
+    _INT_LITERAL_CASES.append((f"OpDecorate Location {_lit}", _INT_HEAD + f"OpDecorate %u32 Location {_lit}\n",
+                               _words))
+    _INT_LITERAL_CASES.append((f"OpGroupMemberDecorate {_lit}",
+                               _INT_HEAD + f"%g = OpDecorationGroup\nOpGroupMemberDecorate %g %u32 {_lit}\n",
+                               _words))
+for _t, _lit, _words in (
+    ("u32", "4294967295", [0xFFFFFFFF]), ("u32", "4294967296", None), ("u32", "-1", None),
+    ("i32", "-1", [0xFFFFFFFF]), ("i32", "2147483648", None),
+    ("i16", "0xFFFF", [0xFFFFFFFF]), ("i16", "0x8000", [0xFFFF8000]), ("i16", "32768", None),
+    ("u16", "65536", None), ("i8", "0x80", [0xFFFFFF80]),
+    ("i32", "+0xFFFFFFFF", None), ("i16", "+0x8000", None), ("i32", "0xFFFFFFFF", [0xFFFFFFFF]),
+    ("u64", "18446744073709551615", [0xFFFFFFFF, 0xFFFFFFFF]), ("u64", "18446744073709551616", None),
+    ("u64", "-1", None), ("i64", "-1", [0xFFFFFFFF, 0xFFFFFFFF]),
+):
+    _INT_LITERAL_CASES.append((f"OpSwitch %{_t} case {_lit}", _switch(_t, _lit), _words))
+
+
+def _literal_words(spv: bytes, opcode: int, skip: int):
+    """The words after the first `skip` operand words of the last instruction with `opcode` (the literal)."""
+    words = struct.unpack(f"<{len(spv) // 4}I", spv)
+    i, found = 5, None
+    while i < len(words):
+        n = words[i] >> 16
+        if words[i] & 0xFFFF == opcode:
+            found = list(words[i + 1 + skip:i + n])
+        i += n
+    return found
+
+
+# opcode and leading operand words before the literal: OpConstant (result type, result), OpDecorate (target,
+# decoration), OpGroupMemberDecorate (group, then the struct id the literal pairs with), OpSwitch (selector,
+# default); a switch target label follows its literal.
+_LITERAL_AT = {"OpConstant": (43, 2), "OpDecorate": (71, 2), "OpGroupMemberDecorate": (75, 2), "OpSwitch": (251, 2)}
+
+
+class IntegerLiteralRangeTests(unittest.TestCase):
+    """BUILD-1012: an integer literal that doesn't fit its type is refused as spirv-as refuses it, not masked."""
+
+    def check_case(self, name, text, expected):
+        op = name.split()[0]
+        opcode, skip = _LITERAL_AT[op]
+        if expected is None:
+            with self.assertRaises(spirv_asm.SpirvAsmError):
+                spirv_asm.assemble(text)
+            return
+        got = _literal_words(spirv_asm.assemble(text), opcode, skip)
+        if op == "OpSwitch":
+            got = got[:-1]  # the case's target label
+        self.assertEqual(got, expected)
+
+    def test_literals_fit_their_type_or_are_refused(self):
+        for name, text, expected in _INT_LITERAL_CASES:
+            with self.subTest(name):
+                self.check_case(name, text, expected)
+
+    def test_refusal_names_the_literal_and_the_type(self):
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError,
+                                    r"line 14: integer 4294967296 does not fit in a 32-bit unsigned integer"):
+            spirv_asm.assemble(_INT_HEAD + "%c = OpConstant %u32 4294967296\n")
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"negative number in an unsigned literal: -1"):
+            spirv_asm.assemble(_INT_HEAD + "%c = OpConstant %u16 -1\n")
+
+    @unittest.skipUnless(SPIRV_AS, "spirv-as not installed")
+    def test_cases_match_spirv_as(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+            for name, text, expected in _INT_LITERAL_CASES:
+                with self.subTest(name):
+                    with open(src, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(text)
+                    r = subprocess.run([SPIRV_AS, src, "-o", dst, "--target-env", "vulkan1.2"],
+                                       capture_output=True, text=True)
+                    if expected is None:
+                        self.assertNotEqual(r.returncode, 0, f"spirv-as accepted {name}")
+                        continue
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    with open(dst, "rb") as f:
+                        ref = f.read()
+                    got = spirv_asm.assemble(text)
+                    a = struct.unpack(f"<{len(got) // 4}I", got)
+                    b = struct.unpack(f"<{len(ref) // 4}I", ref)
+                    self.assertEqual(a[:2] + a[3:], b[:2] + b[3:])
+
+
 if __name__ == "__main__":
     unittest.main()

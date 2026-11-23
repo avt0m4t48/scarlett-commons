@@ -279,7 +279,7 @@ const char* slot_name(unsigned slot) {
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 74: return "Xbox (pointer, u32, pointer) stand-in";
         case 75: return "CreateCommandQueue1 -> queue proxy";
-        case 133: return "Xbox CreatePlacedResourceX -> committed resource";
+        case 133: return "Xbox CreatePlacedResourceX -> a buffer on the title's pages, else a committed resource";
         case 76: return "Xbox resource creation";
         case 127: return "Xbox CreateCommittedResource3";
         case 78: return "Xbox SetFrameIntervalX";
@@ -3166,6 +3166,13 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
 constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
 constexpr unsigned kPcCreateCommittedResource3Slot = 76;  // ID3D12Device10's CreateCommittedResource3
 
+// A buffer goes first to the handler the device behind the proxy registered (set_placed_at_va_handler, #7218): it
+// makes the buffer on the title's own pages at `va`, so the CPU's writes there are the GPU's reads. The handler takes
+// the PC flags the host accepts (0x200 dropped, USE_TIGHT_ALIGNMENT 0x400 kept). A texture, a device with no handler
+// and a handler that refuses keep the committed stand-in below.
+std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+constexpr std::uint32_t kPlacedAtVaResourceFlags = 0x5ff;
+
 D3D12_RESOURCE_STATES legacy_state_for_layout(std::uint32_t layout, bool buffer) {
     if (buffer) return D3D12_RESOURCE_STATE_COMMON;
     switch (layout) {
@@ -3203,7 +3210,16 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                      "created committed, not backed by the VA\n",
                      static_cast<int>(pc_desc.Dimension), xbox_flags, static_cast<unsigned>(pc_desc.Flags),
                      initial_state);
-    (void)va;
+    if (buffer) {
+        if (const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire)) {
+            D3D12_RESOURCE_DESC placed_desc = pc_desc;
+            placed_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPlacedAtVaResourceFlags);
+            const HRESULT placed =
+                handler(self->real, reinterpret_cast<void*>(va), placed_desc, initial_state, *riid, out);
+            if (SUCCEEDED(placed)) return placed;
+            *out = nullptr;
+        }
+    }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
     const D3D12_CLEAR_VALUE* const clear = clearable ? clear_value : nullptr;
@@ -3881,6 +3897,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, 
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
+}
+
+void set_placed_at_va_handler(PlacedAtVaHandler handler) {
+    g_placed_at_va.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

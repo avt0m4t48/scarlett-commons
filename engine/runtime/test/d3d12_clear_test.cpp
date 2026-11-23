@@ -1,6 +1,7 @@
 
 // Compare render-target and depth-stencil clears against native Windows D3D12/WARP, through D3D12 clear/copy/Map on
-// both sides. Covers UNORM/SNORM/FLOAT/UINT/SINT render targets and depth/stencil, full and rectangle clears.
+// both sides. Covers UNORM/SNORM/FLOAT/UINT/SINT render targets and depth/stencil, full and rectangle clears, and RTVs
+// through castable-format lists in the other channel order.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -9,6 +10,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -26,8 +28,10 @@ struct Event {
     ~Event() { if (handle) CloseHandle(handle); }
 };
 
+// With `cast` set, the texture lists it as its castable format (CreateCommittedResource3) and the clears go through an
+// RTV in it.
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, const FLOAT* full, const FLOAT* part,
-                    std::vector<unsigned char>& pixels, bool volume = false) {
+                    std::vector<unsigned char>& pixels, bool volume = false, DXGI_FORMAT cast = DXGI_FORMAT_UNKNOWN) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -51,8 +55,24 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
     texture.Format = format;
     texture.SampleDesc.Count = 1;
     texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
-        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))));
+    if (cast == DXGI_FORMAT_UNKNOWN) {
+        CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))));
+    } else {
+        Ref<ID3D12Device10> device10;
+        CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+        D3D12_RESOURCE_DESC1 texture1{};
+        texture1.Dimension = texture.Dimension;
+        texture1.Width = texture.Width;
+        texture1.Height = texture.Height;
+        texture1.DepthOrArraySize = texture.DepthOrArraySize;
+        texture1.MipLevels = texture.MipLevels;
+        texture1.Format = texture.Format;
+        texture1.SampleDesc = texture.SampleDesc;
+        texture1.Flags = texture.Flags;
+        CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture1,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &cast, IID_PPV_ARGS(&image.p))));
+    }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed[2]{};
     UINT64 total = 0;
     device->GetCopyableFootprints(&texture, 0, texture.MipLevels, 0, placed, nullptr, nullptr, &total);
@@ -69,7 +89,14 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p))));
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(image.p, nullptr, handle);
+    if (cast == DXGI_FORMAT_UNKNOWN) {
+        device->CreateRenderTargetView(image.p, nullptr, handle);
+    } else {
+        D3D12_RENDER_TARGET_VIEW_DESC listed{};
+        listed.Format = cast;
+        listed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(image.p, &listed, handle);
+    }
     list->ClearRenderTargetView(handle, full, 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
     if (volume) {
@@ -275,6 +302,72 @@ bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
     std::printf("3D RTVs: %zu RGBA texels match WARP and expected slice colours\n", expected.size() / 4);
     return true;
 }
+
+// A texture with a castable list takes an RTV in its own format and in the listed one, and none in a format the
+// list doesn't name (the descriptor stays empty): in the other channel order, across B8G8R8X8 and B8G8R8A8, or the
+// texture's own sRGB format. Typed R8G8B8A8, B8G8R8A8 and B8G8R8X8 textures refuse alike.
+bool check_unlisted_rtvs(ID3D12Device* device) {
+    Ref<ID3D12Device10> device10;
+    CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+    const D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+    struct Listed {
+        DXGI_FORMAT resource, listed;
+        VkFormat listed_view;
+        std::array<DXGI_FORMAT, 3> unlisted;
+    };
+    const Listed textures[] = {
+        {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB}},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+         {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM}},
+    };
+    const leonida::TargetView none{};
+    unsigned refused = 0;
+    for (const Listed& t : textures) {
+        D3D12_RESOURCE_DESC1 texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = texture.Height = 4;
+        texture.DepthOrArraySize = 1;
+        texture.MipLevels = 1;
+        texture.Format = t.resource;
+        texture.SampleDesc.Count = 1;
+        texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        Ref<ID3D12Resource> image;
+        CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &t.listed, IID_PPV_ARGS(&image.p))));
+        const auto rtv = [&](DXGI_FORMAT format) {
+            D3D12_RENDER_TARGET_VIEW_DESC desc{};
+            desc.Format = format;
+            desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            std::memset(reinterpret_cast<void*>(handle.ptr), 0x55, sizeof(leonida::TargetView));
+            device->CreateRenderTargetView(image.p, &desc, handle);
+            leonida::TargetView view{};
+            std::memcpy(&view, reinterpret_cast<const void*>(handle.ptr), sizeof(view));
+            return view;
+        };
+        CHECK(rtv(t.resource).resource);
+        const leonida::TargetView listed_view = rtv(t.listed);
+        CHECK(listed_view.resource && listed_view.format == static_cast<leonida::ColorViewFormat>(t.listed_view));
+        for (const DXGI_FORMAT unlisted : t.unlisted) {
+            const leonida::TargetView view = rtv(unlisted);
+            if (std::memcmp(&view, &none, sizeof(view)) != 0) {
+                std::fprintf(stderr, "castable RTVs: format %d {%d} took an RTV in unlisted format %d\n",
+                             int(t.resource), int(t.listed), int(unlisted));
+                return false;
+            }
+            ++refused;
+        }
+    }
+    std::printf("castable RTVs: %zu textures take their own and the listed format, and refuse %u formats their "
+                "lists don't name\n", std::size(textures), refused);
+    return true;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -327,6 +420,7 @@ int main(int argc, char** argv) {
         }
         if (!check_volume_rtvs(host.p, ours.p)) return 1;
         if (volume_only) return 0;
+        if (!check_unlisted_rtvs(ours.p)) return 1;
         const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
         // Integer-format values: negatives, fractions, NaN and overflow exercise the numeric float->int conversion.
         const std::array<float, 4> int_values[] = {
@@ -392,6 +486,53 @@ int main(int argc, char** argv) {
                     }
                     ++format_failures;
                     break; // first mismatch per format; keep checking the other formats
+                }
+                ++cases_checked;
+            }
+        }
+        // RTVs through a castable-format list in another channel order or family, or a typed BGRA8 texture's sRGB
+        // view: the clear is stored in the view's channel order and encoding, as WARP and AMD's D3D12 driver store
+        // it. An X8 view leaves its X byte undefined (WARP and AMD's driver differ), so it isn't compared. The bytes
+        // are compared within 1: drivers round the 0.5 tie differently (WARP 128, NVIDIA 127), and Intel's encodes
+        // sRGB 1 off WARP in places (its own D3D12 driver stores the same bytes as the layer there); a wrong channel
+        // order or a missing sRGB encoding is many steps off.
+        struct CastFormat { DXGI_FORMAT resource, view; const char* name; };
+        const CastFormat cast_formats[] = {
+            {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "R8G8B8A8_UNORM{B8G8R8A8_UNORM}"},
+            {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, "B8G8R8A8_UNORM{R8G8B8A8_UNORM}"},
+            {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "R8G8B8A8_UNORM{B8G8R8A8_UNORM_SRGB}"},
+            {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, "B8G8R8A8_UNORM{R8G8B8A8_UNORM_SRGB}"},
+            {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "B8G8R8A8_UNORM{B8G8R8A8_UNORM_SRGB}"},
+            {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "B8G8R8A8_UNORM{B8G8R8X8_UNORM}"},
+            {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "B8G8R8X8_UNORM{B8G8R8A8_UNORM}"},
+            {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "R8G8B8A8_UNORM{B8G8R8X8_UNORM}"},
+        };
+        for (const auto& cf : cast_formats) {
+            for (unsigned i = 0; i < nf; ++i) {
+                const auto& full = float_values[i];
+                const auto& part = float_values[(i + 1) % nf];
+                std::vector<unsigned char> actual, expected;
+                if (!clear_and_read(ours.p, cf.resource, 4, full.data(), part.data(), actual, false, cf.view) ||
+                    !clear_and_read(host.p, cf.resource, 4, full.data(), part.data(), expected, false, cf.view)) {
+                    std::fprintf(stderr, "%s case %u: clear or readback failed\n", cf.name, i);
+                    ++format_failures;
+                    break;
+                }
+                if (cf.view == DXGI_FORMAT_B8G8R8X8_UNORM) {
+                    for (std::size_t b = 3; b < actual.size() && b < expected.size(); b += 4) actual[b] = expected[b] = 0;
+                }
+                bool close = actual.size() == expected.size();
+                std::size_t off = 0;
+                for (; close && off < actual.size(); ++off)
+                    if (std::abs(int(actual[off]) - int(expected[off])) > 1) { close = false; break; }
+                if (!close) {
+                    if (actual.size() == expected.size())
+                        std::fprintf(stderr, "%s case %u byte %zu: Vulkan %02x, WARP %02x\n",
+                            cf.name, i, off, unsigned(actual[off]), unsigned(expected[off]));
+                    else
+                        std::fprintf(stderr, "%s case %u: readback sizes differ\n", cf.name, i);
+                    ++format_failures;
+                    break;
                 }
                 ++cases_checked;
             }

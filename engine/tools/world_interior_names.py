@@ -44,6 +44,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
@@ -57,7 +58,10 @@ LIMBO = joaat("limbo")
 ROOM_KEY = 0xA261E0A9  # a room's hash member that holds an interior key's joaat
 OVERLAP = 64 << 20  # a worker reads this far past its window so a resource that straddles the edge is whole
 THRESHOLDS = (0, 1, 2, 5, 10, 25, 100)
-ROOM_EPS = 1e-6  # metres; a point on a room face stays inside despite the rounding of the inverse rotation
+# Metres. A point on an interior or room face stays inside despite the rounding of the inverse rotation (about
+# 1e-17 m with a float32 quaternion). Positions are float32, which near the 13 km map edge resolve to about 1 mm,
+# so any tolerance far below that decides exactly as exact arithmetic would.
+EPS = 1e-6
 
 
 def _vec3(b, base, member):
@@ -145,6 +149,21 @@ def scan_window(job):
     return out
 
 
+def start_error(path, start):
+    """Why --start cannot be used on ``path``, or None. Checked before scanning, so --jobs > 1 also gives one line
+    instead of a traceback from a worker; a carved file or folder has no data area and ignores --start."""
+    if start is None or not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        magic = f.read(8)
+    if magic[:4] != b"9FPR" or len(magic) < 8:
+        return None
+    data_start, size = WI._u32(magic, 4), os.path.getsize(path)
+    if not data_start <= start < size:
+        return f"--start 0x{start:x} is outside the data area 0x{data_start:x}..0x{size:x} of {path}"
+    return None
+
+
 def scan(path, start=None, limit=None, jobs=1):
     """{offset or file: (interiors, placements)} for an RPF9 archive window or a carved file/folder."""
     magic = b""
@@ -156,7 +175,7 @@ def scan(path, start=None, limit=None, jobs=1):
     size = os.path.getsize(path)
     lo = start if start is not None else WI._u32(magic, 4)
     hi = min(size, lo + limit) if limit is not None else size
-    n = max(1, jobs)
+    n = process_workers(max(1, jobs))  # one window per worker: a window past the cap only re-reads OVERLAP
     step = max(1, -(-(hi - lo) // n))
     windows = [(path, s, min(hi, s + step), size) for s in range(lo, hi, step)]
     found = {}
@@ -183,17 +202,53 @@ def _pairs(pairs):
     return out
 
 
+def _position(pos):
+    """``pos`` as three floats, or None when it is not a list of three finite numbers."""
+    if not isinstance(pos, list) or len(pos) != 3:
+        return None
+    if not all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in pos):
+        return None
+    try:
+        out = [float(c) for c in pos]  # an integer past float range (over 308 digits) raises OverflowError
+    except OverflowError:
+        return None
+    return out if all(math.isfinite(c) for c in out) else None
+
+
+def _json_type(v):
+    if v is None:
+        return "null"
+    if isinstance(v, bool):  # before the number test: bool is an int in Python
+        return "a boolean"
+    return ("a list" if isinstance(v, list) else "a string" if isinstance(v, str)
+            else "a number" if isinstance(v, (int, float)) else "an object")
+
+
 def load_names(path):
-    """({key: [position]}, number of repeated keys in the InteriorNames section)."""
+    """({key: [position]}, repeated keys in the InteriorNames section, positions that are not three numbers).
+
+    Raises ValueError (with OSError and json.JSONDecodeError, which is one) when the file is not such a table."""
     with open(path, encoding="utf-8") as f:
         doc = json.load(f, object_pairs_hook=_pairs)
+    if not isinstance(doc, dict):
+        raise ValueError(f"expected a JSON object, found {_json_type(doc)}")
     section = doc.get("InteriorNames", doc)
+    if not isinstance(section, dict):
+        raise ValueError(f"InteriorNames is {_json_type(section)}, not an object")
     duplicates = len(section.pop("\0duplicates", []))
-    out = {}
+    out, malformed = {}, 0
     for key, items in section.items():
         items = items if isinstance(items, list) else [items]
-        out[key] = [it.get("Pos") for it in items if isinstance(it, dict) and it.get("Pos")]
-    return out, duplicates
+        out[key] = []
+        for it in items:
+            if not isinstance(it, dict) or "Pos" not in it:
+                continue
+            pos = _position(it["Pos"])
+            if pos is None:
+                malformed += 1
+            else:
+                out[key].append(pos)
+    return out, duplicates, malformed
 
 
 def _local(q, p, r):
@@ -229,7 +284,7 @@ def _buckets(values):
             "within_m": {str(t): bisect.bisect_right(values, t) for t in THRESHOLDS}}
 
 
-def resolve(names, found, duplicate_keys=0):
+def resolve(names, found, duplicate_keys=0, malformed_positions=0):
     interiors, placements = {}, {}
     n_interiors = n_placements = duplicate_interiors = 0
     for parsed_interiors, parsed_placements in found.values():
@@ -252,6 +307,7 @@ def resolve(names, found, duplicate_keys=0):
                "placed_unknown_names": sum(1 for k in placements if k not in interiors),
                "placements_of_unknown_interior": sum(len(v) for k, v in placements.items() if k not in interiors),
                "keys": len(names), "duplicate_keys": duplicate_keys, "positions": sum(map(len, names.values())),
+               "malformed_positions": malformed_positions, "keys_without_a_placement_position": 0,
                "keys_in_a_room_key_member": sum(1 for k in names if joaat(k) in room_keys),
                "keys_naming_an_interior": 0, "confirmed_by_64bit_key": {}, "keys_not_confirmed": 0,
                "keys_with_placements": 0, "positions_vs_placements": {"equal": 0, "more_positions": 0,
@@ -281,16 +337,21 @@ def resolve(names, found, duplicate_keys=0):
         pv = summary["positions_vs_placements"]
         pv["equal" if len(positions) == len(pl) else "more_positions" if len(positions) > len(pl)
            else "fewer_positions"] += 1
+        positioned = [p for p in pl if p["position"] is not None and len(p["position"]) == 3]
+        if not positioned:  # no placement to measure from; counted instead of failing the whole run
+            summary["keys_without_a_placement_position"] += 1
+            continue
         lo, hi = d["bb_min"], d["bb_max"]
         if lo is None or hi is None:
             continue
         for tag, conj in (("stored", False), ("conjugate", True)):
-            placed = [(p, WA._rotation(p["rotation"], conj)) for p in pl if p["position"]]
+            placed = [(p, WA._rotation(p["rotation"], conj)) for p in positioned]
             out = []
             for q in positions:
                 locs = [(_local(q, p["position"], r), p) for p, r in placed]
-                out.append(min(_outside(v, *_scaled(lo, hi, p)) for v, p in locs))
-                if any(rn != LIMBO and rlo and rhi and _outside(v, *_scaled(rlo, rhi, p)) <= ROOM_EPS
+                gap = min(_outside(v, *_scaled(lo, hi, p)) for v, p in locs)
+                out.append(gap if gap > EPS else 0.0)
+                if any(rn != LIMBO and rlo and rhi and _outside(v, *_scaled(rlo, rhi, p)) <= EPS
                        for v, p in locs for rn, rlo, rhi, _ in d["rooms"]):
                     summary["positions_in_a_room_box"][tag] += 1
             row["outside_box_m_" + tag] = [round(x, 3) for x in out]
@@ -324,6 +385,10 @@ def main(argv=None):
             ap.error("no such file or folder: %s" % p)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
+    if a.start is not None and a.start < 0:
+        ap.error("--start must not be negative")
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be at least 1 byte")  # 0 would scan nothing and report every count as 0
     out_abs = os.path.abspath(a.out)
     if same_report_path(a.out, a.path) or same_report_path(a.out, a.names) or _inside(a.path, out_abs):
         print("world_interior_names.py: --out would overwrite an input: %s" % a.out, file=sys.stderr)
@@ -331,8 +396,17 @@ def main(argv=None):
     if os.path.isdir(a.out):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
-    names, duplicate_keys = load_names(a.names)
-    summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys)
+    try:
+        names, duplicate_keys, malformed = load_names(a.names)
+    except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
+        why = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+        print("world_interior_names.py: --names %s: %s" % (a.names, why), file=sys.stderr)
+        return 2
+    why = start_error(a.path, a.start)
+    if why:
+        print("world_interior_names.py: %s" % why, file=sys.stderr)
+        return 2
+    summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys, malformed)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)

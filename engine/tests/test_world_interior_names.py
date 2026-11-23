@@ -222,6 +222,31 @@ class ResolveTest(unittest.TestCase):
             s, _ = T.resolve({KEY_A: [[13.75, 22.5, z]]}, {0: ([d], [p])})
             self.assertEqual(s["positions_in_a_room_box"]["stored"], hits, z)
 
+    def test_interior_face_after_rotation_counts_as_inside(self):
+        # The room-face case above, on the interior box instead. Scale Z -2 puts the box's local Z face at 0, which
+        # +90 degrees about X turns into world Y 20. The inverse rotation (float32 quaternion) leaves the point on
+        # that face about 8e-18 m outside, so without the tolerance the "inside" bucket (within 0 m) missed it while
+        # the room test counted the same kind of point. Found by mapping face points forward and back.
+        q = struct.unpack("<4f", struct.pack("<4f", S, 0.0, 0.0, S))
+        d = {"name": HA, "keys": {}, "bb_min": [1.0, -2.0, 0.0], "bb_max": [4.0, 1.0, 3.0], "rooms": []}
+        p = {"archetype": HA, "position": [10.0, 20.0, 30.0], "rotation": list(q), "scale_xy": 1.5, "scale_z": -2.0}
+        for y, inside in ((20.001, 1), (20.0, 1), (19.999, 0)):
+            s, _ = T.resolve({KEY_A: [[11.613, y, 30.038]]}, {0: ([d], [p])})
+            self.assertEqual(s["distance_outside_own_interior_box"]["stored"]["within_m"]["0"], inside, y)
+
+    def test_placements_without_position_are_counted_not_fatal(self):
+        unit = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+        d = {"name": HA, "keys": {}, "bb_min": unit[0], "bb_max": unit[1], "rooms": []}
+        p = {"archetype": HA, "position": None, "rotation": None, "scale_xy": None, "scale_z": None}
+        s, rows = T.resolve({KEY_A: [[0.0, 0.0, 0.0]]}, {0: ([d], [p])})
+        self.assertEqual((s["keys_with_placements"], s["keys_without_a_placement_position"]), (1, 1))
+        self.assertNotIn("outside_box_m_stored", rows[KEY_A])
+        self.assertEqual(s["distance_outside_own_interior_box"]["stored"]["n"], 0)
+        # Counted even when the interior has no box either.
+        d2 = dict(d, bb_min=None, bb_max=None)
+        s, _ = T.resolve({KEY_A: [[0.0, 0.0, 0.0]]}, {0: ([d2], [p])})
+        self.assertEqual(s["keys_without_a_placement_position"], 1)
+
     def test_scaled_box_negative_and_missing_scale(self):
         lo, hi = [-1.0, -2.0, 0.0], [3.0, 2.0, 4.0]
         self.assertEqual(T._scaled(lo, hi, {"scale_xy": -2.0, "scale_z": 0.5}), ([-6.0, -4.0, 0.0], [2.0, 4.0, 2.0]))
@@ -256,9 +281,25 @@ class HelperTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write('{"InteriorNames": {"K": [{"Pos": [1, 2, 3]}], "J": {"Pos": [0, 0, 0]},'
                         ' "K": {"Pos": [4, 5, 6]}}}')
-            names, dup = T.load_names(path)
-        self.assertEqual(dup, 1)
+            names, dup, malformed = T.load_names(path)
+        self.assertEqual((dup, malformed), (1, 0))
         self.assertEqual(names, {"K": [[1, 2, 3], [4, 5, 6]], "J": [[0, 0, 0]]})
+
+    def test_malformed_positions_are_counted_not_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"InteriorNames": {"K": [{"Pos": [1, 2]}, {"Pos": "x"}, {"Pos": [1, 2, true]},'
+                        ' {"Pos": [1, 2, 3]}, {"Pos": 5}, {"Pos": []}, {"Pos": 0}, {"Pos": false},'
+                        ' {"Pos": [1, 2, 1%s]}, {"Name": "no position"}]}}' % ("0" * 400))
+            names, dup, malformed = T.load_names(path)
+        # Every present Pos that is not three finite numbers is counted, the empty and false ones and an integer
+        # past float range included; an item without Pos is not a position at all.
+        self.assertEqual((names, dup, malformed), ({"K": [[1.0, 2.0, 3.0]]}, 0, 8))
+
+    def test_json_type_names(self):
+        self.assertEqual([T._json_type(v) for v in (None, True, 1, 1.5, "s", [], {})],
+                         ["null", "a boolean", "a number", "a number", "a string", "a list", "an object"])
 
 
 class CliTest(unittest.TestCase):
@@ -321,8 +362,58 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(f.read(), data, p)
         self.assertFalse(os.path.exists(os.path.join(folder, "r.json")))
 
+    def fails_with_one_line(self, argv):
+        """main(argv) returns 2 with exactly one stderr line, prints nothing and writes no report."""
+        out = os.path.join(self.tmp.name, "fail", "r.json")
+        err = io.StringIO()
+        sys.stderr, saved = err, sys.stderr
+        try:
+            with redirect_stdout(io.StringIO()) as so:
+                self.assertEqual(T.main([*argv, "--out", out]), 2, argv)
+        finally:
+            sys.stderr = saved
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertEqual(so.getvalue(), "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_pool_size_goes_through_process_workers(self):
+        # Windows refuses a ProcessPoolExecutor above 61 workers; tools/pool_workers.py caps it there.
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([interiors(), placements()]))
+        asked = []
+        saved = getattr(T, "process_workers", None)
+        T.process_workers = lambda n: asked.append(n) or 2
+        try:
+            s = self.run_cli(path, "--jobs", "70")
+        finally:
+            T.process_workers = saved
+        self.assertEqual(asked, [70])
+        self.assertEqual((s["interior_names"], s["placements"]), (2, 3))  # 70 windows on 2 workers, same result
+
+    def test_malformed_names_file_is_one_line(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        for i, text in enumerate(("", "[]", '{"InteriorNames": null}', '{"InteriorNames": []}', "{")):
+            bad = os.path.join(self.tmp.name, "bad%d.json" % i)
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.fails_with_one_line([folder, "--names", bad])
+        self.fails_with_one_line([folder, "--names", folder])  # a folder, not a file
+
+    def test_start_outside_the_data_area_is_one_line(self):
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        archive = rpf([interiors(), placements()])
+        with open(path, "wb") as f:
+            f.write(archive)
+        for jobs in ("1", "3"):  # with 3 the error used to come back from a worker as a pickled traceback
+            for start in ("1", str(len(archive))):
+                self.fails_with_one_line([path, "--names", self.names, "--start", start, "--jobs", jobs])
+
     def test_bad_arguments(self):
-        for argv in (["nope", "--names", self.names], [self.names, "--names", self.names, "--jobs", "0"]):
+        for argv in (["nope", "--names", self.names], [self.names, "--names", self.names, "--jobs", "0"],
+                     [self.names, "--names", self.names, "--start", "-1"],
+                     [self.names, "--names", self.names, "--limit", "0"]):
             with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
                 sys.stderr, saved = io.StringIO(), sys.stderr
                 try:

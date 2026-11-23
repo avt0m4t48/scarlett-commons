@@ -364,6 +364,29 @@ OpFunctionEnd
             with open(dst, "rb") as f:
                 _validate(f.read())
 
+    def test_invalid_id_spelling_in_results_and_references(self):
+        for identifier in ("%", "%bad-name", "%bad.name", "%\u0436"):
+            for line in (f"{identifier} = OpLabel", f"OpBranch {identifier}"):
+                with self.subTest(line=line):
+                    with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "line 2: invalid ID"):
+                        spirv_asm.assemble(f"OpCapability Shader\n{line}\n")
+
+    def test_cli_invalid_id_leaves_existing_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "bad.spvasm")
+            dst = os.path.join(d, "existing.spv")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("OpCapability Shader\n%bad.name = OpTypeVoid\n")
+            with open(dst, "wb") as f:
+                f.write(b"existing output")
+            result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("line 2: invalid ID", result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            with open(dst, "rb") as f:
+                self.assertEqual(f.read(), b"existing output")
+
     def test_cli_source_that_is_not_utf8_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "bad.spvasm")

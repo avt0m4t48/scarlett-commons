@@ -46,6 +46,7 @@ TARGET_ENV_VERSION = {
 }
 
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
+_ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
 }
@@ -280,6 +281,8 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             raise SpirvAsmError(f"line {lineno}: expected %id, got {tok!r}")
         vid = sym_to_id.get(tok)
         if vid is None:
+            if not _ID_RE.fullmatch(tok):
+                raise SpirvAsmError(f"line {lineno}: invalid ID {tok!r}")
             vid = next_id
             next_id += 1
             sym_to_id[tok] = vid

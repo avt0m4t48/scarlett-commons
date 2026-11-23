@@ -11,6 +11,7 @@
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
+#include "../src/d3d12_xs_frame_events.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -714,6 +715,17 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
+    // 81 GetFrameEventsX(frame_token, flags, &num_events, events): sets *num_events = 0 and returns S_OK without
+    // reaching the mock's table (slot 81 is past ID3D12Device11's 80 slots).
+    std::uint32_t num_events = 6;
+    leonida::d3d12_xs::XboxFrameEvent events[6] = {};
+    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), word(events))) == S_OK && num_events == 0);
+    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), 0)) == S_OK && num_events == 0);
+    EXPECT(hr_of(raw(device, 81, token, 0x11100u, 0, word(events))) == E_POINTER);
+    num_events = 6;
+    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), 0)) == E_POINTER);
+    EXPECT(mock->calls[81] == 0 && xs::device_slot_hits(81) == 4);
+
     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
@@ -753,12 +765,12 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
 
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
+           xs::device_slot_overridden(79) && xs::device_slot_overridden(80) && xs::device_slot_overridden(81));
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
+    std::printf("%s: device slots 48/73/78/79/80/81 route to a queue, a list and frame-event tokens without reaching "
                 "the mock's own PC slots\n", g_label);
     return 0;
 #else
@@ -773,11 +785,13 @@ int run_env_slots(bool valid) {
     const char* frame_interval = valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
+    const char* frame_events = valid ? "101" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_INTERVAL_SLOT", frame_interval) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_SCHEDULE_EVENT_SLOT", schedule_event) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_WAIT_EVENT_SLOT", wait_event) != FALSE);
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_EVENTS_SLOT", frame_events) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_QUEUE_X_SLOT", queue_x) != FALSE);
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_LIST_X_SLOT", list_x) != FALSE);
 
@@ -791,6 +805,10 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
+        std::uint32_t ev_count = 6;
+        leonida::d3d12_xs::XboxFrameEvent ev_buf[6] = {};
+        EXPECT(hr_of(raw(device, 101, token, 0x11100u, word(&ev_count), word(ev_buf))) == S_OK && ev_count == 0 &&
+               mock->calls[101] == 0);
         void* queue = nullptr;
         EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
@@ -813,11 +831,15 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
+        std::uint32_t ev_count = 6;
+        leonida::d3d12_xs::XboxFrameEvent ev_buf[6] = {};
+        EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&ev_count), word(ev_buf))) == S_OK && ev_count == 0 &&
+               mock->calls[81] == 0);
         EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
-                valid ? "move all five routes" : "outside 3..127 are ignored");
+                valid ? "move all six routes" : "outside 3..127 are ignored");
     return 0;
 }
 

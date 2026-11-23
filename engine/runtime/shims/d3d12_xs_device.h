@@ -12,12 +12,13 @@
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
 //             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
 //             in the console call (public HLE; the PC six-argument form differs).
-//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
-//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
-//             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
-// The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
-// be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
-// LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+//   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameEventsX. A per-device token
+//             state machine answers them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh
+//             non-zero token and GetFrameEventsX reports zero pending 0x38-byte frame events. Slots 80/81 are outside
+//             a PC ID3D12Device11 table, so they are checked before the beyond-table refusal.
+// The slots 48/73/78/79/80/81 can be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT,
+// LEONIDA_XS_FRAME_INTERVAL_SLOT, LEONIDA_XS_SCHEDULE_EVENT_SLOT, LEONIDA_XS_WAIT_EVENT_SLOT and
+// LEONIDA_XS_FRAME_EVENTS_SLOT (3..127; anything else is logged once and ignored).
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -91,9 +92,9 @@ ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// 78/79/80/81 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false:
+// the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the
+// proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object

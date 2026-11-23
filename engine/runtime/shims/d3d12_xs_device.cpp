@@ -24,6 +24,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "../src/d3d12_xs_frame_events.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -147,6 +148,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 81: return "Xbox GetFrameEventsX";
         default: return "forwarded";
     }
 }
@@ -170,6 +172,7 @@ struct XboxDeviceSlotRoutes {
     unsigned frame_interval = 78;  // SetFrameIntervalX(output, interval_us, latency, flags)
     unsigned schedule_event = 79;  // ScheduleFrameEventX(event, offset_us, reserved, flags)
     unsigned wait_event = 80;      // WaitFrameEventX(event, timeout_ms, reserved, flags, &token)
+    unsigned frame_events = 81;    // GetFrameEventsX(frame_token, flags, &num_events, events)
     unsigned queue_x = 48;         // CreateCommandQueueX(desc, riid, out)
     unsigned list_x = 73;          // CreateCommandListX(desc, allocator, initial_state, riid, out)
 };
@@ -199,20 +202,23 @@ const XboxDeviceSlotRoutes& xbox_device_slot_routes() {
         const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
         const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
         const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
+        const unsigned frame_events = env_device_slot("LEONIDA_XS_FRAME_EVENTS_SLOT", r.frame_events);
         const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
         const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
         const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
-                           wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
+                           wait_event != r.wait_event || frame_events != r.frame_events || queue_x != r.queue_x ||
+                           list_x != r.list_x;
         r.frame_interval = frame_interval;
         r.schedule_event = schedule_event;
         r.wait_event = wait_event;
+        r.frame_events = frame_events;
         r.queue_x = queue_x;
         r.list_x = list_x;
         if (moved)
             std::fprintf(stderr,
                          "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
-                         "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
-                         r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
+                         "WaitFrameEventX=%u GetFrameEventsX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
+                         r.frame_interval, r.schedule_event, r.wait_event, r.frame_events, r.queue_x, r.list_x);
         return r;
     }();
     return routes;
@@ -1184,6 +1190,20 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     return S_OK;
 }
 
+// Xbox device slot 81: GetFrameEventsX(frame_token, flags, &num_events, events). Queries 0x38-byte frame-event
+// records on a previous frame pipeline token from WaitFrameEventX. With no hardware flip-event history yet,
+// reporting zero events (*num_events = 0, S_OK) is cleanly handled by callers.
+HRESULT proxy_get_frame_events_x(DeviceProxy* self, std::uint64_t frame_token, std::uint64_t flags,
+                                 std::uint64_t num_events_word, std::uint64_t events_word) {
+    (void)self;
+    (void)frame_token;
+    (void)flags;
+    auto* num_events = reinterpret_cast<std::uint32_t*>(num_events_word);
+    auto* events = reinterpret_cast<leonida::d3d12_xs::XboxFrameEvent*>(events_word);
+    const auto status = leonida::d3d12_xs::query_frame_events_empty(num_events, events);
+    return status == leonida::d3d12_xs::FrameEventQueryStatus::ok ? S_OK : E_POINTER;
+}
+
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
 // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
 // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
@@ -1547,6 +1567,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
         }
+        if (Slot == routes.frame_events) {
+            log_xbox_route_once(Slot, "GetFrameEventsX", a1, a2, a3, a4, a5);
+            return hr_to_u64(proxy_get_frame_events_x(self, a1, a2, a3, a4));
+        }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
@@ -1705,12 +1729,11 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 || slot == 75 || slot == 76)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
-           slot == routes.queue_x || slot == routes.list_x;
+           slot == routes.frame_events || slot == routes.queue_x || slot == routes.list_x;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }

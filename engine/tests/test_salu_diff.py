@@ -60,6 +60,30 @@ class Reference(unittest.TestCase):
     def test_scc_survives_ops_that_do_not_write_it(self):
         self.assertEqual(run("s_cmp_eq_u32 1, 1", "s_mov_b32 s4, 0", "s_bfm_b32 s5, 1, 1")[3], 1)
 
+    def test_cmov_selects_on_scc_and_keeps_it(self):
+        seeds = {4: 0x11111111, 5: 0x22222222, 6: 0x33333333, 7: 0x44444444}
+        for scc in (0, 1):
+            with self.subTest(scc=scc):
+                cmp = f"s_cmp_eq_u32 {scc}, 1"
+                self.assertEqual(run(cmp, "s_cmov_b32 s4, s5", seeds=seeds)[::3], [(0x11111111, 0x22222222)[scc], scc])
+                self.assertEqual(run(cmp, "s_cmovk_i32 s4, 0x8000", seeds=seeds)[::3], [(0x11111111, 0xFFFF8000)[scc], scc])
+                self.assertEqual(run(cmp, "s_cmovk_i32 s4, 0x7fff", seeds=seeds)[0], (0x11111111, 0x7FFF)[scc])
+                self.assertEqual(run(cmp, "s_cmov_b64 s[4:5], s[6:7]", regs=(4, 5, 8), seeds=seeds),
+                                 [(0x11111111, 0x33333333)[scc], (0x22222222, 0x44444444)[scc], 0, scc])
+        for op in ("s_cmov_b32", "s_cmovk_i32", "s_cmov_b64"):
+            self.assertFalse(d.writes_scc(op), op)
+            self.assertIn(op, d.SCC_CONSUMERS)
+
+    def test_movrels_reads_s0_plus_m0(self):
+        seeds = {r: 0x100 + r for r in d.REGS}
+        self.assertEqual(run("s_mov_b32 m0, 3", "s_movrels_b32 s4, s5", seeds=seeds)[0], 0x108)
+        self.assertEqual(run("s_mov_b32 m0, 0", "s_movrels_b32 s4, s5", seeds=seeds)[0], 0x105)
+        self.assertEqual(run("s_mov_b32 m0, 6", "s_movrels_b64 s[4:5], s[8:9]", seeds=seeds)[:2], [0x10E, 0x10F])
+        # D overlapping the source: both words are read before either is written
+        self.assertEqual(run("s_mov_b32 m0, 2", "s_movrels_b64 s[4:5], s[4:5]", seeds=seeds)[:2], [0x106, 0x107])
+        with self.assertRaises(d.RefError):            # past the seeded SGPRs
+            run("s_mov_b32 m0, 7", "s_movrels_b32 s4, s19", seeds=seeds)
+
     def test_absdiff_mul_hi_and_lshl_add(self):
         self.assertEqual(run("s_absdiff_i32 s4, 0x7FFFFFFF, 0x80000000")[::3], [1, 1])
         self.assertEqual(run("s_absdiff_i32 s4, 5, 5")[::3], [0, 0])
@@ -122,6 +146,43 @@ class Translated(unittest.TestCase):
 
 
 class Generator(unittest.TestCase):
+    def test_movrels_stays_inside_the_seeded_sgprs(self):
+        rng = d.random.Random(3)
+        for m0 in range(8):
+            for _ in range(200):
+                for op in ("s_movrels_b32", "s_movrels_b64"):
+                    line = d.emit(rng, op, m0)
+                    name, rest = line.split(" ", 1)
+                    src = rest.split(", ")[1]
+                    if name == "s_movrels_b64":
+                        self.assertEqual(m0 % 2, 0, line)          # no odd-aligned pair
+                        lo = int(src[2:src.index(":")])
+                        self.assertLessEqual(lo + m0 + 1, d.REGS[-1], line)
+                    else:
+                        self.assertLessEqual(int(src[1:]) + m0, d.REGS[-1], line)
+
+    def test_m0_is_set_only_with_movrels_and_survives_shrinking(self):
+        plain = d.generate(d.random.Random(4), 3, ["s_add_u32"])
+        self.assertFalse(any(line.startswith("s_mov_b32 m0") for line in plain))
+        lines = d.generate(d.random.Random(4), 3, ["s_movrels_b32"])
+        self.assertTrue(lines[len(d.REGS)].startswith("s_mov_b32 m0, "))
+        self.assertEqual(d.shrink(lines, check_fn=lambda _l: "mismatch")[:len(d.REGS) + 1], lines[:len(d.REGS) + 1])
+
+    def test_selects_and_relative_reads_match_the_translator(self):
+        seeds = [f"s_mov_b32 s{r}, 0x{0x100 + r:x}" for r in d.REGS]
+        for body in (["s_mov_b32 m0, 2", "s_movrels_b64 s[4:5], s[8:9]"],
+                     ["s_mov_b32 m0, 3", "s_movrels_b32 s4, s5"],
+                     ["s_cmp_eq_u32 0, 1", "s_cmov_b32 s4, s5", "s_cmovk_i32 s6, -2"],
+                     ["s_cmp_eq_u32 1, 1", "s_cmov_b64 s[4:5], s[8:9]", "s_cmovk_i32 s6, 0x8000"]):
+            with self.subTest(body=body):
+                self.assertIsNone(d.check(seeds + body + d.observe([4, 5, 6])))
+        ops = ["s_cmov_b32", "s_cmovk_i32", "s_cmov_b64", "s_movrels_b32", "s_movrels_b64", "s_cmp_lt_i32",
+               "s_add_u32", "s_mov_b64", "s_lshl_b64"]
+        for branches in (False, True):
+            with self.subTest(branches=branches):
+                counts, failures = d.run_suite(60, 6, 6, ops, branches=branches)
+                self.assertEqual((counts["pass"], counts["skip"], failures), (60, {}, []))
+
     def test_two_source_forms_share_one_literal_word(self) -> None:
         for op in ("s_add_u32", "s_bfm_b64", "s_cmp_eq_u32"):
             for operands in (("0x12345", "0x23456"), ("0x12345", "0x12345")):
@@ -162,7 +223,7 @@ class Branches(unittest.TestCase):
         producers = {o for o in ops if d.writes_scc(o)}
         seen = set()
         rng = d.random.Random(1)
-        for _ in range(3000):
+        for _ in range(5000):     # seed 1 meets the last of the 560 pairs at program 3,548
             lines = d.generate(rng, rng.randrange(1, 7), ops, branches=True)
             for prev, nxt in zip(lines, lines[1:]):
                 op, after = prev.split()[0], nxt.split()[0]

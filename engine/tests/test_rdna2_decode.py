@@ -208,6 +208,26 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["insns"][4]["args"][2]["t"], "off")
         self.assertEqual(info["insns"][4]["mods"], ["offset:-4"])
 
+    def test_sdwa_inline_sources(self):
+        values = list(range(65)) + list(range(-1, -17, -1))
+        floats = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494]
+        constants = [(128 + i, "imm", v) for i, v in enumerate(values)]
+        constants += [(240 + i, "fimm", v) for i, v in enumerate(floats)]
+        # gfx1013 v_mov_b32, v_add_f32 and v_cmp_eq_f32 SDWA encodings.
+        for opcode in (0x7E0002F9, 0x060000F9, 0x7C0400F9):
+            slots = (0,) if opcode == 0x7E0002F9 else (0, 1)
+            for slot in slots:
+                for code, kind, value in constants:
+                    with self.subTest(opcode=hex(opcode), slot=slot, code=code):
+                        first = opcode
+                        second = code | (1 << 23)
+                        if slot == 1:
+                            first |= code << 9
+                            second = 1 | (1 << 31)
+                        ins = rdna2_decode.decode_bytes(words(first, second))["insns"][0]
+                        operand = ins["args"][1 + slot]
+                        self.assertEqual((operand["k"], operand["v"]), (kind, value))
+
     def test_roundtrip_binary_to_spirv_and_interpreter(self):
         # Synthetic pixel shader binary: v_mov_b32 v0, 1.0; v_add_f32 v1, v0, 2.0; exp mrt0 v0, v1, v0, v1 done vm; s_endpgm
         w_mov = (0x3F << 25) | (0 << 17) | (1 << 9) | 242        # v0 = 1.0

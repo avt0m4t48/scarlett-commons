@@ -142,20 +142,36 @@ def find_harness(explicit=None):
 
 def find_spirv_as():
     exe = "spirv-as.exe" if os.name == "nt" else "spirv-as"
-    found = shutil.which(exe) or shutil.which("spirv-as")
-    if not found:
-        raise SystemExit("spirv-as not found on PATH (install spirv-tools or the Vulkan SDK)")
-    return found
+    return shutil.which(exe) or shutil.which("spirv-as")
 
 
-def assemble(text: str, out_spv: str) -> None:
+def assemble(text: str, out_spv: str, assembler: str) -> None:
     p = subprocess.run(
-        [find_spirv_as(), "--target-env", "vulkan1.2", "-o", out_spv, "-"],
+        [assembler, "--target-env", "vulkan1.2", "-o", out_spv, "-"],
         input=text.encode(),
         capture_output=True,
     )
     if p.returncode != 0:
         raise SystemExit(f"spirv-as failed for {out_spv}:\n{p.stderr.decode(errors='replace')}")
+
+
+def shaders_into(out_dir: str) -> None:
+    # The documented no-SDK path: drop prebuilt vs.spv/ps.spv (from --emit-only on a machine that has
+    # spirv-as) into the work directory and they are used as-is. Assembly still wins when spirv-as is
+    # on PATH, so a stale pair never shadows fresh sources.
+    vs_spv = os.path.join(out_dir, "vs.spv")
+    ps_spv = os.path.join(out_dir, "ps.spv")
+    assembler = find_spirv_as()
+    if assembler is None:
+        if os.path.exists(vs_spv) and os.path.exists(ps_spv):
+            print("spirv-as not found; using the prebuilt vs.spv and ps.spv in the work directory")
+            return
+        raise SystemExit(
+            "spirv-as not found on PATH (install spirv-tools or the Vulkan SDK), and the work directory "
+            "has no prebuilt vs.spv/ps.spv pair (--emit-only on a machine that has one produces them)"
+        )
+    assemble(VS_ASM, vs_spv, assembler)
+    assemble(PS_ASM, ps_spv, assembler)
 
 
 def write_mesh(path: str) -> None:
@@ -299,8 +315,7 @@ def main(argv=None) -> int:
         f.write(VS_ASM)
     with open(os.path.join(out_dir, "ps.asm"), "w", encoding="utf-8", newline="\n") as f:
         f.write(PS_ASM)
-    assemble(VS_ASM, os.path.join(out_dir, "vs.spv"))
-    assemble(PS_ASM, os.path.join(out_dir, "ps.spv"))
+    shaders_into(out_dir)
     write_mesh(os.path.join(out_dir, "mesh.bin"))
     print(f"emitted vs.spv, ps.spv, mesh.bin in {out_dir}")
     if args.emit_only:

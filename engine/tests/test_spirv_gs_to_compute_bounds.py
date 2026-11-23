@@ -487,12 +487,18 @@ class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
     def test_end_to_end_translated_gs_with_pc_tail_ubo(self):
         # End-to-end check with tools/rdna2spirv.py (PC_TAIL_UBO = True) on gs_tri.asm reading the heap base
         # via s_load_dword, lowered by tools/spirv_gs_to_compute.py and assembled with tools/spirv_asm.py.
-        sys.path.insert(0, os.path.join(ROOT, "tests"))
+        import struct
         import rdna2spirv
-        from conftest import make_dxbc, signature_chunk
 
-        gs_dxbc = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),
-                             signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
+        def sig_chunk(fourcc):
+            out = struct.pack("<II", 2, 8)
+            for reg, sysv in ((0, 1), (1, 0)):
+                out += struct.pack("<6I", 0, 0, 0, sysv, 3, reg) + bytes([0xF, 0xF, 0, 0]) + struct.pack("<I", 0)
+            return fourcc + struct.pack("<I", len(out)) + out
+
+        c0, c1 = sig_chunk(b"ISG1"), sig_chunk(b"OSG1")
+        gs_dxbc = (b"DXBC" + bytes(16) + struct.pack("<III", 1, 40 + len(c0) + len(c1), 2)
+                   + struct.pack("<II", 40, 40 + len(c0)) + c0 + c1)
         with tempfile.TemporaryDirectory() as d:
             os.mkdir(os.path.join(d, "disasm"))
             src = os.path.join(d, "disasm", "gs_pctail.s")

@@ -954,10 +954,20 @@ int check_xbox_slots() {
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
     EXPECT(mock->args[12][4] == word(&list_iid));
-
-    // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
-    // output on failure, so an invalid call would clear this pointer.
     EXPECT(release(list) == 0);
+
+    // A list takes its allocator's type on the PC: a compute allocator with a description that says DIRECT (the
+    // retail title's first call had desc words 0x0 0x2) reaches CreateCommandList as COMPUTE, or the PC refuses it.
+    void* compute_allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_COMPUTE, word(&allocator_iid), word(&compute_allocator))) ==
+           S_OK);
+    Mock* const real_compute_allocator =
+        reinterpret_cast<Mock*>(xs::allocator_proxy_real_allocator(compute_allocator));
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(compute_allocator), 0, word(&list_iid), word(&list))) == S_OK);
+    EXPECT(mock->calls[12] == 2 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    EXPECT(mock->args[12][2] == word(real_compute_allocator));
+    EXPECT(release(list) == 0);
+    EXPECT(release(compute_allocator) == 0 && real_compute_allocator->refs == 0);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);

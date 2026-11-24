@@ -41,6 +41,8 @@
 #include <iterator>
 #include <new>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -1414,6 +1416,28 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     return S_OK;
 }
 
+// The type each command allocator was created with (device slot 9), keyed by every pointer that names it: the real
+// allocator and what the title was handed. On the PC a list must have its allocator's type, so slot 73 takes the type
+// from here and not from a description word whose layout is not established (the retail title's first
+// CreateCommandListX had desc words 0x0 0x2 and the PC runtime refused the call). A freed allocator's address that is
+// reused is overwritten by the next slot 9 call that returns it.
+std::mutex g_allocator_types_mutex;
+std::unordered_map<const void*, D3D12_COMMAND_LIST_TYPE> g_allocator_types;
+
+void remember_allocator_type(const void* real, const void* handed, D3D12_COMMAND_LIST_TYPE type) {
+    std::lock_guard<std::mutex> lock(g_allocator_types_mutex);
+    if (real) g_allocator_types[real] = type;
+    if (handed) g_allocator_types[handed] = type;
+}
+
+bool allocator_type(const void* allocator, D3D12_COMMAND_LIST_TYPE* type) {
+    std::lock_guard<std::mutex> lock(g_allocator_types_mutex);
+    const auto it = g_allocator_types.find(allocator);
+    if (it == g_allocator_types.end()) return false;
+    *type = it->second;
+    return true;
+}
+
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
 // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
 // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
@@ -1441,11 +1465,33 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     // are not wrapped by this proxy, so initial_state is already the real object (a proxy there is passed through too).
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
+    D3D12_COMMAND_LIST_TYPE allocator_kind{};
+    if (allocator_type(allocator, &allocator_kind) && allocator_kind != type) {
+        static std::atomic<bool> differs{false};
+        if (first_call(differs))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 73: the description says type %d, its allocator is type %d: using the "
+                         "allocator's\n",
+                         static_cast<int>(type), static_cast<int>(allocator_kind));
+        type = allocator_kind;
+    }
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
-    if (FAILED(hr)) return hr;
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
+    if (hr == E_NOINTERFACE) {
+        // An interface the PC runtime does not know (a console-only list interface): create the base list; the
+        // proxy then answers riid itself or refuses it, and the refusal is logged there.
+        created = nullptr;
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state, __uuidof(ID3D12GraphicsCommandList),
+                                           &created);
+    }
+    if (FAILED(hr)) {
+        static std::atomic<bool> failed{false};
+        if (first_call(failed))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 73: PC CreateCommandList(type %d) failed with 0x%08lx\n",
+                         static_cast<int>(type), static_cast<unsigned long>(hr));
+        return hr;
+    }
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
 
@@ -1550,10 +1596,13 @@ HRESULT proxy_create_command_allocator(DeviceProxy* self, std::uint64_t type, co
             std::fprintf(stderr, "[rt] d3d12_xs: allocators of this device are not wrapped: its command lists "
                                  "cannot resolve an allocator proxy\n");
         const HRESULT asked = allocator->QueryInterface(*riid, out);
+        if (SUCCEEDED(asked)) remember_allocator_type(allocator, *out, list_type);
         allocator->Release();
         return asked;
     }
-    return wrap_child<ChildKind::allocator>(allocator, self, riid, out);
+    const HRESULT wrapped = wrap_child<ChildKind::allocator>(allocator, self, riid, out);
+    if (SUCCEEDED(wrapped)) remember_allocator_type(allocator, *out, list_type);
+    return wrapped;
 }
 
 // Device slot 32: OpenSharedHandle(handle, riid, out). The object is opened as asked; when it is a fence (whatever

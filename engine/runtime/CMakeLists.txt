@@ -516,6 +516,8 @@ elseif(NOT WIN32)
 endif()
 
 include(CTest)
+# LEONIDA_TRANSLATOR_DEPS: what the rules that run test/shaders/build.py depend on besides their .asm files.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
@@ -2413,11 +2415,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M15_DIR} vs_m15 ps_m15
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
         VERBATIM)
       add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp
@@ -2440,11 +2440,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BINDLESS_DIR} vs_ids ps_tex ps_imgatomic
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ids.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_tex.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_imgatomic.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_ids, ps_tex and ps_imgatomic for vk_bindless_test"
         VERBATIM)
       add_custom_target(vk_bindless_shaders ALL DEPENDS ${LEONIDA_BINDLESS_FILES})
@@ -2468,13 +2467,11 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2_DIR} vs_m2 ps_m2 ps_m2_uoff ps_m2_literal
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_uoff.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_literal.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2 and ps_m2 for the textured draw test"
         VERBATIM)
       add_executable(d3d12_m2_textured_test test/d3d12_m2_textured_test.cpp shims/d3d12_xs_device.cpp
@@ -2497,12 +2494,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2F_DIR} vs_m2 ps_m2 ps_m2_array
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_array.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2, ps_m2 and ps_m2_array for the M2 formats test"
         VERBATIM)
       add_executable(d3d12_m2_formats_test test/d3d12_m2_formats_test.cpp shims/d3d12_xs_device.cpp
@@ -2527,14 +2522,12 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M3_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post ps_m3_query
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_post.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_query.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating M3 frame and single-output occlusion-probe shaders"
         VERBATIM)
       add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M3_FILES})
@@ -2563,11 +2556,9 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M4_DIR} cs_m4_fill cs_m4_indirect
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_fill.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_m4_fill and cs_m4_indirect for the compute test"
         VERBATIM)
       add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
@@ -2593,11 +2584,9 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BUFFER_UAV_DIR} cs_buf_typed cs_buf_counter
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_typed.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_counter.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_buf_typed and cs_buf_counter for the buffer UAV test"
         VERBATIM)
       add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_BUFFER_UAV_FILES})
@@ -3051,10 +3040,8 @@ if(TARGET Vulkan::Headers)
                   LEONIDA_USER_DATA_SHIFT=4
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
-          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+          DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/${shader}.asm
-                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
           COMMENT "Translating ${shader} for the subgroup size test (${folder})"
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${index})

@@ -9,14 +9,21 @@ target:
 On Windows, arguments follow the MSVC C runtime's quoting rules. Double a trailing backslash in a quoted
 argument before the closing quote.
 
+With LLVM_MC unset, the plain name llvm-mc is used when it is on PATH. Debian and Ubuntu install `llvm-<N>` under
+versioned names only (/usr/bin/llvm-mc-<N> and /usr/lib/llvm-<N>/bin/llvm-mc; the plain name comes with the
+unversioned `llvm` package), so off Windows the newest of those is used when the plain name is missing.
+
 run() starts such a command and turns a missing llvm-mc into one line instead of a FileNotFoundError traceback.
 """
 from __future__ import annotations
 
+import glob
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 
 def split_windows_command(raw: str) -> list[str]:
@@ -76,20 +83,65 @@ def split_command(raw: str) -> list[str]:
         raise SystemExit(f"LLVM_MC: invalid command line {raw!r}: {e}") from None
 
 
+DEBIAN_LLVM_MC = "/usr/lib/llvm-*/bin/llvm-mc"   # Debian and Ubuntu: one folder per llvm-<N> package
+
+
+def versioned_llvm_mc() -> str | None:
+    """Off Windows: the newest llvm-mc installed under a versioned name, llvm-mc-<N> on PATH or
+    /usr/lib/llvm-<N>/bin/llvm-mc, or None. Only names are looked at; nothing is started, because
+    shader_disasm.py resolves the command at import time. Empty PATH entries (the current folder) are skipped."""
+    if os.name == "nt":
+        return None
+    found = {}
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder:
+            continue
+        for path in glob.glob(os.path.join(glob.escape(folder), "llvm-mc-[0-9]*")):
+            m = re.fullmatch(r"llvm-mc-(\d+)", os.path.basename(path))
+            if m and os.path.isfile(path) and os.access(path, os.X_OK):
+                found.setdefault(int(m.group(1)), path)
+    for path in glob.glob(DEBIAN_LLVM_MC):
+        m = re.fullmatch(r"llvm-(\d+)", os.path.basename(os.path.dirname(os.path.dirname(path))))
+        if m and os.path.isfile(path) and os.access(path, os.X_OK):
+            found.setdefault(int(m.group(1)), path)
+    return found[max(found)] if found else None
+
+
+def default_command() -> str:
+    """llvm-mc when the plain name is on PATH (the name a work folder's disassembly record already holds), else
+    versioned_llvm_mc(), else the plain name, which then fails with not_found()'s message."""
+    if shutil.which("llvm-mc"):
+        return "llvm-mc"
+    return versioned_llvm_mc() or "llvm-mc"
+
+
 def mc_command(raw: str | None = None) -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'."""
+    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'. Unset or empty,
+    default_command()."""
     if raw is None:
-        raw = os.environ.get("LLVM_MC", "llvm-mc")
-    return split_command(raw) or ["llvm-mc"]
+        raw = os.environ.get("LLVM_MC", "")
+    return split_command(raw) or [default_command()]
+
+
+def install_hint() -> str:
+    """Where to get an llvm-mc with the AMDGPU target on this OS, for the messages that report a missing one."""
+    if os.name == "nt":
+        return ("The official Windows LLVM build has no AMDGPU target: build a native one with "
+                "scripts\\build_llvm_mc.ps1 (it sets LLVM_MC), or install llvm-21 in WSL and set LLVM_MC to the "
+                "whole command, e.g.\n  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+    if sys.platform == "darwin":
+        return ("Homebrew's llvm has the AMDGPU target but is keg-only (not on PATH): brew install llvm, then\n"
+                "  LLVM_MC=\"$(brew --prefix llvm)/bin/llvm-mc\"")
+    return ("Distribution LLVM packages include the AMDGPU target: on Debian or Ubuntu, sudo apt install llvm-21\n"
+            "(found as /usr/lib/llvm-21/bin/llvm-mc without further setup); elsewhere install your distribution's\n"
+            "LLVM 21+ package and put llvm-mc on PATH, or set LLVM_MC=/path/to/llvm-mc")
 
 
 def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
     """The message for an llvm-mc that can't be started (shader_disasm.py's wording). `flag` is the tool's own
     option for the command, if it has one (run_gpu_tests.py's --llvm-mc); the others read LLVM_MC only."""
     where = f"set LLVM_MC (or pass {flag})" if flag else "set LLVM_MC"
-    return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it\n"
-            f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+    return f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it.\n{install_hint()}"
 
 
 def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:

@@ -2,13 +2,28 @@
 #include "host_cpu.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 namespace {
+
+// Sets (value) or removes (nullptr) an environment variable the way check_skipped() reads it on each OS.
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    SetEnvironmentVariableA(name, value);
+#else
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
 
 int g_failures = 0;
 int g_xcr0_reads = 0;
@@ -92,10 +107,10 @@ int main() {
             bool skipped;
         } cases[] = {{nullptr, false}, {"1", true}, {"0", false}, {"10", false}, {"", false}, {"1234567", false}};
         for (const auto& c : cases) {
-            SetEnvironmentVariableA("LEONIDA_SKIP_CPU_CHECK", c.value);
+            set_env("LEONIDA_SKIP_CPU_CHECK", c.value);
             expect(check_skipped() == c.skipped, c.value ? c.value : "LEONIDA_SKIP_CPU_CHECK unset");
         }
-        SetEnvironmentVariableA("LEONIDA_SKIP_CPU_CHECK", nullptr);
+        set_env("LEONIDA_SKIP_CPU_CHECK", nullptr);
     }
     // The real host: whatever it reports, the call itself must not fault (OSXSAVE gates XGETBV).
     std::printf("host: %zu missing feature(s)\n", missing_host_features().size());

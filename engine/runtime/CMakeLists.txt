@@ -16,6 +16,29 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+# Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h), and the host CPU preflight of
+# --init/--run (src/host_cpu.h). Built on every OS, so their tests run in the Linux and macOS jobs as well as with the
+# Windows runtime.
+add_library(gta6rt_root_signature STATIC
+  src/root_signature.cpp
+)
+target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Portable contract test: model, packer, canonical codec and RTS0 hypothesis. Needs neither d3d12.lib nor the game.
+add_executable(root_signature_test
+  test/root_signature_test.cpp
+)
+target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
+# AVX, OSXSAVE and XCR0 YMM state from synthetic CPUID/XCR0 words, plus one call on the real host.
+add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
+target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(MSVC)
+  foreach(_portable gta6rt_root_signature root_signature_test host_cpu_test)
+    target_compile_definitions(${_portable} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${_portable} PRIVATE /W4 /permissive- /utf-8)
+  endforeach()
+  target_link_options(root_signature_test PRIVATE /OPT:NOREF)
+endif()
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -54,30 +77,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_include_directories(gta6rt_d3d12_xs_rootsig PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(gta6rt_d3d12_xs_rootsig PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(gta6rt_d3d12_xs_rootsig PRIVATE /W4 /permissive- /utf-8)
-
-  # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h).
-  add_library(gta6rt_root_signature STATIC
-    src/root_signature.cpp
-  )
-  target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_definitions(gta6rt_root_signature PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(gta6rt_root_signature PRIVATE /W4 /permissive- /utf-8)
-
-  # Portable contract test: model, packer, canonical codec and RTS0 hypothesis.
-  # Needs neither d3d12.lib nor the game; runs on Windows CI like the rest here.
-  add_executable(root_signature_test
-    test/root_signature_test.cpp
-  )
-  target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
-  target_compile_definitions(root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(root_signature_test PRIVATE /OPT:NOREF)
-
-  # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
-  # CPUID/XCR0 words.
-  add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
-  target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
 
   # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
   # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
@@ -1330,10 +1329,10 @@ if(BUILD_TESTING)
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
   endif()
-  if(WIN32 AND TARGET root_signature_test)
+  if(TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
   endif()
-  if(WIN32 AND TARGET host_cpu_test)
+  if(TARGET host_cpu_test)
     add_test(NAME host_cpu COMMAND host_cpu_test)
   endif()
   if(WIN32 AND TARGET root_signature_oracle_test)

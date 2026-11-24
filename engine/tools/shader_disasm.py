@@ -9,7 +9,8 @@ Usage:
     python -I shader_disasm.py <fssm dir or file> [--unpack-index FILE] [--out DIR] [--mcpu gfx1013] [--limit N] [--skip-existing]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
-'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
+'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH. Off Windows, a versioned install
+(llvm-mc-21, /usr/lib/llvm-21/bin/llvm-mc) is found without it (tools/mc_command.py).
 """
 import argparse
 import os
@@ -20,7 +21,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mc_command import mc_command  # noqa: E402
+from mc_command import install_hint, mc_command, not_found  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 import fssm_header  # noqa: E402
@@ -78,16 +79,12 @@ def probe(mcpu: str) -> None:
                            input=PROBE, capture_output=True, text=True, errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
-        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
-             f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+        fail(not_found(MC[0], e))
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
-             f"The disassembler needs LLVM 21+ with the AMDGPU target. The official Windows LLVM build has no\n"
-             f"AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
-             f"(docs/design.md, 'Disassembling shaders'), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+             f"The disassembler needs LLVM 21+ with the AMDGPU target (docs/design.md, 'Disassembling shaders').\n"
+             f"{install_hint()}")
 
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):

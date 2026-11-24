@@ -142,6 +142,28 @@ class VersionParsingAndMatchingTest(PreflightTestBase):
             for name in make_game.PROBES:
                 self.assertIn(f"Missing {name}.", err)
 
+    def test_a_probe_whose_name_differs_only_in_case_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = make_game.versions()[0]
+            for probe_name in make_game.PROBES:
+                with open(os.path.join(tmp, probe_name.lower()), "wb") as f:
+                    f.truncate(manifest["files"][probe_name]["size"])
+            if os.path.exists(os.path.join(tmp, "MicrosoftGame.Config")):
+                self.skipTest("case-insensitive file system: the lower-cased names open under the package's")
+            mismatches = make_game.probe_mismatches(tmp, manifest)
+        self.assertIn("Missing MicrosoftGame.Config: there is microsoftgame.config, but file names are "
+                      "case-sensitive", mismatches[0])
+        self.assertIn("Rename it to MicrosoftGame.Config", mismatches[0])
+        self.assertIn("Missing Catalog000.bin: there is catalog000.bin", mismatches[1])
+        self.assertEqual(len(mismatches), 2)   # appdata0.rpf is lower case in the package too: it matches
+
+    def test_other_case_ignores_the_exact_name_and_unrelated_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("Catalog000.bin.bak", "Catalog000.bin"):
+                open(os.path.join(tmp, name), "wb").close()
+            self.assertIsNone(make_game.other_case(tmp, "Catalog000.bin"))
+            self.assertIsNone(make_game.other_case(os.path.join(tmp, "absent"), "Catalog000.bin"))
+
 
 class GameCheckTest(PreflightTestBase):
     def test_check_nonexistent_directory_fails(self):

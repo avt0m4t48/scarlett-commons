@@ -1408,13 +1408,33 @@ void test_compat_modules() {
             std::filesystem::path bad = g_dir / "compat_bad";
             std::filesystem::create_directories(bad);
             write_image_as(std::vector<uint8_t>(64, 0x5A), "compat_bad/testcompat.dll");
+            // The loader has to keep Windows from raising its "Bad Image" box for this file (the load would wait
+            // on a click), and has to leave the thread's error mode as it found it. The mode here is one without
+            // SEM_FAILCRITICALERRORS, so a loader that suppresses nothing shows the box, and one that does not
+            // restore the mode is caught below.
+            const DWORD mode_before = GetThreadErrorMode() & ~static_cast<DWORD>(SEM_FAILCRITICALERRORS);
+            DWORD mode_at_entry = 0;
+            SetThreadErrorMode(mode_before, &mode_at_entry);
+            const ULONGLONG started = GetTickCount64();
             try {
                 bind_with_compat(bad, "testcompat.dll", "Answer", bound);
                 failed(what, "the load succeeded");
             } catch (const std::exception& e) {
                 if (std::string(e.what()).find("LEONIDA_COMPAT_DIR") == std::string::npos) failed(what, e.what());
+                else if (std::string(e.what()).find("(error 0)") != std::string::npos)
+                    failed(what, "the message lost the Windows error code");
                 else pass(what);
             }
+            const ULONGLONG waited_ms = GetTickCount64() - started;
+            const DWORD mode_after = GetThreadErrorMode();
+            SetThreadErrorMode(mode_at_entry, nullptr);
+            if (mode_after != mode_before)
+                failed("a compat file Windows cannot load: the thread error mode is put back", "the mode changed");
+            else pass("a compat file Windows cannot load: the thread error mode is put back");
+            // A refused load takes milliseconds; with the box up, the load returns only after someone clicks it.
+            if (waited_ms > 5000)
+                failed("a compat file Windows cannot load is refused without an error box", "the load took over 5 s");
+            else pass("a compat file Windows cannot load is refused without an error box");
         }
     } catch (const std::exception& e) {
         failed("LEONIDA_COMPAT_DIR", e.what());

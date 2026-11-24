@@ -19,7 +19,7 @@ Sources, each optional and reported as missing rather than counted as zero when 
     imports         the measured import tables in docs/runtime_imports.md
     corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
     github          --github, read-only through `gh`: every pull request into main (merged = implemented, open =
-                    partial), latest CI runs on main, the D3D- table of #313 checked against those merges, the
+                    partial), latest CI runs on main, the D3D- table of the D3D12 tracking issue checked against those merges, the
                     coordination issue's section sizes and, with --login, that account's claims and pull requests
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
@@ -831,8 +831,25 @@ def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
              "items": item_ids(p.get("title")), "author": (p.get("author") or {}).get("login")} for p in latest]
 
 
-def collect_github(col, repo, login):
-    col.panel("d3d12", "D3D12 → Vulkan layer items (#313)", "D3D- items")
+D3D_ISSUE_TITLE = "D3D12 → Vulkan layer"
+
+
+def find_d3d_issue(repo):
+    """Number of the open issue that tracks the D3D12 → Vulkan layer in this repository, or None.
+
+    It is looked up by title, like the coordination issue: a fixed number only holds for one repository (it was
+    #313 where the project started), and in another one the same number is some unrelated issue or pull request."""
+    found = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "D3D12 Vulkan layer in:title",
+                     "--json", "number,title"]) or []
+    want = re.sub(r"\W+", " ", D3D_ISSUE_TITLE).lower().split()
+    for issue in sorted(found, key=lambda i: i["number"]):
+        if re.sub(r"\W+", " ", issue.get("title") or "").lower().split()[:len(want)] == want:
+            return issue["number"]
+    return None
+
+
+def collect_github(col, repo, login, d3d_issue=None):
+    col.panel("d3d12", "D3D12 → Vulkan layer items", "D3D- items")
     col.panel("ci", "CI on main", "workflows")
     if not shutil.which("gh"):
         col.source("github", None, "missing", note="gh is not installed")
@@ -871,7 +888,17 @@ def collect_github(col, repo, login):
                     detail=f"{what} on {r['headSha'][:10]}" + (f"; a newer run is {newer['status']}" if newer and newer is not r else ""),
                     at=r["createdAt"], url=r.get("url"))
         col.source("github_ci", None, "ok", len(latest))
-    issue = gh_json(["issue", "view", "313", "-R", repo, "--json", "body,updatedAt"])
+    d3d_number = d3d_issue or find_d3d_issue(repo)
+    issue = None
+    if d3d_number is None:
+        col.source("github_d3d12", None, "missing",
+                   note=f'no open issue titled "{D3D_ISSUE_TITLE} ..." in {repo}: pass --d3d-issue N to name one')
+    else:
+        col.panel("d3d12", f"D3D12 → Vulkan layer items (#{d3d_number})", "D3D- items")
+        summary["d3d_issue"] = d3d_number
+        issue = gh_json(["issue", "view", str(d3d_number), "-R", repo, "--json", "body,updatedAt"])
+        if not issue:
+            col.source("github_d3d12", None, "invalid", note=f"issue #{d3d_number} could not be read")
     if issue:
         n = 0
         table_ids, table_done = set(), set()
@@ -890,19 +917,19 @@ def collect_github(col, repo, login):
                 n += 1
                 col.add(f"d3d.{plain(row[0])}", "d3d12", why, f"{plain(row[0])} {plain(row[1])}"[:120], status,
                         detail=(st or why)[:200], owner=owner, prs=pr[:120])
-        col.source("github_313", None, "ok", n, note=f"issue updated {issue.get('updatedAt')}")
+        col.source("github_d3d12", None, "ok", n, note=f"issue #{d3d_number}, updated {issue.get('updatedAt')}")
         if n:
             # the table lists only items still in progress; a merged item leaves it, so the merges are counted where they are recorded
             lists_read = merged_set is not None
             merged_ids = d3d_item_ids(merged) if lists_read else set()
             open_ids = d3d_item_ids(open_prs) if lists_read else set()
-            pr_done = (merged_ids - table_ids) - open_ids    # rows in #313 keep the table's state; the rest need a merged PR and no open one
+            pr_done = (merged_ids - table_ids) - open_ids    # rows in the issue keep the table's state; the rest need a merged PR and no open one
             col.metric("d3d12.merged", "d3d12", "D3D- items merged on main" + ("" if lists_read else " (partial)"),
                        len(table_done | pr_done), len(table_ids | merged_ids | open_ids),
-                       "#313 rows whose state is implemented (d3d_state), plus D3D- IDs not in #313 that a merged PR title names "
-                       "and no open PR title names / all known D3D- IDs (#313 rows plus IDs named by any merged or open PR title)",
+                       "tracking-issue rows whose state is implemented (d3d_state), plus D3D- IDs not in it that a merged PR title names "
+                       "and no open PR title names / all known D3D- IDs (its rows plus IDs named by any merged or open PR title)",
                        note=None if lists_read else "partial: the merged or open PR list could not be read, "
-                                                     "so only the #313 rows are counted")
+                                                     "so only the tracking issue's rows are counted")
     coord = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "Coordinating who works on what in:title",
                      "--json", "number,title,updatedAt"])
     if coord:
@@ -953,9 +980,10 @@ def build(args, out_dir):
     collect_contract(col)
     collect_imports(col)
     collect_corpus(col, args.work)
-    gh = collect_github(col, args.repo, args.login) if args.github else {}
+    gh = collect_github(col, args.repo, args.login, args.d3d_issue) if args.github else {}
     if not args.github:
-        col.source("github", None, "skipped", note="pass --github to read pull requests into main, CI, #313 and the coordination issue")
+        col.source("github", None, "skipped", note="pass --github to read pull requests into main, CI, the D3D12 tracking issue and the "
+                                                    "coordination issue")
     snap = {
         "schema": SCHEMA, "generated_at": iso(now_utc()), "git": g,
         "panels": [col.panels[k] for k in ("tests", "runtime", "gpu", "contract", "imports", "corpus", "merged", "d3d12", "ci") if k in col.panels],
@@ -1016,12 +1044,20 @@ def main(argv=None):
     ap.add_argument("--junit", nargs="*", metavar="FILE", help="additional independent CTest or pytest JUnit reports")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
                     help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
-    ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
+    ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, the D3D12 tracking issue and the coordination issue "
+                                                         "through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
+    ap.add_argument("--d3d-issue", type=int, metavar="N",
+                    help=f'with --github, the issue holding the D3D- table (default: the open issue titled '
+                         f'"{D3D_ISSUE_TITLE} ...")')
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)
     if args.login is not None and not args.github:
         ap.error("--login requires --github")
+    if args.d3d_issue is not None and not args.github:
+        ap.error("--d3d-issue requires --github")
+    if args.d3d_issue is not None and args.d3d_issue < 1:
+        ap.error("--d3d-issue must be a positive integer")
     if args.jobs < 1:
         ap.error("--jobs must be a positive integer")
     if args.test_timeout < 1:

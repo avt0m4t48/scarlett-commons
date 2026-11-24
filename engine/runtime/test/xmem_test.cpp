@@ -711,6 +711,8 @@ void test_write_combine_window(const PhysicalApi& api) {
     const bool mapped = api.map(window, 1, &page) == window;
     check(mapped, "a page maps into a window reserved with PAGE_WRITECOMBINE");
     if (mapped) {
+        // Physical pages are committed on first touch, so the view is written before it is queried.
+        *static_cast<volatile unsigned char*>(window) = 1;
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,

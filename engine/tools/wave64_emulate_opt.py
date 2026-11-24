@@ -748,7 +748,13 @@ def _holds_lane_mask(ins, x, lm_map):
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
     if k == "sgpr":
-        return all(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+        n = x.get("n", 1)
+        if n == 2:
+            # Gen.holds_lane_mask takes a pair as a mask when one word is a mask and the other a constant 0 / -1
+            # (s_mov_b32 s5, 0 after a v_cmp into s[4:5]). `lm_map` has no constants, so one mask word is enough
+            # here; a pair with a data word too is then over-approximated, which only costs a fold (old #4480).
+            return x["r"] in lm_map or x["r"] + 1 in lm_map
+        return all(x["r"] + i in lm_map for i in range(n))
     return False
 
 

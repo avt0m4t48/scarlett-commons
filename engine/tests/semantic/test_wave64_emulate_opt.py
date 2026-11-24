@@ -992,6 +992,35 @@ class LocalExecFoldTests(unittest.TestCase):
         got = [mem.get(i * 4, 0) for i in range(8)]
         self.assertEqual(got, [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])
 
+    def test_mask_pair_with_constant_half_is_not_folded(self):
+        # Old #4480: s[4:5] is a v_cmp mask whose high half was set to 0, s[12:13] a -1 whose high half became a
+        # mask. rdna2spirv reads both as lane masks (s_bcnt1 collects the wave), so the execz region they are
+        # counted in must not be folded as lane-local; it was, and translate() asserted on the x_split inside it.
+        fixture = os.path.join(HERE, "fixtures", "wave64_mask_const_half.asm")
+        with open(fixture, encoding="ascii") as f:
+            lines = f.read().splitlines()
+        prev_emu = rdna2spirv.WAVE64_EMULATE
+        for threads in (64, 128):
+            with self.subTest(threads=threads):
+                rdna2spirv.WAVE64_EMULATE = True
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        os.mkdir(os.path.join(td, "disasm"))
+                        os.mkdir(os.path.join(td, "fssm"))
+                        s_path = os.path.join(td, "disasm", "cs_w64_mask_const_half.s")
+                        with open(s_path, "w", encoding="utf-8") as dst:
+                            dst.write("; cs_w64_mask_const_half  hand-written\n; mattr: +wavefrontsize64,-wavefrontsize32\n")
+                            dst.write("\n".join(ln for ln in lines if not ln.startswith(";")) + "\n")
+                        with open(os.path.join(td, "fssm", "cs_w64_mask_const_half.fssm"), "wb") as f:
+                            f.write(bytes(0x138) + struct.pack("<4I", 0x8088, threads, 1, 1))
+                        spv = rdna2spirv.translate(s_path)
+                finally:
+                    rdna2spirv.WAVE64_EMULATE = prev_emu
+                mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
+                for t in range(threads):
+                    want = (8, 40) if t >= 16 else (0, 0)
+                    self.assertEqual((mem.get(8 * t, 0), mem.get(8 * t + 4, 0)), want, f"thread {t}")
+
     def test_write_before_folded_scalar_load_orders_cleanly(self):
         # #1587 interaction: buffer_store before a folded s_cbranch_execz containing s_load_dword must emit
         # a uniform x_split BEFORE `if (%active)`, never inside the divergent branch.
@@ -1596,6 +1625,11 @@ class StructuredEmulationTests(unittest.TestCase):
         lm_45 = {id(bcnt): {4: "mask", 5: "mask"}}
         self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, pair_45, lm_45[id(bcnt)]))
         self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, pair_89, lm_45[id(bcnt)]))
+        # One mask word and one constant word (absent from the map) is still a mask pair (old #4480).
+        self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {4: "mask_lo"}))
+        self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {5: "mask_hi"}))
+        self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {6: "mask_lo"}))
+        self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(5), {4: "mask_lo"}))
         self.assertTrue(wave64_emulate_opt._is_mask_op(bcnt, vcc_pair, {}))
         self.assertTrue(wave64_emulate_opt._insn_may_barrier(bcnt, lm_45, set()))
         clean, _, _, _, _ = wave64_emulate_opt._classify_block_body([bcnt], lm_45, set(), frozenset())

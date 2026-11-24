@@ -418,6 +418,47 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(self.out_json, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {f"{hashdict.joaat('pso_metadata_token'):08x}": "pso_metadata_token"})
 
+    def archive_names(self, *args):
+        p = self.run_tool(self.carve_dir, "--out", self.out_json, *args)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            return set(json.load(f).values())
+
+    def test_archives_list_ignores_spaces_and_empty_entries(self):
+        # "common, custom_pack" used to select only common: " custom_pack" matched no archive, silently
+        names = self.archive_names("--archives", " common, custom_pack ,,")
+        self.assertIn("common_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
+        # an empty list harvests only the PSIN/RBF0 blobs
+        names = self.archive_names("--archives", "")
+        self.assertNotIn("common_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
+
+    def test_archive_named_but_not_carved_is_a_usage_error(self):
+        previous = {"00000001": "previous_name"}
+        with open(self.out_json, "w", encoding="utf-8") as f:
+            json.dump(previous, f)
+        common = os.path.join(self.carve_dir, "common")
+        for carve, archives, message in (
+                (self.carve_dir, "comon,custom_pack", "--archives: comon not found"),
+                (self.carve_dir, "common, data", "--archives: data not found"),
+                # a one-archive folder holds that archive only
+                (common, "custom_pack", "(archives there: common)")):
+            p = self.run_tool(carve, "--out", self.out_json, "--archives", archives)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("usage:", p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(p.stdout, "")
+            with open(self.out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), previous)
+
+    def test_default_archives_absent_from_a_partial_carve_are_not_an_error(self):
+        # the default list names data, script, ... which this carve lacks
+        names = self.archive_names()
+        self.assertIn("common_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
+
     def test_out_naming_a_one_archive_index_is_refused(self):
         index = os.path.join(self.carve_dir, "common", "index.json")
         with open(index, "rb") as f:

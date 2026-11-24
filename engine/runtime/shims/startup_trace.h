@@ -206,7 +206,19 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
         const std::lock_guard lock(m);
         first = seen.insert(at).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    if (first) {
+        // The integer registers at the assert: a soft assert's condition is usually in one of them (the value it
+        // compared), so the trace names the number, not just the place.
+        const CONTEXT& c = *info->ContextRecord;
+        char regs[256];
+        std::snprintf(regs, sizeof(regs),
+                      ",\"rax\":\"0x%llx\",\"rcx\":\"0x%llx\",\"rdx\":\"0x%llx\",\"r8\":\"0x%llx\",\"r9\":\"0x%llx\","
+                      "\"rsp\":\"0x%llx\"",
+                      static_cast<unsigned long long>(c.Rax), static_cast<unsigned long long>(c.Rcx),
+                      static_cast<unsigned long long>(c.Rdx), static_cast<unsigned long long>(c.R8),
+                      static_cast<unsigned long long>(c.R9), static_cast<unsigned long long>(c.Rsp));
+        event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))) + regs);
+    }
     info->ContextRecord->Rip += 1;
     return true;
 }

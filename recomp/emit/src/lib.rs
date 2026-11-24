@@ -61,6 +61,10 @@ pub unsafe fn setup() {
             assert!(index < 64, "TLS index {index} is beyond the TEB's own slots");
             TLS_INDEX = index;
             TLS_GS = 0x1480 + 8 * index as u64;
+            let thread = TlsAlloc();
+            assert!(thread < 64, "TLS index {thread} is beyond the TEB's own slots");
+            THREAD_INDEX = thread;
+            THREAD_GS = 0x1480 + 8 * thread as u64;
         }
     }
 }
@@ -73,6 +77,14 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
     unsafe {
         let old = TlsGetValue(TLS_INDEX);
         TlsSetValue(TLS_INDEX, c as *mut Ctx as *mut core::ffi::c_void);
+        // An entry nested in the native callee builds its context below this frame on the side stack.
+        let thread = TlsGetValue(THREAD_INDEX) as *mut Thread;
+        let side = if thread.is_null() { 0 } else { (*thread).side_top };
+        if !thread.is_null() {
+            let here: u64;
+            core::arch::asm!("mov {}, rsp", out(reg) here);
+            (*thread).side_top = (here - 0x400) & !0x3f;
+        }
         c.target = target;
         let p = c as *mut Ctx;
         core::arch::asm!(
@@ -185,8 +197,166 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
         );
         TlsSetValue(TLS_INDEX, old);
+        if !thread.is_null() {
+            (*thread).side_top = side;
+        }
     }
 }
+/// One per thread that enters translated code: a side stack for the translations' own frames, so that the guest
+/// stack stays the title's (a translation's pushes and the Rust frames that run it would otherwise overlap).
+#[repr(C)]
+pub struct Thread {
+    /// Where the next entry on this thread puts its context: the top of the side stack, or below the frames of a
+    /// translation that is in a call to native code.
+    pub side_top: u64,
+    pub side_base: u64,
+}
+static mut THREAD_INDEX: u32 = u32::MAX;
+static mut THREAD_GS: u64 = 0;
+const SIDE_STACK: usize = 1 << 20;
+unsafe extern "system" {
+    fn VirtualAlloc(address: *mut core::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut core::ffi::c_void;
+}
+extern "C" fn commons_thread_alloc() -> *mut Thread {
+    unsafe {
+        let base = VirtualAlloc(core::ptr::null_mut(), SIDE_STACK, 0x3000, 0x04) as u64;
+        assert!(base != 0, "no side stack for translated code");
+        let t = Box::into_raw(Box::new(Thread { side_top: (base + SIDE_STACK as u64) & !0x3f, side_base: base }));
+        TlsSetValue(THREAD_INDEX, t as *mut core::ffi::c_void);
+        t
+    }
+}
+extern "C" fn commons_dispatch(c: *mut Ctx) {
+    unsafe {
+        let f: unsafe fn(&mut Ctx) = core::mem::transmute((*c).target);
+        f(&mut *c);
+    }
+}
+/// Where a replaced function's native entry lands, through its stub (`e_<name>`, which pushed rax and put the
+/// translation's address in rax): the title's registers go into a context on this thread's side stack, the
+/// translation runs there, and its results go back into the registers before returning to the title's caller, as the
+/// native function would have.
+#[unsafe(naked)]
+unsafe extern "C" fn commons_entry() {
+    core::arch::naked_asm!(
+        "push rcx",
+        "push rax",
+        "mov rcx, [rip + {tgs}]",
+        "mov rcx, qword ptr gs:[rcx]",
+        "test rcx, rcx",
+        "jnz 3f",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "sub rsp, 232",
+        "vmovdqu [rsp + 40], ymm0",
+        "vmovdqu [rsp + 72], ymm1",
+        "vmovdqu [rsp + 104], ymm2",
+        "vmovdqu [rsp + 136], ymm3",
+        "vmovdqu [rsp + 168], ymm4",
+        "vmovdqu [rsp + 200], ymm5",
+        "call {alloc}",
+        "vmovdqu ymm0, [rsp + 40]",
+        "vmovdqu ymm1, [rsp + 72]",
+        "vmovdqu ymm2, [rsp + 104]",
+        "vmovdqu ymm3, [rsp + 136]",
+        "vmovdqu ymm4, [rsp + 168]",
+        "vmovdqu ymm5, [rsp + 200]",
+        "add rsp, 232",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "mov rcx, rax",
+        "3:",
+        "mov rcx, [rcx]",
+        "sub rcx, 768",
+        "and rcx, -64",
+        "mov rax, [rsp]",
+        "mov [rcx + 152], rax",
+        "mov rax, [rsp + 16]",
+        "mov [rcx], rax",
+        "mov rax, [rsp + 8]",
+        "mov [rcx + 8], rax",
+        "mov [rcx + 16], rdx",
+        "mov [rcx + 24], rbx",
+        "mov [rcx + 40], rbp",
+        "mov [rcx + 48], rsi",
+        "mov [rcx + 56], rdi",
+        "mov [rcx + 64], r8",
+        "mov [rcx + 72], r9",
+        "mov [rcx + 80], r10",
+        "mov [rcx + 88], r11",
+        "mov [rcx + 96], r12",
+        "mov [rcx + 104], r13",
+        "mov [rcx + 112], r14",
+        "mov [rcx + 120], r15",
+        "lea rax, [rsp + 24]",
+        "mov [rcx + 32], rax",
+        "mov dword ptr [rcx + 128], 0",
+        "vmovdqu [rcx + 160], ymm0",
+        "vmovdqu [rcx + 192], ymm1",
+        "vmovdqu [rcx + 224], ymm2",
+        "vmovdqu [rcx + 256], ymm3",
+        "vmovdqu [rcx + 288], ymm4",
+        "vmovdqu [rcx + 320], ymm5",
+        "vmovdqu [rcx + 352], ymm6",
+        "vmovdqu [rcx + 384], ymm7",
+        "vmovdqu [rcx + 416], ymm8",
+        "vmovdqu [rcx + 448], ymm9",
+        "vmovdqu [rcx + 480], ymm10",
+        "vmovdqu [rcx + 512], ymm11",
+        "vmovdqu [rcx + 544], ymm12",
+        "vmovdqu [rcx + 576], ymm13",
+        "vmovdqu [rcx + 608], ymm14",
+        "vmovdqu [rcx + 640], ymm15",
+        "mov rsp, rcx",
+        "sub rsp, 64",
+        "call {dispatch}",
+        "lea rcx, [rsp + 64]",
+        "vmovdqu ymm0, [rcx + 160]",
+        "vmovdqu ymm1, [rcx + 192]",
+        "vmovdqu ymm2, [rcx + 224]",
+        "vmovdqu ymm3, [rcx + 256]",
+        "vmovdqu ymm4, [rcx + 288]",
+        "vmovdqu ymm5, [rcx + 320]",
+        "vmovdqu ymm6, [rcx + 352]",
+        "vmovdqu ymm7, [rcx + 384]",
+        "vmovdqu ymm8, [rcx + 416]",
+        "vmovdqu ymm9, [rcx + 448]",
+        "vmovdqu ymm10, [rcx + 480]",
+        "vmovdqu ymm11, [rcx + 512]",
+        "vmovdqu ymm12, [rcx + 544]",
+        "vmovdqu ymm13, [rcx + 576]",
+        "vmovdqu ymm14, [rcx + 608]",
+        "vmovdqu ymm15, [rcx + 640]",
+        "mov rax, [rcx]",
+        "mov rdx, [rcx + 16]",
+        "mov rbx, [rcx + 24]",
+        "mov rbp, [rcx + 40]",
+        "mov rsi, [rcx + 48]",
+        "mov rdi, [rcx + 56]",
+        "mov r8, [rcx + 64]",
+        "mov r9, [rcx + 72]",
+        "mov r10, [rcx + 80]",
+        "mov r11, [rcx + 88]",
+        "mov r12, [rcx + 96]",
+        "mov r13, [rcx + 104]",
+        "mov r14, [rcx + 112]",
+        "mov r15, [rcx + 120]",
+        "mov rsp, [rcx + 32]",
+        "push qword ptr [rcx + 136]",
+        "mov rcx, [rcx + 8]",
+        "ret",
+        tgs = sym THREAD_GS,
+        alloc = sym commons_thread_alloc,
+        dispatch = sym commons_dispatch,
+    );
+}
+
 #[inline(always)]
 fn mask(n: u32) -> u64 { if n >= 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 } }
 #[inline(always)]
@@ -671,6 +841,14 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
     s.push(' ');
     s += &next;
     Some(s)
+}
+
+/// The entry stub of translated function `name` (`e_<name>`): the address a replaced function's native entry jumps
+/// to. It keeps every register of the title's call and enters the translation through `commons_entry`.
+pub fn emit_entry(name: &str) -> String {
+    format!(
+        "#[unsafe(naked)]\npub unsafe extern \"C\" fn e_{name}() {{\n    core::arch::naked_asm!(\"push rax\", \"lea rax, [rip + {{f}}]\", \"jmp {{e}}\", f = sym {name}, e = sym commons_entry);\n}}\n"
+    )
 }
 
 /// Whether the emitter covers this instruction (the census uses this one definition). Branch targets are not known

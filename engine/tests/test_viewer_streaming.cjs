@@ -412,6 +412,11 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
         addEventListener: (type, handler) => handlers.set(type, handler),
         devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
         performance: { now: () => 0 },
+        // viewer/index.html starts loadWorld() at module scope, which creates an AbortController and arms a
+        // timeout; a vm context only has what the sandbox gives it, so the browser globals it needs are here:
+        // the timers never fire, the manifest has no chunks to stream.
+        AbortController,
+        setTimeout: () => 1, clearTimeout() {},
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
     });
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.

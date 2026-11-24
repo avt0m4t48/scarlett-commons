@@ -790,5 +790,27 @@ class FloatLiteralTests(unittest.TestCase):
             spirv_asm.assemble(head + "%c = OpConstant %bf 1e39\n")
 
 
+class DebugPrintfTests(unittest.TestCase):
+    def test_debugprintf_by_name_as_spirv_dis_writes_it(self):
+        # old #4322: the instruction name spirv-dis prints for NonSemantic.DebugPrintf was refused as an integer.
+        def module(inst):
+            return (
+                'OpCapability Shader\nOpExtension "SPV_KHR_non_semantic_info"\n'
+                '%dp = OpExtInstImport "NonSemantic.DebugPrintf"\nOpMemoryModel Logical GLSL450\n'
+                'OpEntryPoint GLCompute %main "main"\nOpExecutionMode %main LocalSize 1 1 1\n'
+                '%fmt = OpString "x=%u"\n%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%uint = OpTypeInt 32 0\n'
+                '%u7 = OpConstant %uint 7\n%main = OpFunction %void None %fn\n%l = OpLabel\n'
+                f'%p = OpExtInst %void %dp {inst} %fmt %u7\nOpReturn\nOpFunctionEnd\n'
+            )
+        spv = spirv_asm.assemble(module("DebugPrintf"))
+        self.assertEqual(spv, spirv_asm.assemble(module("1")))
+        ext_inst = _literal_words(spv, 12, 0)
+        self.assertEqual(len(ext_inst), 6)          # result type, result, set, instruction, format, one argument
+        self.assertEqual(ext_inst[3], 1)
+        _validate(spv)
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "invalid integer literal 'Printf'"):
+            spirv_asm.assemble(module("Printf"))
+
+
 if __name__ == "__main__":
     unittest.main()

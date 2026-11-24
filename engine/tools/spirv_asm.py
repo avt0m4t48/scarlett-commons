@@ -5,8 +5,8 @@ conforming SPIR-V assembly targeting Vulkan 1.0–1.4) directly into binary SPIR
 words in memory.
 
 Grammar tables in tools/spirv_asm_tables.py are derived from Khronos Group
-SPIRV-Headers (MIT License): spirv.core.grammar.json and
-extinst.glsl.std.450.grammar.json.
+SPIRV-Headers (MIT License): spirv.core.grammar.json,
+extinst.glsl.std.450.grammar.json and extinst.nonsemantic.debugprintf.grammar.json.
 
 As a module:
     from spirv_asm import assemble
@@ -29,7 +29,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
+from spirv_asm_tables import (  # noqa: E402
+    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF, VALUE_ENUMS,
+)
 
 SPIRV_MAGIC = 0x07230203
 
@@ -53,6 +55,7 @@ _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemory
 _ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
+    "NonSemantic.DebugPrintf": NONSEMANTIC_DEBUGPRINTF,    # spirv-dis writes its instruction by name
 }
 
 # OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.

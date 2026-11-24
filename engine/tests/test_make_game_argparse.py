@@ -380,7 +380,8 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
-                with patch("make_game.below_normal"):
+                # main() clamps --jobs to the machine's hardware threads; pin them so 10 is in range anywhere.
+                with patch("make_game.below_normal"), patch("make_game.leonida_tui.os.cpu_count", return_value=16):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):

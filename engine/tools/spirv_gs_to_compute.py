@@ -193,6 +193,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     cur_block = None
     emit_split = set()
     block_tail = {}
+    derived = {}            # pointer id from an input or output -> the storage class it has now ("sb" or "pv")
     main_start = None
     state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in _assembly_lines(text):
@@ -289,10 +290,24 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
                     f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}",
                     " ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
+            derived[m.group(1)] = "sb"
             continue
         if m and m.group(3) in out_vars:
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
+            derived[m.group(1)] = "pv"
+            continue
+        # A pointer made from one of those (a further access chain, or a copy) points into the same buffer or
+        # private variable, so its result type takes that storage class too, not the old Input / Output (old #4126).
+        m = re.match(r"(%\w+) = (Op(?:InBounds)?(?:Ptr)?AccessChain|OpCopyObject) (%\w+) (%\w+)(.*)$", s)
+        if m and m.group(4) in derived:
+            pointee = defs.get(m.group(3), (None, []))[1][1:2]
+            if pointee not in ([v4], [f32]):
+                raise Unsupported(f"pointer into a geometry input or output of an unhandled type: {s}")
+            sc = derived[m.group(4)]
+            ptr = f"%gsc_ptr_{sc}_{'v4' if pointee == [v4] else 'f'}"
+            out.append(f"{m.group(1)} = {m.group(2)} {ptr} {m.group(4)}{m.group(5)}")
+            derived[m.group(1)] = sc
             continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):

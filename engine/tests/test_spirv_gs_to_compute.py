@@ -395,3 +395,46 @@ def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, befo
 
     assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
     assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+
+
+def test_pointers_derived_from_interface_access_chains_take_the_new_storage_class(tmp_path: Path) -> None:
+    # Old #4126: a copy of, or an access chain into, a pointer from an input or output access chain kept its Input /
+    # Output result type, while its base now points into the input buffer or a private variable.
+    geometry = PHI_GS.replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_in_float = OpTypePointer Input %float\n%ptr_out_float = OpTypePointer Output %float\n"
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+    ).replace(
+        "%v = OpLoad %v4float %p\nOpStore %out_pos %v",
+        "%pc = OpCopyObject %ptr_in_v4 %p\n"
+        "%py = OpInBoundsAccessChain %ptr_in_float %pc %u1\n"
+        "%y = OpLoad %float %py\n"
+        "%v = OpLoad %v4float %pc\n"
+        "OpStore %out_pos %v\n"
+        "%ox = OpAccessChain %ptr_out_float %out_pos %u0\n"
+        "%oc = OpCopyObject %ptr_out_float %ox\n"
+        "OpStore %oc %y",
+    )
+    lowered, _ = gsc.rewrite(geometry)
+    assert "%pc = OpCopyObject %gsc_ptr_sb_v4 %p\n" in lowered
+    assert "%py = OpInBoundsAccessChain %gsc_ptr_sb_f %pc %u1\n" in lowered
+    assert "%ox = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0\n" in lowered
+    assert "%oc = OpCopyObject %gsc_ptr_pv_f %ox\n" in lowered
+    assert "%ptr_in_v4 %p" not in lowered and "%ptr_in_float %pc" not in lowered
+    if HAVE_SPIRV:
+        for name, assembly in (("geometry", geometry), ("compute", lowered)):
+            module = tmp_path / f"{name}.spv"
+            subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                           input=assembly, text=True, check=True)
+            subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    # OpPtrAccessChain gets the same treatment; a pointer to some other type is refused rather than mistyped.
+    ptr_chain = geometry.replace("%py = OpInBoundsAccessChain %ptr_in_float %pc %u1",
+                                 "%py = OpPtrAccessChain %ptr_in_float %pc %u0 %u1")
+    assert "%py = OpPtrAccessChain %gsc_ptr_sb_f %pc %u0 %u1\n" in gsc.rewrite(ptr_chain)[0]
+    odd = geometry.replace(
+        "%ptr_in_float = OpTypePointer Input %float",
+        "%ptr_in_float = OpTypePointer Input %float\n%ptr_in_uint = OpTypePointer Input %uint",
+    ).replace("%y = OpLoad %float %py", "%y = OpLoad %float %py\n%pu = OpAccessChain %ptr_in_uint %pc %u0")
+    with pytest.raises(gsc.Unsupported, match="unhandled type"):
+        gsc.rewrite(odd)

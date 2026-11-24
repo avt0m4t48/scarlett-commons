@@ -111,6 +111,19 @@ class FmaKhrTests(unittest.TestCase):
             self.assertEqual([f for f in meta["features"] if f == "shaderFmaFloat32"], feats)
             self.assertEqual("SPV_KHR_fma" in meta["extensions"], khr)
 
+    def test_index_records_the_mode_of_the_translation(self):
+        # Translated under one --fma option, indexed after the option changed: the index keeps the translation's mode.
+        old = rdna2spirv.FMA_KHR, rdna2spirv.FMA_EXACT
+        try:
+            for mode, later in (("khr", "glsl"), ("exact", "glsl"), ("glsl", "khr"), ("glsl", "exact")):
+                with self.subTest(mode=mode, later=later):
+                    rdna2spirv.FMA_KHR, rdna2spirv.FMA_EXACT = mode == "khr", mode == "exact"
+                    spv = translate_lines("ps_fma_khr", F32_FMA_OPS[0] + EXIT)
+                    rdna2spirv.FMA_KHR, rdna2spirv.FMA_EXACT = later == "khr", later == "exact"
+                    self.assertEqual(rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)["fma"], mode)
+        finally:
+            rdna2spirv.FMA_KHR, rdna2spirv.FMA_EXACT = old
+
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "SPIRV-Tools not installed")
     def test_spirv_tools_accept_it(self):
         require_tools = os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS") == "1"

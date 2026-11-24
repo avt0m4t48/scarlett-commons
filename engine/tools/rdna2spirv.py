@@ -311,6 +311,9 @@ class Gen:
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
         self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
+        # The --fma option this module is translated under, for the index: a caller that changes the option before
+        # shader_meta (translation and indexing in separate steps) must not relabel it.
+        self.fma_mode = "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl"
         self.uses_clock = set()
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
@@ -18498,7 +18501,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
          # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
-         "fma": "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl",
+         "fma": g.fma_mode,
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]

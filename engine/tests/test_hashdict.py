@@ -305,12 +305,15 @@ class CarveAndExtraCLITest(unittest.TestCase):
         meta_index = {
             "files": [
                 {"off": 32, "head": "5053494e1234", "type": "bin"},
+                {"off": 48, "head": "00000000", "type": "bin"},
             ]
         }
         with open(os.path.join(meta_dir, "index.json"), "w", encoding="utf-8") as f:
             json.dump(meta_index, f)
         with open(os.path.join(meta_dir, f"{32:012x}.bin"), "wb") as f:
             f.write(b"\x00\x00pso_metadata_token\x00\x00")
+        with open(os.path.join(meta_dir, f"{48:012x}.bin"), "wb") as f:
+            f.write(b"\x00custom_archive_asset\x00")
 
         # 3. Extra directory with filenames
         self.extra_dir = os.path.join(self.dir, "extra_files")
@@ -428,10 +431,12 @@ class CarveAndExtraCLITest(unittest.TestCase):
         # "common, custom_pack" used to select only common: " custom_pack" matched no archive, silently
         names = self.archive_names("--archives", " common, custom_pack ,,")
         self.assertIn("common_archive_asset", names)
+        self.assertIn("custom_archive_asset", names)
         self.assertIn("pso_metadata_token", names)
         # an empty list harvests only the PSIN/RBF0 blobs
         names = self.archive_names("--archives", "")
         self.assertNotIn("common_archive_asset", names)
+        self.assertNotIn("custom_archive_asset", names)
         self.assertIn("pso_metadata_token", names)
 
     def test_archive_named_but_not_carved_is_a_usage_error(self):

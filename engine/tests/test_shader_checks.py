@@ -5,6 +5,7 @@ import io
 import json
 import re
 import struct
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -341,6 +342,45 @@ class MeshWorkgroupChecks(unittest.TestCase):
             self.assertEqual(status, 1)
             self.assertIn("could not remove the previous readback", message)
             self.assertTrue(raw.is_dir())
+
+
+MESH_GRADIENT = [((i % 64 + .5) / 64, (i // 64 + .5) / 64, .5, 1.0) for i in range(4096)]
+
+
+class MeshGradientChecks(unittest.TestCase):
+    """ms_w64x_ballot and ms_wave_info_s3 with a fake vk_harness that writes `pixels` and reports `subgroups`."""
+
+    def run_mesh(self, name, pixels, subgroups):
+        def harness(cmd, **_kw):
+            Path(cmd[3]).write_bytes(b"".join(struct.pack("<4f", *p) for p in pixels))
+            return subprocess.CompletedProcess(cmd, 0, "", f"device: fake (subgroup {subgroups})\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in (name, "fs_passthru"):
+                (Path(tmp) / f"{shader}.spv").touch()
+            with patch.object(check, "W64_EMULATED", False), \
+                    patch.object(check.subprocess, "run", side_effect=harness):
+                return check.mesh_w64x_test(tmp, tmp, name)
+
+    def test_a_nan_readback_fails(self):
+        nan = float("nan")
+        for name in ("ms_w64x_ballot", "ms_wave_info_s3"):
+            problem = self.run_mesh(name, [(nan, nan, nan, nan)] * 4096, "32..64")
+            self.assertIn("4096 of 4096 pixels differ", problem, name)
+            pixels = list(MESH_GRADIENT)
+            pixels[5] = (pixels[5][0], pixels[5][1], nan, 1.0)
+            self.assertIn("1 of 4096 pixels differ", self.run_mesh(name, pixels, "32..64"), name)
+
+    def test_the_gradient_passes(self):
+        for name in ("ms_w64x_ballot", "ms_wave_info_s3"):
+            self.assertEqual(self.run_mesh(name, MESH_GRADIENT, "32..64"), "", name)
+
+    def test_wave_info_is_judged_on_a_32_wide_device(self):
+        # Its wave id is LocalInvocationIndex >> 6, whatever the subgroup width; only the ballot needs 64 lanes.
+        self.assertEqual(self.run_mesh("ms_wave_info_s3", MESH_GRADIENT, "32..32"), "")
+        wrong = [(r, g, 0.0, a) for r, g, _, a in MESH_GRADIENT]
+        self.assertIn("4096 of 4096 pixels differ", self.run_mesh("ms_wave_info_s3", wrong, "32..32"))
+        self.assertIsNone(self.run_mesh("ms_w64x_ballot", MESH_GRADIENT, "32..32"))
 
 
 class PixelDeviceLimits(unittest.TestCase):

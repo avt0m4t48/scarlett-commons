@@ -54,8 +54,10 @@ public class Loader { public static void Main(string[] args) { System.Console.Wr
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             out = repo / "reports/exe" / image.stem
             self.assertIn(hashlib.sha256(image.read_bytes()).hexdigest(), (out / "hash.txt").read_text("utf-16"))
+            # PowerShell's Resolve-Path hands the loader the canonical path: on Windows tempfile gives the 8.3
+            # name (RUNNER~1) and resolve() expands it to the long one.
             self.assertEqual((out / "dryrun.txt").read_text("utf-16").splitlines(),
-                             ["--dry-run", str(image), "--game-dir", str(game)])
+                             ["--dry-run", str(image.resolve()), "--game-dir", str(game.resolve())])
             imports = json.loads((out / (image.name + ".json")).read_text("utf-8"))["imports"]
             self.assertTrue(any(d["dll"].lower() == "xmem.dll" and d["where"] == "bundled" for d in imports))
             self.assertIn("fake_lib.dll", (out / "shim-todo.txt").read_text())

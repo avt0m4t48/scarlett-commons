@@ -829,7 +829,10 @@ public:
     // when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
+    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
+    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
+    //     like the FSPX ones (docs/shader_library.md).
     // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
     // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
@@ -849,7 +852,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "library"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -865,8 +868,9 @@ public:
     // The folder load() read, made absolute; empty before.
     const std::filesystem::path& directory() const { return dir_; }
     std::size_t size() const { return count_; }
-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
+    // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
+    // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
@@ -1041,7 +1045,7 @@ private:
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
+            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
             ++count_;
         }

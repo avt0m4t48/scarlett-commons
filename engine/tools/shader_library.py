@@ -306,7 +306,8 @@ def main(argv=None) -> int:
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     carve_errors = []
     sources = carve_digests(a.carve, errors=carve_errors) if a.carve else None
-    cs_state = {c["program"]: c["state"] for c in lib["compute"]}
+    cs_state = {c["program"]: c["state"] for c in lib["compute"]
+                if c["program"] is not None and c["state"] is not None}
     index, written, work = [], 0, []
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())

@@ -304,6 +304,11 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def test_default_repo_is_the_one_the_readme_clones(self):
+        # --github once read a repository that had gone private; the README is where the address is kept current
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            self.assertIn(f"`git clone --recursive https://github.com/{pd.DEFAULT_REPO}`", f.read())
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")
@@ -339,6 +344,8 @@ class Github(unittest.TestCase):
                 return merged if "merged" in args else open_prs
             if args[:2] == ["issue", "view"]:
                 return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return [{"number": 313, "title": "D3D12 → Vulkan layer: critical path, who builds what"}]
             return []
         col = pd.Collector()
         with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
@@ -353,11 +360,83 @@ class Github(unittest.TestCase):
                 return merged if "merged" in args else open_prs
             if args[:2] == ["issue", "view"]:
                 return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return [{"number": 313, "title": "D3D12 → Vulkan layer: critical path, who builds what"}]
             return []
         col = pd.Collector()
         with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
             pd.collect_github(col, "o/r", "me")
         return next(m for m in col.metrics if m["id"] == "d3d12.merged")
+
+    D3D_BODY = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-4 | b | @b | #60 merged | merged |\n| D3D-5 | c | @c | #61 | PR open |\n")
+
+    def run_d3d_lookup(self, issues, d3d_issue=None, readable=True):
+        """collect_github() with these open issues answering the D3D12 title search: the collector, the summary and
+        every gh call made."""
+        calls = []
+
+        def fake_gh(args, timeout=60):
+            calls.append(args)
+            if args[:2] == ["issue", "view"]:
+                return {"body": self.D3D_BODY, "updatedAt": "2026-11-22T00:00:00Z"} if readable else None
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return issues
+            return []
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            summary = pd.collect_github(col, "o/r", None, d3d_issue)
+        return col, summary, calls
+
+    @staticmethod
+    def viewed(calls):
+        return [a[2] for a in calls if a[:2] == ["issue", "view"]]
+
+    def test_d3d_issue_is_found_by_title_not_by_a_fixed_number(self):
+        # #313 was the tracking issue in the repository the project started in; here that number is something else
+        col, summary, calls = self.run_d3d_lookup([
+            {"number": 12, "title": "d3d12_vulkan_device: a crash in the Vulkan layer"},
+            {"number": 90, "title": "D3D12 -> Vulkan layer: critical path (continues the one below)"},
+            {"number": 41, "title": "D3D12 → Vulkan layer: critical path, who builds what, open methods"},
+        ])
+        self.assertEqual(self.viewed(calls), ["41"])                    # the oldest issue with the title; never "313"
+        self.assertEqual(summary["d3d_issue"], 41)
+        self.assertEqual(col.panels["d3d12"]["title"], "D3D12 → Vulkan layer items (#41)")
+        source = next(s for s in col.sources if s["id"] == "github_d3d12")
+        self.assertEqual((source["status"], source["records"]), ("ok", 2))
+        self.assertTrue(any(m["id"] == "d3d12.merged" for m in col.metrics))
+
+    def test_no_d3d_issue_is_reported_and_no_other_issue_is_read(self):
+        for issues in ([], None, [{"number": 313, "title": "tests: an unrelated pull request"}]):
+            with self.subTest(issues=issues):
+                col, summary, calls = self.run_d3d_lookup(issues)
+                self.assertEqual(self.viewed(calls), [])
+                self.assertNotIn("d3d_issue", summary)
+                source = next(s for s in col.sources if s["id"] == "github_d3d12")
+                self.assertEqual(source["status"], "missing")
+                self.assertIn("--d3d-issue", source["note"])
+                self.assertEqual(col.panels["d3d12"]["title"], "D3D12 → Vulkan layer items")
+                self.assertFalse(any(m["id"] == "d3d12.merged" for m in col.metrics))
+
+    def test_d3d_issue_option_names_the_issue(self):
+        col, summary, calls = self.run_d3d_lookup([{"number": 41, "title": "D3D12 → Vulkan layer: x"}], d3d_issue=7)
+        self.assertEqual(self.viewed(calls), ["7"])
+        self.assertFalse(any(a[:2] == ["issue", "list"] and "D3D12" in a[a.index("--search") + 1] for a in calls))
+        self.assertEqual(summary["d3d_issue"], 7)
+
+    def test_unreadable_d3d_issue_is_reported(self):
+        col, _, _ = self.run_d3d_lookup([], d3d_issue=7, readable=False)
+        source = next(s for s in col.sources if s["id"] == "github_d3d12")
+        self.assertEqual(source["status"], "invalid")
+        self.assertIn("#7", source["note"])
+
+    def test_d3d_issue_option_is_checked(self):
+        for argv in (["--out", "x", "--d3d-issue", "7"], ["--out", "x", "--github", "--d3d-issue", "0"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as stop:
+                    pd.main(argv)
+                self.assertEqual(stop.exception.code, 2)
+                self.assertIn("--d3d-issue", err.getvalue())
 
     @staticmethod
     def prs(*pairs):

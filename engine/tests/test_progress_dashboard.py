@@ -304,6 +304,11 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def test_default_repo_is_the_one_the_readme_clones(self):
+        # --github once read a repository that had gone private; the README is where the address is kept current
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            self.assertIn(f"`git clone --recursive https://github.com/{pd.DEFAULT_REPO}`", f.read())
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")

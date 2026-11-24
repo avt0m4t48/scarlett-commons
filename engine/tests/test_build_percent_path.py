@@ -17,7 +17,7 @@ import unittest
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 
-def run_ps(script, *args):
+def run_ps(script, *args, cwd=None):
     # Without the check the scripts would go on to a real build. Hide git, python and vswhere from them (PATH keeps
     # only the system folders, ProgramFiles(x86) points nowhere), so they stop at "wasn't found" instead.
     system = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
@@ -26,7 +26,7 @@ def run_ps(script, *args):
     return subprocess.run(
         [os.path.join(system, "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-NonInteractive",
          "-ExecutionPolicy", "Bypass", "-File", str(script), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env, cwd=cwd,
     )
 
 
@@ -53,6 +53,14 @@ class PercentPathTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("contains '%'", r.stderr + r.stdout)
         self.assertFalse(temp.exists())
+
+    def test_build_llvm_mc_refuses_a_relative_temp_under_a_percent_folder(self):
+        cwd = self.dir / "c%d"
+        cwd.mkdir()
+        r = run_ps(SCRIPTS / "build_llvm_mc.ps1", "-Temp", "tmp", "-Dest", str(self.dir / "dest"), "-NoEnv", cwd=cwd)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("contains '%'", r.stderr + r.stdout)
+        self.assertFalse((cwd / "tmp").exists())
 
 
 if __name__ == "__main__":

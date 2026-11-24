@@ -20,8 +20,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 # cmd.exe expands %...% on every line of _build.cmd (twice on a CALL line), so a -Temp with % in it breaks the build.
-if ($Temp.Contains('%')) {
-    throw "-Temp '$Temp' contains '%', which cmd.exe expands in the generated _build.cmd. Choose a -Temp folder without % in its path."
+# A relative -Temp is checked as the full path it resolves to (the working directory can hold the %).
+$fullTemp = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Temp))
+if ($fullTemp.Contains('%')) {
+    throw "-Temp '$fullTemp' contains '%', which cmd.exe expands in the generated _build.cmd. Choose a -Temp folder without % in its path."
 }
 
 if (-not $Keep) {

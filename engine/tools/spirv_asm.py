@@ -249,11 +249,43 @@ def _u32_literal(tok: str, lineno: int) -> int:
 
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
-_FLOAT_SPEC = {
-    16: (5, 10, 15, "<e", "<H"),
-    32: (8, 23, 127, "<f", "<I"),
-    64: (11, 52, 1023, "<d", "<Q"),
+_FLOAT_SPEC = {     # width -> (exponent bits, fraction bits, exponent bias)
+    16: (5, 10, 15),
+    32: (8, 23, 127),
+    64: (11, 52, 1023),
 }
+
+
+def _round_float(negative: bool, sig: int, exp: int, width, to_nearest: bool, tie_break=None):
+    """The bits of (-1)^negative * sig * 2^exp in the float format `width`, or None when that overflows to infinity.
+
+    Rounds to nearest-even when `to_nearest`, otherwise toward zero; a value below the smallest subnormal becomes a
+    zero of the same sign. On an exact tie, `tie_break()` (when given) says whether the value the caller approximates
+    by sig * 2^exp lies above (> 0) or below (< 0) it, so a literal read through a wider format is rounded once.
+    """
+    exp_bits, mant_bits, bias = _FLOAT_SPEC[width]
+    sign = int(negative) << (exp_bits + mant_bits)
+    if sig == 0:
+        return sign
+    # The weight of the last fraction bit: set by the exponent, or fixed in the subnormal range.
+    quantum = max(exp + sig.bit_length() - 1, 1 - bias) - mant_bits
+    shift = quantum - exp
+    if shift <= 0:
+        n = sig << -shift
+    else:
+        n = sig >> shift
+        if to_nearest:
+            rem, half = sig & ((1 << shift) - 1), 1 << (shift - 1)
+            if rem == half:
+                above = tie_break() if tie_break is not None else 0
+                n += above > 0 or (above == 0 and n & 1)
+            elif rem > half:
+                n += 1
+    # A subnormal n is its own encoding; a normal one carries its leading bit into the exponent field.
+    bits = ((quantum + mant_bits + bias - 1) << mant_bits) + n
+    if bits >= ((1 << exp_bits) - 1) << mant_bits:
+        return None
+    return sign | bits
 
 
 def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
@@ -261,7 +293,7 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
     spec = _FLOAT_SPEC.get(width)
     if spec is None:
         raise SpirvAsmError(f"line {lineno}: unsupported float constant width {width}")
-    exp_bits, mant_bits, bias, pack_fmt, unpack_fmt = spec
+    exp_bits, mant_bits, bias = spec
     exp_max = (1 << exp_bits) - 1
     m = _HEX_FLOAT_RE.match(tok)
     if m:
@@ -284,23 +316,15 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
             else:
                 mant = frac >> (top - mant_bits)
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) | mant
-        if e_biased > exp_max:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        if 0 < e_biased < exp_max and top <= mant_bits:
-            frac = sig & ((1 << top) - 1)
-            mant = frac << (mant_bits - top)
-            return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
-        try:
-            fv = float.fromhex(tok)
-            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-        except OverflowError:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        except ValueError as exc:
-            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+        # SPIRV-Tools (HexFloat's operator>>) drops the digits that do not fit: a hex-float is truncated toward
+        # zero, in the subnormal range too, and one too large for the type is an infinity.
+        bits = _round_float(bool(sign), sig, exp, width, False)
+        return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) if bits is None else bits
     try:
         fv = float(tok)
     except ValueError as exc:
         raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+    pack_fmt, unpack_fmt = {16: ("<e", "<H"), 32: ("<f", "<I"), 64: ("<d", "<Q")}[width]
     try:
         return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
     except OverflowError:

@@ -708,5 +708,38 @@ class SelectorMustBeDefinedBeforeTests(unittest.TestCase):
         self.assertEqual(len(_switch_instruction(spirv_asm.assemble(load))), 6)
 
 
+_FLOAT_HEAD = (
+    "OpCapability Shader\nOpCapability Float16\nOpCapability Float64\nOpMemoryModel Logical GLSL450\n"
+    "%f16 = OpTypeFloat 16\n%f32 = OpTypeFloat 32\n%f64 = OpTypeFloat 64\n"
+)
+
+
+def _float_constant(type_name: str, literal: str) -> list[int]:
+    """The literal words of `%c = OpConstant %<type_name> <literal>` as spirv_asm encodes them."""
+    spv = spirv_asm.assemble(_FLOAT_HEAD + f"%c = OpConstant %{type_name} {literal}\n")
+    return _literal_words(spv, 43, 2)
+
+
+class FloatLiteralTests(unittest.TestCase):
+    """Float constant bits as SPIRV-Tools' HexFloat parser (source/util/hex_float.h) gives them."""
+
+    def _check(self, cases):
+        for type_name, literal, expected in cases:
+            with self.subTest(type=type_name, literal=literal):
+                self.assertEqual(_float_constant(type_name, literal), expected)
+
+    def test_hex_float_digits_that_do_not_fit_are_truncated_toward_zero(self):
+        # old #4330 (@mrbean56): rounding to nearest gave the next value up for each of these.
+        self._check((
+            ("f32", "0x1.0000018p0", [0x3F800000]), ("f32", "-0x1.0000018p0", [0xBF800000]),
+            ("f32", "0x1.fffffffp127", [0x7F7FFFFF]), ("f32", "0x1.8p-149", [0x00000001]),
+            ("f32", "0x1.8p-150", [0x00000000]), ("f32", "-0x1p-150", [0x80000000]),
+            ("f32", "0x1.8p+0", [0x3FC00000]), ("f32", "0x1p+128", [0x7F800000]), ("f32", "0x1p+129", [0x7F800000]),
+            ("f16", "0x1.003p0", [0x3C00]), ("f16", "0x1.ffep15", [0x7BFF]), ("f16", "0x1.8p-24", [0x0001]),
+            ("f64", "0x1.0000000000000cp0", [0x00000000, 0x3FF00000]),
+            ("f64", "0x1.fffffffffffff8p1023", [0xFFFFFFFF, 0x7FEFFFFF]),
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

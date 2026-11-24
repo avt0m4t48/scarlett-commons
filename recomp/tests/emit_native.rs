@@ -163,6 +163,11 @@ impl Rng {
 
 const MEM: usize = 1024;
 const STACK: usize = 4096;
+// Both orders of a cross product, including quiet and signaling NaNs on either side.
+const COMPARE_INPUTS: &[u32] = &[
+    0, 0x8000_0000, 0x0000_0001, 0x8000_0001, 0x3f80_0000, 0xbf80_0000,
+    0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0xff80_0001,
+];
 
 #[test]
 fn translated_functions_match_the_cpu() {
@@ -188,7 +193,7 @@ fn translated_functions_match_the_cpu() {
                     start.x[r][q] = rng.vector();
                 }
             }
-            let initial_memory: Vec<u8> = (0..MEM).map(|_| rng.next() as u8).collect();
+            let mut initial_memory: Vec<u8> = (0..MEM).map(|_| rng.next() as u8).collect();
             let base = memory.as_mut_ptr() as u64;
             start.r[2] = base + 64 + (rng.next() % 64); // rdx points into the buffer
             if case.name == "call_indirect" {
@@ -197,6 +202,15 @@ fn translated_functions_match_the_cpu() {
             if case.name == "loop" {
                 start.r[1] = rng.next() % 32; // rcx: how many quadwords to add
                 start.r[2] = base + 64;
+            }
+            if case.name == "vucomiss" && round < COMPARE_INPUTS.len().pow(2) {
+                let a = COMPARE_INPUTS[round / COMPARE_INPUTS.len()];
+                let b = COMPARE_INPUTS[round % COMPARE_INPUTS.len()];
+                for (reg, value) in [(0, a), (1, b), (2, b)] {
+                    start.x[reg][0] = (start.x[reg][0] & 0xffff_ffff_0000_0000) | u64::from(value);
+                }
+                let offset = (start.r[2] - base) as usize + 1;
+                initial_memory[offset..offset + 4].copy_from_slice(&a.to_le_bytes());
             }
             let top = ((stack.as_mut_ptr() as u64 + STACK as u64) & !0xf) - 64;
 
@@ -234,6 +248,7 @@ fn translated_functions_match_the_cpu() {
             assert_eq!(memory, native_memory, "memory, {ctx}");
             assert_eq!(our_stack, native_stack, "stack, {ctx}");
             if want(0x1) { assert_eq!(ours.cf, flag(0x1), "CF, {ctx}"); }
+            if want(0x4) { assert_eq!(ours.pf, flag(0x4), "PF, {ctx}"); }
             if want(0x40) { assert_eq!(ours.zf, flag(0x40), "ZF, {ctx}"); }
             if want(0x80) { assert_eq!(ours.sf, flag(0x80), "SF, {ctx}"); }
             if want(0x800) { assert_eq!(ours.of, flag(0x800), "OF, {ctx}"); }

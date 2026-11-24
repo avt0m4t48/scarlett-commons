@@ -5,24 +5,23 @@
 //! covered exactly when [`emit_instruction`] can translate it.
 //!
 //! The generated function is `unsafe fn NAME(c: &mut Ctx)` over [`PRELUDE`]'s `Ctx`: the sixteen general-purpose
-//! registers in encoding order, the CF, ZF, SF and OF flags, and `ret`, the return address a `ret` popped. Memory is the
+//! registers in encoding order, the CF, PF, ZF, SF and OF flags, and `ret`, the return address a `ret` popped. Memory is the
 //! process's own (the title's memory is mapped at its addresses), read and written unaligned. The body is a loop over
 //! the function's instruction addresses, so branches inside the function are a change of `pc`.
 //!
 //! Covered today (v1): mov, movzx, movsx, movsxd, lea, add, sub, and, or, xor, cmp, test, inc, dec, neg, not,
-//! shl/shr/sar on 32- and 64-bit operands, jcc (without parity) and jmp to an instruction of the same function, ret,
+//! shl/shr/sar on 32- and 64-bit operands, jcc and jmp to an instruction of the same function, ret,
 //! push and pop of 64-bit values, setcc, cmovcc, xchg of two registers, nop, and calls (direct and indirect, through
 //! `call_native`: the callee runs natively and a replaced callee is reached through its own patched entry); general-purpose registers (not AH-DH) and
 //! memory without FS/GS; imul with two or three operands; the AVX moves (vmovaps/ups/apd/upd/dqa/dqu, vmovss/sd),
-//! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss and vzeroupper, through core::arch
-//! intrinsics (the same instructions as the title's). Not yet: the rest. Shifts by a count above 1 leave OF
+//! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss, vzeroupper and vucomiss. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use iced_x86::{
-    ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+    Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
 };
 
 /// The context and helpers every generated file starts with.
@@ -35,6 +34,7 @@ pub struct Ctx {
     pub zf: bool,
     pub sf: bool,
     pub of: bool,
+    pub pf: bool,
     pub ret: u64,
     pub host_rsp: u64,
     pub target: u64,
@@ -85,6 +85,14 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             "mov rcx, [rax + 152]",
             "mov [rsp - 16], rcx",
             "sub rsp, 16",
+            // Restore guest PF and keep the other bits in RFLAGS as they were.
+            "pushfq",
+            "pop rcx",
+            "and rcx, -5",
+            "movzx edx, byte ptr [rax + 132]",
+            "lea rcx, [rcx + rdx * 4]",
+            "push rcx",
+            "popfq",
             "mov rcx, [rax + 8]",
             "mov rdx, [rax + 16]",
             "mov rbx, [rax + 24]",
@@ -170,6 +178,10 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             "shr rdx, 11",
             "and edx, 1",
             "mov [rax + 131], dl",
+            "mov rdx, rcx",
+            "shr rdx, 2",
+            "and edx, 1",
+            "mov [rax + 132], dl",
             "pop rcx",
             "mov [rax], rcx",
             "mov rsp, [rax + 144]",
@@ -224,7 +236,11 @@ fn wr(c: &mut Ctx, r: usize, n: u32, v: u64) {
     }
 }
 #[inline(always)]
-fn szf(c: &mut Ctx, r: u64, n: u32) { c.zf = r & mask(n) == 0; c.sf = sign(r, n); }
+fn szpf(c: &mut Ctx, r: u64, n: u32) {
+    c.zf = r & mask(n) == 0;
+    c.sf = sign(r, n);
+    c.pf = (r as u8).count_ones() & 1 == 0;
+}
 type Y = [u64; 4];
 #[inline(always)]
 unsafe fn vld(a: u64, n: usize) -> Y {
@@ -289,6 +305,30 @@ unsafe fn fsd(op: F, a: Y, b: Y) -> Y {
         _mm_storeu_pd(o.as_mut_ptr() as *mut f64, r);
         o
     }
+}
+/// Capture the three result flags from one comparison, including the unordered case.
+#[target_feature(enable = "avx")]
+unsafe fn vucomiss(c: &mut Ctx, a: u32, b: u32) {
+    let (cf, pf, zf): (u8, u8, u8);
+    unsafe {
+        core::arch::asm!(
+            "vucomiss {a}, {b}",
+            "setc {cf}",
+            "setp {pf}",
+            "setz {zf}",
+            a = in(xmm_reg) f32::from_bits(a),
+            b = in(xmm_reg) f32::from_bits(b),
+            cf = lateout(reg_byte) cf,
+            pf = lateout(reg_byte) pf,
+            zf = lateout(reg_byte) zf,
+            options(nomem, nostack),
+        );
+    }
+    c.cf = cf != 0;
+    c.pf = pf != 0;
+    c.zf = zf != 0;
+    c.sf = false;
+    c.of = false;
 }
 "#;
 
@@ -400,11 +440,13 @@ fn condition(cc: ConditionCode) -> Option<&'static str> {
         ConditionCode::a => "!(c.cf || c.zf)",
         ConditionCode::s => "c.sf",
         ConditionCode::ns => "!c.sf",
+        ConditionCode::p => "c.pf",
+        ConditionCode::np => "!c.pf",
         ConditionCode::l => "(c.sf != c.of)",
         ConditionCode::ge => "(c.sf == c.of)",
         ConditionCode::le => "(c.zf || c.sf != c.of)",
         ConditionCode::g => "(!c.zf && c.sf == c.of)",
-        _ => return None, // parity
+        ConditionCode::None => return None,
     })
 }
 
@@ -456,7 +498,7 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 Or => s += "let r = a | b; c.cf = false; c.of = false; ",
                 _ => s += "let r = a ^ b; c.cf = false; c.of = false; ",
             }
-            s += "szf(c, r, N); ";
+            s += "szpf(c, r, N); ";
             if !matches!(i.mnemonic(), Cmp | Test) {
                 s += &write(i, n, "r")?;
             }
@@ -466,13 +508,13 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             let n = size_of_op0(i)?;
             let a = read(i, 0, n)?;
             let (op, ov) = if i.mnemonic() == Inc { ("wrapping_add", "!(a ^ 1) & (a ^ r)") } else { ("wrapping_sub", "(a ^ 1) & (a ^ r)") };
-            let _ = write!(s, "let a = {a}; let r = a.{op}(1) & mask({n}); c.of = sign({ov}, {n}); szf(c, r, {n}); ");
+            let _ = write!(s, "let a = {a}; let r = a.{op}(1) & mask({n}); c.of = sign({ov}, {n}); szpf(c, r, {n}); ");
             s += &write(i, n, "r")?;
         }
         Neg => {
             let n = size_of_op0(i)?;
             let a = read(i, 0, n)?;
-            let _ = write!(s, "let a = {a}; let r = 0u64.wrapping_sub(a) & mask({n}); c.cf = a != 0; c.of = a == 1u64 << ({n} * 8 - 1); szf(c, r, {n}); ");
+            let _ = write!(s, "let a = {a}; let r = 0u64.wrapping_sub(a) & mask({n}); c.cf = a != 0; c.of = a == 1u64 << ({n} * 8 - 1); szpf(c, r, {n}); ");
             s += &write(i, n, "r")?;
         }
         Not => {
@@ -498,7 +540,7 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 Shr => { let _ = write!(s, "let r = a >> k; c.cf = (a >> (k - 1)) & 1 == 1; c.of = sign(a, {n}); "); }
                 _ => { let _ = write!(s, "let w = sx(a, {n}) as i64; let r = ((w >> k) as u64) & mask({n}); c.cf = (w >> (k - 1)) & 1 == 1; c.of = false; "); }
             }
-            let _ = write!(s, "szf(c, r, {n}); ");
+            let _ = write!(s, "szpf(c, r, {n}); ");
             s += &write(i, n, "r")?;
             s += " }";
             // A count of 0 changes no flag and no value, but a 32-bit register destination is still written, so its
@@ -523,7 +565,7 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
         Imul if i.op_count() >= 2 => {
             let n = size_of_op0(i)?;
             let (a, b) = if i.op_count() == 2 { (read(i, 0, n)?, read(i, 1, n)?) } else { (read(i, 1, n)?, read(i, 2, n)?) };
-            let _ = write!(s, "let a = sx({a}, {n}) as i64 as i128; let b = sx({b}, {n}) as i64 as i128; let full = a * b; let r = (full as u64) & mask({n}); c.cf = sx(r, {n}) as i64 as i128 != full; c.of = c.cf; szf(c, r, {n}); ");
+            let _ = write!(s, "let a = sx({a}, {n}) as i64 as i128; let b = sx({b}, {n}) as i64 as i128; let full = a * b; let r = (full as u64) & mask({n}); c.cf = sx(r, {n}) as i64 as i128 != full; c.of = c.cf; szpf(c, r, {n}); ");
             s += &write(i, n, "r")?;
         }
         Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovdqa | Vmovdqu => match (i.op_kind(0), i.op_kind(1)) {
@@ -601,6 +643,10 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 _ => return None,
             };
             let _ = write!(s, "let v = {src} & 0xffff_ffff; let q = v | (v << 32); vset(c, {d}, {w}, [q, q, q, q]);");
+        }
+        Vucomiss if i.code() == Code::VEX_Vucomiss_xmm_xmmm32 => {
+            let (a, b) = (vread(i, 0, 4)?, vread(i, 1, 4)?);
+            let _ = write!(s, "let a = {a}[0] as u32; let b = {b}[0] as u32; vucomiss(c, a, b);");
         }
         Vzeroupper => {
             s += "for k in 0..16 { c.x[k][2] = 0; c.x[k][3] = 0; }";

@@ -204,6 +204,12 @@ mod tests {
     }
 
     #[test]
+    fn scalar_compare_and_parity_branches_are_covered() {
+        // vucomiss xmm0, xmm1; jp +2; jnp +0; ret
+        assert_eq!(code(&[0xc5, 0xf8, 0x2e, 0xc1, 0x7a, 2, 0x7b, 0, 0xc3]), (4, 4, 0, true, false));
+    }
+
+    #[test]
     fn simd_and_indirect_flow_are_not_covered() {
         // movaps xmm0, xmm1; jmp rax; ret
         let mut u = BTreeMap::new();

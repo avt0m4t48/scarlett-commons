@@ -6566,9 +6566,7 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                // Through the inner Vulkan device, not the Xbox-ABI proxy: the proxy routes device slot 78, the PC
-                // ID3D12Device10::CreateReservedResource2, to the console's SetFrameIntervalX (2dbcb882c, #6935),
-                // which answers S_OK and creates nothing.
+                // Not through the proxy: its slot 78 is the Xbox SetFrameIntervalX (2dbcb882c), not this method.
                 EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));

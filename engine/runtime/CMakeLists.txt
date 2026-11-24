@@ -521,6 +521,10 @@ if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
+  # The console's texture sizes for device slots 25 and 108 (runtime/src/console_texture_size.h): pure stdlib.
+  add_executable(console_texture_size_test test/console_texture_size_test.cpp)
+  add_test(NAME console_texture_size COMMAND console_texture_size_test)
+
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.

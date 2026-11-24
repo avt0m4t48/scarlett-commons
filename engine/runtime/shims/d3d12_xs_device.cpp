@@ -27,6 +27,7 @@
 #include "d3d12_trace.h"
 #include "progress_events.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/console_texture_size.h"  // slots 25 and 108
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -2203,12 +2204,45 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
 }
 
+// Slots 25 and 108 answer textures with the console's layout sizes (src/console_texture_size.h): the retail title keeps
+// those in its texture tables and asserts when an answer disagrees (its first soft assert after device creation came
+// right after a slot 25 call that the PC sizes answered). Resources placed one after another, each at its alignment;
+// the whole at least 64 KiB aligned. When any description is not a texture the model sizes (a buffer, an unknown
+// format), the call is answered by the device behind the proxy as before. LEONIDA_PC_TEXTURE_SIZES=1 keeps the PC
+// answer for every call, to compare.
+template <typename Desc>
+bool console_allocation(UINT count, const Desc* descs, D3D12_RESOURCE_ALLOCATION_INFO* total,
+                        D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    static const bool pc_sizes = GetEnvironmentVariableW(L"LEONIDA_PC_TEXTURE_SIZES", nullptr, 0) != 0;
+    if (pc_sizes || !count || !descs) return false;
+    D3D12_RESOURCE_ALLOCATION_INFO sum{0, 64 * 1024};
+    for (UINT i = 0; i < count; ++i) {
+        const Desc& d = descs[i];
+        const auto one = leonida::gfx10::console_texture_size(
+            static_cast<std::uint32_t>(d.Dimension), d.Width, d.Height, d.DepthOrArraySize, d.MipLevels,
+            static_cast<std::uint32_t>(d.Format), d.SampleDesc.Count, static_cast<std::uint32_t>(d.Layout),
+            static_cast<std::uint32_t>(d.Flags), d.Alignment);
+        if (!one) return false;
+        const UINT64 offset = (sum.SizeInBytes + one->alignment - 1) / one->alignment * one->alignment;
+        if (each) each[i] = D3D12_RESOURCE_ALLOCATION_INFO1{offset, one->alignment, one->size};
+        sum.SizeInBytes = offset + one->size;
+        sum.Alignment = std::max<UINT64>(sum.Alignment, one->alignment);
+    }
+    *total = sum;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: allocation info from the console texture layout: %llu bytes, %llu aligned\n",
+                     static_cast<unsigned long long>(sum.SizeInBytes), static_cast<unsigned long long>(sum.Alignment));
+    return true;
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
-    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
-        static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+    auto* const ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
+    if (console_allocation(static_cast<UINT>(count), descs, ret, nullptr)) return call.ret;
+    *ret = call.self->real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
     return call.ret;
 }
 
@@ -2226,6 +2260,7 @@ void* WINAPI proxy_get_resource_allocation_info2(std::uint64_t a0, std::uint64_t
     auto* const ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
     *ret = D3D12_RESOURCE_ALLOCATION_INFO{UINT64_MAX, 0};
     const UINT n = static_cast<UINT>(count);
+    if (console_allocation(n, descs, ret, each)) return ret;
     ID3D12Device8* device8 = nullptr;
     if ((n && !descs) || FAILED(call.self->real->QueryInterface(IID_PPV_ARGS(&device8))) || !device8) return ret;
     std::unique_ptr<D3D12_RESOURCE_DESC1[]> pc(new (std::nothrow) D3D12_RESOURCE_DESC1[n ? n : 1]);

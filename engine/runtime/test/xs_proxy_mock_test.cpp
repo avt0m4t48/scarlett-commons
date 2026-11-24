@@ -1168,6 +1168,22 @@ int check_resource_allocation_info() {
     EXPECT(mock->calls[25] == 2 && mock->args[25][2] == 1 && mock->args[25][3] == word(descs));
     EXPECT(pc.SizeInBytes == kAllocationMarker + 1 && pc.Alignment == 1);
 
+    // A texture the console layout sizes is answered with the console's size, not the device's: a 1920x1080 D24S8
+    // depth buffer with layout word 0 is 64 KiB Z_X depth plus its stencil plane (console_texture_size_test).
+    D3D12_RESOURCE_DESC depth{};
+    depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depth.Width = 1920;
+    depth.Height = 1080;
+    depth.DepthOrArraySize = 1;
+    depth.MipLevels = 1;
+    depth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth.SampleDesc.Count = 1;
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_RESOURCE_ALLOCATION_INFO console{};
+    EXPECT(reinterpret_cast<ConsoleFn>(vtable[25])(&console, device, 1, 1, word(&depth)) == word(&console));
+    EXPECT(mock->calls[25] == 2);  // not forwarded
+    EXPECT(console.SizeInBytes == 1920ull * 1152 * 4 + 2048ull * 1280 && console.Alignment == 65536);
+
     EXPECT(release(device) == 0 && mock->refs == 0);
 
     // Slot 108, the console's GetResourceAllocationInfo2, in the same C form: it reaches the PC ID3D12Device8 method

@@ -540,6 +540,20 @@ class ValidatedOutput(unittest.TestCase):
         self.assertFalse(self.module.exists())
         self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
 
+    def test_translator_bug_in_one_program_does_not_end_the_run(self):
+        for error in (AssertionError("synthetic assert"), TypeError("synthetic"), AttributeError("synthetic")):
+            with self.subTest(error=type(error).__name__):
+                self.module.write_bytes(b"old module")
+                self.index.write_text(json.dumps({"ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+                output = io.StringIO()
+                with mock.patch.object(rdna2spirv, "translate", side_effect=error), \
+                        mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                        redirect_stdout(output):
+                    rdna2spirv.main()
+                self.assertIn(f"translator error {type(error).__name__}", output.getvalue())
+                self.assertFalse(self.module.exists())
+                self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+
     def test_validation_success_publishes_binary_and_metadata(self):
         self.assertIn("1 pass spirv-val", self.translate())
         self.assertEqual(self.module.read_bytes(), b"new module")

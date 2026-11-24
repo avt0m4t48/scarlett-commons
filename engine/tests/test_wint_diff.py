@@ -46,6 +46,35 @@ class Reference(unittest.TestCase):
         self.assertEqual(out[1][:2], (0xFFFFFFFF, 1))
         self.assertEqual(out[4][:2], (0, 0))
 
+    def test_clamp_saturates_d_and_keeps_the_carry(self):
+        # v1 = lane + 0xfffffffe saturates from lane 2 on; v2 = lane - 2 saturates to 0 in lanes 0 and 1;
+        # both masks still get the real carry / borrow
+        out = run(["v_add_co_u32_e64 v1, s20, v0, -2 clamp", "v_sub_co_u32_e64 v2, s21, v0, 2 clamp",
+                   "v_cndmask_b32_e64 v3, 0, 1, s20", "v_cndmask_b32_e64 v4, 0, 1, s21"])
+        self.assertEqual(out[0], (0xFFFFFFFE, 0, 0, 1))
+        self.assertEqual(out[1], (0xFFFFFFFF, 0, 0, 1))
+        self.assertEqual(out[2], (0xFFFFFFFF, 0, 1, 0))
+        self.assertEqual(out[5], (0xFFFFFFFF, 3, 1, 0))
+
+    def test_clamp_counts_the_carry_in(self):
+        # carry in = lanes 0..3. Lane 0: -1 + 0 + 1 and 0 - 0 - 1 overflow only through the carry in
+        out = run(["v_add_co_ci_u32_e64 v1, s21, -1, v0, s20 clamp", "v_cndmask_b32_e64 v2, 0, 1, s21",
+                   "v_subrev_co_ci_u32_e64 v3, vcc_lo, v0, 0, s20 clamp", "v_cndmask_b32_e64 v4, 0, 1, vcc_lo"])
+        self.assertEqual(out[0], (0xFFFFFFFF, 1, 0, 1))
+        self.assertEqual(out[4], (0xFFFFFFFF, 1, 0, 1))
+        for line in ("v_add_co_u32_e32 v1, vcc_lo, v0, v2 clamp", "v_xor_b32_e64 v1, v0, v2 clamp",
+                     "v_add_nc_u16 v1, v0, v2 clamp", "s_mov_b32 s20, 1 clamp", "v_writelane_b32 v1, s20, 3 clamp",
+                     "v_mbcnt_lo_u32_b32 v0, -1, 0 clamp", "v_xor_b32_e64 v1, v0, v2 op_sel:[1,0,0]",
+                     "s_mov_b32 s20, 1 op_sel:[1,0]"):
+            with self.subTest(line=line), self.assertRaises(d.RefError):
+                run([line])
+        # rejected before it runs: EXEC keeps its value (it used to become 1)
+        st = d.State(32)
+        before = st.exec
+        with self.assertRaises(d.RefError):
+            d.step(st, "s_mov_b32 exec_lo, 1 clamp")
+        self.assertEqual(st.exec, before)
+
     def test_inactive_lanes_get_a_zero_mask_bit(self):
         # s20 starts as lanes 0..3; a compare that is true everywhere but runs on lanes 2..31 clears lanes 0 and 1
         out = run(["s_mov_b32 exec_lo, 0xfffffffc", "v_cmp_t_u32_e64 s20, v0, v0", "s_mov_b32 exec_lo, -1",
@@ -122,11 +151,22 @@ class Generator(unittest.TestCase):
             seen = {self.opname(line) for line in self.lines(wave=wave)}
             self.assertEqual(set(d.ALL_OPS) - seen, set(), wave)
 
+    def test_clamp_only_on_the_e64_carry_ops(self):
+        for wave in (32, 64):
+            lines = self.lines(wave=wave)
+            clamped = [line for line in lines if line.endswith(" clamp")]
+            self.assertEqual({self.opname(line) for line in clamped}, set(d.CARRY), wave)
+            self.assertTrue(all(line.split()[0].endswith("_e64") for line in clamped), wave)
+            plain = [line for line in lines if line.split()[0].endswith("_e64") and self.opname(line) in d.CARRY
+                     and not line.endswith(" clamp")]
+            self.assertTrue(plain, wave)
+
     def test_known_divergences_are_left_out_by_default(self):
         def forms(lines):
             out = set()
             for line in lines:
                 op, _, rest = line.partition(" ")
+                rest = rest.removesuffix(" clamp")
                 if op == "s_mov_b32" and rest.startswith("vcc"):
                     out.add("vcc-data-mask")
                 if op.startswith("s_"):
@@ -166,6 +206,22 @@ class Translated(unittest.TestCase):
             (64, ["s_mov_b32 exec_hi, 0x80000001", "v_cmp_ge_u32_e64 s[20:21], v0, 33",
                  "v_sub_co_ci_u32_e64 v1, s[22:23], 0, v0, s[20:21]", "s_mov_b32 s22, 0xa", "s_mov_b32 s23, 0x3",
                  "v_cndmask_b32_e64 v2, 0, 1, s[22:23]", "v_add_co_ci_u32_e32 v3, vcc, 5, v0, vcc"]),
+        ]
+        for wave, body in cases:
+            with self.subTest(wave=wave):
+                self.assertIsNone(d.check(program(body, wave, (1, 2, 3, 12 if wave == 32 else 4))))
+
+    def test_clamp_cases_match_the_translator(self):
+        cases = [
+            # lane + 0xffffffff + carry in: the sum's low word is the lane again, and in lane 0 only the carry in
+            # overflows
+            (32, ["s_mov_b32 exec_lo, 0xfffffff3", "v_add_co_ci_u32_e64 v3, vcc_lo, v0, -1, s21 clamp",
+                  "v_add_co_u32_e64 v1, s20, v0, -2 clamp", "v_sub_co_u32_e64 v2, s21, v0, 2 clamp",
+                  "s_mov_b32 exec_lo, -1", "v_subrev_co_ci_u32_e64 v12, s20, v0, 3, s21 clamp"]),
+            # lane - 0xffffffff - borrow in: with the borrow in, the low word is the lane again
+            (64, ["s_mov_b32 exec_hi, 0xfffffff3", "v_add_co_u32_e64 v1, s[22:23], v0, -40 clamp",
+                  "v_sub_co_ci_u32_e64 v2, vcc, v0, -1, s[22:23] clamp",
+                  "v_subrev_co_u32_e64 v3, s[20:21], 40, v0 clamp", "v_cndmask_b32_e64 v4, 0, 1, vcc"]),
         ]
         for wave, body in cases:
             with self.subTest(wave=wave):
@@ -214,6 +270,7 @@ class Cli(unittest.TestCase):
         rc, out = self.main("--list-ops")
         self.assertEqual(rc, 0)
         self.assertIn("v_mad_i64_i32", out)
+        self.assertRegex(out, r"v_sub_co_ci_u32 +carry, clamp \(e64\)")
         self.assertEqual(self.main("--ops", "v_nope")[0], 2)
         self.assertEqual(self.main("--oracle", "gpu")[0], 2)
         self.assertEqual(self.main("--wave", "16")[0], 2)

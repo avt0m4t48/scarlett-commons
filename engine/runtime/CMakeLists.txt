@@ -128,6 +128,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    shims/xapu_chad.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -244,6 +245,24 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
+
+  # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
+  # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
+  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
+  target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
+
+  # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
+  add_executable(xapu_chad_test
+    test/xapu_chad_test.cpp
+    shims/xapu_chad.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xapu_chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xapu_chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xapu_chad_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xapu_chad_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -1124,6 +1143,12 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
+  endif()
+  if(WIN32 AND TARGET cpu_emulation_test)
+    add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
+  endif()
+  if(WIN32 AND TARGET xapu_chad_test)
+    add_test(NAME xapu_chad COMMAND xapu_chad_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)

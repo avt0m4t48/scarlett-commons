@@ -2,7 +2,8 @@ r"""Measure RDNA2 (GFX10) f16/f64 results under MODE.FP_ROUND[3:2] nearest-even 
 
 Runs two native sweeps through tools/hw_oracle in wave32 and wave64:
 1. Targeted f16/f64 rounding cases (v_cvt_f16_f32, v_add_f16, v_sub_f16, v_mul_f16, v_fma_f16, v_pk_add_f16,
-   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_add_f64 including exact-sum and finite-overflow saturation)
+   v_pk_fma_f16, v_fma_mixlo_f16, v_fma_mixhi_f16, v_ldexp_f16 overflow and denormal results, v_add_f64 including
+   exact-sum and finite-overflow saturation)
    under s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0 (RNE) vs 3 (RTZ).
 2. Exhaustive 65,536-input RNE vs RTZ comparison of all seven f16 transcendentals (v_rcp_f16, v_rsq_f16,
    v_sqrt_f16, v_sin_f16, v_cos_f16, v_exp_f16, v_log_f16), confirming that none of them depend on MODE.FP_ROUND.
@@ -59,6 +60,10 @@ CASES = (
      "v_fma_mixhi_f16 v3, v1, v2, v5", False, 0xC0001234, 0xBFFF1234),
     ("fma_mixlo_ovf", ("v_mov_b32 v1, 0x5f800000", "v_mov_b32 v2, 0x5f800000", "v_mov_b32 v5, 0"),
      "v_fma_mixlo_f16 v3, v1, v2, v5", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_ovf", ("v_mov_b32 v1, 0x7bff", "v_mov_b32 v2, 1"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x7C00, 0x7BFF),
+    ("ldexp_f16_sub", ("v_mov_b32 v1, 0xbc03", "v_mov_b32 v2, -15"),
+     "v_ldexp_f16_e32 v3, v1, v2", False, 0x8202, 0x8201),
     ("add_f64", ("v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff00000", "v_mov_b32 v6, 0", "v_mov_b32 v7, 0xbc300000"),
      "v_add_f64 v[3:4], v[0:1], v[6:7]", True, (0x00000000, 0x3FF00000), (0xFFFFFFFF, 0x3FEFFFFF)),
     ("add_f64_ovf", ("v_mov_b32 v0, -1", "v_mov_b32 v1, 0x7fefffff"),

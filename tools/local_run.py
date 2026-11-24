@@ -125,6 +125,16 @@ def notes_text(total, failed, reasons, limit=480):
     return out[:limit]
 
 
+def shader_index_path(build_work):
+    """The translator's index.json: the profile's build writes it to <work>/shaders/spirv; older builds used
+    <work>/spirv. None when neither exists."""
+    for parts in (("shaders", "spirv"), ("spirv",)):
+        path = os.path.join(build_work, *parts, "index.json")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def build_report(build_id, commit, hw_class, os_name, driver, stage, fps, stop, notes):
     run = {"build": build_id, "commit": commit, "hw_class": hw_class, "os": os_name, "driver": driver,
            "stage": stage, "fps": fps, "stop": stop, "notes": notes}
@@ -231,8 +241,8 @@ def main():
         crash = crash or (stage_from_trace(crash_lines)[2])
     if a.stage_reached and (stage is None or title_runs.STAGES.index(a.stage_reached) > title_runs.STAGES.index(stage)):
         stage = a.stage_reached
-    index_path = os.path.join(build_work, "spirv", "index.json")
-    index = json.load(open(index_path, encoding="utf-8")) if os.path.isfile(index_path) else {}
+    index_path = shader_index_path(build_work)
+    index = json.load(open(index_path, encoding="utf-8")) if index_path else {}
     total, failed, reasons = shader_stats(index)
     commit = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if stage is None:

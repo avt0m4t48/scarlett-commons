@@ -58,6 +58,21 @@ class Shaders(unittest.TestCase):
         self.assertLessEqual(len(lr.notes_text(10 ** 6, 10 ** 6, {f"E{i}": 1 for i in range(500)})), 480)
 
 
+class ShaderIndex(unittest.TestCase):
+    def test_finds_the_profile_layout_first(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as work:
+            self.assertIsNone(lr.shader_index_path(work))
+            old = os.path.join(work, "spirv")
+            os.makedirs(old)
+            open(os.path.join(old, "index.json"), "w").close()
+            self.assertEqual(lr.shader_index_path(work), os.path.join(old, "index.json"))
+            new = os.path.join(work, "shaders", "spirv")
+            os.makedirs(new)
+            open(os.path.join(new, "index.json"), "w").close()
+            self.assertEqual(lr.shader_index_path(work), os.path.join(new, "index.json"))
+
+
 class Report(unittest.TestCase):
     def test_report_passes_title_run_validation(self):
         c = "c" * 40

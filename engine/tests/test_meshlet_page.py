@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zlib
 
@@ -353,6 +354,33 @@ class RejectTests(unittest.TestCase):
         with self.assertRaises(mp.PageError):
             mp.parse_group(bytes(g), 0)
 
+    def test_empty_zero_meshlet_group_rejected(self):
+        empty = struct.pack("<3I", 0x80000000, 0, 0) + bytes(16)
+        with self.assertRaisesRegex(mp.PageError, "no meshlets"):
+            mp.parse_group(empty, 0)
+        self.assertFalse(mp.is_mesh_page(empty))
+
+    def test_zero_meshlet_group_page_walk_terminates(self):
+        # A 0-meshlet group ends 12 bytes in; with data right after it the walk realigned back onto the same header
+        # and parsed it forever (old #5600). Run in a daemon thread so a regression fails instead of hanging.
+        empty = struct.pack("<3I", 0x80000000, 0, 0) + struct.pack("<I", 1) + bytes(12)
+        results = []
+
+        def walk():
+            for data in (empty, page(group([(4, 2)]), empty)):
+                try:
+                    mp.parse_page(data)
+                    results.append(None)
+                except mp.PageError as exc:
+                    results.append(str(exc))
+
+        t = threading.Thread(target=walk, daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "parse_page did not terminate on a 0-meshlet group")
+        self.assertIn("neither a vertex block nor a meshlet group", results[0])
+        self.assertIn("has no meshlets", results[1])
+
     def test_slot_size_mismatch(self):
         b = bytearray(block(10))
         struct.pack_into("<I", b, 4, 0x26 | (((0x60 + 120 + 8) // 2) << 8))
@@ -617,6 +645,94 @@ class MeshletCentreTests(unittest.TestCase):
             c = mp.summarise_page(bytes(data), "p", cones=True)["checks"]
             self.assertEqual((c["cones_4240_cones"], c["cones_4240_axis_within_25_degrees"], c["cones_4240_faces_inside"],
                               c["cones_4240_faces_inside_within_0_05"]), want, hex(cone))
+
+    def test_group_running_sums_past_u16_wrap(self):
+        # 512 meshlets of 128 verts + 128 tris = 65536 refs & 65536 tris, followed by meshlet 512 whose
+        # 16-bit w1 wraps to (0, 0) and references distinct vertices (3, 4, 5) at (10, 20, 30) facing +z.
+        positions = [
+            (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0),          # meshlets 0..511: near origin, -z winding
+            (10.0, 20.0, 30.0), (11.0, 20.0, 30.0), (10.0, 21.0, 30.0), # meshlet 512: at (10, 20, 30), +z winding
+        ]
+        n_full = 512
+        recs = bytearray()
+        tris = bytearray()
+        refs = bytearray()
+        vbase = tbase = 0
+        # Stored centre for origin triangle box (0.5, 0.5, 0.0) at step 1/16 m.
+        f0 = [round(c * 16) + 2047 for c in (0.5, 0.5, 0.0)]
+        w2_0, w3_0 = f0[0] | (f0[1] << 12), f0[2]
+        rad_f16 = struct.unpack("<H", struct.pack("<e", 2.0))[0] << 16
+        for m in range(n_full):
+            recs += struct.pack("<4I", 127 | (127 << 7) | rad_f16, (vbase & 0xFFFF) | ((tbase & 0xFFFF) << 16), w2_0, w3_0)
+            tri_word = 0 | (1 << 7) | (2 << 14) | (m << 21)
+            tris += struct.pack("<I", tri_word) * 128
+            refs += struct.pack("<3H", 0, 1, 2) + struct.pack("<H", 0) * 125
+            vbase += 128
+            tbase += 128
+        self.assertEqual((vbase, tbase), (65536, 65536))
+        # Meshlet 512: 3 verts, 1 tri, w1 wraps to 0, stored centre = (10.5, 20.5, 30.0), cone = +z.
+        f1 = [round(c * 16) + 2047 for c in (10.5, 20.5, 30.0)]
+        up_cone = (32 << 14) | (32 << 20) | (16 << 26)
+        w2_1, w3_1 = f1[0] | (f1[1] << 12), f1[2] | up_cone
+        recs += struct.pack("<4I", 2 | (0 << 7) | rad_f16, (vbase & 0xFFFF) | ((tbase & 0xFFFF) << 16), w2_1, w3_1)
+        tris += struct.pack("<I", 0 | (1 << 7) | (2 << 14) | (n_full << 21))
+        refs += struct.pack("<3H", 3, 4, 5)
+        vbase += 3
+        tbase += 1
+        data = struct.pack("<3I", 0x80000000 | (n_full + 1), tbase, vbase) + bytes(recs + tris + refs)
+
+        grp, end = mp.parse_group(data, 0)
+        self.assertEqual(end, len(data))
+        self.assertEqual(grp["meshlets"], 513)
+
+        all_tris = list(mp.group_triangles(data, grp))
+        self.assertEqual(all_tris[-1], (3, 4, 5))
+
+        ca = mp.centre_agreement(data, grp, positions)
+        self.assertEqual(ca["axes_exact"], 513 * 3)
+        self.assertEqual(ca["radius_covers"], 513)
+
+        dist = mp.centre_distance(data, grp, positions)
+        self.assertIsNotNone(dist)
+        self.assertAlmostEqual(dist, 0.0, places=4)
+
+        cone = mp.cone_agreement(data, grp, positions)
+        self.assertEqual(
+            (cone["cones"], cone["axis_within_25_degrees"], cone["faces_inside"]),
+            (1, 1, 1),
+        )
+
+    def test_centre_agreement_and_distance_handle_non_finite_positions(self):
+        blk, grp_bytes = self.grid_parts((0, 0, 0))
+        for bad_val in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bias_x=bad_val):
+                bad_blk = bytearray(blk)
+                struct.pack_into("<f", bad_blk, 0x60, bad_val)
+                summary = mp.summarise_page(page(bytes(bad_blk), grp_bytes), "p", centres=True)
+                self.assertNotIn("error", summary)
+                c = summary["checks"]
+                self.assertEqual(c["centres_4240_axes_exact"], 2)  # y and z stay finite; x is skipped
+                self.assertEqual(c["centres_4240_radius_covers"], 0)
+
+        # Trailing NaN vertex after finite vertices must not be silently dropped by min()/max().
+        grp_data = page(grp_bytes)
+        grp = mp.parse_page(grp_data)[0]
+        mixed = [(0.0, 0.0, 0.0)] * 15 + [(math.nan, 0.0, 0.0)]
+        self.assertIsNone(mp.centre_distance(grp_data, grp, mixed))
+        ca = mp.centre_agreement(grp_data, grp, mixed)
+        self.assertEqual(ca["radius_covers"], 0)
+        self.assertLessEqual(ca["axes_exact"], 2)
+
+    def test_cone_agreement_skips_overflowing_normals(self):
+        grp_data = bytearray(page(grid_group(2, 2)))
+        grp = mp.parse_page(bytes(grp_data))[0]
+        rec = grp["offset"] + 12
+        w3 = struct.unpack_from("<I", grp_data, rec + 12)[0]
+        struct.pack_into("<I", grp_data, rec + 12, (w3 & 0xFFF) | (32 << 14) | (32 << 20) | (16 << 26))
+        # Two triangles with finite normals (~1e154, whose square is 1e308) whose summed normal length overflows to +inf.
+        huge = [(0.0, 0.0, 0.0), (1e77, 0.0, 0.0), (0.0, 1e77, 0.0), (1e77, 1e77, 0.0)]
+        cone = mp.cone_agreement(bytes(grp_data), grp, huge)
+        self.assertEqual(cone["cones"], 0)
 
     def test_block4240_checks_streaming_and_summary_counts(self):
         # Normal block with 16 vertices within 300m

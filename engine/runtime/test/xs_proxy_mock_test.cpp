@@ -77,6 +77,7 @@ constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
+constexpr UINT64 kAllocationMarker = 0x2525252500000000ull;  // in the SizeInBytes a mock device's slot 25 answers
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
 
@@ -215,6 +216,13 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 return static_cast<std::uint32_t>(E_INVALIDARG);
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
+            case 25: {  // GetResourceAllocationInfo, the PC method: (return buffer, visible mask, count, descs)
+                auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
+                if (!out) break;
+                out->SizeInBytes = kAllocationMarker + a3;  // the count, so the test sees the arguments arrive
+                out->Alignment = static_cast<UINT>(a2);     // the visible mask
+                return a1;
+            }
             case 26: {  // GetCustomHeapProperties, the PC method: (return buffer, node mask, heap type)
                 auto* out = reinterpret_cast<D3D12_HEAP_PROPERTIES*>(a1);
                 if (!out) break;
@@ -1030,6 +1038,46 @@ int check_custom_heap_properties() {
     return 0;
 }
 
+// ---- 8c. Device slot 25, GetResourceAllocationInfo, in the console's form and the PC's ----
+
+int check_resource_allocation_info() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device && xs::device_slot_overridden(25));
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    const D3D12_RESOURCE_DESC descs[2] = {};
+
+    // The console form: the buffer for the struct in RCX, the device in RDX, then the mask, the count and the
+    // descriptions. The buffer sits inside a pattern that must stay.
+    struct Padded {
+        std::uint8_t before[16];
+        D3D12_RESOURCE_ALLOCATION_INFO value;
+        std::uint8_t after[64];
+    } padded;
+    std::memset(&padded, 0xA5, sizeof(padded));
+    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t, std::uint64_t);
+    const std::uint64_t returned =
+        reinterpret_cast<ConsoleFn>(vtable[25])(&padded.value, device, 1, 2, word(descs));
+    EXPECT(returned == word(&padded.value));
+    // The PC method got (a return buffer, mask, count, descriptions) once, on the device behind the proxy.
+    EXPECT(mock->calls[25] == 1 && mock->args[25][1] == 1 && mock->args[25][2] == 2 && mock->args[25][3] == word(descs));
+    EXPECT(padded.value.SizeInBytes == kAllocationMarker + 2 && padded.value.Alignment == 1);
+    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
+    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+    EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock));
+
+    // A PC C++ caller: the proxy in RCX and its buffer in RDX.
+    D3D12_RESOURCE_ALLOCATION_INFO pc{};
+    EXPECT(raw(device, 25, word(&pc), 1, 1, word(descs)) == word(&pc));
+    EXPECT(mock->calls[25] == 2 && mock->args[25][2] == 1 && mock->args[25][3] == word(descs));
+    EXPECT(pc.SizeInBytes == kAllocationMarker + 1 && pc.Alignment == 1);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 25 with the buffer in RCX and the device in RDX reaches the PC method and writes "
+                "only the struct; the PC form reaches it too\n", g_label);
+    return 0;
+}
+
 // ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
 
 int check_slot70() {
@@ -1361,7 +1409,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
-        check_custom_heap_properties() || check_slot70())
+        check_custom_heap_properties() ||
+        check_resource_allocation_info() || check_slot70())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

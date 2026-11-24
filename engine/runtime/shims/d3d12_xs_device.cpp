@@ -1104,6 +1104,35 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4);
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            if constexpr (Slot == 71 || Slot == 72) {
+                // The retail title's bottom-of-pipe value writes, (address, value, flush, flags), 32-bit (71) and
+                // 64-bit (72): its lists two slots later than the base console layout from 0x1d8 on (VIctory,
+                // GPL-3.0, crates/victory-gpu/src/list.rs). Recorded in list order as PC WriteBufferImmediate
+                // (ID3D12GraphicsCommandList2); a 64-bit value is two 32-bit writes. A timestamp flag (1 GPU, 2
+                // system) writes the CPU's performance counter at recording time, which only orders, not measures.
+                if (!a1) return 0;
+                std::uint64_t value = a2;
+                if (Slot == 72 && (a4 == 1 || a4 == 2)) {
+                    LARGE_INTEGER now{};
+                    QueryPerformanceCounter(&now);
+                    value = static_cast<std::uint64_t>(now.QuadPart);
+                }
+                ID3D12GraphicsCommandList2* list2 = nullptr;
+                if (SUCCEEDED(self->real->QueryInterface(IID_PPV_ARGS(&list2))) && list2) {
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {
+                        {a1, static_cast<UINT>(value)}, {a1 + 4, static_cast<UINT>(value >> 32)}};
+                    list2->WriteBufferImmediate(Slot == 72 ? 2 : 1, params, nullptr);
+                    list2->Release();
+                } else {
+                    static std::atomic<bool> warned{false};
+                    if (!warned.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u: the real list has no WriteBufferImmediate; "
+                                             "the value write is dropped\n", Slot);
+                }
+                return 0;
+            }
+            // 73/74: waits for a memory value. Lists run one after another and to completion, so a value another
+            // queue or the CPU writes first is there already; nothing to record.
             if constexpr (Slot == 148) {
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true, std::memory_order_relaxed))

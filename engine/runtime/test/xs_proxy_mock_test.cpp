@@ -1014,6 +1014,27 @@ int check_xbox_slots() {
     EXPECT(static_cast<IUnknown*>(list)->QueryInterface(console_list_iid, &again) == S_OK && again == list);
     EXPECT(release(again) == 1);
     EXPECT(release(list) == 0);
+
+    // The retail title's list methods past the PC chain (VIctory's console list table): queries at 28..30 reach the
+    // PC BeginQuery/EndQuery/ResolveQueryData (52..54); the value writes at 71 (32-bit) and 72 (64-bit) become PC
+    // WriteBufferImmediate (GCL2 slot 66) with one or two parameters; the waits at 73/74 record nothing.
+    static_assert(xs::console_to_pc_list_slot(28) == 52 && xs::console_to_pc_list_slot(30) == 54);
+    static_assert(xs::console_to_pc_list_slot(27) == xs::kListNotForwarded);
+    mock->list_level = 7;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
+    Mock* const real_list = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list));
+    EXPECT(real_list && real_list->list_level == 7);
+    raw(list, 28, 0x77, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+    EXPECT(real_list->calls[52] == 1 && real_list->args[52][0] == 0x77 && real_list->args[52][2] == 3);
+    raw(list, 71, 0x10000, 5, 0, 0);
+    EXPECT(real_list->calls[66] == 1 && real_list->args[66][0] == 1);
+    raw(list, 72, 0x20000, 0x1122334455667788ull, 0, 0);
+    EXPECT(real_list->calls[66] == 2 && real_list->args[66][0] == 2);
+    raw(list, 73, 0x20000, 3, 1);
+    raw(list, 74, 0x20000, 3, 1);
+    EXPECT(real_list->calls[66] == 2);
+    EXPECT(release(list) == 0);
+    mock->list_level = 0;
     EXPECT(release(compute_allocator) == 0 && real_compute_allocator->refs == 0);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.

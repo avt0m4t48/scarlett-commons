@@ -204,6 +204,9 @@ bool heap_slot_overridden(unsigned slot);
 inline constexpr unsigned kListNotForwarded = ~0u;
 inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
+    // The console's BeginQuery/EndQuery/ResolveQueryData (0xe0..0xf0), with the PC arguments; VIctory's list table
+    // (GPL-3.0, crates/victory-gpu/src/list.rs). 27 stays unforwarded.
+    if (slot >= 28 && slot <= 30) return slot + 24;
     if (slot <= 30) return kListNotForwarded;  // console-only extras
     if (slot <= 59) return slot - 4;           // PC chain, shifted +4
     if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)

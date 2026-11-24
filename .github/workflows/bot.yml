@@ -1,17 +1,21 @@
-# /claim and /unclaim on task issues, and an hourly sweep: ready labels, expired claims, overdue fixes, merges.
+# /claim, /unclaim and /split on task issues; the sweep (ready labels, expired claims, overdue fixes, merges)
+# runs whenever a task opens, closes or changes, and every 15 minutes as a fallback, so the board is never stale.
 name: bot
 on:
   issue_comment:
     types: [created]
+  issues:
+    types: [opened, closed, reopened, edited]
   schedule:
-    - cron: "17 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 permissions:
+  actions: write
   contents: write
   issues: write
   pull-requests: write
 concurrency:
-  group: bot-${{ github.event_name }}
+  group: bot-${{ github.event_name == 'issue_comment' && 'command' || 'sweep' }}
 jobs:
   command:
     if: github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/')
@@ -33,3 +37,7 @@ jobs:
       - run: python3 -I bot/main.py sweep
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Labels the sweep changes do not start other workflows, so it asks for a fresh progress page itself.
+      - run: gh workflow run progress.yml --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

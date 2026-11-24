@@ -58,7 +58,7 @@ The recompiler, broken into tasks with the ready-made tools for each: [docs/engi
 
 **Phase 0 (foundation) is done; the engine track is active.** The rules, the bot, the docs, engine CI, the crash report and the one-command local run are in; the first test cases are in.
 Live numbers, every task and who is on it: **[progress page](https://github.com/scarlett-commons/scarlett-commons/blob/status/PROGRESS.md)**
-(regenerated every 6 hours).
+(rebuilt whenever the board changes).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/scarlett-commons/scarlett-commons/status/images/progress.svg" alt="Tasks by area" width="640">

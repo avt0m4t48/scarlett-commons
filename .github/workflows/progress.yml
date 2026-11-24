@@ -1,10 +1,14 @@
-# Regenerates the progress page and chart from the task board, every 6 hours.
+# Regenerates the progress page, chart and badges whenever a task or the main branch changes, and hourly.
 # They are written to the `status` branch, not main: main only changes through reviewed pull requests, and the
 # README embeds the chart from `status`. Runs trusted code from main only.
 name: progress
 on:
+  issues:
+    types: [opened, closed, reopened, labeled, unlabeled, assigned, unassigned]
+  push:
+    branches: [main]
   schedule:
-    - cron: "41 */6 * * *"
+    - cron: "41 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,6 +16,7 @@ permissions:
   pull-requests: read
 concurrency:
   group: progress
+  cancel-in-progress: true
 jobs:
   progress:
     runs-on: ubuntu-latest

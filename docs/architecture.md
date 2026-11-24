@@ -17,8 +17,8 @@
 | `bot/main.py` | Talks to the GitHub API and applies the rules. Never runs pull request code. |
 | `.github/workflows/gate.yml` | Rule check on every pull request (`pull_request_target`, write token, no checkout of PR code). |
 | `.github/workflows/verify.yml` | Runs PR code: tests must fail on base (`pull_request`, read-only, no secrets). |
-| `.github/workflows/bot.yml` | `/claim`, `/unclaim`, `/split`; hourly sweep: ready labels, expiry, fix tasks, merges. |
-| `.github/workflows/progress.yml` | Regenerates the progress page every 6 hours on the `status` branch. |
+| `.github/workflows/bot.yml` | `/claim`, `/unclaim`, `/split`; sweep on every task change and every 15 min: ready labels, expiry, fix tasks, merges. |
+| `.github/workflows/progress.yml` | Regenerates the progress page and badges on every task change, on the `status` branch. |
 | `tools/fails_on_base.py` | The verify step, runnable locally. |
 | `tools/results.py` | Hardware results by consensus. |
 | `tools/check_build.py` | Hash check of your own files against a list; never copies anything. |

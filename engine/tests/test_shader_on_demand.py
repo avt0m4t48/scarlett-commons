@@ -123,7 +123,9 @@ class ShaderOnDemand(unittest.TestCase):
             results = list(pool.map(lambda _: compile_one(), range(2)))
         self.assertEqual(results[0].directory, results[1].directory)
         self.assertEqual(sorted(result.cache_hit for result in results), [False, True])
-        self.assertEqual(list(self.cache.iterdir()), [results[0].directory])
+        published = list(self.cache.iterdir())
+        self.assertEqual(len(published), 1)
+        self.assertTrue(published[0].samefile(results[0].directory))
         self.assertEqual(sorted(p.name for p in results[0].directory.iterdir()), ["cs_shader.spv", "index.json"])
 
     @unittest.skipUnless(shutil.which("spirv-val"), "the real worker requires spirv-val")

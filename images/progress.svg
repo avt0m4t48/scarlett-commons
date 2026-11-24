@@ -3,17 +3,19 @@
 <text x="10" y="24" font-size="15" font-weight="600" fill="#1f2328">Tasks by area</text>
 <text x="10" y="55" fill="#1f2328">shaders</text>
 <rect x="110.0" y="43" width="94.0" height="16" fill="#2da44e"/>
-<rect x="204.0" y="43" width="376.0" height="16" fill="#d0d7de"/>
+<rect x="204.0" y="43" width="376.0" height="16" fill="#0969da"/>
 <text x="588" y="55" fill="#57606a">2/10</text>
 <text x="10" y="81" fill="#1f2328">results</text>
-<rect x="110.0" y="69" width="470.0" height="16" fill="#d0d7de"/>
+<rect x="110.0" y="69" width="235.0" height="16" fill="#0969da"/>
+<rect x="345.0" y="69" width="235.0" height="16" fill="#d0d7de"/>
 <text x="588" y="81" fill="#57606a">0/2</text>
 <text x="10" y="107" fill="#1f2328">system</text>
 <rect x="110.0" y="95" width="470.0" height="16" fill="#0969da"/>
 <text x="588" y="107" fill="#57606a">0/2</text>
 <text x="10" y="133" fill="#1f2328">graphics</text>
-<rect x="110.0" y="121" width="470.0" height="16" fill="#0969da"/>
-<text x="588" y="133" fill="#57606a">0/1</text>
+<rect x="110.0" y="121" width="156.7" height="16" fill="#0969da"/>
+<rect x="266.7" y="121" width="313.3" height="16" fill="#d0d7de"/>
+<text x="588" y="133" fill="#57606a">0/3</text>
 <text x="10" y="159" fill="#1f2328">audio</text>
 <rect x="110.0" y="147" width="470.0" height="16" fill="#0969da"/>
 <text x="588" y="159" fill="#57606a">0/1</text>
@@ -27,13 +29,12 @@
 <rect x="110.0" y="225" width="470.0" height="16" fill="#d0d7de"/>
 <text x="588" y="237" fill="#57606a">0/1</text>
 <text x="10" y="263" fill="#1f2328">infra</text>
-<rect x="110.0" y="251" width="156.7" height="16" fill="#2da44e"/>
-<rect x="266.7" y="251" width="104.4" height="16" fill="#0969da"/>
+<rect x="110.0" y="251" width="261.1" height="16" fill="#2da44e"/>
 <rect x="371.1" y="251" width="208.9" height="16" fill="#d0d7de"/>
-<text x="588" y="263" fill="#57606a">3/9</text>
+<text x="588" y="263" fill="#57606a">5/9</text>
 <text x="10" y="289" fill="#1f2328">docs</text>
 <rect x="110.0" y="277" width="470.0" height="16" fill="#2da44e"/>
-<text x="588" y="289" fill="#57606a">1/1</text>
+<text x="588" y="289" fill="#57606a">2/2</text>
 <rect x="10" y="304" width="12" height="12" fill="#2da44e"/>
 <text x="27" y="314" fill="#57606a">done</text>
 <rect x="72" y="304" width="12" height="12" fill="#bf8700"/>

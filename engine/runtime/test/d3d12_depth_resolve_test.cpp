@@ -89,13 +89,16 @@ struct Planes {
 };
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
+// `c` and reads every plane of the destination back. The clears, the resolve and the read-back are three lists, so a
+// refused resolve leaves the other two to run: since 4da716493 the layer refuses a whole batch that holds a list whose
+// Close failed (as D3D12 must not be given one), which used to take the clears and the read-back with it. The resolve
+// list is executed after a failed Close only when `run_invalid` (the layer's refusal is what is checked; the host
+// runtime must not be given such a list) and then on its own, so the destination must keep its clears.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
-    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList> list, resolve_list, copy_list;
     Ref<ID3D12GraphicsCommandList1> list1;
     Ref<ID3D12Fence> fence;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -103,7 +106,6 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                              IID_PPV_ARGS(&list.p))));
-    CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     D3D12_HEAP_PROPERTIES heap_properties{};
@@ -198,14 +200,25 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.pResource = target.p;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     list->ResourceBarrier(2, barriers);
+    CHECK(SUCCEEDED(list->Close()));
+
+    // The resolve alone, so a refusal is the only thing its Close reports.
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                             IID_PPV_ARGS(&resolve_list.p))));
+    CHECK(SUCCEEDED(resolve_list->QueryInterface(IID_PPV_ARGS(&list1.p))));
     D3D12_RECT rect = source_rect;
     const UINT x = c.dst_x >= 0 ? UINT(c.dst_x) : c.rect ? UINT(rect.left) : 0;
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
                                     c.mode);
+    out.close = resolve_list->Close();
+    if (FAILED(out.close) && !run_invalid) return true;
+
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                             IID_PPV_ARGS(&copy_list.p))));
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &barriers[1]);
+    copy_list->ResourceBarrier(1, &barriers[1]);
     for (UINT i = 0; i < planes; ++i) {
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
         src.pResource = target.p;
@@ -214,12 +227,15 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         dst.pResource = readback.p;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint = placed[i];
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        copy_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
-    out.close = list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(copy_list->Close()));
+
+    // Three batches: a refused resolve list is a batch of its own, which the layer refuses whole.
+    for (ID3D12CommandList* one : {static_cast<ID3D12CommandList*>(list.p),
+                                   static_cast<ID3D12CommandList*>(resolve_list.p),
+                                   static_cast<ID3D12CommandList*>(copy_list.p)})
+        queue->ExecuteCommandLists(1, &one);
     CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
     Event event;
     CHECK(event.handle);

@@ -596,8 +596,9 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
     except ImportError as exc:
-        raise ModsError("Tkinter is not installed; on Windows install Python from python.org with Tcl/Tk") \
-            from exc
+        hint = ("on Windows install Python from python.org with Tcl/Tk" if os.name == "nt" else
+                "install your distribution's Tkinter package (Debian and Ubuntu: sudo apt install python3-tk)")
+        raise ModsError(f"Tkinter is not installed; {hint}") from exc
 
     class ModsApp:
         def __init__(self, root):
@@ -943,7 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_target_args(parser)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    commands.add_parser("gui", help="open the Windows mod-manager window")
+    commands.add_parser("gui", help="open the mod-manager window")
     commands.add_parser("path", help="print the managed mods folder")
 
     listing = commands.add_parser("list", help="list installed mods")

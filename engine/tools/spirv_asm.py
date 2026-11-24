@@ -252,11 +252,13 @@ def _u32_literal(tok: str, lineno: int) -> int:
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
 _DECIMAL_FLOAT_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\Z")
-_FLOAT_SPEC = {     # width -> (exponent bits, fraction bits, exponent bias)
+_FLOAT_SPEC = {     # width (or "bf16") -> (exponent bits, fraction bits, exponent bias)
     16: (5, 10, 15),
     32: (8, 23, 127),
     64: (11, 52, 1023),
+    "bf16": (8, 7, 127),    # OpTypeFloat 16 BFloat16KHR: the top half of an f32
 }
+_BFLOAT16_KHR = VALUE_ENUMS["FPEncoding"]["BFloat16KHR"][0]
 
 
 def _round_float(negative: bool, sig: int, exp: int, width, to_nearest: bool, tie_break=None):
@@ -291,13 +293,17 @@ def _round_float(negative: bool, sig: int, exp: int, width, to_nearest: bool, ti
     return sign | bits
 
 
-def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
-    """Encode a SPIR-V float literal (decimal or width-aware hex-float incl. Inf/NaN) as IEEE-754 bits."""
+def _parse_float_bits(tok: str, width, lineno: int) -> int:
+    """Encode a SPIR-V float literal (decimal or width-aware hex-float incl. Inf/NaN) as IEEE-754 bits.
+
+    `width` is 16, 32 or 64, or "bf16" for a 16-bit float with the BFloat16KHR encoding.
+    """
     spec = _FLOAT_SPEC.get(width)
     if spec is None:
         raise SpirvAsmError(f"line {lineno}: unsupported float constant width {width}")
     exp_bits, mant_bits, bias = spec
     exp_max = (1 << exp_bits) - 1
+    type_name = "bfloat16" if width == "bf16" else f"{width}-bit float"
     m = _HEX_FLOAT_RE.match(tok)
     if m:
         sign_s, ipart, fpart, exp_s = m.groups()
@@ -328,7 +334,7 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}")
     fv = float(tok)
     if math.isinf(fv):
-        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {width}-bit float")
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {type_name}")
     if width == 64:
         return struct.unpack("<Q", struct.pack("<d", fv))[0]
     # float() rounds the decimal once to a double, as strtod does. A narrower type is rounded from that double,
@@ -337,14 +343,14 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
     negative = math.copysign(1.0, fv) < 0
     sig, den = abs(fv).as_integer_ratio()
     bits = _round_float(negative, sig, 1 - den.bit_length(), 32, True, lambda: _compare_decimal(tok, fv))
-    if bits is not None and width == 16:
-        # SPIRV-Tools reads a 16-bit decimal as that f32 and narrows it toward zero (ParseNormalFloat<Float16>),
-        # so 1.0006 is 0x3C00, not the nearer 0x3C01.
+    if bits is not None and width in (16, "bf16"):
+        # SPIRV-Tools reads a 16-bit decimal as that f32 and narrows it toward zero (ParseNormalFloat<Float16>, and
+        # the same for BFloat16), so 1.0006 is 0x3C00, not the nearer 0x3C01.
         sig, den = abs(struct.unpack("<f", struct.pack("<I", bits))[0]).as_integer_ratio()
-        bits = _round_float(negative, sig, 1 - den.bit_length(), 16, False)
+        bits = _round_float(negative, sig, 1 - den.bit_length(), width, False)
     if bits is None:
         # A decimal that overflows the type is an error in spirv-as, not an infinity (a hex-float can spell one).
-        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {width}-bit float")
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {type_name}")
     return bits
 
 
@@ -364,7 +370,8 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
         val = _int_literal(tok, width, bool(type_info[2]), lineno)
         return [val] if width <= 32 else [val & 0xFFFFFFFF, val >> 32]
     if kind == "float":
-        bits = _parse_float_bits(tok, width, lineno)
+        bf16 = width == 16 and type_info[2] == _BFLOAT16_KHR
+        bits = _parse_float_bits(tok, "bf16" if bf16 else width, lineno)
         if width <= 32:
             return [bits & 0xFFFFFFFF]
         if width == 64:
@@ -394,7 +401,7 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
     sym_to_id: dict[str, int] = {}
     next_id = 1
     defined_types: set[str] = set()
-    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
+    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width, encoding)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
@@ -614,7 +621,13 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
         if opname == "OpTypeInt" and res_id is not None and arg_idx + 1 < len(toks):
             type_info[res_id] = ("int", _parse_int(toks[arg_idx], lineno), _parse_int(toks[arg_idx + 1], lineno))
         elif opname == "OpTypeFloat" and res_id is not None and arg_idx < len(toks):
-            type_info[res_id] = ("float", _parse_int(toks[arg_idx], lineno))
+            # The optional FPEncoding operand (BFloat16KHR) changes how a 16-bit constant is laid out.
+            encoding = None
+            if arg_idx + 1 < len(toks):
+                enc_tok = toks[arg_idx + 1]
+                entry = VALUE_ENUMS["FPEncoding"].get(enc_tok)
+                encoding = entry[0] if entry is not None else _u32_literal(enc_tok, lineno)
+            type_info[res_id] = ("float", _parse_int(toks[arg_idx], lineno), encoding)
         elif opname == "OpExtInstImport" and res_id is not None and arg_idx < len(toks):
             ext_name = _unquote_string(toks[arg_idx], lineno)
             if ext_name in _EXT_SETS:

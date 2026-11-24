@@ -774,6 +774,21 @@ class FloatLiteralTests(unittest.TestCase):
             ("f32", "1.", [0x3F800000]), ("f32", ".5", [0x3F000000]), ("f32", "+2E1", [0x41A00000]),
         ))
 
+    def test_bfloat16_constant_is_the_top_half_of_an_f32(self):
+        # old #4237: OpTypeFloat 16 BFloat16KHR constants were encoded as IEEE halves (1.5 was 0x3E00).
+        head = _FLOAT_HEAD + "%bf = OpTypeFloat 16 BFloat16KHR\n%bf0 = OpTypeFloat 16 0\n"
+        for type_name, literal, expected in (
+            ("bf", "1.5", [0x3FC0]), ("bf", "-2", [0xC000]), ("bf", "0.1", [0x3DCC]), ("bf", "1.0078125", [0x3F81]),
+            ("bf", "1.00390625", [0x3F80]), ("bf", "3.4e38", [0x7F7F]), ("bf", "0x1.fep0", [0x3FFF]),
+            ("bf", "0x1.ffp0", [0x3FFF]), ("bf", "-0x1p+128", [0xFF80]), ("bf", "0x1.8p+128", [0x7FC0]),
+            ("bf0", "1.5", [0x3FC0]), ("f16", "1.5", [0x3E00]),
+        ):
+            with self.subTest(type=type_name, literal=literal):
+                spv = spirv_asm.assemble(head + f"%c = OpConstant %{type_name} {literal}\n")
+                self.assertEqual(_literal_words(spv, 43, 2), expected)
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 10: .* 1e39 is out of range for a bfloat16"):
+            spirv_asm.assemble(head + "%c = OpConstant %bf 1e39\n")
+
 
 if __name__ == "__main__":
     unittest.main()

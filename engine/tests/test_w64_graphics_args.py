@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -56,13 +57,10 @@ class TestW64GraphicsHarnessTimeout(unittest.TestCase):
             for name in ("ps_w64_a_skip", "gs_w64_a_ring", "vs_ids"):
                 open(os.path.join(work, "spirv", name + ".spv"), "wb").close()
             out = io.StringIO()
-            real_run = w64_graphics.subprocess.run
-            w64_graphics.subprocess.run = fake_run
-            try:
-                with contextlib.redirect_stdout(out):
-                    rc = w64_graphics.main([work, tools, "ps_w64_a_skip", "gs_w64_a_ring"])
-            finally:
-                w64_graphics.subprocess.run = real_run
+            with patch.object(w64_graphics.subprocess, "run", side_effect=fake_run), \
+                    patch.dict(os.environ, W64G_REF="", W64G_SAVE_REF=""), \
+                    patch.dict(w64_graphics._applied, {}, clear=True), contextlib.redirect_stdout(out):
+                rc = w64_graphics.main([work, tools, "ps_w64_a_skip", "gs_w64_a_ring"])
         lines = out.getvalue().splitlines()
         self.assertEqual(rc, 1)
         self.assertEqual(len(lines), 2, out.getvalue())

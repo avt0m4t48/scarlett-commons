@@ -89,11 +89,8 @@ struct Planes {
 };
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. The clears, the resolve and the read-back are three lists, so a
-// refused resolve leaves the other two to run: since 4da716493 the layer refuses a whole batch that holds a list whose
-// Close failed (as D3D12 must not be given one), which used to take the clears and the read-back with it. The resolve
-// list is executed after a failed Close only when `run_invalid` (the layer's refusal is what is checked; the host
-// runtime must not be given such a list) and then on its own, so the destination must keep its clears.
+// `c` and reads every plane of the destination back. The resolve is its own list, so a refused one (run only when
+// `run_invalid`) can't take the clears and read-back with it: the layer refuses a failed list's whole batch.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
@@ -202,7 +199,6 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     list->ResourceBarrier(2, barriers);
     CHECK(SUCCEEDED(list->Close()));
 
-    // The resolve alone, so a refusal is the only thing its Close reports.
     CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                              IID_PPV_ARGS(&resolve_list.p))));
     CHECK(SUCCEEDED(resolve_list->QueryInterface(IID_PPV_ARGS(&list1.p))));
@@ -231,7 +227,6 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     }
     CHECK(SUCCEEDED(copy_list->Close()));
 
-    // Three batches: a refused resolve list is a batch of its own, which the layer refuses whole.
     for (ID3D12CommandList* one : {static_cast<ID3D12CommandList*>(list.p),
                                    static_cast<ID3D12CommandList*>(resolve_list.p),
                                    static_cast<ID3D12CommandList*>(copy_list.p)})

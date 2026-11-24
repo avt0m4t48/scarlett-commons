@@ -74,7 +74,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertEqual(summary["error"], "full: exit code 7")
                     self.assertEqual(summary["runs"]["full"]["outcome"], "exited")
                     self.assertEqual(summary["runs"]["full"]["returncode"], 7)
-                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    # The runner resolves --out before it writes (run_guest_scene.py:355), so the report path it
+                    # prints is the physical one: on Windows the 8.3 name (RUNNER~1) is expanded, and on macOS the
+                    # unresolved /var prefix only matched as a suffix of /private/var.
+                    self.assertIn(str(report.resolve()).encode(encoding, "backslashreplace"), result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
@@ -117,7 +120,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(record, report["runs"]["full"])
             self.assertEqual(record["outcome"], "launch_failed")
             self.assertIsNone(record["returncode"])
-            self.assertEqual(record["cmd"][0], str(bad_loader))
+            # The runner resolves --loader, --guest and --shaders before it runs (scripts/run_guest_scene.py:348),
+            # so the record holds the physical path: on macOS /var/folders is a symlink to /private/var/folders.
+            self.assertEqual(record["cmd"][0], str(bad_loader.resolve()))
             if sys.platform != "win32":
                 self.assertEqual(record["cmd"][1:3], ["-a", "path with spaces/wine"])
             self.assertTrue(record["launch_error"])

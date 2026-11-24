@@ -219,8 +219,18 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacyS
 
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
 // dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
-// so the policy is accepted and ignored.
-HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
+// so the inputs are accepted and ignored. The block also has outputs: the range graphics addresses fall in, as two
+// 64-bit words at +0x10 and +0x18 (layout from VIctory, GPL-3.0, crates/victory-gpu/src/device.rs). They were left at
+// zero; graphics addresses here are CPU addresses, so the range is the whole user address space.
+HRESULT WINAPI configure_virtual_memory(void* desc) {
+    if (!desc) return E_INVALIDARG;
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::uint64_t range[2] = {reinterpret_cast<std::uint64_t>(info.lpMinimumApplicationAddress),
+                                    reinterpret_cast<std::uint64_t>(info.lpMaximumApplicationAddress)};
+    std::memcpy(static_cast<std::uint8_t*>(desc) + 0x10, range, sizeof(range));
+    return S_OK;
+}
 
 }  // namespace
 

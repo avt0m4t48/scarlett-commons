@@ -1144,6 +1144,7 @@ Module& Loader::load(const std::filesystem::path& image) {
                                         ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
                                         ",\"size\":" + startup_trace::quote(startup_trace::hex(m.size)) +
                                         ",\"relocated\":" + (m.relocated ? "true" : "false"));
+    if (startup_trace::enabled()) startup_trace::detail::arm_watch(reinterpret_cast<uint64_t>(m.base), m.size);
     return m;
 }
 

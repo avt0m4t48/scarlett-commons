@@ -21,6 +21,7 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <set>
 
 #include <atomic>
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -223,8 +225,128 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// LEONIDA_WATCH_AT=0xADDR:reg[+offset] or 0xADDR:0xTARGET (diagnostic, with --trace): when execution reaches ADDR in a mapped module, the 8 bytes
+// at the address in `reg` get a hardware write watch on that thread (DR0), and every later write there is logged as a
+// "watch_write" event with the writing place and the new value (32 at most). It answers "who fills this field" in one
+// run: a breakpoint byte is planted at ADDR when its module is mapped and restored when it is hit.
+struct Watch {
+    uint64_t at = 0;
+    int reg = -1;  // index into kWatchRegs
+    uint64_t offset = 0;  // reg+offset (`rdi+0x8`)
+    unsigned char saved = 0;
+    bool planted = false;
+    uint64_t target = 0;
+    std::atomic<unsigned> hits{0};
+};
+inline Watch& watch() {
+    static Watch w;
+    return w;
+}
+inline constexpr const char* kWatchRegs[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                             "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+inline uint64_t watch_reg(const CONTEXT& c, int i) {
+    const DWORD64 regs[] = {c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi,
+                            c.R8,  c.R9,  c.R10, c.R11, c.R12, c.R13, c.R14, c.R15};
+    return regs[i];
+}
+
+// Called when a module is mapped (pe_loader): plants the breakpoint when ADDR is inside it.
+inline void arm_watch(uint64_t base, uint64_t size) {
+    char spec[64] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_WATCH_AT", spec, sizeof(spec));
+    Watch& w = watch();
+    if (!n || n >= sizeof(spec) || w.planted) return;
+    char* colon = std::strchr(spec, ':');
+    if (!colon) return;
+    *colon = '\0';
+    w.at = std::strtoull(spec, nullptr, 0);
+    char* plus = std::strchr(colon + 1, '+');
+    if (plus) {
+        *plus = '\0';
+        w.offset = std::strtoull(plus + 1, nullptr, 0);
+    }
+    for (int i = 0; i < 16; ++i)
+        if (std::strcmp(colon + 1, kWatchRegs[i]) == 0) w.reg = i;
+    if (w.reg < 0 && colon[1] == '0' && (colon[2] == 'x' || colon[2] == 'X')) {
+        w.reg = 16;  // an absolute target address
+        w.offset = std::strtoull(colon + 1, nullptr, 0);
+    }
+    if (w.reg < 0 || w.at < base || w.at >= base + size) return;
+    auto* p = reinterpret_cast<unsigned char*>(w.at);
+    DWORD old = 0;
+    if (!VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old)) return;
+    w.saved = *p;
+    *p = 0xCC;
+    VirtualProtect(p, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 1);
+    w.planted = true;
+    event("watch_planted", "\"at\":" + quote(where(w.at)));
+}
+
+inline bool handle_watch(EXCEPTION_POINTERS* info) {
+    Watch& w = watch();
+    if (!w.planted || !info->ContextRecord) return false;
+    CONTEXT& c = *info->ContextRecord;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_BREAKPOINT && reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress) == w.at) {
+        auto* p = reinterpret_cast<unsigned char*>(w.at);
+        DWORD old = 0;
+        VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old);
+        *p = w.saved;
+        VirtualProtect(p, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 1);
+        w.target = (w.reg == 16 ? 0 : watch_reg(c, w.reg)) + w.offset;
+        c.Rip = w.at;  // run the restored instruction
+        c.Dr0 = w.target;
+        c.Dr7 = (c.Dr7 & ~0xF0003ull) | 0x1ull | (1ull << 16) | (3ull << 18);  // L0, write, 8 bytes
+        // The same watch on every other thread that exists now: a field may be filled from another thread.
+        if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{};
+            te.dwSize = sizeof(te);
+            const DWORD self_pid = GetCurrentProcessId(), self_tid = GetCurrentThreadId();
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != self_pid || te.th32ThreadID == self_tid) continue;
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
+                                      te.th32ThreadID);
+                if (!t) continue;
+                if (SuspendThread(t) != static_cast<DWORD>(-1)) {
+                    CONTEXT tc{};
+                    tc.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(t, &tc)) {
+                        tc.Dr0 = w.target;
+                        tc.Dr7 = (tc.Dr7 & ~0xF0003ull) | 0x1ull | (1ull << 16) | (3ull << 18);
+                        SetThreadContext(t, &tc);
+                    }
+                    ResumeThread(t);
+                }
+                CloseHandle(t);
+            }
+            CloseHandle(snap);
+        }
+        char line[96];
+        std::snprintf(line, sizeof(line), ",\"target\":\"0x%llx\"", static_cast<unsigned long long>(w.target));
+        event("watch_armed", "\"at\":" + quote(where(w.at)) + line);
+        return true;
+    }
+    if (code == EXCEPTION_SINGLE_STEP && (c.Dr6 & 1) && w.target) {
+        c.Dr6 &= ~0xFull;
+        if (w.hits.fetch_add(1) < 32) {
+            uint64_t value = 0;
+            std::memcpy(&value, reinterpret_cast<const void*>(w.target), sizeof(value));
+            char line[96];
+            std::snprintf(line, sizeof(line), ",\"value\":\"0x%llx\"", static_cast<unsigned long long>(value));
+            event("watch_write", "\"by\":" + quote(where(c.Rip)) + line);
+        } else {
+            c.Dr7 &= ~0x1ull;  // enough
+        }
+        return true;
+    }
+    return false;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (handle_watch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
 #ifdef _MSC_VER

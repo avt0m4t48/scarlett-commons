@@ -308,6 +308,19 @@ void test_registered_shim(bool supports_1_2) {
           "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
     check(rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice") != nullptr,
           "shim registry exposes d3d12_xs!D3D12XboxCreateDevice");
+
+    // D3D12ConfigureVirtualMemoryX fills the graphics address range at +0x10/+0x18 of the title's 32-byte block (it
+    // was left at zero) and keeps the inputs; a null block is refused.
+    using ConfigureFn = HRESULT(WINAPI*)(void*);
+    const auto configure =
+        reinterpret_cast<ConfigureFn>(rt::shims::find("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX"));
+    check(configure != nullptr, "shim registry exposes d3d12_xs!D3D12ConfigureVirtualMemoryX");
+    if (configure) {
+        std::uint64_t block[4] = {0x0000000700000000ull, 0, 0, 0};  // the dword at +4 set, as the title does
+        check(configure(block) == S_OK && block[0] == 0x0000000700000000ull, "ConfigureVirtualMemoryX keeps inputs");
+        check(block[2] != 0 && block[3] > block[2], "ConfigureVirtualMemoryX writes a graphics address range");
+        check(configure(nullptr) == E_INVALIDARG, "ConfigureVirtualMemoryX refuses a null block");
+    }
     if (!fn) return;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox{};

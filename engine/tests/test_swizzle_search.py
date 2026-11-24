@@ -602,6 +602,17 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
                     self.assertIn("ERROR:", err.getvalue())
                     self.assertNotIn("Traceback", err.getvalue())
 
+    def test_empty_search_without_out_reports_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "blob.bin"
+            blob.write_bytes(bytes(64))
+            err = io.StringIO()
+            with mock.patch.object(self.mod, "search", return_value=[]):
+                with mock.patch.object(sys, "stderr", err):
+                    rc = self.mod.main([str(blob)])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR: no layout fits", err.getvalue())
+
     def test_valid_nested_out_creates_parent_dirs_and_handles_render_oserror(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

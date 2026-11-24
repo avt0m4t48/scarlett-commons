@@ -152,12 +152,12 @@ def main(argv=None):
         print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
     res = search(data, a.bpe, a.tile, widths, a.tiles)
+    if not res:
+        print("ERROR: no layout fits the input, tile size and requested widths", file=sys.stderr)
+        return 1
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
     if a.out is not None:
-        if not res:
-            print("ERROR: no layout fits the input, tile size and requested widths", file=sys.stderr)
-            return 1
         parent = os.path.dirname(os.path.abspath(a.out))
         try:
             if parent:

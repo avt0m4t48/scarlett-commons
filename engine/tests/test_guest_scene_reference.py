@@ -117,7 +117,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(record, report["runs"]["full"])
             self.assertEqual(record["outcome"], "launch_failed")
             self.assertIsNone(record["returncode"])
-            self.assertEqual(record["cmd"][0], str(bad_loader))
+            # The runner resolves --loader, --guest and --shaders before it runs (scripts/run_guest_scene.py:348),
+            # so the record holds the physical path: on macOS /var/folders is a symlink to /private/var/folders.
+            self.assertEqual(record["cmd"][0], str(bad_loader.resolve()))
             if sys.platform != "win32":
                 self.assertEqual(record["cmd"][1:3], ["-a", "path with spaces/wine"])
             self.assertTrue(record["launch_error"])

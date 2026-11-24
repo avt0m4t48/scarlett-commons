@@ -2307,10 +2307,15 @@ public:
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
-    // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
-    // structure reports its real device address (instance descriptors and builds hand it to the driver); other
-    // buffers report their console VA into the GPU address arena.
+    // Buffers report their console VA into the GPU address arena; an acceleration structure reports its real device
+    // address (instance descriptors and builds hand it to the driver). A texture the title placed at its own address
+    // through Xbox slot 133 reports that title address, as the console does: a title uses it as the CPU pointer it
+    // clears the texture through (docs/d3d12_vulkan.md 3.3). Any other texture answers 0, as on D3D12.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
+    // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
+    // behavior, measured on a retail title).
+    void set_title_address(D3D12_GPU_VIRTUAL_ADDRESS address) { va_ = address; }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2621,7 +2626,7 @@ private:
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
-    D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;  // a buffer's console VA, or a slot-133 texture's title address
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
     // A placed buffer's heap range, held as a D3D12 placed resource holds its heap: the app may release the heap
@@ -7135,9 +7140,12 @@ public:
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
             // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
-            // review). What the title writes at `address` does not reach it.
-            log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
-                     "dimension",
+            // review). Its GPU VA is still the title's address: the console answers a placed texture's
+            // GetGPUVirtualAddress with the address the title placed it at, and a title turns that into the CPU
+            // pointer it clears the texture through (docs/d3d12_vulkan.md 3.3). What the title writes at `address`
+            // does not reach the image yet.
+            log_once("a title-placed texture (device slot 133) is a committed texture whose GPU VA is the title "
+                     "address; its pixels do not alias the title's pages yet; dimension",
                      int(desc.Dimension));
             // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
             // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
@@ -7150,6 +7158,13 @@ public:
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
+            if (SUCCEEDED(hr) && out && *out) {
+                // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
+                // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
+                // retail title). The image stays the committed fallback above, so only the address is folded in.
+                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out)))
+                    texture->set_title_address(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+            }
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};

@@ -6566,11 +6566,15 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                // Through the inner Vulkan device, not the Xbox-ABI proxy: the proxy routes device slot 78, the PC
+                // ID3D12Device10::CreateReservedResource2, to the console's SetFrameIntervalX (2dbcb882c, #6935),
+                // which answers S_OK and creates nothing.
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                EXPECT(one.p && two.p);
                 UINT tiles = 0;
                 device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
                 EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile

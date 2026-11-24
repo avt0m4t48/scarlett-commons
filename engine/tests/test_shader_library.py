@@ -247,6 +247,44 @@ class Main(unittest.TestCase):
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
                               "lib_vs_00001.json"])
 
+    def test_compute_missing_state_removes_stale_state_and_skips_none_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "fspx"))
+            stale = os.path.join(out, "fspx", "lib_cs_00000.state")
+            with open(stale, "wb") as f:
+                f.write(b"stale state")
+            src = os.path.join(tmp, "lib.bin")
+            # Compute record with NONE state (0xFFFFFFFF) must not crash or keep a stale .state sidecar.
+            with open(src, "wb") as f:
+                f.write(build([], [(NONE, NONE, 0, NONE)], [], [prog(0x11112222)]))
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(stale))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00000.s")
+            self.assertIsNone(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00000"))
+            meta = shader_meta.collect(disasm_file, "lib_cs_00000", [[]], [[]])
+            self.assertIn("fspx_code_sha256", meta)
+            self.assertNotIn("fspx_state_sha256", meta)
+
+    def test_same_code_with_distinct_states_gets_distinct_state_keys(self):
+        code = prog(0x44556677)
+        s_a, s_b = kind0(threads=(32, 1, 1)), kind0(threads=(64, 1, 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(0, NONE, 0, NONE), (1, NONE, 1, NONE)], [s_a, s_b], [code, code]))
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            metas = [
+                shader_meta.collect(os.path.join(out, "disasm", f"lib_cs_{i:05d}.s"), f"lib_cs_{i:05d}", [[]], [[]])
+                for i in range(2)
+            ]
+            self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
+            self.assertEqual([m["fspx_state_sha256"] for m in metas],
+                             [hashlib.sha256(s_a).hexdigest(), hashlib.sha256(s_b).hexdigest()])
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")

@@ -5,8 +5,8 @@ conforming SPIR-V assembly targeting Vulkan 1.0–1.4) directly into binary SPIR
 words in memory.
 
 Grammar tables in tools/spirv_asm_tables.py are derived from Khronos Group
-SPIRV-Headers (MIT License): spirv.core.grammar.json and
-extinst.glsl.std.450.grammar.json.
+SPIRV-Headers (MIT License): spirv.core.grammar.json,
+extinst.glsl.std.450.grammar.json and extinst.nonsemantic.debugprintf.grammar.json.
 
 As a module:
     from spirv_asm import assemble
@@ -18,16 +18,20 @@ Usage: `python -I tools/spirv_asm.py --help` lists the options.
 """
 import argparse
 import array
+import math
 import os
 import re
 import struct
 import sys
+from fractions import Fraction
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
+from spirv_asm_tables import (  # noqa: E402
+    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF, VALUE_ENUMS,
+)
 
 SPIRV_MAGIC = 0x07230203
 
@@ -51,6 +55,7 @@ _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemory
 _ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
+    "NonSemantic.DebugPrintf": NONSEMANTIC_DEBUGPRINTF,    # spirv-dis writes its instruction by name
 }
 
 # OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.
@@ -249,20 +254,59 @@ def _u32_literal(tok: str, lineno: int) -> int:
 
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
-_FLOAT_SPEC = {
-    16: (5, 10, 15, "<e", "<H"),
-    32: (8, 23, 127, "<f", "<I"),
-    64: (11, 52, 1023, "<d", "<Q"),
+_DECIMAL_FLOAT_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\Z")
+_FLOAT_SPEC = {     # width (or "bf16") -> (exponent bits, fraction bits, exponent bias)
+    16: (5, 10, 15),
+    32: (8, 23, 127),
+    64: (11, 52, 1023),
+    "bf16": (8, 7, 127),    # OpTypeFloat 16 BFloat16KHR: the top half of an f32
 }
+_BFLOAT16_KHR = VALUE_ENUMS["FPEncoding"]["BFloat16KHR"][0]
 
 
-def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
-    """Encode a SPIR-V float literal (decimal or width-aware hex-float incl. Inf/NaN) as IEEE-754 bits."""
+def _round_float(negative: bool, sig: int, exp: int, width, to_nearest: bool, tie_break=None):
+    """The bits of (-1)^negative * sig * 2^exp in the float format `width`, or None when that overflows to infinity.
+
+    Rounds to nearest-even when `to_nearest`, otherwise toward zero; a value below the smallest subnormal becomes a
+    zero of the same sign. On an exact tie, `tie_break()` (when given) says whether the value the caller approximates
+    by sig * 2^exp lies above (> 0) or below (< 0) it, so a literal read through a wider format is rounded once.
+    """
+    exp_bits, mant_bits, bias = _FLOAT_SPEC[width]
+    sign = int(negative) << (exp_bits + mant_bits)
+    if sig == 0:
+        return sign
+    # The weight of the last fraction bit: set by the exponent, or fixed in the subnormal range.
+    quantum = max(exp + sig.bit_length() - 1, 1 - bias) - mant_bits
+    shift = quantum - exp
+    if shift <= 0:
+        n = sig << -shift
+    else:
+        n = sig >> shift
+        if to_nearest:
+            rem, half = sig & ((1 << shift) - 1), 1 << (shift - 1)
+            if rem == half:
+                above = tie_break() if tie_break is not None else 0
+                n += above > 0 or (above == 0 and n & 1)
+            elif rem > half:
+                n += 1
+    # A subnormal n is its own encoding; a normal one carries its leading bit into the exponent field.
+    bits = ((quantum + mant_bits + bias - 1) << mant_bits) + n
+    if bits >= ((1 << exp_bits) - 1) << mant_bits:
+        return None
+    return sign | bits
+
+
+def _parse_float_bits(tok: str, width, lineno: int) -> int:
+    """Encode a SPIR-V float literal (decimal or width-aware hex-float incl. Inf/NaN) as IEEE-754 bits.
+
+    `width` is 16, 32 or 64, or "bf16" for a 16-bit float with the BFloat16KHR encoding.
+    """
     spec = _FLOAT_SPEC.get(width)
     if spec is None:
         raise SpirvAsmError(f"line {lineno}: unsupported float constant width {width}")
-    exp_bits, mant_bits, bias, pack_fmt, unpack_fmt = spec
+    exp_bits, mant_bits, bias = spec
     exp_max = (1 << exp_bits) - 1
+    type_name = "bfloat16" if width == "bf16" else f"{width}-bit float"
     m = _HEX_FLOAT_RE.match(tok)
     if m:
         sign_s, ipart, fpart, exp_s = m.groups()
@@ -284,28 +328,39 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
             else:
                 mant = frac >> (top - mant_bits)
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) | mant
-        if e_biased > exp_max:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        if 0 < e_biased < exp_max and top <= mant_bits:
-            frac = sig & ((1 << top) - 1)
-            mant = frac << (mant_bits - top)
-            return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
-        try:
-            fv = float.fromhex(tok)
-            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-        except OverflowError:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        except ValueError as exc:
-            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
-    try:
-        fv = float(tok)
-    except ValueError as exc:
-        raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
-    try:
-        return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-    except OverflowError:
-        sign = 1 if tok.startswith("-") else 0
-        return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+        # SPIRV-Tools (HexFloat's operator>>) drops the digits that do not fit: a hex-float is truncated toward
+        # zero, in the subnormal range too, and one too large for the type is an infinity.
+        bits = _round_float(bool(sign), sig, exp, width, False)
+        return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) if bits is None else bits
+    # The decimal spelling the C++ stream reads: no inf, nan or digit separators, which float() would also take.
+    if not _DECIMAL_FLOAT_RE.match(tok):
+        raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}")
+    fv = float(tok)
+    if math.isinf(fv):
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {type_name}")
+    if width == 64:
+        return struct.unpack("<Q", struct.pack("<d", fv))[0]
+    # float() rounds the decimal once to a double, as strtod does. A narrower type is rounded from that double,
+    # except where the double sits on a tie of the narrower type: the exact decimal breaks it, so the result is the
+    # decimal rounded once to the nearest-even f32, as strtof (and so spirv-as) gives it.
+    negative = math.copysign(1.0, fv) < 0
+    sig, den = abs(fv).as_integer_ratio()
+    bits = _round_float(negative, sig, 1 - den.bit_length(), 32, True, lambda: _compare_decimal(tok, fv))
+    if bits is not None and width in (16, "bf16"):
+        # SPIRV-Tools reads a 16-bit decimal as that f32 and narrows it toward zero (ParseNormalFloat<Float16>, and
+        # the same for BFloat16), so 1.0006 is 0x3C00, not the nearer 0x3C01.
+        sig, den = abs(struct.unpack("<f", struct.pack("<I", bits))[0]).as_integer_ratio()
+        bits = _round_float(negative, sig, 1 - den.bit_length(), width, False)
+    if bits is None:
+        # A decimal that overflows the type is an error in spirv-as, not an infinity (a hex-float can spell one).
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {type_name}")
+    return bits
+
+
+def _compare_decimal(tok: str, approx: float) -> int:
+    """1 when the decimal literal `tok` is larger in magnitude than the double `approx` read from it, -1 when smaller."""
+    exact, near = abs(Fraction(tok)), Fraction(abs(approx))
+    return (exact > near) - (exact < near)
 
 
 def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
@@ -318,7 +373,8 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
         val = _int_literal(tok, width, bool(type_info[2]), lineno)
         return [val] if width <= 32 else [val & 0xFFFFFFFF, val >> 32]
     if kind == "float":
-        bits = _parse_float_bits(tok, width, lineno)
+        bf16 = width == 16 and type_info[2] == _BFLOAT16_KHR
+        bits = _parse_float_bits(tok, "bf16" if bf16 else width, lineno)
         if width <= 32:
             return [bits & 0xFFFFFFFF]
         if width == 64:
@@ -348,7 +404,7 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
     sym_to_id: dict[str, int] = {}
     next_id = 1
     defined_types: set[str] = set()
-    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
+    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width, encoding)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
@@ -568,7 +624,13 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
         if opname == "OpTypeInt" and res_id is not None and arg_idx + 1 < len(toks):
             type_info[res_id] = ("int", _parse_int(toks[arg_idx], lineno), _parse_int(toks[arg_idx + 1], lineno))
         elif opname == "OpTypeFloat" and res_id is not None and arg_idx < len(toks):
-            type_info[res_id] = ("float", _parse_int(toks[arg_idx], lineno))
+            # The optional FPEncoding operand (BFloat16KHR) changes how a 16-bit constant is laid out.
+            encoding = None
+            if arg_idx + 1 < len(toks):
+                enc_tok = toks[arg_idx + 1]
+                entry = VALUE_ENUMS["FPEncoding"].get(enc_tok)
+                encoding = entry[0] if entry is not None else _u32_literal(enc_tok, lineno)
+            type_info[res_id] = ("float", _parse_int(toks[arg_idx], lineno), encoding)
         elif opname == "OpExtInstImport" and res_id is not None and arg_idx < len(toks):
             ext_name = _unquote_string(toks[arg_idx], lineno)
             if ext_name in _EXT_SETS:

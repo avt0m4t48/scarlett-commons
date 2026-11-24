@@ -1,7 +1,8 @@
-"""SPIR-V core and GLSL.std.450 grammar tables for tools/spirv_asm.py.
+"""SPIR-V core, GLSL.std.450 and NonSemantic.DebugPrintf grammar tables for tools/spirv_asm.py.
 
 Derived from Khronos Group SPIRV-Headers (MIT License):
-  spirv.core.grammar.json and extinst.glsl.std.450.grammar.json (unified1).
+  spirv.core.grammar.json, extinst.glsl.std.450.grammar.json and
+  extinst.nonsemantic.debugprintf.grammar.json (unified1).
 Grammar aliases have the entry of the name they stand for: instruction aliases such as
 OpDemoteToHelperInvocationEXT in INSTRUCTIONS, enumerant aliases in VALUE_ENUMS and BIT_ENUMS.
 spirv-as accepts either spelling.
@@ -1105,4 +1106,8 @@ GLSL_STD_450 = {
     'UnpackSnorm4x8': 63,
     'UnpackUnorm2x16': 61,
     'UnpackUnorm4x8': 64,
+}
+
+NONSEMANTIC_DEBUGPRINTF = {
+    'DebugPrintf': 1,
 }

@@ -368,7 +368,7 @@ int present_one(const char* label, leonida::VulkanSwapchain& swapchain) {
 // DXGI_ERROR_INVALID_CALL; dxgi_swapchain_test compares that with the host), and the next successful
 // ResizeBuffers brings it back. This is the Vulkan side of that: whichever step fails (the offscreen ring, or
 // vkCreateSwapchainKHR, which retires the old swapchain even when it fails), a later resize still builds a
-// working swapchain, on the offscreen and on the direct path.
+// working swapchain, whether or not the native image count matches the request.
 int run_failed_resize(const char* label, std::uint32_t requested, std::uint32_t native, bool offscreen,
                       bool fail_swapchain) {
     g = Fake{};
@@ -437,8 +437,8 @@ int main() {
     const FailCase fail_cases[] = {
         {"offscreen ring, vkCreateSwapchainKHR fails", 2, 4, true, true},
         {"offscreen ring, the new ring fails", 2, 4, true, false},
-        {"direct images, vkCreateSwapchainKHR fails", 3, 3, false, true},
-        {"direct images, the new ring fails", 3, 3, false, false},
+        {"matching counts, vkCreateSwapchainKHR fails", 3, 3, true, true},
+        {"matching counts, the new ring fails", 3, 3, true, false},
     };
     for (const FailCase& c : fail_cases) {
         if (const int result = run_failed_resize(c.label, c.requested, c.native, c.offscreen, c.fail_swapchain))

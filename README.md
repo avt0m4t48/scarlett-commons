@@ -74,7 +74,7 @@ Live numbers, every task and who is on it: **[progress page](https://github.com/
 | **Reference interpreter** | ⏳ waiting | A GPL-3.0 candidate exists ([landscape](docs/landscape.md)) | Evaluate and import |
 | **System API specs** | 🟦 ready | Tasks for memory, threads, graphics differences, audio, storage, input | Write them from public sources |
 | **Adapters and compatibility table** | ⏳ waiting | Batch PR tester for any repository (`tools/try_prs.py`) | SPIR-V runner, then adapters for five translators |
-| **Translations** | 🔨 started | README, plan, getting started and roadmap in ru, zh-CN, es; AGENTS and CONTRIBUTING in ru | Engine pages; more languages welcome |
+| **Translations** | ✅ current | README, AGENTS, CONTRIBUTING, roadmap, plan, getting started, engine guide and title runs in ru, zh-CN, es | Engine plan; more languages welcome |
 
 Legend: ✅ working · 🔨 in progress · 🟦 ready to take · ⏳ waiting on other tasks
 

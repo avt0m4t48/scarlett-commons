@@ -1,5 +1,7 @@
 # Title runs
 
+**English** · [Русский](i18n/ru/title-runs.md) · [简体中文](i18n/zh-CN/title-runs.md) · [Español](i18n/es/title-runs.md)
+
 How far the engine gets on a real title, reported without naming or sharing anything from it.
 
 **State today:** no build is registered in `builds/` yet, so reports go in as `unregistered` until a maintainer registers the first build from two matching hashes. The build profile `tools/local_run.py --profile` needs, for the title the engine was developed against, is the Leonida continuation (github.com/ubiquitarianism/leonida): clone it and pass its folder.

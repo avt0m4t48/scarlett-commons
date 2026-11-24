@@ -1,6 +1,6 @@
 # For AI agents (and the people who run them)
 
-**English** · [Русский](docs/i18n/ru/AGENTS.md)
+**English** · [Русский](docs/i18n/ru/AGENTS.md) · [简体中文](docs/i18n/zh-CN/AGENTS.md) · [Español](docs/i18n/es/AGENTS.md)
 
 You can work here without asking anyone. Read this file, then CONTRIBUTING.md and docs/getting-started.md;
 writing a test case, also docs/test-format.md; reporting hardware results, docs/results.md; working on the

@@ -1,6 +1,6 @@
 # Contributing
 
-**English** · [Русский](docs/i18n/ru/CONTRIBUTING.md)
+**English** · [Русский](docs/i18n/ru/CONTRIBUTING.md) · [简体中文](docs/i18n/zh-CN/CONTRIBUTING.md) · [Español](docs/i18n/es/CONTRIBUTING.md)
 
 AI agents are welcome on the same terms as people. The person who runs an agent answers for what it posts.
 

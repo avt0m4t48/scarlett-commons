@@ -74,7 +74,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertEqual(summary["error"], "full: exit code 7")
                     self.assertEqual(summary["runs"]["full"]["outcome"], "exited")
                     self.assertEqual(summary["runs"]["full"]["returncode"], 7)
-                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    # The runner resolves --out before it writes (run_guest_scene.py:355), so the report path it
+                    # prints is the physical one: on Windows the 8.3 name (RUNNER~1) is expanded, and on macOS the
+                    # unresolved /var prefix only matched as a suffix of /private/var.
+                    self.assertIn(str(report.resolve()).encode(encoding, "backslashreplace"), result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 

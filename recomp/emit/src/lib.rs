@@ -13,7 +13,9 @@
 //! shl/shr/sar on 32- and 64-bit operands, jcc (without parity) and jmp to an instruction of the same function, ret,
 //! push and pop of 64-bit values, setcc, cmovcc, xchg of two registers, nop, and calls (direct and indirect, through
 //! `call_native`: the callee runs natively and a replaced callee is reached through its own patched entry); general-purpose registers (not AH-DH) and
-//! memory without FS/GS. Not yet: the remaining integer instructions, SIMD. Shifts by a count above 1 leave OF
+//! memory without FS/GS; imul with two or three operands; the AVX moves (vmovaps/ups/apd/upd/dqa/dqu, vmovss/sd),
+//! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss and vzeroupper, through core::arch
+//! intrinsics (the same instructions as the title's). Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -36,6 +38,8 @@ pub struct Ctx {
     pub ret: u64,
     pub host_rsp: u64,
     pub target: u64,
+    /// ymm0-ymm15, four quadwords each (offset 160).
+    pub x: [[u64; 4]; 16],
 }
 static mut IMAGE_BASE: u64 = 0;
 /// Where the title's image is mapped: RIP-relative addresses and call targets are relative to it.
@@ -64,6 +68,7 @@ pub unsafe fn setup() {
 /// returns into this function, which stores the registers and flags it left. As the guest's `call`, a return address
 /// sits at the guest rsp - 8 while the callee runs.
 #[inline(never)]
+#[target_feature(enable = "avx")]
 unsafe fn call_native(c: &mut Ctx, target: u64) {
     unsafe {
         let old = TlsGetValue(TLS_INDEX);
@@ -94,6 +99,22 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             "mov r13, [rax + 104]",
             "mov r14, [rax + 112]",
             "mov r15, [rax + 120]",
+            "vmovdqu ymm0, [rax + 160]",
+            "vmovdqu ymm1, [rax + 192]",
+            "vmovdqu ymm2, [rax + 224]",
+            "vmovdqu ymm3, [rax + 256]",
+            "vmovdqu ymm4, [rax + 288]",
+            "vmovdqu ymm5, [rax + 320]",
+            "vmovdqu ymm6, [rax + 352]",
+            "vmovdqu ymm7, [rax + 384]",
+            "vmovdqu ymm8, [rax + 416]",
+            "vmovdqu ymm9, [rax + 448]",
+            "vmovdqu ymm10, [rax + 480]",
+            "vmovdqu ymm11, [rax + 512]",
+            "vmovdqu ymm12, [rax + 544]",
+            "vmovdqu ymm13, [rax + 576]",
+            "vmovdqu ymm14, [rax + 608]",
+            "vmovdqu ymm15, [rax + 640]",
             "mov rax, [rax]",
             "ret",
             "2:",
@@ -115,6 +136,22 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             "mov [rax + 104], r13",
             "mov [rax + 112], r14",
             "mov [rax + 120], r15",
+            "vmovdqu [rax + 160], ymm0",
+            "vmovdqu [rax + 192], ymm1",
+            "vmovdqu [rax + 224], ymm2",
+            "vmovdqu [rax + 256], ymm3",
+            "vmovdqu [rax + 288], ymm4",
+            "vmovdqu [rax + 320], ymm5",
+            "vmovdqu [rax + 352], ymm6",
+            "vmovdqu [rax + 384], ymm7",
+            "vmovdqu [rax + 416], ymm8",
+            "vmovdqu [rax + 448], ymm9",
+            "vmovdqu [rax + 480], ymm10",
+            "vmovdqu [rax + 512], ymm11",
+            "vmovdqu [rax + 544], ymm12",
+            "vmovdqu [rax + 576], ymm13",
+            "vmovdqu [rax + 608], ymm14",
+            "vmovdqu [rax + 640], ymm15",
             "lea rcx, [rsp + 16]",
             "mov [rax + 32], rcx",
             "pop rcx",
@@ -143,6 +180,9 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
             out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _, out("ymm5") _,
+            out("ymm6") _, out("ymm7") _, out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
+            out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
         );
         TlsSetValue(TLS_INDEX, old);
     }
@@ -185,6 +225,71 @@ fn wr(c: &mut Ctx, r: usize, n: u32, v: u64) {
 }
 #[inline(always)]
 fn szf(c: &mut Ctx, r: u64, n: u32) { c.zf = r & mask(n) == 0; c.sf = sign(r, n); }
+type Y = [u64; 4];
+#[inline(always)]
+unsafe fn vld(a: u64, n: usize) -> Y {
+    let mut y = [0u64; 4];
+    unsafe { core::ptr::copy_nonoverlapping(a as *const u8, y.as_mut_ptr() as *mut u8, n) };
+    y
+}
+#[inline(always)]
+unsafe fn vst(a: u64, n: usize, y: Y) {
+    unsafe { core::ptr::copy_nonoverlapping(y.as_ptr() as *const u8, a as *mut u8, n) };
+}
+/// A VEX write of `w` bytes: the rest of the ymm register is cleared.
+#[inline(always)]
+fn vset(c: &mut Ctx, d: usize, w: usize, y: Y) {
+    let mut v = y;
+    if w <= 16 { v[2] = 0; v[3] = 0; }
+    c.x[d] = v;
+}
+#[derive(Clone, Copy)]
+enum F { Add, Sub, Mul, Div }
+#[target_feature(enable = "avx")]
+unsafe fn fps(op: F, a: Y, b: Y) -> Y {
+    use core::arch::x86_64::*;
+    unsafe {
+        let (x, y) = (_mm256_loadu_ps(a.as_ptr() as *const f32), _mm256_loadu_ps(b.as_ptr() as *const f32));
+        let r = match op { F::Add => _mm256_add_ps(x, y), F::Sub => _mm256_sub_ps(x, y), F::Mul => _mm256_mul_ps(x, y), F::Div => _mm256_div_ps(x, y) };
+        let mut o = [0u64; 4];
+        _mm256_storeu_ps(o.as_mut_ptr() as *mut f32, r);
+        o
+    }
+}
+#[target_feature(enable = "avx")]
+unsafe fn fpd(op: F, a: Y, b: Y) -> Y {
+    use core::arch::x86_64::*;
+    unsafe {
+        let (x, y) = (_mm256_loadu_pd(a.as_ptr() as *const f64), _mm256_loadu_pd(b.as_ptr() as *const f64));
+        let r = match op { F::Add => _mm256_add_pd(x, y), F::Sub => _mm256_sub_pd(x, y), F::Mul => _mm256_mul_pd(x, y), F::Div => _mm256_div_pd(x, y) };
+        let mut o = [0u64; 4];
+        _mm256_storeu_pd(o.as_mut_ptr() as *mut f64, r);
+        o
+    }
+}
+/// Scalar single: the low float from op(a, b), the rest of the low 128 bits from a.
+#[target_feature(enable = "avx")]
+unsafe fn fss(op: F, a: Y, b: Y) -> Y {
+    use core::arch::x86_64::*;
+    unsafe {
+        let (x, y) = (_mm_loadu_ps(a.as_ptr() as *const f32), _mm_loadu_ps(b.as_ptr() as *const f32));
+        let r = match op { F::Add => _mm_add_ss(x, y), F::Sub => _mm_sub_ss(x, y), F::Mul => _mm_mul_ss(x, y), F::Div => _mm_div_ss(x, y) };
+        let mut o = [0u64; 4];
+        _mm_storeu_ps(o.as_mut_ptr() as *mut f32, r);
+        o
+    }
+}
+#[target_feature(enable = "avx")]
+unsafe fn fsd(op: F, a: Y, b: Y) -> Y {
+    use core::arch::x86_64::*;
+    unsafe {
+        let (x, y) = (_mm_loadu_pd(a.as_ptr() as *const f64), _mm_loadu_pd(b.as_ptr() as *const f64));
+        let r = match op { F::Add => _mm_add_sd(x, y), F::Sub => _mm_sub_sd(x, y), F::Mul => _mm_mul_sd(x, y), F::Div => _mm_div_sd(x, y) };
+        let mut o = [0u64; 4];
+        _mm_storeu_pd(o.as_mut_ptr() as *mut f64, r);
+        o
+    }
+}
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -258,6 +363,27 @@ fn write(i: &Instruction, size: u32, value: &str) -> Option<String> {
             Some(format!("wr(c, {r}, {size}, {value});"))
         }
         OpKind::Memory => Some(format!("st({}, {size}, {value});", address(i)?)),
+        _ => None,
+    }
+}
+
+fn vreg(r: Register) -> Option<(usize, usize)> {
+    if r.is_xmm() {
+        let i = r as usize - Register::XMM0 as usize;
+        return (i < 16).then_some((i, 16));
+    }
+    if r.is_ymm() {
+        let i = r as usize - Register::YMM0 as usize;
+        return (i < 16).then_some((i, 32));
+    }
+    None
+}
+
+/// Operand `n` as a ymm value of `w` bytes (a register's whole value, or `w` bytes of memory).
+fn vread(i: &Instruction, n: u32, w: usize) -> Option<String> {
+    match i.op_kind(n) {
+        OpKind::Register => Some(format!("c.x[{}]", vreg(i.op_register(n))?.0)),
+        OpKind::Memory => Some(format!("vld({}, {w})", address(i)?)),
         _ => None,
     }
 }
@@ -394,6 +520,91 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             }
             let _ = write!(s, "let t = c.r[{x}] & mask({n}); let u = c.r[{y}] & mask({n}); wr(c, {x}, {n}, u); wr(c, {y}, {n}, t);");
         }
+        Imul if i.op_count() >= 2 => {
+            let n = size_of_op0(i)?;
+            let (a, b) = if i.op_count() == 2 { (read(i, 0, n)?, read(i, 1, n)?) } else { (read(i, 1, n)?, read(i, 2, n)?) };
+            let _ = write!(s, "let a = sx({a}, {n}) as i64 as i128; let b = sx({b}, {n}) as i64 as i128; let full = a * b; let r = (full as u64) & mask({n}); c.cf = sx(r, {n}) as i64 as i128 != full; c.of = c.cf; szf(c, r, {n}); ");
+            s += &write(i, n, "r")?;
+        }
+        Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovdqa | Vmovdqu => match (i.op_kind(0), i.op_kind(1)) {
+            (OpKind::Register, _) => {
+                let (d, w) = vreg(i.op_register(0))?;
+                let _ = write!(s, "let y = {}; vset(c, {d}, {w}, y);", vread(i, 1, w)?);
+            }
+            (OpKind::Memory, OpKind::Register) => {
+                let (r, w) = vreg(i.op_register(1))?;
+                let _ = write!(s, "vst({}, {w}, c.x[{r}]);", address(i)?);
+            }
+            _ => return None,
+        },
+        Vmovss | Vmovsd => {
+            let e = if i.mnemonic() == Vmovss { 4 } else { 8 };
+            match (i.op_count(), i.op_kind(0), i.op_kind(1)) {
+                (2, OpKind::Register, OpKind::Memory) => {
+                    let (d, _) = vreg(i.op_register(0))?;
+                    let _ = write!(s, "let y = vld({}, {e}); vset(c, {d}, 16, y);", address(i)?);
+                }
+                (2, OpKind::Memory, OpKind::Register) => {
+                    let (r, _) = vreg(i.op_register(1))?;
+                    let _ = write!(s, "vst({}, {e}, c.x[{r}]);", address(i)?);
+                }
+                (3, OpKind::Register, OpKind::Register) if i.op_kind(2) == OpKind::Register => {
+                    let (d, _) = vreg(i.op_register(0))?;
+                    let (a, _) = vreg(i.op_register(1))?;
+                    let (b, _) = vreg(i.op_register(2))?;
+                    let low = if e == 4 {
+                        format!("(y[0] & !0xffff_ffff) | (c.x[{b}][0] & 0xffff_ffff)")
+                    } else {
+                        format!("c.x[{b}][0]")
+                    };
+                    let _ = write!(s, "let mut y = c.x[{a}]; y[0] = {low}; vset(c, {d}, 16, y);");
+                }
+                _ => return None,
+            }
+        }
+        Vxorps | Vxorpd | Vpxor | Vandps | Vandpd | Vpand | Vorps | Vorpd | Vpor | Vandnps | Vandnpd | Vpandn => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let f = match i.mnemonic() {
+                Vxorps | Vxorpd | Vpxor => "a[k] ^ b[k]",
+                Vandps | Vandpd | Vpand => "a[k] & b[k]",
+                Vorps | Vorpd | Vpor => "a[k] | b[k]",
+                _ => "!a[k] & b[k]",
+            };
+            let _ = write!(s, "let a = {a}; let b = {b}; let mut y = [0u64; 4]; for k in 0..4 {{ y[k] = {f}; }} vset(c, {d}, {w}, y);");
+        }
+        Vaddps | Vsubps | Vmulps | Vdivps | Vaddpd | Vsubpd | Vmulpd | Vdivpd | Vaddss | Vsubss | Vmulss | Vdivss
+        | Vaddsd | Vsubsd | Vmulsd | Vdivsd => {
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let op = match &name[1..4] {
+                "add" => "F::Add",
+                "sub" => "F::Sub",
+                "mul" => "F::Mul",
+                _ => "F::Div",
+            };
+            let kind = &name[4..6];
+            let (d, w) = vreg(i.op_register(0))?;
+            let (f, bw, ww) = match kind {
+                "ps" => ("fps", w, w),
+                "pd" => ("fpd", w, w),
+                "ss" => ("fss", 4, 16),
+                _ => ("fsd", 8, 16),
+            };
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, bw)?);
+            let _ = write!(s, "let y = {f}({op}, {a}, {b}); vset(c, {d}, {ww}, y);");
+        }
+        Vbroadcastss => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let src = match i.op_kind(1) {
+                OpKind::Memory => format!("ld({}, 4)", address(i)?),
+                OpKind::Register => format!("c.x[{}][0]", vreg(i.op_register(1))?.0),
+                _ => return None,
+            };
+            let _ = write!(s, "let v = {src} & 0xffff_ffff; let q = v | (v << 32); vset(c, {d}, {w}, [q, q, q, q]);");
+        }
+        Vzeroupper => {
+            s += "for k in 0..16 { c.x[k][2] = 0; c.x[k][3] = 0; }";
+        }
         Push => {
             let v = read(i, 0, 8)?;
             if matches!(i.op_kind(0), OpKind::Register) && gpr(i.op_register(0))?.1 != 8 {
@@ -501,6 +712,6 @@ pub fn emit_function(name: &str, code: &[u8], ip: u64) -> Result<String, String>
         let _ = writeln!(body, "            {:#x} => {{ {stmt} }} // {i}", i.ip());
     }
     Ok(format!(
-        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
+        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\n#[target_feature(enable = \"avx,avx2\")]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
     ))
 }

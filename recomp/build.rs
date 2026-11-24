@@ -52,6 +52,22 @@ fn main() {
             a.cmp(rcx, rdx)?; a.cmovg(rax, rcx)?; a.cmovle(rax, rdx)?; a.cmovb(esi, edi)?; a.neg(r8)?;
             a.not(r9)?; a.inc(r10)?; a.dec(r11d)?; a.xchg(r12, r13)?; a.ret()
         })),
+        ("imul", 0x801, assemble(|a| {
+            a.imul_2(r11, qword_ptr(rdx))?; a.imul_2(rax, rcx)?; a.imul_2(edx, r8d)?; a.imul_3(r9, r10, 0x1234)?;
+            a.imul_3(r12d, r13d, -7)?; a.imul_2(rsi, rdi)?; a.ret()
+        })),
+        ("vector", 0x8c1, assemble(|a| {
+            a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vmovups(xmm1, xmmword_ptr(rdx + 32))?; a.vaddps(ymm2, ymm0, ymm3)?;
+            a.vmulps(xmm4, xmm1, xmm5)?; a.vxorps(ymm6, ymm6, ymm7)?; a.vsubss(xmm8, xmm9, dword_ptr(rdx + 4))?;
+            a.vdivsd(xmm10, xmm11, xmm12)?; a.vbroadcastss(ymm13, dword_ptr(rdx + 8))?;
+            a.vmovss(xmm14, dword_ptr(rdx + 12))?; a.vmovups(ymmword_ptr(rdx + 64), ymm2)?;
+            a.vandps(xmm15, xmm0, xmm1)?; a.vmulpd(ymm3, ymm4, ymm5)?; a.vaddss(xmm5, xmm6, xmm7)?;
+            a.vmovss_3(xmm9, xmm10, xmm11)?; a.vmovsd(qword_ptr(rdx + 128), xmm3)?; a.vpxor(xmm12, xmm12, xmm13)?;
+            a.vmovaps(ymm11, ymm2)?; a.ret()
+        })),
+        ("zeroupper", 0x8c1, assemble(|a| {
+            a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
+        })),
         ("call", 0x8c1, assemble(|a| {
             a.push(rbx)?; a.mov(rbx, rcx)?; a.mov(rcx, rdx)?; a.mov(rdx, rbx)?; a.call(CALLEE)?;
             a.add(rax, rbx)?; a.pop(rbx)?; a.ret()

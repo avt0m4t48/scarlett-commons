@@ -19,8 +19,11 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+# Scarlett Commons, track B (recomp/): enabled by the `recomp` feature (`cargo commons`).
+commons-recomp = { path = "../../../recomp", optional = true }
 
 [features]
+recomp = ["dep:commons-recomp"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

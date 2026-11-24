@@ -32,6 +32,15 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    // Scarlett Commons: track B installs its recompiled functions over the mapped image before anything runs
+    // (recomp/, `cargo commons`); a build without a manifest runs as track A alone.
+    #[cfg(feature = "recomp")]
+    {
+        let dir = std::env::var_os("COMMONS_RECOMP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../recomp/manifests")
+        });
+        println!("{}", commons_recomp::install(image.base() as u64, &hash, &dir));
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),

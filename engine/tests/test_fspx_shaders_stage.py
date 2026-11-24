@@ -296,6 +296,29 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
 
+    def test_malformed_or_missing_output_index_fails_cleanly(self):
+        for raw in (False, "{broken", "[]"):
+            with self.subTest(raw=raw):
+                def bad_py(tool, *args):
+                    self.calls.append((tool, args))
+                    if tool == "fspx_unpack.py":
+                        os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
+                        open(os.path.join(self.unpacked, "disasm", "upscaler.s"), "w").close()
+                    elif tool == "rdna2spirv.py":
+                        os.makedirs(self.spirv, exist_ok=True)
+                        if raw is not False:
+                            with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8",
+                                      newline="\n") as f:
+                                f.write(raw)
+
+                with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.calls = []
+                    with mock.patch.object(make_game, "py", bad_py), mock.patch.object(make_game, "log", lambda *a: None):
+                        make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+                self.assertIn("unreadable index", err.getvalue())
+                self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+                self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
+
     def test_a_stopped_translation_leaves_no_marker_and_no_old_modules(self):
         self.run_step()
         open(os.path.join(self.spirv, "notes.txt"), "w").close()

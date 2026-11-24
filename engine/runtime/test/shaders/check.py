@@ -1080,7 +1080,9 @@ def cvt_f32_sat_test(tools, spirv):
 
 
 def mesh_w64x_test(tools, spirv, name):
-    """ms_w64x_ballot: ms_tri's picture, blue 0.5 only if the ballot/mbcnt compaction was exact across both halves."""
+    """ms_w64x_ballot: ms_tri's picture, blue 0.5 only if the ballot/mbcnt compaction was exact across both halves.
+    ms_wave_info_s3 draws the same picture; its wave id is LocalInvocationIndex >> 6, so it is judged on any
+    subgroup width, as run_gpu_tests.py does."""
     shader, fs = os.path.join(spirv, name + ".spv"), os.path.join(spirv, "fs_passthru.spv")
     if not (os.path.isfile(shader) and os.path.isfile(fs)):
         return Skip("SKIP (mesh shader: build it with scripts/run_gpu_tests.py, build.py does not)")
@@ -1106,7 +1108,8 @@ def mesh_w64x_test(tools, spirv, name):
     if len(data) != 64 * 64 * 16:
         return "vk_harness returned an unexpected pixel count"
     px = list(struct.iter_unpack("<4f", data))
-    if not W64_EMULATED and 64 not in [int(x) for x in re.findall(r"subgroup \d+\.\.(\d+)", r.stderr)]:
+    if (name == "ms_w64x_ballot" and not W64_EMULATED
+            and 64 not in [int(x) for x in re.findall(r"subgroup \d+\.\.(\d+)", r.stderr)]):
         return None   # the device has no 64-wide subgroups
     # A NaN fails every comparison, so each component must be within the tolerance, not merely not outside it.
     wrong = sum(not all(abs(v - w) <= 1e-3 for v, w in zip(p, (((i % 64) + .5) / 64, ((i // 64) + .5) / 64, .5, 1)))

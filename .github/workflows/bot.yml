@@ -1,0 +1,35 @@
+# /claim and /unclaim on task issues, and an hourly sweep: ready labels, expired claims, overdue fixes, merges.
+name: bot
+on:
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+concurrency:
+  group: bot-${{ github.event_name }}
+jobs:
+  command:
+    if: github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -I bot/main.py command
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  sweep:
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -I bot/main.py sweep
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

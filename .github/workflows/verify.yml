@@ -1,0 +1,16 @@
+# Runs the pull request's code, so it gets no secrets and a read-only token (pull_request, not _target).
+name: verify
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  fails-on-base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 -I tools/fails_on_base.py origin/${{ github.base_ref }} HEAD

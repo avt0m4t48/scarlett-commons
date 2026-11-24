@@ -525,7 +525,9 @@ class MainTest(unittest.TestCase):
 
     def test_relative_root_launches_the_artifact_from_its_working_directory(self):
         (self.artifact / "check_cwd.py").write_text(
-            "from pathlib import Path\nassert Path.cwd() == Path(__file__).resolve().parent\n",
+            # resolve() on both sides: on Windows tempfile hands out the 8.3 name (RUNNER~1) and the module's
+            # path resolves to the long one, so the two spellings differ while naming one folder.
+            "from pathlib import Path\nassert Path.cwd().resolve() == Path(__file__).resolve().parent\n",
             encoding="utf-8", newline="\n")
         entry = ctest_entry("ok", self.command("check_cwd.py"))
         with contextlib.chdir(self.root):

@@ -967,6 +967,17 @@ int check_xbox_slots() {
     EXPECT(mock->calls[12] == 2 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_COMPUTE);
     EXPECT(mock->args[12][2] == word(real_compute_allocator));
     EXPECT(release(list) == 0);
+
+    // A list interface the PC does not know (the retail title asks for a console one): the PC call gets the base
+    // list interface, the title gets the list proxy, and the proxy answers that interface afterwards too.
+    static const IID console_list_iid = {0x1234abcd, 0x5678, 0x9abc, {0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc}};
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&console_list_iid), word(&list))) == S_OK);
+    EXPECT(xs::is_command_list_proxy(list) && mock->calls[12] == 3);
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
+    void* again = nullptr;
+    EXPECT(static_cast<IUnknown*>(list)->QueryInterface(console_list_iid, &again) == S_OK && again == list);
+    EXPECT(release(again) == 1);
+    EXPECT(release(list) == 0);
     EXPECT(release(compute_allocator) == 0 && real_compute_allocator->refs == 0);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.

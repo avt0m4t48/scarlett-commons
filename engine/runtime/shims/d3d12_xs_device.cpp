@@ -1000,6 +1000,31 @@ inline bool is_list_iid(const IID& iid) {
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
 }
 
+// Console list interfaces a title created lists with through slot 73 (see proxy_create_command_list_x). The list
+// proxy answers them as itself, so a later QueryInterface for the interface the list was made with succeeds.
+SRWLOCK g_console_list_iids_lock = SRWLOCK_INIT;
+IID g_console_list_iids[8];
+unsigned g_console_list_iid_count = 0;
+
+void accept_console_list_iid(const IID& iid) {
+    AcquireSRWLockExclusive(&g_console_list_iids_lock);
+    bool known = false;
+    for (unsigned i = 0; i < g_console_list_iid_count && !known; ++i)
+        known = IsEqualIID(g_console_list_iids[i], iid) != 0;
+    if (!known && g_console_list_iid_count < std::size(g_console_list_iids))
+        g_console_list_iids[g_console_list_iid_count++] = iid;
+    ReleaseSRWLockExclusive(&g_console_list_iids_lock);
+}
+
+bool is_console_list_iid(const IID& iid) {
+    AcquireSRWLockShared(&g_console_list_iids_lock);
+    bool known = false;
+    for (unsigned i = 0; i < g_console_list_iid_count && !known; ++i)
+        known = IsEqualIID(g_console_list_iids[i], iid) != 0;
+    ReleaseSRWLockShared(&g_console_list_iids_lock);
+    return known;
+}
+
 inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
 
 inline void destroy_list(ListProxy* self) {
@@ -1021,6 +1046,11 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
+    if (is_console_list_iid(*riid)) {
+        *out = self;
+        list_add_ref(self);
+        return S_OK;
+    }
     if (!is_list_iid(*riid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
@@ -1476,15 +1506,25 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
         type = allocator_kind;
     }
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    void* created = nullptr;
-    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
-    if (hr == E_NOINTERFACE) {
-        // An interface the PC runtime does not know (a console-only list interface): create the base list; the
-        // proxy then answers riid itself or refuses it, and the refusal is logged there.
-        created = nullptr;
-        hr = self->real->CreateCommandList(0, type, allocator, initial_state, __uuidof(ID3D12GraphicsCommandList),
-                                           &created);
+    // The retail title asks slot 73 for a list interface the PC runtime does not know (a console list interface):
+    // the PC call with it fails, and refusing it stops the title on its own int3. Such a list is the PC base list in
+    // the list proxy; a call past the PC table is refused and logged by the proxy, so the next missing method shows.
+    const bool console_iid = !is_list_iid(*riid);
+    const IID& create_iid = console_iid ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    if (console_iid) {
+        accept_console_list_iid(*riid);
+        static std::atomic<bool> logged_iid{false};
+        if (first_call(logged_iid))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 73: console list interface "
+                         "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}: handing the list proxy over the PC "
+                         "base list\n",
+                         static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3, riid->Data4[0],
+                         riid->Data4[1], riid->Data4[2], riid->Data4[3], riid->Data4[4], riid->Data4[5],
+                         riid->Data4[6], riid->Data4[7]);
     }
+    void* created = nullptr;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, create_iid, &created);
     if (FAILED(hr)) {
         static std::atomic<bool> failed{false};
         if (first_call(failed))
@@ -1492,7 +1532,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
                          static_cast<int>(type), static_cast<unsigned long>(hr));
         return hr;
     }
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, &create_iid, out);
 }
 
 // Device slot 48, measured on the retail title: (desc, riid, out) with riid = IID_ID3D12CommandQueue. On the PC the

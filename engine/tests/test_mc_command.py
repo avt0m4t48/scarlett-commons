@@ -126,8 +126,80 @@ class SplitCommandTest(unittest.TestCase):
                              ["wsl", "-d", "Ubuntu", "-e", "/opt/llvm-21/bin/llvm-mc"])
 
     def test_mc_command_falls_back_to_the_path_name(self):
-        with mock.patch.dict(os.environ, {"LLVM_MC": ""}):
+        with mock.patch.dict(os.environ, {"LLVM_MC": ""}), \
+             mock.patch.object(mc_command.shutil, "which", return_value="/usr/bin/llvm-mc"):
             self.assertEqual(mc_command.mc_command(), ["llvm-mc"])
+
+    def test_mc_command_without_any_llvm_mc_keeps_the_plain_name(self):
+        with mock.patch.dict(os.environ, {"LLVM_MC": ""}), \
+             mock.patch.object(mc_command.shutil, "which", return_value=None), \
+             mock.patch.object(mc_command, "versioned_llvm_mc", return_value=None):
+            self.assertEqual(mc_command.mc_command(), ["llvm-mc"])
+
+
+def _executable(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+@unittest.skipIf(os.name == "nt", "versioned LLVM installs are a Linux distribution layout")
+class VersionedLlvmMcTest(unittest.TestCase):
+    """Debian and Ubuntu's llvm-<N> packages install llvm-mc-<N> and /usr/lib/llvm-<N>/bin/llvm-mc, not llvm-mc."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.bin = os.path.join(self.tmp.name, "bin")
+        self.lib = os.path.join(self.tmp.name, "lib")
+        os.makedirs(self.bin)
+        os.makedirs(self.lib)
+
+    def found(self):
+        pattern = os.path.join(self.lib, "llvm-*", "bin", "llvm-mc")
+        with mock.patch.dict(os.environ, {"PATH": self.bin, "LLVM_MC": ""}), \
+             mock.patch.object(mc_command, "DEBIAN_LLVM_MC", pattern):
+            return mc_command.versioned_llvm_mc(), mc_command.mc_command()
+
+    def test_nothing_installed(self):
+        self.assertEqual(self.found(), (None, ["llvm-mc"]))
+
+    def test_the_highest_version_wins_by_number_not_by_name(self):
+        _executable(os.path.join(self.bin, "llvm-mc-9"))
+        want = _executable(os.path.join(self.bin, "llvm-mc-21"))
+        _executable(os.path.join(self.lib, "llvm-19", "bin", "llvm-mc"))
+        self.assertEqual(self.found(), (want, [want]))
+
+    def test_the_debian_library_folder_counts(self):
+        want = _executable(os.path.join(self.lib, "llvm-22", "bin", "llvm-mc"))
+        _executable(os.path.join(self.bin, "llvm-mc-21"))
+        self.assertEqual(self.found(), (want, [want]))
+
+    def test_other_tools_and_non_executables_are_not_llvm_mc(self):
+        _executable(os.path.join(self.bin, "llvm-mca-23"))        # the machine-code analyser, not llvm-mc
+        _executable(os.path.join(self.bin, "llvm-mc-23.bak"))
+        with open(os.path.join(self.bin, "llvm-mc-24"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("not executable\n")
+        self.assertEqual(self.found(), (None, ["llvm-mc"]))
+
+    def test_the_plain_name_on_path_is_kept(self):
+        # A work folder records the command that disassembled it; one built with llvm-mc on PATH must keep that.
+        _executable(os.path.join(self.bin, "llvm-mc"))
+        _executable(os.path.join(self.bin, "llvm-mc-21"))
+        self.assertEqual(self.found()[1], ["llvm-mc"])
+
+    def test_llvm_mc_set_wins(self):
+        _executable(os.path.join(self.bin, "llvm-mc-21"))
+        with mock.patch.dict(os.environ, {"PATH": self.bin, "LLVM_MC": "/opt/llvm/bin/llvm-mc --flag"}):
+            self.assertEqual(mc_command.mc_command(), ["/opt/llvm/bin/llvm-mc", "--flag"])
+
+    def test_the_message_names_the_distribution_package_off_windows(self):
+        with mock.patch.object(mc_command.sys, "platform", "linux"):
+            message = mc_command.not_found("llvm-mc", FileNotFoundError(2, "No such file"))
+        self.assertIn("apt install llvm-21", message)
+        self.assertNotIn("build_llvm_mc.ps1", message)
 
 
 class MissingLlvmMcTest(unittest.TestCase):
@@ -146,8 +218,19 @@ class MissingLlvmMcTest(unittest.TestCase):
         message = str(cm.exception.code)
         self.assertIn(f"'{self.missing}' could not be started", message)
         self.assertIn("LLVM_MC", message)
-        self.assertIn("build_llvm_mc.ps1", message)
+        # The way to get one is the OS's own: the Windows build script there, a distribution package elsewhere.
+        self.assertIn(mc_command.install_hint(), message)
+        if os.name == "nt":
+            self.assertIn("build_llvm_mc.ps1", message)
+        else:
+            self.assertNotIn("build_llvm_mc.ps1", message)
         self.assertNotIn("--llvm-mc", message)   # only a tool that has the option names it
+
+    def test_windows_keeps_the_build_script_and_wsl_advice(self):
+        with mock.patch.object(mc_command.os, "name", "nt"):
+            hint = mc_command.install_hint()
+        self.assertIn("build_llvm_mc.ps1", hint)
+        self.assertIn("LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc", hint)
 
     def test_run_names_the_tools_own_option(self):
         with self.assertRaises(SystemExit) as cm:

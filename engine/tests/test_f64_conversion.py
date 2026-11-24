@@ -49,9 +49,8 @@ class F64ConversionTest(unittest.TestCase):
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
-        old_word = result(rf"OpLoad %uint {dest}")
-        masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+        # This straight-line fixture keeps EXEC full, so the result is stored directly.
+        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {word}$")
 
 
 if __name__ == "__main__":

@@ -255,6 +255,7 @@ int main(int argc, char** argv) {
         D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
     auto get_custom_heap = reinterpret_cast<XboxGetCustomHeapPropertiesFn>(proxy_vtbl[26]);
     const D3D12_HEAP_TYPE heap_types[] = {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK};
+    const auto slot26_hits_before = rt::d3d12_xs::device_slot_hits(26);
     bool console_returns_buffer = true, console_matches_pc = real != nullptr, console_writes_only_struct = true;
     for (const D3D12_HEAP_TYPE type : heap_types) {
         struct Padded {
@@ -272,15 +273,18 @@ int main(int argc, char** argv) {
     check(console_returns_buffer, "slot 26 console form returns the buffer's address");
     check(console_matches_pc, "slot 26 console form writes the PC device's DEFAULT, UPLOAD and READBACK properties");
     check(console_writes_only_struct, "slot 26 console form writes nothing past the struct");
-    check(rt::d3d12_xs::device_slot_hits(26) == 3, "slot 26 hit counter is 3");
+    check(rt::d3d12_xs::device_slot_hits(26) == slot26_hits_before + 3,
+          "slot 26 hit counter increases by three for the console calls");
     check(rt::d3d12_xs::is_device_proxy(device.Get()) && rt::d3d12_xs::device_proxy_real_device(device.Get()) == real,
           "the proxy is intact after the console-form calls");
     // A PC C++ call through the proxy (the proxy in RCX, the buffer in RDX) is still forwarded.
     const D3D12_HEAP_PROPERTIES pc_form = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
     const D3D12_HEAP_PROPERTIES pc_want = real ? real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD)
                                                : D3D12_HEAP_PROPERTIES{};
-    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0 && rt::d3d12_xs::device_slot_hits(26) == 4,
+    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0,
           "slot 26 PC form still forwards GetCustomHeapProperties");
+    check(rt::d3d12_xs::device_slot_hits(26) == slot26_hits_before + 4,
+          "slot 26 hit counter also includes the PC call");
 
     // Slot 14: descriptor heap through the proxy. The proxy wraps the real PC heap for the handle ABI.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};

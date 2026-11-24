@@ -140,6 +140,35 @@ def build_profile(dwords=None, account_id=0, total_size=PROFILE_PAYLOAD_SIZE):
 JSAV_HDR = 16
 JSAV_ENTRY = struct.Struct('<IIIII')  # hash, flags (1), reserved (0), absolute offset, size
 JSAV_SEP = b',\r\n'
+# A save's deepest object is a handful of levels. Since 3.14 the C JSON decoder is iterative and no longer raises
+# RecursionError on a deeply nested document, so the limit is explicit and not the interpreter's: 512 is far above
+# real data and below the depth at which Python's recursive encoder (json.dump in extract/pack) fails.
+JSON_NESTING_LIMIT = 512
+
+
+def json_nesting_exceeds(text, limit=JSON_NESTING_LIMIT):
+    """Whether the JSON text nests arrays and objects deeper than `limit`, ignoring brackets inside strings."""
+    if isinstance(text, (bytes, bytearray)):
+        text = bytes(text).decode("latin-1")   # the structural characters are ASCII, so this cannot fail
+    depth = 0
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
 
 
 def parse_jsav(d):
@@ -163,8 +192,10 @@ def parse_jsav(d):
         raise ValueError('JSAV body marker not found after the entry table') from None
     try:
         body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
+        if json_nesting_exceeds(body_text):
+            raise ValueError(f'nesting exceeds {JSON_NESTING_LIMIT} levels')
         _, json_end = json.JSONDecoder().raw_decode(body_text)
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
     # raw_decode returns a character offset, while the entry table uses byte offsets.
     # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
@@ -378,6 +409,8 @@ def pack_from_dir(src, refuse=None):
 
     text = source('index.json')
     try:
+        if json_nesting_exceeds(text):
+            raise ValueError(f'nesting exceeds {JSON_NESTING_LIMIT} levels')
         idx = json.loads(text)
     except (ValueError, RecursionError) as exc:
         raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
@@ -456,6 +489,8 @@ def verify(p):
     blocks = jsav_blocks(d, es)
     for index, b in enumerate(blocks):
         try:
+            if json_nesting_exceeds(b):
+                raise RecursionError
             json.loads(b)             # every block must be valid JSON on its own
         except RecursionError as e:
             raise ValueError(f'JSAV block {index} exceeds the JSON nesting limit') from e

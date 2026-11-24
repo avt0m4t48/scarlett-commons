@@ -438,6 +438,99 @@ class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
             gsc.rewrite(gs)
         self.assertIn("OpLoopMerge", str(ctx.exception))
 
+    def test_pc_tail_ubo_in_set1_binding0_shifts_capture_bindings(self):
+        # A GS translated with --pc-tail-ubo that reads the heap base or code base already binds %pc_tail as a
+        # Uniform block at (DescriptorSet 1, Binding 0). Lowering it to compute must shift %gsc_in, %gsc_rec, and
+        # %gsc_meta to Bindings 1, 2, 3 so no two variables share (set=1, binding=0) with different descriptor types.
+        gs_base = _make_gs([
+            "%entry = OpLabel",
+            "%p_tail = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %u2",
+            "%code_lo = OpLoad %uint %p_tail",
+            "OpStore %out_pos %v_a",
+            "OpEmitVertex",
+            "OpEndPrimitive",
+            "OpReturn",
+        ], max_verts=3)
+        gs_with_pc_tail = gs_base.replace(
+            'OpEntryPoint Geometry %main "main" %in_pos %out_pos',
+            'OpEntryPoint Geometry %main "main" %in_pos %out_pos %pc_tail',
+        ).replace(
+            "OpDecorate %out_pos BuiltIn Position",
+            "OpDecorate %out_pos BuiltIn Position\n"
+            "OpDecorate %PcTail Block\n"
+            "OpMemberDecorate %PcTail 0 Offset 0\n"
+            "OpMemberDecorate %PcTail 1 Offset 4\n"
+            "OpMemberDecorate %PcTail 2 Offset 8\n"
+            "OpMemberDecorate %PcTail 3 Offset 12\n"
+            "OpDecorate %pc_tail DescriptorSet 1\n"
+            "OpDecorate %pc_tail Binding 0",
+        ).replace(
+            "%main = OpFunction %void None %fn",
+            "%PcTail = OpTypeStruct %uint %uint %uint %uint\n"
+            "%_ptr_Uniform_PcTail = OpTypePointer Uniform %PcTail\n"
+            "%_ptr_Uniform_uint_tail = OpTypePointer Uniform %uint\n"
+            "%pc_tail = OpVariable %_ptr_Uniform_PcTail Uniform\n"
+            "%main = OpFunction %void None %fn",
+        )
+        out, lay = gsc.rewrite(gs_with_pc_tail)
+        maybe_validate_spirv(out)
+        self.assertEqual(lay.get("base_binding"), 1)
+        _, deco = gsc.parse(out)
+        set1_map = {}
+        for var, ds in deco.items():
+            if "DescriptorSet 1" in ds:
+                b = next(int(x.split()[1]) for x in ds if x.startswith("Binding "))
+                self.assertNotIn(b, set1_map, f"duplicate (DescriptorSet 1, Binding {b}) on {var} and {set1_map.get(b)}")
+                set1_map[b] = var
+        self.assertEqual(set1_map, {0: "%pc_tail", 1: "%gsc_in", 2: "%gsc_rec", 3: "%gsc_meta"})
+
+    def test_end_to_end_translated_gs_with_pc_tail_ubo(self):
+        # End-to-end check with tools/rdna2spirv.py (PC_TAIL_UBO = True) on gs_tri.asm reading the heap base
+        # via s_load_dword, lowered by tools/spirv_gs_to_compute.py and assembled with tools/spirv_asm.py.
+        import struct
+        import rdna2spirv
+
+        def sig_chunk(fourcc):
+            out = struct.pack("<II", 2, 8)
+            for reg, sysv in ((0, 1), (1, 0)):
+                out += struct.pack("<6I", 0, 0, 0, sysv, 3, reg) + bytes([0xF, 0xF, 0, 0]) + struct.pack("<I", 0)
+            return fourcc + struct.pack("<I", len(out)) + out
+
+        c0, c1 = sig_chunk(b"ISG1"), sig_chunk(b"OSG1")
+        gs_dxbc = (b"DXBC" + bytes(16) + struct.pack("<III", 1, 40 + len(c0) + len(c1), 2)
+                   + struct.pack("<II", 40, 40 + len(c0)) + c0 + c1)
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "disasm"))
+            src = os.path.join(d, "disasm", "gs_pctail.s")
+            with open(os.path.join(d, "gs_pctail.dxbc"), "wb") as f:
+                f.write(gs_dxbc)
+            with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+                raw = f.read()
+            lines = ["\t" + ln.strip() for ln in raw.splitlines()
+                     if ln.strip() and not ln.strip().startswith((";", "."))]
+            lines.insert(-1, "\ts_load_dword s10, s[0:1], 0x0")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("; gs_pctail\n" + "\n".join(lines) + "\n")
+            prev = rdna2spirv.PC_TAIL_UBO
+            rdna2spirv.PC_TAIL_UBO = True
+            try:
+                spvasm = rdna2spirv.translate(src)
+            finally:
+                rdna2spirv.PC_TAIL_UBO = prev
+        self.assertIn("OpDecorate %pc_tail DescriptorSet 1", spvasm)
+        self.assertIn("OpDecorate %pc_tail Binding 0", spvasm)
+        lowered, lay = gsc.rewrite(spvasm)
+        maybe_validate_spirv(lowered)
+        self.assertEqual(lay.get("base_binding"), 1)
+        _, deco = gsc.parse(lowered)
+        set1_map = {
+            next(int(x.split()[1]) for x in ds if x.startswith("Binding ")): var
+            for var, ds in deco.items()
+            if "DescriptorSet 1" in ds
+        }
+        self.assertEqual(set1_map, {0: "%pc_tail", 1: "%gsc_in", 2: "%gsc_rec", 3: "%gsc_meta"})
+
+
 
 if __name__ == "__main__":
     unittest.main()

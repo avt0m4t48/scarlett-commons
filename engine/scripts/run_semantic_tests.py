@@ -17,7 +17,8 @@ or on a single core, it runs that discover command itself. Prints the output of 
 line, and exits 1 if a file fails or none is found. Standard library only.
 
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
-`-j 1`. A timeout fails the run and reports any output already produced; other parallel modules keep running.
+`-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
+A timeout fails the run and reports any output already produced; other parallel modules keep running.
 The default has no time limit. This stops the direct test subprocess, not any descendants it may have started.
 """
 import argparse
@@ -30,6 +31,8 @@ import re
 import subprocess
 import sys
 import time
+
+MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 
 
 def test_modules(directory, pattern="test*.py"):
@@ -46,8 +49,9 @@ def test_modules(directory, pattern="test*.py"):
 
 def positive_seconds(value):
     seconds = float(value)
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise argparse.ArgumentTypeError("timeout must be a positive finite number of seconds")
+    if not math.isfinite(seconds) or not 0 < seconds <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"timeout must be a positive finite number of seconds no greater than {MAX_TIMEOUT_SECONDS} (24 hours)")
     return seconds
 
 
@@ -73,8 +77,8 @@ def main(argv=None):
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
     ap.add_argument("--timeout", type=positive_seconds, default=None, metavar="SECONDS",
-                    help="positive finite time limit per module subprocess, or for the whole discover subprocess "
-                         "with -j 1 (default: no limit)")
+                    help=f"positive finite time limit up to {MAX_TIMEOUT_SECONDS} seconds (24 hours) per module "
+                         "subprocess, or for the whole discover subprocess with -j 1 (default: no limit)")
     a = ap.parse_args(argv)
     directory = os.path.abspath(a.directory)
     modules = test_modules(directory, a.pattern)

@@ -75,6 +75,24 @@ class RunnerTest(unittest.TestCase):
                 self.assertIn("positive finite", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_out_of_range_timeout_is_rejected_before_running_the_suite(self):
+        for jobs in (1, 2):
+            for value in ("86400.1", "1e100"):
+                with self.subTest(jobs=jobs, value=value):
+                    result = cli("unused-suite", "-j", str(jobs), "--timeout=" + value)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("no greater than 86400", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("TIMED OUT", result.stdout + result.stderr)
+                    self.assertNotIn("no test*.py files", result.stdout)
+
+    def test_maximum_timeout_runs_a_passing_suite_in_both_modes(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_pass.py": PASS})
+                result = cli(tmp, "-j", str(jobs), "--timeout", "86400")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_custom_patterns_find_only_python_modules_in_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"case_one.py": "", "case_two.txt": "", "case_bad-name.py": "",

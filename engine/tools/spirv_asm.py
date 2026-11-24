@@ -251,6 +251,7 @@ def _u32_literal(tok: str, lineno: int) -> int:
 
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
+_DECIMAL_FLOAT_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\Z")
 _FLOAT_SPEC = {     # width -> (exponent bits, fraction bits, exponent bias)
     16: (5, 10, 15),
     32: (8, 23, 127),
@@ -322,13 +323,14 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         # zero, in the subnormal range too, and one too large for the type is an infinity.
         bits = _round_float(bool(sign), sig, exp, width, False)
         return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) if bits is None else bits
-    try:
-        fv = float(tok)
-    except ValueError as exc:
-        raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
-    if width == 64 or not math.isfinite(fv):
-        pack_fmt, unpack_fmt = {16: ("<e", "<H"), 32: ("<f", "<I"), 64: ("<d", "<Q")}[width]
-        return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
+    # The decimal spelling the C++ stream reads: no inf, nan or digit separators, which float() would also take.
+    if not _DECIMAL_FLOAT_RE.match(tok):
+        raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}")
+    fv = float(tok)
+    if math.isinf(fv):
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {width}-bit float")
+    if width == 64:
+        return struct.unpack("<Q", struct.pack("<d", fv))[0]
     # float() rounds the decimal once to a double, as strtod does. A narrower type is rounded from that double,
     # except where the double sits on a tie of the narrower type: the exact decimal breaks it, so the result is the
     # decimal rounded once to the nearest-even f32, as strtof (and so spirv-as) gives it.
@@ -341,7 +343,8 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         sig, den = abs(struct.unpack("<f", struct.pack("<I", bits))[0]).as_integer_ratio()
         bits = _round_float(negative, sig, 1 - den.bit_length(), 16, False)
     if bits is None:
-        return (int(negative) << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+        # A decimal that overflows the type is an error in spirv-as, not an infinity (a hex-float can spell one).
+        raise SpirvAsmError(f"line {lineno}: float literal {tok} is out of range for a {width}-bit float")
     return bits
 
 

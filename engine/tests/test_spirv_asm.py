@@ -757,6 +757,23 @@ class FloatLiteralTests(unittest.TestCase):
             ("f64", "0.1", [0x9999999A, 0x3FB99999]),
         ))
 
+    def test_decimal_that_overflows_or_is_not_finite_is_refused(self):
+        # old #4286: these were emitted as infinities (or NaN); spirv-as refuses each one.
+        for type_name, literal in (
+            ("f64", "1e400"), ("f64", "-1e400"), ("f64", "1.8e308"), ("f32", "1e39"), ("f32", "-3.4028236e38"),
+            ("f16", "65536"), ("f16", "1e5"), ("f32", "inf"), ("f32", "-inf"), ("f64", "nan"),
+            ("f64", "infinity"), ("f32", "1_0"),
+        ):
+            with self.subTest(type=type_name, literal=literal):
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 8: .*float literal"):
+                    _float_constant(type_name, literal)
+        # Underflow is not an error: the value rounds to zero, as strtod gives it.
+        self._check((
+            ("f64", "1.7976931348623157e308", [0xFFFFFFFF, 0x7FEFFFFF]), ("f64", "-1e-400", [0x00000000, 0x80000000]),
+            ("f32", "3.4028235e38", [0x7F7FFFFF]), ("f32", "1e-50", [0x00000000]), ("f16", "65504", [0x7BFF]),
+            ("f32", "1.", [0x3F800000]), ("f32", ".5", [0x3F000000]), ("f32", "+2E1", [0x41A00000]),
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

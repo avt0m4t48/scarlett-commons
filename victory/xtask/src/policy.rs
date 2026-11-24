@@ -28,10 +28,9 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+// Empty in Scarlett Commons: upstream's one exception, crates/victory-formats/src/bcpack-tables.bin, is not
+// distributed here; the runtime reads it from outside the repository (bcpack.rs, Tables::builtin).
+const EXCEPTIONS: &[(&str, &str)] = &[];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[

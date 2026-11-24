@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unicodedata
 import unittest
 from unittest.mock import Mock, patch
@@ -34,6 +35,42 @@ class ManifestSha256Test(unittest.TestCase):
 
         expected = hashlib.sha256(payload).hexdigest()
         self.assertEqual(manifest.sha256(path), expected)
+
+    def test_hashing_reuses_one_chunk_buffer(self):
+        # f.read() per chunk kept the previous chunk alive while the next was allocated: two chunks per worker at
+        # the peak. A file of several chunks plus a partial one has to hash right and stay near one chunk.
+        chunk = 1 << 20
+        payload = b"".join(bytes([i]) * chunk for i in range(1, 7)) + b"partial tail"
+        path = os.path.join(self.tmp.name, "chunks.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+        want = hashlib.sha256(payload).hexdigest()
+        del payload
+        with patch.object(manifest, "CHUNK", chunk):
+            tracemalloc.start()
+            try:
+                size, digest = manifest._hash_file(path)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        self.assertEqual((size, digest), (6 * chunk + 12, want))
+        self.assertLess(peak, chunk * 3 // 2, f"peak {peak} bytes for a {chunk}-byte chunk")
+
+    def test_hashing_follows_short_reads(self):
+        # readinto() may return fewer bytes than asked; every byte still has to be hashed exactly once.
+        payload = bytes(range(256)) * 41
+        path = os.path.join(self.tmp.name, "short.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        def open_short(name, mode, **kwargs):
+            stream = open(name, mode, **kwargs)
+            whole = stream.readinto
+            stream.readinto = lambda buffer: whole(buffer[:7])
+            return stream
+
+        with patch.object(manifest, "CHUNK", 1000), patch.object(manifest, "open", side_effect=open_short, create=True):
+            self.assertEqual(manifest._hash_file(path), (len(payload), hashlib.sha256(payload).hexdigest()))
 
     def test_sha256_empty_file(self):
         path = os.path.join(self.tmp.name, "empty.bin")
@@ -532,18 +569,18 @@ class ManifestAtomicCreateTest(unittest.TestCase):
         def open_with_edit(path, mode, **kwargs):
             stream = open(path, mode, **kwargs)
             if path == source and mode == "rb":
-                original_read = stream.read
+                original_readinto = stream.readinto
 
-                def read_then_edit(size):
-                    chunk = original_read(size)
-                    stream.read = original_read
+                def readinto_then_edit(buffer):
+                    count = original_readinto(buffer)
+                    stream.readinto = original_readinto
                     stamp = os.stat(source)
                     with open(source, "r+b") as f:
                         f.write(b"X")
                     os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
-                    return chunk
+                    return count
 
-                stream.read = read_then_edit
+                stream.readinto = readinto_then_edit
             return stream
 
         with patch.object(manifest, "open", side_effect=open_with_edit, create=True):

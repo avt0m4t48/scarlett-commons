@@ -192,6 +192,65 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             make_game.preflight(["pipelines"], self.work)
         build.assert_not_called()
 
+    def put_checker_older_than_its_source(self):
+        """runtime/build/linux/vk_pipeline_check built before its source last changed (a pull since the build)."""
+        build = os.path.join(self.root, "runtime", "build", "linux")
+        test = os.path.join(self.root, "runtime", "test")
+        os.makedirs(build)
+        os.makedirs(test)
+        checker = os.path.join(build, "vk_pipeline_check")
+        for path, text in ((checker, ""), (os.path.join(test, "vk_pipeline_check.cpp"), '#include "gate.h"\n'),
+                           (os.path.join(test, "gate.h"), "")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        os.utime(checker, (1_000_000, 1_000_000))
+        os.utime(os.path.join(test, "vk_pipeline_check.cpp"), (500_000, 500_000))
+        return checker
+
+    def test_a_checker_older_than_its_sources_is_rebuilt(self):
+        # Old #7148: a checker from before a pull was taken as it was, and the stage checked with the old program.
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assertEqual(make_game.stale_checker(checker), ["runtime/test/gate.h"])
+            make_game.preflight(["pipelines"], self.work, jobs=4)
+        build.assert_called_once_with(4)
+
+    def test_a_current_checker_in_the_build_folder_is_not_rebuilt(self):
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        future = os.path.getmtime(os.path.join(self.root, "runtime", "test", "gate.h")) + 60
+        os.utime(checker, (future, future))
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assertEqual(make_game.stale_checker(checker), [])
+            make_game.preflight(["pipelines"], self.work)
+        build.assert_not_called()
+
+    def test_a_stale_checker_without_cmake_is_used_with_a_warning(self):
+        self.write_shader_index()
+        checker = self.put_checker_older_than_its_source()
+        with mock.patch.object(make_game, "ROOT", self.root),                 mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"),                 mock.patch.object(make_game, "pipeline_check_exe", return_value=checker),                 mock.patch.object(make_game, "build_pipeline_check") as build:
+            make_game.preflight(["pipelines"], self.work)
+            build.assert_not_called()
+            with mock.patch.object(make_game, "log") as log,                     mock.patch.object(make_game, "checker_supports", side_effect=SystemExit(0)):
+                with self.assertRaises(SystemExit):
+                    make_game.pipelines(self.work, os.path.join(self.root, "out"))
+        warning = log.call_args_list[0].args[0]
+        self.assertIn("WARNING", warning)
+        self.assertIn("runtime/test/gate.h", warning)
+        self.assertIn("cmake --build runtime/build/linux --target vk_pipeline_check", warning)
+
+    def test_a_checker_outside_the_build_folder_is_not_compared(self):
+        # --runtime-build and the like: their time stamps say nothing about this checkout's sources.
+        self.put_checker_older_than_its_source()
+        elsewhere = os.path.join(self.root, "elsewhere", "vk_pipeline_check")
+        os.makedirs(os.path.dirname(elsewhere))
+        with open(elsewhere, "w", encoding="utf-8"):
+            pass
+        os.utime(elsewhere, (1_000_000, 1_000_000))
+        with mock.patch.object(make_game, "ROOT", self.root):
+            self.assertEqual(make_game.stale_checker(elsewhere), [])
+
     def test_the_build_uses_the_readme_folder(self):
         with mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.object(make_game, "log"), \

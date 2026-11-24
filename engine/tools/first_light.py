@@ -50,6 +50,8 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
+sys.path.insert(0, TOOLS)   # python -I leaves the script's own folder off sys.path
+from stale_build import newer_sources  # noqa: E402
 
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
@@ -584,6 +586,24 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
     return found
 
 
+def warn_if_stale(harness: str) -> str:
+    """`harness`, after a warning when it is a build in this checkout's runtime/build older than vk_harness's sources
+    (a pull since it was built): it would draw with the old harness and say nothing. A harness outside runtime/build
+    (--harness or LEONIDA_VK_HARNESS naming another folder) isn't compared."""
+    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
+    try:
+        ours = os.path.commonpath([build, os.path.abspath(harness)]) == build
+    except ValueError:   # another drive
+        ours = False
+    newer = newer_sources(harness, ROOT, "vk_harness") if ours else []
+    if newer:
+        more = f" and {len(newer) - 3} more" if len(newer) > 3 else ""
+        print(f"WARNING: {harness} is older than {', '.join(newer[:3])}{more}; rebuild it "
+              f"(cmake --build <build folder> --target vk_harness) to draw with this checkout's harness",
+              file=sys.stderr)
+    return harness
+
+
 def find_harness(explicit: str | None) -> str:
     executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
     build = os.path.join(ROOT, "runtime", "build")
@@ -594,11 +614,11 @@ def find_harness(explicit: str | None) -> str:
         *(os.path.join(folder, executable) for folder in build_dirs),
     ):
         if candidate and os.path.isfile(candidate):
-            return candidate
+            return warn_if_stale(candidate)
     for folder in build_dirs:
         configured = find_test_program(folder, "vk_harness")
         if configured:
-            return os.path.join(configured, executable)
+            return warn_if_stale(os.path.join(configured, executable))
     raise SystemExit(
         "vk_harness not found: build runtime/build/linux or runtime/build/windows (target vk_harness), "
         "or set --harness/LEONIDA_VK_HARNESS"

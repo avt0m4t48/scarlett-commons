@@ -78,9 +78,9 @@ def build_archive(cache, drop_tail=False, tail=True):
     return bytes(data)
 
 
-def run(*args):
+def run(*args, env=None):
     return subprocess.run(
-        [sys.executable, "-I", TOOL, *args], capture_output=True, text=True
+        [sys.executable, "-I", TOOL, *args], capture_output=True, text=True, env=env
     )
 
 
@@ -145,7 +145,12 @@ class PsocacheExtractTest(unittest.TestCase):
 
     def test_output_outside_the_temp_directory_is_refused(self):
         outside = os.path.join(ROOT, "psocache_should_not_exist.bin")
-        p = run(self.archive, outside)
+        self.addCleanup(lambda: os.path.exists(outside) and os.unlink(outside))
+        # Pin the tool's temporary directory to a fresh one: the check compares against the system temporary
+        # directory, and a checkout that lives under /tmp (or %TEMP%) would make ROOT itself look "inside" it.
+        tool_tmp = os.path.join(self.tmp.name, "tool-tmp")
+        os.mkdir(tool_tmp)
+        p = run(self.archive, outside, env=dict(os.environ, TMPDIR=tool_tmp))
         self.assertEqual(p.returncode, 2)
         self.assertIn("temporary directory", p.stderr)
         self.assertFalse(os.path.exists(outside))

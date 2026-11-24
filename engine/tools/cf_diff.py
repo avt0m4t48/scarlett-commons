@@ -64,6 +64,10 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 DATA = (1, 2, 3, 8, 9)            # VGPRs the bodies compute on (v0 = lane id is kept intact)
 SREGS = (10, 11, 12, 13)          # uniform SGPRs the bodies compute on
 CCS = ("eq", "ne", "lt", "le", "gt", "ge")
+# VOPC has v_cmp_ne_*; SOPC does not: the RDNA2 encoding for "not equal" is s_cmp_lg_*
+# (rdna2spirv correctly refuses s_cmp_ne_*, tests/semantic/test_sopc_validation.py). Map the
+# condition where the fuzzer emits a scalar compare, or a seeded program is skipped as unsupported.
+SCALAR_CC = {"ne": "lg"}
 VOP3 = ("v_mul_lo_u32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32")
 
 
@@ -315,7 +319,7 @@ class Emitter:
         elif kind == "sif":
             _, (cc, sr, k), on_one, then, other = n
             els, end = self.label(), self.label()
-            self.ins(f"s_cmp_{cc}_u32 s{sr}, {k}")
+            self.ins(f"s_cmp_{SCALAR_CC.get(cc, cc)}_u32 s{sr}, {k}")
             self.br("s_cbranch_scc0" if on_one else "s_cbranch_scc1", els if other else end)
             self.nodes(then)
             if other:

@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -64,13 +65,13 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 }
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
-    void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    Ref<ID3D12Device> proxy;
+    real_device->AddRef();  // create_device_proxy takes ownership of one reference on success
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy.p))) || !proxy.p) {
+        real_device->Release();  // the caller keeps its reference on failure
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
-    Ref<ID3D12Device> proxy;
-    proxy.p = static_cast<ID3D12Device*>(proxy_raw);
 
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
@@ -90,7 +91,14 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    // The proxy's own GetCPUDescriptorHandleForHeapStart answers the console (RAX) convention; this test is a PC
+    // caller, so read the wrapped heap's PC method. The address proves slot 14 passed the console VA through.
+    ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap.p);
+    if (!real) {
+        std::fprintf(stderr, "heap proxy has no real heap\n");
+        return false;
+    }
+    const auto cpu = real->GetCPUDescriptorHandleForHeapStart();
     if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
                      static_cast<unsigned long long>(cpu.ptr),

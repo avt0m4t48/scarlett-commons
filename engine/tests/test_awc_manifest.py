@@ -355,13 +355,26 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
-    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+    def test_read_only_manifest_is_refused_without_staging_a_file(self):
+        # The writer opens the destination for writing first, to keep the direct writer's permission check. A
+        # read-only manifest raises there, before anything is staged, so the directory stays as it was.
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'
         with open(out, "w", encoding="utf-8") as f:
             f.write(previous)
         os.chmod(out, 0o444)
         self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        with self.assertRaises(OSError):
+            awc_manifest.write_manifest([], 0, 0, "json", out)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
+
+    def test_failed_replace_removes_the_staging_file_and_keeps_the_manifest(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(previous)
         made_writable = []
         real_chmod = os.chmod
 

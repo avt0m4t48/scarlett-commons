@@ -3,6 +3,7 @@
     python -I tests/test_rdna2spirv_index_write.py
 """
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -86,6 +87,42 @@ class WriteIndexTest(unittest.TestCase):
         self.assertEqual(len(set(staged)), 2)
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), self.index)
         self.assertEqual(list(self.out.iterdir()), [self.path])
+
+    def test_posix_mode_is_applied_before_publication(self):
+        real_replace = R.replace_retry
+        def publish(source, destination):
+            mode.assert_called_once_with(str(self.path))
+            chmod.assert_called_once_with(source, 0o640)
+            real_replace(source, destination)
+
+        with patch.object(R.os, "name", "posix"), \
+                patch.object(R, "published_mode", return_value=0o640, create=True) as mode, \
+                patch.object(R.os, "chmod") as chmod, \
+                patch.object(R, "replace_retry", side_effect=publish):
+            R.write_index(str(self.path), self.index)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), self.index)
+
+    def test_mode_error_preserves_index_and_removes_staging(self):
+        for operation in ("mode", "chmod"):
+            with self.subTest(operation=operation):
+                with patch.object(R.os, "name", "posix"), \
+                        patch.object(R, "published_mode", return_value=0o640, create=True) as mode, \
+                        patch.object(R.os, "chmod") as chmod:
+                    (mode if operation == "mode" else chmod).side_effect = OSError("mode failed")
+                    with self.assertRaisesRegex(OSError, "mode failed"):
+                        R.write_index(str(self.path), self.index)
+                self.assert_previous_only()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_permissions_of_existing_and_new_indexes(self):
+        os.chmod(self.path, 0o640)
+        R.write_index(str(self.path), self.index)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
+        self.path.unlink()
+        probe = self.out / "ordinary-file"
+        probe.write_bytes(b"")
+        R.write_index(str(self.path), self.index)
+        self.assertEqual(self.path.stat().st_mode & 0o777, probe.stat().st_mode & 0o777)
 
 
 if __name__ == "__main__":

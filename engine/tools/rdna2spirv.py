@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import fssm_unpack  # noqa: E402
@@ -18645,6 +18646,8 @@ def write_index(path, index):
             _json.dump(index, f, indent=0, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
+        if os.name != "nt":
+            os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
         replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
     except BaseException:
         if tmp is not None:

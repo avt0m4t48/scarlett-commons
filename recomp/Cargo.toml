@@ -11,3 +11,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 iced-x86 = "1"
 serde_json = "1"
+commons-recomp-emit = { path = "emit" }
+
+[build-dependencies]
+commons-recomp-emit = { path = "emit" }
+iced-x86 = { version = "1", features = ["code_asm"] }

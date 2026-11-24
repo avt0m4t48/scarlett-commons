@@ -2,14 +2,12 @@
 //! iced-x86 (MIT), counted against what the track B emitter covers. It reads the file and never runs it; the report
 //! holds counts only, no code.
 //!
-//! "Covered" is the integer subset the PC emitter starts with (#157): moves, integer arithmetic and logic, shifts,
-//! compares, conditional moves and sets, direct branches, calls, push/pop and return, with general-purpose registers
-//! and memory only. A function is fully covered when every instruction is; a leaf is one without calls, the first
-//! functions track B can take with generated inputs alone.
+//! "Covered" is what the track B emitter translates (commons-recomp-emit, the one definition): today its v1 integer
+//! subset, without calls. A function is fully covered when every instruction is; a leaf is one without calls.
 
 use std::collections::BTreeMap;
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,38 +101,9 @@ impl<'a> Image<'a> {
     }
 }
 
-/// Whether the track B emitter covers this instruction (see the module comment).
+/// Whether the track B emitter covers this instruction: the emitter's own definition (commons-recomp-emit).
 pub fn covered(i: &Instruction) -> bool {
-    use Mnemonic::*;
-    let gpr_only = (0..i.op_count()).all(|n| match i.op_kind(n) {
-        OpKind::Register => {
-            let r = i.op_register(n);
-            r.is_gpr() || r == Register::None
-        }
-        OpKind::Memory => i.memory_segment() != Register::FS && i.memory_segment() != Register::GS,
-        _ => true, // immediates and near branch targets
-    });
-    if !gpr_only {
-        return false;
-    }
-    match i.flow_control() {
-        FlowControl::ConditionalBranch => return !matches!(i.mnemonic(), Jrcxz | Jecxz | Loop | Loope | Loopne),
-        FlowControl::UnconditionalBranch | FlowControl::Return => return true,
-        FlowControl::Call => return i.op0_kind() == OpKind::NearBranch64,
-        FlowControl::IndirectBranch | FlowControl::IndirectCall | FlowControl::Interrupt | FlowControl::XbeginXabortXend
-        | FlowControl::Exception => return false,
-        FlowControl::Next => {}
-    }
-    let name = format!("{:?}", i.mnemonic());
-    if name.starts_with("Set") || name.starts_with("Cmov") {
-        return true;
-    }
-    matches!(
-        i.mnemonic(),
-        Mov | Movzx | Movsx | Movsxd | Lea | Add | Sub | Adc | Sbb | And | Or | Xor | Not | Neg | Inc | Dec | Cmp
-            | Test | Shl | Shr | Sar | Rol | Ror | Imul | Mul | Push | Pop | Nop | Xchg | Bt | Cdq | Cdqe | Cqo | Cwde
-            | Cwd | Cbw
-    )
+    commons_recomp_emit::supported(i)
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -228,10 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_call_is_covered_but_not_a_leaf() {
-        // call rel32; ret
+    fn a_call_is_not_covered_yet() {
+        // call rel32; ret: the emitter has no calls in v1
         let (n, ok, _, full, calls) = code(&[0xE8, 0, 0, 0, 0, 0xC3]);
-        assert_eq!((n, ok, full, calls), (2, 2, true, true));
+        assert_eq!((n, ok, full, calls), (2, 1, false, true));
     }
 
     #[test]

@@ -6,10 +6,18 @@ version = 4
 name = "commons-recomp"
 version = "0.1.0"
 dependencies = [
+ "commons-recomp-emit",
  "iced-x86",
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "commons-recomp-emit"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
 ]
 
 [[package]]

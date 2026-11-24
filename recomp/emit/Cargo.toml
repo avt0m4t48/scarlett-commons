@@ -1,0 +1,10 @@
+[package]
+name = "commons-recomp-emit"
+description = "Track B: x86-64 functions to Rust source, generated on the player's machine from their own copy."
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+iced-x86 = "1"

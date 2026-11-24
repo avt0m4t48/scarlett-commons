@@ -14,6 +14,8 @@
 //! `COMMONS_TRACK=a` installs nothing (the title runs as track A alone); `COMMONS_ONLY=name[,name]` installs just those.
 //! No game code or data is kept here: addresses, byte signatures and names are interoperability facts.
 
+pub mod census;
+
 use std::collections::BTreeMap;
 use std::fmt;
 

@@ -39,6 +39,8 @@ META_HEADS = ("5053494e", "52424630")                # PSIN, RBF0
 NEW_STREAM_HEADS = META_HEADS + ("3c3f786d6c", "efbbbf3c3f786d6c")
 # A stream whose inflated size is a non-zero multiple of this continues in the next one (docs/page_directory.md).
 CONTINUATION_BLOCK = 65536
+# Archives harvested fully when --archives is not given. A partial carve may lack some of them: that is not an error.
+DEFAULT_ARCHIVES = "common,data,script,pack_story000_story000_script,textures"
 
 
 def joaat(s: str) -> int:
@@ -75,7 +77,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
     ap.add_argument("--out", default="hashes.json")
-    ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
+    ap.add_argument("--archives", help=f"comma-separated archives to harvest fully (default: {DEFAULT_ARCHIVES})")
     ap.add_argument("--extra", nargs="*", default=[])
     ap.add_argument("--min", type=int, default=3)
     ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
@@ -118,6 +120,16 @@ def main():
         archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
     else:
         archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
+    # "common, data" names "common" and "data". An archive named on the command line that is not in the carve is
+    # a typo or the wrong folder, not a partial carve: refuse it rather than harvest without it. The default list
+    # may name archives a partial carve lacks.
+    full = {x.strip() for x in (DEFAULT_ARCHIVES if a.archives is None else a.archives).split(",")} - {""}
+    if a.archives is not None:
+        found = [arch for arch, d in archives if os.path.isfile(os.path.join(d, "index.json"))]
+        unknown = sorted(full.difference(found))
+        if unknown:
+            ap.error(f"--archives: {', '.join(unknown)} not found in {a.carve} "
+                     f"(archives there: {', '.join(found) or 'none'})")
     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
     # samefile also catches a case-only difference on Windows and macOS's default volume.
     if os.path.exists(a.out):
@@ -140,7 +152,6 @@ def main():
     except OSError:
         output_stat = None
     strings = set()
-    full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
     for arch, arch_dir in archives:
         p = os.path.join(arch_dir, "index.json")

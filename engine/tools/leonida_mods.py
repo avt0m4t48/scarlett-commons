@@ -68,11 +68,14 @@ class ModInfo:
 
 
 def joaat(name: str) -> int:
-    """RAGE's joaat over the name's UTF-8 bytes, ASCII-lowercased like the C++ runtime."""
+    """RAGE's joaat over the lowercased latin-1 bytes, the rule ``tools/hashdict.py`` (the pinned name
+    dictionary) and every other name-hashing tool use.
+
+    Encoding to UTF-8 first gives a different hash for any non-ASCII character (``é`` is one byte 0xE9, not
+    0xC3 0xA9), so a model or swap name written with an accent would resolve to an id nothing in the package
+    has. Characters outside latin-1 hash as ``?``, as ``hashdict.joaat`` does."""
     h = 0
-    for byte in name.encode("utf-8"):
-        if 0x41 <= byte <= 0x5A:
-            byte += 0x20
+    for byte in name.lower().encode("latin-1", "replace"):
         h = (h + byte) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6

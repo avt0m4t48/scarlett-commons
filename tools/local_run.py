@@ -222,6 +222,10 @@ def main():
     timed_out, exit_code = False, None
     if os.path.isfile(runtime):
         env = dict(os.environ, LEONIDA_CRASH_FILE=crash_file)
+        # The engine's own D3D12-on-Vulkan device is the one that implements the console's resource slots
+        # (CreatePlacedResourceX and others); the host D3D12 device refuses them. LEONIDA_D3D12=host keeps the host one.
+        env.setdefault("LEONIDA_D3D12", "vulkan")
+        print(f"== D3D12 device: {env['LEONIDA_D3D12']} (set LEONIDA_D3D12 to choose)")
         print(f"== running for up to {a.seconds} s")
         p = subprocess.Popen([runtime, "--run", exe, "--game-dir", a.game, "--overlay", os.path.join(work, "overlay"),
                               "--trace", trace], env=env)

@@ -1563,6 +1563,18 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+// A console descriptor heap carries a size as well as an address, and that size is 32 bytes per descriptor. A PC
+// desc's trailing words are whatever the caller holds next; they do not encode NumDescriptors * 32, so this
+// separates the two layouts without guessing anything about the address itself.
+static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, std::uint64_t address,
+                                         std::uint64_t size) {
+    constexpr std::uint64_t kConsoleDescriptorSize = 32;
+    if (address == 0 || size == 0) return false;
+    if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFull / kConsoleDescriptorSize)) return false;
+    if (size != static_cast<std::uint64_t>(desc->NumDescriptors) * kConsoleDescriptorSize) return false;
+    return true;
+}
+
 static bool readable_range(const void* ptr, std::size_t bytes) {
     if (!ptr || !bytes) return false;
     const auto* p = static_cast<const std::uint8_t*>(ptr);
@@ -1602,9 +1614,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. A non-zero word is not evidence
+            // of that layout - the bytes after a PC desc are whatever the caller holds next, and they are almost
+            // always readable and non-zero. The size has to agree with the descriptor count for the path to be taken.
+            if (console_heap_range_plausible(desc, address, size)) {
                 const ConsoleDescriptorHeapHandler handler =
                     g_console_descriptor_heap.load(std::memory_order_acquire);
                 if (handler) {

@@ -5769,7 +5769,7 @@ class Gen:
         store is done before the wave issues it, but here the other half could load before this half has stored
         (#1587: valu_fuzz --family mem --emulate, lanes 32-63 read the fill pattern). Not ordered: sampling an
         image the wave wrote."""
-        if op in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32"):
+        if op in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32", "ds_nop"):
             return
         if op.startswith("ds_"):
             kind = "lds"

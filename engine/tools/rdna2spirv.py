@@ -18634,12 +18634,25 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
 def write_index(path, index):
     """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
     one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
-    tmp = path + ".tmp"     # must not end in .json: --merge globs index.part*.json
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        _json.dump(index, f, indent=0, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-    replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
+    tmp = None
+    try:
+        # Unique per writer, and not a .json file: --merge globs index.part*.json.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=os.path.dirname(os.path.abspath(path)),
+            prefix=".index-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = f.name
+            _json.dump(index, f, indent=0, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
+        replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
+    except BaseException:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
 
 
 class ShardSetError(Exception):

@@ -29,9 +29,9 @@
 <rect x="110.0" y="225" width="470.0" height="16" fill="#d0d7de"/>
 <text x="588" y="237" fill="#57606a">0/1</text>
 <text x="10" y="263" fill="#1f2328">infra</text>
-<rect x="110.0" y="251" width="261.1" height="16" fill="#2da44e"/>
-<rect x="371.1" y="251" width="208.9" height="16" fill="#d0d7de"/>
-<text x="588" y="263" fill="#57606a">5/9</text>
+<rect x="110.0" y="251" width="299.1" height="16" fill="#2da44e"/>
+<rect x="409.1" y="251" width="170.9" height="16" fill="#d0d7de"/>
+<text x="588" y="263" fill="#57606a">7/11</text>
 <text x="10" y="289" fill="#1f2328">docs</text>
 <rect x="110.0" y="277" width="470.0" height="16" fill="#2da44e"/>
 <text x="588" y="289" fill="#57606a">2/2</text>

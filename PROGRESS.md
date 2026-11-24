@@ -1,8 +1,8 @@
 # Progress
 
-Generated 2026-11-24 10:07 UTC from the task board by `tools/progress.py`. Do not edit by hand.
+Generated 2026-11-24 10:58 UTC from the task board by `tools/progress.py`. Do not edit by hand.
 
-**9 of 32 tasks done** `██████··············` · 0 in progress · 15 ready to take · 8 waiting on others · 6 pull requests merged by 1 contributors
+**11 of 34 tasks done** `██████··············` · 0 in progress · 15 ready to take · 8 waiting on others · 8 pull requests merged by 1 contributors
 
 ![Tasks by area](images/progress.svg)
 
@@ -12,11 +12,11 @@ Legend: ✅ done · 🔨 in progress · 🟦 ready to take · ⏳ waiting on oth
 
 | Phase | What it means | Progress | Done |
 |---|---|---|---:|
-| 0. Foundation | the bot, the rules and the docs that let anyone join | `██████████` | 7/7 |
+| 0. Foundation | the bot, the rules and the docs that let anyone join | `██████████` | 8/8 |
 | 1. Shared knowledge | tests that define correct behaviour, checked on real hardware | `█·········` | 2/19 |
 | 2. Adapters | running other projects' translators against those tests | `··········` | 0/6 |
 | 3. Upstream fixes | fixing what the tests find, in the projects themselves | `··········` | 0/0 |
-| 4. Shared components | pieces several projects need and nobody has yet | `··········` | 0/0 |
+| 4. Shared components | pieces several projects need and nobody has yet | `██████████` | 1/1 |
 
 ## Areas
 
@@ -30,7 +30,7 @@ Legend: ✅ done · 🔨 in progress · 🟦 ready to take · ⏳ waiting on oth
 | storage | `··········` | 0 | 0 | 1 | 0 |
 | input | `··········` | 0 | 0 | 1 | 0 |
 | platforms | `··········` | 0 | 0 | 0 | 1 |
-| infra | `██████····` | 5 | 0 | 0 | 4 |
+| infra | `██████····` | 7 | 0 | 0 | 4 |
 | docs | `██████████` | 2 | 0 | 0 | 0 |
 
 ## Phase 0: Foundation
@@ -46,6 +46,7 @@ Legend: ✅ done · 🔨 in progress · 🟦 ready to take · ⏳ waiting on oth
 | ✅ | [#13](https://github.com/scarlett-commons/scarlett-commons/issues/13) Foundation docs: roadmap, architecture, getting started, translations, progress page | docs | @DeSunShine |
 | ✅ | [#31](https://github.com/scarlett-commons/scarlett-commons/issues/31) Finish phase 0: protected rules, batch PR testing, visual progress, mirror, maintainer proposals, community files | infra | @DeSunShine |
 | ✅ | [#38](https://github.com/scarlett-commons/scarlett-commons/issues/38) Presentation: README redesign, detailed progress page, badges, translations of key docs, reverse-engineering tools in the landscape | docs | @DeSunShine |
+| ✅ | [#44](https://github.com/scarlett-commons/scarlett-commons/issues/44) Title runs by build hash, engine upstream sync, recompiler direction in the docs | infra | @DeSunShine |
 
 ## Phase 1: Shared knowledge
 
@@ -86,6 +87,14 @@ Legend: ✅ done · 🔨 in progress · 🟦 ready to take · ⏳ waiting on oth
 | ⏳ | [#33](https://github.com/scarlett-commons/scarlett-commons/issues/33) Adapter: VIctory shader recompiler (DXIL) | infra | — |
 | ⏳ | [#34](https://github.com/scarlett-commons/scarlett-commons/issues/34) Adapter: Xbox2Windows (DXIL) and five-star-recomp (HLSL) | infra | — |
 
+## Phase 4: Shared components
+
+*Pieces several projects need and nobody has yet.*
+
+| | Task | Area | Who |
+|---|---|---|---|
+| ✅ | [#42](https://github.com/scarlett-commons/scarlett-commons/issues/42) Import the recompiler engine from the Leonida continuation, with history | infra | @DeSunShine |
+
 ## Test cases
 
 | Group | Cases |
@@ -99,10 +108,16 @@ Legend: ✅ done · 🔨 in progress · 🟦 ready to take · ⏳ waiting on oth
 
 No reports yet. See docs/results.md.
 
+## Title runs
+
+No reports yet. See docs/title-runs.md.
+
 ## Recently merged
 
 | Date | Pull request | Author |
 |---|---|---|
+| 2026-11-24 | [#45](https://github.com/scarlett-commons/scarlett-commons/pull/45) Title runs by build hash, engine upstream sync, recompiler in README and ROADMAP | @DeSunShine |
+| 2026-11-24 | [#43](https://github.com/scarlett-commons/scarlett-commons/pull/43) Import the recompiler engine from the Leonida continuation, with history | @DeSunShine |
 | 2026-11-24 | [#41](https://github.com/scarlett-commons/scarlett-commons/pull/41) Presentation: README redesign, detailed progress page, badges, translations, RE tools | @DeSunShine |
 | 2026-11-24 | [#37](https://github.com/scarlett-commons/scarlett-commons/pull/37) Shared test format, validator and the first three cases | @DeSunShine |
 | 2026-11-24 | [#36](https://github.com/scarlett-commons/scarlett-commons/pull/36) Finish phase 0: protected rules, batch PR testing, visual progress, mirror, community files | @DeSunShine |
@@ -114,6 +129,6 @@ No reports yet. See docs/results.md.
 
 | Contributor | Merged pull requests |
 |---|---:|
-| @DeSunShine | 6 |
+| @DeSunShine | 8 |
 
 Take a ready task: see docs/getting-started.md.

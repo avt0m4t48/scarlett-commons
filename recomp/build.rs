@@ -3,12 +3,18 @@
 
 use iced_x86::code_asm::*;
 
-const IP: u64 = 0x1000_0000;
+/// RVAs: the cases at 0x1000, the native callee the call cases call at 0x2000; the test maps them at a base.
+const IP: u64 = 0x1000;
+const CALLEE: u64 = 0x2000;
 
-fn assemble(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
+fn assemble_at(ip: u64, build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
     let mut a = CodeAssembler::new(64).expect("assembler");
     build(&mut a).expect("assemble");
-    a.assemble(IP).expect("encode")
+    a.assemble(ip).expect("encode")
+}
+
+fn assemble(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
+    assemble_at(IP, build)
 }
 
 fn main() {
@@ -46,9 +52,23 @@ fn main() {
             a.cmp(rcx, rdx)?; a.cmovg(rax, rcx)?; a.cmovle(rax, rdx)?; a.cmovb(esi, edi)?; a.neg(r8)?;
             a.not(r9)?; a.inc(r10)?; a.dec(r11d)?; a.xchg(r12, r13)?; a.ret()
         })),
+        ("call", 0x8c1, assemble(|a| {
+            a.push(rbx)?; a.mov(rbx, rcx)?; a.mov(rcx, rdx)?; a.mov(rdx, rbx)?; a.call(CALLEE)?;
+            a.add(rax, rbx)?; a.pop(rbx)?; a.ret()
+        })),
+        ("call_indirect", 0x8c1, assemble(|a| {
+            a.push(rbx)?; a.mov(rbx, rcx)?; a.call(r15)?; a.sub(rax, rbx)?; a.mov(rcx, r9)?; a.pop(rbx)?; a.ret()
+        })),
     ];
+    // The native callee of the call cases: it reads three arguments and leaves volatile registers changed.
+    let callee = assemble_at(CALLEE, |a| {
+        a.lea(rax, qword_ptr(rcx + rdx))?; a.add(rax, r8)?; a.mov(r9, rax)?; a.xor(r10d, r10d)?; a.ret()
+    });
     let mut out = String::from(commons_recomp_emit::PRELUDE);
     out += "pub struct Case { pub name: &'static str, pub flags: u64, pub code: &'static [u8], pub translated: unsafe fn(&mut Ctx) }\n";
+    out += &format!(
+        "pub const CALLEE: &[u8] = &{callee:?};\npub const CODE_RVA: u64 = {IP:#x};\npub const CALLEE_RVA: u64 = {CALLEE:#x};\n"
+    );
     let mut table = String::from("pub const CASES: &[Case] = &[\n");
     for (name, flags, code) in &cases {
         let f = format!("t_{name}");

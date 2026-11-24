@@ -197,10 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn a_call_is_not_covered_yet() {
-        // call rel32; ret: the emitter has no calls in v1
+    fn a_call_is_covered_but_not_a_leaf() {
+        // call rel32; ret: calls go through call_native, so the function is covered, and it is no leaf
         let (n, ok, _, full, calls) = code(&[0xE8, 0, 0, 0, 0, 0xC3]);
-        assert_eq!((n, ok, full, calls), (2, 1, false, true));
+        assert_eq!((n, ok, full, calls), (2, 2, true, true));
     }
 
     #[test]

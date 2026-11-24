@@ -11,8 +11,9 @@
 //!
 //! Covered today (v1): mov, movzx, movsx, movsxd, lea, add, sub, and, or, xor, cmp, test, inc, dec, neg, not,
 //! shl/shr/sar on 32- and 64-bit operands, jcc (without parity) and jmp to an instruction of the same function, ret,
-//! push and pop of 64-bit values, setcc, cmovcc, xchg of two registers, nop; general-purpose registers (not AH-DH) and
-//! memory without FS/GS. Not yet: calls, the remaining integer instructions, SIMD. Shifts by a count above 1 leave OF
+//! push and pop of 64-bit values, setcc, cmovcc, xchg of two registers, nop, and calls (direct and indirect, through
+//! `call_native`: the callee runs natively and a replaced callee is reached through its own patched entry); general-purpose registers (not AH-DH) and
+//! memory without FS/GS. Not yet: the remaining integer instructions, SIMD. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -33,6 +34,118 @@ pub struct Ctx {
     pub sf: bool,
     pub of: bool,
     pub ret: u64,
+    pub host_rsp: u64,
+    pub target: u64,
+}
+static mut IMAGE_BASE: u64 = 0;
+/// Where the title's image is mapped: RIP-relative addresses and call targets are relative to it.
+pub unsafe fn set_image_base(base: u64) { unsafe { IMAGE_BASE = base; } }
+#[inline(always)]
+fn base() -> u64 { unsafe { IMAGE_BASE } }
+unsafe extern "system" {
+    fn TlsAlloc() -> u32;
+    fn TlsGetValue(index: u32) -> *mut core::ffi::c_void;
+    fn TlsSetValue(index: u32, value: *mut core::ffi::c_void) -> i32;
+}
+static mut TLS_INDEX: u32 = u32::MAX;
+static mut TLS_GS: u64 = 0;
+/// Once, before translated code that calls out: a TLS slot holds the calling thread's context during a call.
+pub unsafe fn setup() {
+    unsafe {
+        if TLS_INDEX == u32::MAX {
+            let index = TlsAlloc();
+            assert!(index < 64, "TLS index {index} is beyond the TEB's own slots");
+            TLS_INDEX = index;
+            TLS_GS = 0x1480 + 8 * index as u64;
+        }
+    }
+}
+/// A call from translated code: the callee runs natively with the context's registers, on the guest stack, and
+/// returns into this function, which stores the registers and flags it left. As the guest's `call`, a return address
+/// sits at the guest rsp - 8 while the callee runs.
+#[inline(never)]
+unsafe fn call_native(c: &mut Ctx, target: u64) {
+    unsafe {
+        let old = TlsGetValue(TLS_INDEX);
+        TlsSetValue(TLS_INDEX, c as *mut Ctx as *mut core::ffi::c_void);
+        c.target = target;
+        let p = c as *mut Ctx;
+        core::arch::asm!(
+            "push rbx",
+            "push rbp",
+            "mov [rax + 144], rsp",
+            "mov rsp, [rax + 32]",
+            "lea rcx, [rip + 2f]",
+            "mov [rsp - 8], rcx",
+            "mov rcx, [rax + 152]",
+            "mov [rsp - 16], rcx",
+            "sub rsp, 16",
+            "mov rcx, [rax + 8]",
+            "mov rdx, [rax + 16]",
+            "mov rbx, [rax + 24]",
+            "mov rbp, [rax + 40]",
+            "mov rsi, [rax + 48]",
+            "mov rdi, [rax + 56]",
+            "mov r8, [rax + 64]",
+            "mov r9, [rax + 72]",
+            "mov r10, [rax + 80]",
+            "mov r11, [rax + 88]",
+            "mov r12, [rax + 96]",
+            "mov r13, [rax + 104]",
+            "mov r14, [rax + 112]",
+            "mov r15, [rax + 120]",
+            "mov rax, [rax]",
+            "ret",
+            "2:",
+            "push rax",
+            "pushfq",
+            "mov rax, [rip + {gs}]",
+            "mov rax, qword ptr gs:[rax]",
+            "mov [rax + 8], rcx",
+            "mov [rax + 16], rdx",
+            "mov [rax + 24], rbx",
+            "mov [rax + 40], rbp",
+            "mov [rax + 48], rsi",
+            "mov [rax + 56], rdi",
+            "mov [rax + 64], r8",
+            "mov [rax + 72], r9",
+            "mov [rax + 80], r10",
+            "mov [rax + 88], r11",
+            "mov [rax + 96], r12",
+            "mov [rax + 104], r13",
+            "mov [rax + 112], r14",
+            "mov [rax + 120], r15",
+            "lea rcx, [rsp + 16]",
+            "mov [rax + 32], rcx",
+            "pop rcx",
+            "mov rdx, rcx",
+            "and edx, 1",
+            "mov [rax + 128], dl",
+            "mov rdx, rcx",
+            "shr rdx, 6",
+            "and edx, 1",
+            "mov [rax + 129], dl",
+            "mov rdx, rcx",
+            "shr rdx, 7",
+            "and edx, 1",
+            "mov [rax + 130], dl",
+            "mov rdx, rcx",
+            "shr rdx, 11",
+            "and edx, 1",
+            "mov [rax + 131], dl",
+            "pop rcx",
+            "mov [rax], rcx",
+            "mov rsp, [rax + 144]",
+            "pop rbp",
+            "pop rbx",
+            gs = sym TLS_GS,
+            inout("rax") p => _,
+            out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+        );
+        TlsSetValue(TLS_INDEX, old);
+    }
 }
 #[inline(always)]
 fn mask(n: u32) -> u64 { if n >= 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 } }
@@ -89,7 +202,10 @@ fn address(i: &Instruction) -> Option<String> {
     }
     let disp = i.memory_displacement64();
     if i.memory_base() == Register::RIP {
-        return Some(format!("{disp:#x}u64"));
+        return Some(format!("base().wrapping_add({disp:#x})"));
+    }
+    if i.memory_base() == Register::None && i.memory_index() == Register::None {
+        return None; // an absolute address: not relocatable here
     }
     let mut parts = Vec::new();
     if i.memory_base() != Register::None {
@@ -295,6 +411,19 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             }
             let _ = write!(s, "let v = ld(c.r[4], 8); c.r[4] = c.r[4].wrapping_add(8); c.r[{r}] = v;");
         }
+        Call => {
+            let target = match i.op0_kind() {
+                OpKind::NearBranch64 => format!("base().wrapping_add({:#x})", i.near_branch_target()),
+                OpKind::Register | OpKind::Memory => {
+                    if i.op_kind(0) == OpKind::Register && gpr(i.op_register(0))?.1 != 8 {
+                        return None;
+                    }
+                    read(i, 0, 8)?
+                }
+                _ => return None,
+            };
+            let _ = write!(s, "let t = {target}; call_native(c, t);");
+        }
         Ret => {
             if i.op_count() != 0 {
                 return None;
@@ -353,7 +482,8 @@ pub fn decode(code: &[u8], ip: u64) -> Vec<Instruction> {
     out
 }
 
-/// The Rust source of one function, or the address and text of the first instruction it does not cover.
+/// The Rust source of one function whose code is at `rva`, or the address and text of the first instruction it does
+/// not cover.
 pub fn emit_function(name: &str, code: &[u8], ip: u64) -> Result<String, String> {
     let insns = decode(code, ip);
     if insns.is_empty() {

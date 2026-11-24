@@ -115,8 +115,15 @@ fn translated_functions_match_the_cpu() {
     let mut memory = vec![0u8; MEM];
     let mut stack = vec![0u8; STACK];
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    // The exec block is the "image": cases at CODE_RVA, the native callee of the call cases at CALLEE_RVA.
+    unsafe {
+        set_image_base(exec as u64);
+        setup();
+        std::ptr::copy_nonoverlapping(CALLEE.as_ptr(), exec.add(CALLEE_RVA as usize), CALLEE.len());
+    }
+    let entry = exec as u64 + CODE_RVA;
     for case in CASES {
-        unsafe { std::ptr::copy_nonoverlapping(case.code.as_ptr(), exec, case.code.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(case.code.as_ptr(), entry as *mut u8, case.code.len()) };
         for round in 0..3000 {
             let mut start = Ctx::default();
             for r in 0..16 {
@@ -125,6 +132,9 @@ fn translated_functions_match_the_cpu() {
             let initial_memory: Vec<u8> = (0..MEM).map(|_| rng.next() as u8).collect();
             let base = memory.as_mut_ptr() as u64;
             start.r[2] = base + 64 + (rng.next() % 64); // rdx points into the buffer
+            if case.name == "call_indirect" {
+                start.r[15] = exec as u64 + CALLEE_RVA;
+            }
             if case.name == "loop" {
                 start.r[1] = rng.next() % 32; // rcx: how many quadwords to add
                 start.r[2] = base + 64;
@@ -136,7 +146,7 @@ fn translated_functions_match_the_cpu() {
             stack.fill(0);
             let mut native = start;
             native.r[4] = top;
-            let rflags = unsafe { run_native(exec as u64, &mut native) };
+            let rflags = unsafe { run_native(entry, &mut native) };
             let native_memory = memory.clone();
             let mut native_stack = stack.clone();
 
@@ -152,6 +162,10 @@ fn translated_functions_match_the_cpu() {
             let mut our_stack = stack.clone();
             for s in [&mut native_stack, &mut our_stack] {
                 s[slot..slot + 8].fill(0); // the return address (and the thunk's pushfq) differ by design
+                if case.name.starts_with("call") {
+                    // Below the caller's frame: the inner call's return address and the thunk's scratch words.
+                    s[slot - 32..slot - 8].fill(0);
+                }
             }
             let flag = |bit: u64| rflags & bit != 0;
             let want = |bit: u64| case.flags & bit != 0;

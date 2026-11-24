@@ -223,6 +223,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 out->Alignment = static_cast<UINT>(a2);     // the visible mask
                 return a1;
             }
+            case 68: {  // ID3D12Device8::GetResourceAllocationInfo2: (return buffer, mask, count, descs1, infos1)
+                auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
+                if (!out) break;
+                const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4);
+                out->SizeInBytes = kAllocationMarker + a3;
+                // The first description's layout, so the test sees the Xbox word replaced before the PC call.
+                out->Alignment = descs ? static_cast<UINT64>(descs[0].Layout) : 99;
+                return a1;
+            }
             case 26: {  // GetCustomHeapProperties, the PC method: (return buffer, node mask, heap type)
                 auto* out = reinterpret_cast<D3D12_HEAP_PROPERTIES*>(a1);
                 if (!out) break;
@@ -923,6 +932,33 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
+    // 61 CreateSamplerX(desc, handle): the console's 27 sampler words become a PC sampler at the handle (PC slot 22
+    // CreateSampler). Forwarded by number it was the PC CreateMetaCommand, which faulted on the retail title.
+    std::uint32_t sampler[27] = {};
+    sampler[1] = 1;                        // bilinear magnification
+    sampler[2] = 0;                        // point minification
+    sampler[3] = 2;                        // linear mips
+    sampler[6] = sampler[7] = sampler[8] = 3;  // clamp
+    const float max_lod = 1000.0f;
+    std::memcpy(&sampler[10], &max_lod, sizeof(max_lod));
+    D3D12_SAMPLER_DESC sd = xs::sampler_desc_from_console(sampler);
+    EXPECT(sd.Filter == 0x5 && sd.AddressW == D3D12_TEXTURE_ADDRESS_MODE_CLAMP && sd.MaxLOD == 1000.0f);
+    sampler[16] = D3D12_COMPARISON_FUNC_LESS_EQUAL;  // a real test makes a comparison sampler
+    sd = xs::sampler_desc_from_console(sampler);
+    EXPECT(sd.Filter == 0x85 && sd.ComparisonFunc == D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    sampler[16] = D3D12_COMPARISON_FUNC_NEVER;  // never is a plain sampler
+    EXPECT(xs::sampler_desc_from_console(sampler).Filter == 0x5);
+    sampler[3] = 0;  // no mip filter: the first level only
+    EXPECT(xs::sampler_desc_from_console(sampler).MaxLOD == 0.0f);
+    sampler[1] = 3;
+    sampler[13] = 99;  // anisotropic, clamped to the PC's 16
+    sd = xs::sampler_desc_from_console(sampler);
+    EXPECT(sd.Filter == 0x55 && sd.MaxAnisotropy == 16);
+    const std::uint64_t sampler_handle = 0x5000;
+    EXPECT(raw(device, 61, word(sampler), sampler_handle) == 0);
+    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && mock->args[22][1] == sampler_handle);
+    EXPECT(xs::device_slot_overridden(61) && xs::device_slot_hits(61) == 1);
+
     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
@@ -1133,6 +1169,22 @@ int check_resource_allocation_info() {
     EXPECT(pc.SizeInBytes == kAllocationMarker + 1 && pc.Alignment == 1);
 
     EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // Slot 108, the console's GetResourceAllocationInfo2, in the same C form: it reaches the PC ID3D12Device8 method
+    // (PC slot 68) with the Xbox layout word made a PC one. Forwarded by number it was past the PC vtable and faulted.
+    Mock* mock8 = nullptr;
+    void* device8 = make_device(mock8, 11, true);
+    EXPECT(device8 && xs::device_slot_overridden(108));
+    void* const* vtable8 = *reinterpret_cast<void* const* const*>(device8);
+    D3D12_RESOURCE_DESC1 desc1[1] = {};
+    desc1[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc1[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the console's tiled word
+    D3D12_RESOURCE_ALLOCATION_INFO info2{};
+    using Console2Fn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    EXPECT(reinterpret_cast<Console2Fn>(vtable8[108])(&info2, device8, 1, 1, word(desc1), 0) == word(&info2));
+    EXPECT(mock8->calls[68] == 1 && mock8->calls[108] == 0);
+    EXPECT(info2.SizeInBytes == kAllocationMarker + 1 && info2.Alignment == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(release(device8) == 0 && mock8->refs == 0);
     std::printf("%s: device slot 25 with the buffer in RCX and the device in RDX reaches the PC method and writes "
                 "only the struct; the PC form reaches it too\n", g_label);
     return 0;

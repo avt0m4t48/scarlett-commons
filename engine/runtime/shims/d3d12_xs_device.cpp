@@ -150,6 +150,8 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 61: return "Xbox CreateSamplerX (console sampler words)";
+        case 108: return "Xbox GetResourceAllocationInfo2 (C form)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox shader-resource view from raw words";
@@ -2089,6 +2091,15 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 61) {
+        // CreateSamplerX(desc, handle) returns nothing. Forwarded by number it reached the PC CreateMetaCommand and
+        // faulted on the retail title.
+        note_slot(61);
+        if (a1) {
+            const D3D12_SAMPLER_DESC desc = sampler_desc_from_console(reinterpret_cast<const std::uint32_t*>(a1));
+            self->real->CreateSampler(&desc, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
+        }
+        return 0;
     } else if constexpr (Slot == 70) {
         proxy_create_srv_from_raw_x(self, a1, a2, a3);
         return 0;
@@ -2201,11 +2212,43 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     return call.ret;
 }
 
+// Device slot 108 is the console's GetResourceAllocationInfo2: (return buffer, device, visible mask, count,
+// D3D12_RESOURCE_DESC1 array, D3D12_RESOURCE_ALLOCATION_INFO1 array or null), in the C form above. Forwarded by number
+// it was past the PC device's vtable and faulted on the retail title. The slot assignment follows VIctory's device
+// table (GPL-3.0, crates/victory-gpu/src/device.rs). The PC ID3D12Device8 method answers it, with each description's
+// Xbox layout word and flags made PC ones as slot 127 does; without ID3D12Device8 the answer is the documented
+// failure (size UINT64_MAX).
+void* WINAPI proxy_get_resource_allocation_info2(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
+                                                 std::uint64_t count, const D3D12_RESOURCE_DESC1* descs,
+                                                 D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    note_slot(108);
+    const StructReturnCall call = struct_return_call(a0, a1);
+    auto* const ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
+    *ret = D3D12_RESOURCE_ALLOCATION_INFO{UINT64_MAX, 0};
+    const UINT n = static_cast<UINT>(count);
+    ID3D12Device8* device8 = nullptr;
+    if ((n && !descs) || FAILED(call.self->real->QueryInterface(IID_PPV_ARGS(&device8))) || !device8) return ret;
+    std::unique_ptr<D3D12_RESOURCE_DESC1[]> pc(new (std::nothrow) D3D12_RESOURCE_DESC1[n ? n : 1]);
+    if (pc) {
+        for (UINT i = 0; i < n; ++i) {
+            pc[i] = descs[i];
+            pc[i].Layout = pc[i].Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                             : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            pc[i].Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc[i].Flags) &
+                                                            kPcResourceFlagsMask);
+        }
+        *ret = device8->GetResourceAllocationInfo2(static_cast<UINT>(visible_mask), n, pc.get(), each);
+    }
+    device8->Release();
+    return ret;
+}
+
 void** get_vtable() {
     static void** vtable = [] {
         static void* storage[kMaxSlots];
         fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
         storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
+        storage[108] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info2);
         return storage;
     }();
     return vtable;
@@ -2344,12 +2387,41 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 70 || slot == 75 || slot == 76 || slot == 133 || slot == kCreateCommittedResource3X)
+        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 61 || slot == 62 || slot == 67 ||
+        slot == 70 || slot == 75 || slot == 76 || slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
            slot == routes.queue_x || slot == routes.list_x;
+}
+
+D3D12_SAMPLER_DESC sampler_desc_from_console(const std::uint32_t* w) {
+    const auto as_float = [w](int i) {
+        float f;
+        std::memcpy(&f, &w[i], sizeof(f));
+        return f;
+    };
+    const std::uint32_t mag = w[1], min = w[2], mip = w[3], mode = w[5], compare = w[16];
+    // Magnification and minification: point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3. Mip: none 0,
+    // point 1, linear 2. Mode: plain 0, minimum 1, maximum 2.
+    const bool anisotropic = mag >= 2 || min >= 2;
+    const auto linear = [](std::uint32_t f) { return f == 1 || f == 3 ? 1u : 0u; };
+    // Only a real test (LESS 2 .. GREATER_EQUAL 7) needs a comparison sampler on the PC; never, always and none don't.
+    const bool compares = compare >= D3D12_COMPARISON_FUNC_LESS && compare <= D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    const std::uint32_t reduction = mode == 1 ? 2u : mode == 2 ? 3u : (compares ? 1u : 0u);
+    const std::uint32_t filter = anisotropic ? 0x55u : (linear(min) << 4 | linear(mag) << 2 | (mip == 2 ? 1u : 0u));
+    D3D12_SAMPLER_DESC d{};
+    d.Filter = static_cast<D3D12_FILTER>(reduction << 7 | filter);
+    d.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[6]);
+    d.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[7]);
+    d.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[8]);
+    d.MipLODBias = as_float(11);
+    d.MaxAnisotropy = anisotropic ? (w[13] < 1 ? 1u : w[13] > 16 ? 16u : w[13]) : 1u;
+    d.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(compare < 1 ? 1u : compare);
+    for (int i = 0; i < 4; ++i) d.BorderColor[i] = as_float(17 + i);
+    d.MinLOD = as_float(9);
+    d.MaxLOD = mip == 0 ? d.MinLOD : as_float(10);  // without a mip filter only the first level is sampled
+    return d;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }

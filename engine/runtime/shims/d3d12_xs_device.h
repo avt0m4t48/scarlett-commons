@@ -137,8 +137,15 @@ void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 // 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// handles for the allocator proxy. Slot 61 (CreateSamplerX) is overridden too.
 bool device_slot_overridden(unsigned slot);
+
+// Device slot 61 is the console's CreateSamplerX(desc, handle): desc is 27 32-bit words that name the hardware
+// sampler's fields (1 magnification, 2 minification, 3 mip filter, 5 filter mode, 6..8 address modes, 9/10 minimum and
+// maximum LOD, 11 LOD bias, 13 anisotropy, 16 comparison, 17..20 border colour, as floats where they are LODs, the bias
+// or the colour). This is the PC description the slot creates the sampler from. The field layout follows VIctory
+// (GPL-3.0), crates/victory-gpu/src/sampler.rs.
+D3D12_SAMPLER_DESC sampler_desc_from_console(const std::uint32_t* words);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.

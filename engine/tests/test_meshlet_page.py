@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zlib
 
@@ -358,6 +359,27 @@ class RejectTests(unittest.TestCase):
         with self.assertRaisesRegex(mp.PageError, "no meshlets"):
             mp.parse_group(empty, 0)
         self.assertFalse(mp.is_mesh_page(empty))
+
+    def test_zero_meshlet_group_page_walk_terminates(self):
+        # A 0-meshlet group ends 12 bytes in; with data right after it the walk realigned back onto the same header
+        # and parsed it forever (old #5600). Run in a daemon thread so a regression fails instead of hanging.
+        empty = struct.pack("<3I", 0x80000000, 0, 0) + struct.pack("<I", 1) + bytes(12)
+        results = []
+
+        def walk():
+            for data in (empty, page(group([(4, 2)]), empty)):
+                try:
+                    mp.parse_page(data)
+                    results.append(None)
+                except mp.PageError as exc:
+                    results.append(str(exc))
+
+        t = threading.Thread(target=walk, daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "parse_page did not terminate on a 0-meshlet group")
+        self.assertIn("neither a vertex block nor a meshlet group", results[0])
+        self.assertIn("has no meshlets", results[1])
 
     def test_slot_size_mismatch(self):
         b = bytearray(block(10))

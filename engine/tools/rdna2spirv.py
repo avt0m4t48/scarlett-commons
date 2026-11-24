@@ -1606,6 +1606,16 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {self.active_b()} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
 
+    def exec_bit(self, word):
+        """Bit L of a 32-bit value written to EXEC as data, as this invocation's 0 or 1: a computed value is one
+        bit per lane (`s_lshl_b32 exec_lo, 1, s5` sets lane 3). A value that already holds this lane's bit of a
+        mask (0 or ~0, `lane_masks.py`) gives the same answer, so no caller needs to say which it has."""
+        sh, shr, bit = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        return bit
+
     def set_exec(self, mask_u):
         self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
         self.uses_active = True
@@ -1632,10 +1642,10 @@ class Gen:
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, self.exec_bit(val))
             return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+            self.set_exec(self.exec_bit(val))
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR

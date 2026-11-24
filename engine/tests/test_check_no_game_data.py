@@ -288,7 +288,13 @@ class CheckNoGameData(unittest.TestCase):
         # the other files are still scanned; a real match wins over the unreadable one
         rc, out, err = self.run_with_unreadable(locked, [locked, sibling, clean])
         self.assertEqual(rc, 1, out + err)
-        self.assertEqual(out.splitlines(), [f"{os.path.relpath(sibling)}: DDS texture"], out)
+        # display() reports the path relative to the working directory and keeps the absolute path when the two are
+        # on different drives: a Windows temp file is on C: while the checkout is on D:.
+        try:
+            expected = os.path.relpath(sibling)
+        except ValueError:
+            expected = sibling
+        self.assertEqual(out.splitlines(), [f"{expected}: DDS texture"], out)
         self.assertIn("cannot read", err)
         self.assertIn("1 file(s) start like game data", err)
         self.assertNotIn("Traceback", err)

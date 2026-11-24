@@ -21,6 +21,10 @@ class Trace(unittest.TestCase):
         stage, fps, crash = lr.stage_from_trace(lines)
         self.assertEqual((stage, fps, crash), ("first-frame", 29.97, None))
 
+    def test_nothing_ran_has_no_stage(self):
+        self.assertEqual(lr.stage_from_trace([]), (None, None, None))
+        self.assertIsNone(lr.stage_from_trace(["not json", ev("trace_open")])[0])
+
     def test_later_events_do_not_lower_the_stage(self):
         self.assertEqual(lr.stage_from_trace([ev("first_frame"), ev("map"), "not json"])[0], "first-frame")
 

@@ -235,8 +235,15 @@ def main():
     index = json.load(open(index_path, encoding="utf-8")) if os.path.isfile(index_path) else {}
     total, failed, reasons = shader_stats(index)
     commit = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if stage is None:
+        # Nothing ran (the build stopped first, or the runtime never mapped the executable): there is no stage to
+        # report, and claiming "loads" would be false. The shader results are still printed for the reporter.
+        print("\nthe title did not start, so there is no title-run report to submit.")
+        print("shader translation: " + notes_text(total, failed, reasons))
+        print("fix the first error above and run the same command again; finished build steps are kept.")
+        return 1
     report = build_report(build_id or "unregistered", commit, a.hw_class, f"{platform.system().lower()}-{platform.release()}",
-                          a.driver, stage or "loads", fps, stop_text(crash, timed_out, exit_code),
+                          a.driver, stage, fps, stop_text(crash, timed_out, exit_code),
                           notes_text(total, failed, reasons))
     problems = title_runs.validate_run(report, report["build"], commit, {report["build"]: {}})
     folder = os.path.join(work, "report")

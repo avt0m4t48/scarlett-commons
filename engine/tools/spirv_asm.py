@@ -18,10 +18,12 @@ Usage: `python -I tools/spirv_asm.py --help` lists the options.
 """
 import argparse
 import array
+import math
 import os
 import re
 import struct
 import sys
+from fractions import Fraction
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -324,12 +326,29 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         fv = float(tok)
     except ValueError as exc:
         raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
-    pack_fmt, unpack_fmt = {16: ("<e", "<H"), 32: ("<f", "<I"), 64: ("<d", "<Q")}[width]
-    try:
+    if width == 64 or not math.isfinite(fv):
+        pack_fmt, unpack_fmt = {16: ("<e", "<H"), 32: ("<f", "<I"), 64: ("<d", "<Q")}[width]
         return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-    except OverflowError:
-        sign = 1 if tok.startswith("-") else 0
-        return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+    # float() rounds the decimal once to a double, as strtod does. A narrower type is rounded from that double,
+    # except where the double sits on a tie of the narrower type: the exact decimal breaks it, so the result is the
+    # decimal rounded once to the nearest-even f32, as strtof (and so spirv-as) gives it.
+    negative = math.copysign(1.0, fv) < 0
+    sig, den = abs(fv).as_integer_ratio()
+    bits = _round_float(negative, sig, 1 - den.bit_length(), 32, True, lambda: _compare_decimal(tok, fv))
+    if bits is not None and width == 16:
+        # SPIRV-Tools reads a 16-bit decimal as that f32 and narrows it toward zero (ParseNormalFloat<Float16>),
+        # so 1.0006 is 0x3C00, not the nearer 0x3C01.
+        sig, den = abs(struct.unpack("<f", struct.pack("<I", bits))[0]).as_integer_ratio()
+        bits = _round_float(negative, sig, 1 - den.bit_length(), 16, False)
+    if bits is None:
+        return (int(negative) << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+    return bits
+
+
+def _compare_decimal(tok: str, approx: float) -> int:
+    """1 when the decimal literal `tok` is larger in magnitude than the double `approx` read from it, -1 when smaller."""
+    exact, near = abs(Fraction(tok)), Fraction(abs(approx))
+    return (exact > near) - (exact < near)
 
 
 def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:

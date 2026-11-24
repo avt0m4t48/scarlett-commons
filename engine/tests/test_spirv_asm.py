@@ -740,6 +740,23 @@ class FloatLiteralTests(unittest.TestCase):
             ("f64", "0x1.fffffffffffff8p1023", [0xFFFFFFFF, 0x7FEFFFFF]),
         ))
 
+    def test_decimal_is_rounded_once_to_f32_and_f16_narrows_that_toward_zero(self):
+        # old #3911 (@lumenpearson): each of these decimals reads as a double on an f32 tie, which rounding the double
+        # again broke the wrong way; strtof rounds the decimal once. A 16-bit decimal is that f32 cut toward zero.
+        self._check((
+            ("f32", "1.00000005960464477539062500000001", [0x3F800001]),
+            ("f32", "-1.00000005960464477539062500000001", [0xBF800001]),
+            ("f32", "1.000000059604644775390625", [0x3F800000]),
+            ("f32", "1.00000017881393432617187499999999", [0x3F800001]),
+            ("f32", "1.000000178813934326171875", [0x3F800002]),
+            ("f32", "7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791"
+                    "015625000001e-46", [0x00000001]),
+            ("f32", "0.1", [0x3DCCCCCD]), ("f32", "3.4028235e38", [0x7F7FFFFF]), ("f32", "-0.0", [0x80000000]),
+            ("f16", "1.0006", [0x3C00]), ("f16", "-1.0006", [0xBC00]), ("f16", "65535", [0x7BFF]),
+            ("f16", "5e-8", [0x0000]), ("f16", "0.1", [0x2E66]), ("f16", "1.5", [0x3E00]),
+            ("f64", "0.1", [0x9999999A, 0x3FB99999]),
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

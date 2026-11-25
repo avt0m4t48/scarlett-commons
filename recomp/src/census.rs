@@ -20,6 +20,8 @@ pub struct RuntimeFunction {
 pub struct Image<'a> {
     data: &'a [u8],
     pub image_base: u64,
+    pub size_of_image: u32,
+    pub size_of_headers: u32,
     sections: Vec<(u32, u32, u32, u32)>, // virtual address, virtual size, raw offset, raw size
     exception: (u32, u32),
 }
@@ -48,6 +50,8 @@ impl<'a> Image<'a> {
             return Err("not PE32+ (64-bit)".into());
         }
         let image_base = u64_at(data, opt + 24).ok_or("short optional header")?;
+        let size_of_image = u32_at(data, opt + 56).ok_or("short optional header")?;
+        let size_of_headers = u32_at(data, opt + 60).ok_or("short optional header")?;
         let dirs = u32_at(data, opt + 108).ok_or("short optional header")?;
         let exception = if dirs > 3 {
             (u32_at(data, opt + 112 + 24).unwrap_or(0), u32_at(data, opt + 112 + 28).unwrap_or(0))
@@ -65,7 +69,7 @@ impl<'a> Image<'a> {
                 u32_at(data, s + 16).ok_or("short section table")?,
             ));
         }
-        Ok(Image { data, image_base, sections, exception })
+        Ok(Image { data, image_base, size_of_image, size_of_headers, sections, exception })
     }
 
     /// The file bytes of [rva, rva + len), when they lie inside one section's raw data.
@@ -82,6 +86,20 @@ impl<'a> Image<'a> {
             }
         }
         None
+    }
+
+    /// Copies the headers and every section's raw data to `dest` at their RVAs, as a loader maps the image (no
+    /// relocations, no imports). `dest` must hold `size_of_image` bytes.
+    pub fn map_into(&self, dest: &mut [u8]) {
+        let h = (self.size_of_headers as usize).min(self.data.len()).min(dest.len());
+        dest[..h].copy_from_slice(&self.data[..h]);
+        for &(va, _vsize, raw, rsize) in &self.sections {
+            let (va, raw, rsize) = (va as usize, raw as usize, rsize as usize);
+            let n = rsize.min(self.data.len().saturating_sub(raw)).min(dest.len().saturating_sub(va));
+            if n > 0 {
+                dest[va..va + n].copy_from_slice(&self.data[raw..raw + n]);
+            }
+        }
     }
 
     /// Every RUNTIME_FUNCTION in `.pdata`, sorted, without empty or reversed entries.

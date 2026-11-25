@@ -16,7 +16,8 @@
 //! memory without FS/GS; imul with two or three operands; the AVX moves (vmovaps/ups/apd/upd/dqa/dqu, vmovss/sd),
 //! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss and vzeroupper, through core::arch
 //! intrinsics (the same instructions as the title's); the shuffles and blends vshufps, vblendps, vblendvps, vpermilps
-//! (immediate), vunpcklps/hps and vinsertf128/vextractf128. Not yet: the rest. Shifts by a count above 1 leave OF
+//! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
+//! vhaddps/pd, vhsubps/pd and vdpps. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -491,6 +492,52 @@ unsafe fn vpermilps<const I: i32>(a: Y) -> Y { unsafe { unps(core::arch::x86_64:
 unsafe fn vunpcklps(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_unpacklo_ps(ps(a), ps(b))) } }
 #[target_feature(enable = "avx")]
 unsafe fn vunpckhps(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_unpackhi_ps(ps(a), ps(b))) } }
+#[target_feature(enable = "avx")]
+unsafe fn pd(a: Y) -> core::arch::x86_64::__m256d { unsafe { core::arch::x86_64::_mm256_loadu_pd(a.as_ptr() as *const f64) } }
+#[target_feature(enable = "avx")]
+unsafe fn unpd(r: core::arch::x86_64::__m256d) -> Y {
+    let mut o = [0u64; 4];
+    unsafe { core::arch::x86_64::_mm256_storeu_pd(o.as_mut_ptr() as *mut f64, r) };
+    o
+}
+/// The horizontal operations are written as the instruction itself: LLVM may lower the intrinsics to shuffles and
+/// a plain add, which swaps the operands of some lanes, and then two NaNs give the other NaN's payload.
+#[target_feature(enable = "avx")]
+unsafe fn hop(op: u8, a: Y, b: Y) -> Y {
+    let mut o = [0u64; 4];
+    unsafe {
+        let (pa, pb, po) = (a.as_ptr(), b.as_ptr(), o.as_mut_ptr());
+        match op {
+            0 => core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", "vhaddps ymm0, ymm0, ymm1", "vmovdqu [{o}], ymm0",
+                                  a = in(reg) pa, b = in(reg) pb, o = in(reg) po, out("ymm0") _, out("ymm1") _),
+            1 => core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", "vhsubps ymm0, ymm0, ymm1", "vmovdqu [{o}], ymm0",
+                                  a = in(reg) pa, b = in(reg) pb, o = in(reg) po, out("ymm0") _, out("ymm1") _),
+            2 => core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", "vhaddpd ymm0, ymm0, ymm1", "vmovdqu [{o}], ymm0",
+                                  a = in(reg) pa, b = in(reg) pb, o = in(reg) po, out("ymm0") _, out("ymm1") _),
+            _ => core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", "vhsubpd ymm0, ymm0, ymm1", "vmovdqu [{o}], ymm0",
+                                  a = in(reg) pa, b = in(reg) pb, o = in(reg) po, out("ymm0") _, out("ymm1") _),
+        }
+    }
+    o
+}
+#[target_feature(enable = "avx")]
+unsafe fn vhaddps(a: Y, b: Y) -> Y { unsafe { hop(0, a, b) } }
+#[target_feature(enable = "avx")]
+unsafe fn vhsubps(a: Y, b: Y) -> Y { unsafe { hop(1, a, b) } }
+#[target_feature(enable = "avx")]
+unsafe fn vhaddpd(a: Y, b: Y) -> Y { unsafe { hop(2, a, b) } }
+#[target_feature(enable = "avx")]
+unsafe fn vhsubpd(a: Y, b: Y) -> Y { unsafe { hop(3, a, b) } }
+#[target_feature(enable = "avx")]
+unsafe fn vdpps<const I: i32>(a: Y, b: Y) -> Y {
+    let mut o = [0u64; 4];
+    unsafe {
+        core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", "vdpps ymm0, ymm0, ymm1, {i}", "vmovdqu [{o}], ymm0",
+                         a = in(reg) a.as_ptr(), b = in(reg) b.as_ptr(), o = in(reg) o.as_mut_ptr(), i = const I,
+                         out("ymm0") _, out("ymm1") _);
+    }
+    o
+}
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -843,6 +890,20 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 }
                 _ => return None,
             }
+        }
+        Vhaddps | Vhsubps | Vhaddpd | Vhsubpd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let f = format!("{:?}", i.mnemonic()).to_lowercase();
+            let _ = write!(s, "let y = {f}({a}, {b}); vset(c, {d}, {w}, y);");
+        }
+        Vdpps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let _ = write!(s, "let y = vdpps::<{}>({a}, {b}); vset(c, {d}, {w}, y);", i.immediate(3) & 0xff);
         }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;

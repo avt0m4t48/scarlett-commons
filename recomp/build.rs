@@ -72,6 +72,11 @@ fn main() {
             a.vinsertf128(ymm9, ymm10, xmmword_ptr(rdx + 16), 0)?; a.vextractf128(xmm10, ymm11, 1)?;
             a.vextractf128(xmmword_ptr(rdx + 64), ymm0, 0)?; a.ret()
         })),
+        ("horizontal", 0x8c1, assemble(|a| {
+            a.vhaddps(ymm0, ymm1, ymm2)?; a.vhaddps(xmm3, xmm4, xmmword_ptr(rdx))?; a.vhsubps(ymm5, ymm6, ymm7)?;
+            a.vhaddpd(ymm8, ymm9, ymm10)?; a.vhsubpd(xmm11, xmm12, xmm13)?; a.vdpps(ymm14, ymm15, ymm0, 0xf1)?;
+            a.vdpps(xmm1, xmm2, xmm3, 0x7f)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

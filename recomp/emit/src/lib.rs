@@ -735,6 +735,27 @@ unsafe fn gsld(at: u64, n: u32) -> u64 {
     }
     v
 }
+/// lock cmpxchg, lock xadd and xchg with memory, as the instructions (op 0, 1, 2): (the register's new value, RFLAGS).
+#[inline(always)]
+unsafe fn atomic(op: u8, a: u64, n: u32, acc: u64, src: u64) -> (u64, u64) {
+    let (mut r, mut f): (u64, u64);
+    unsafe {
+        match (op, n) {
+            (0, 8) => core::arch::asm!("lock cmpxchg [{a}], {s}", "pushfq", "pop {f}", a = in(reg) a, s = in(reg) src, f = out(reg) f, inout("rax") acc => r),
+            (0, _) => core::arch::asm!("lock cmpxchg [{a}], {s:e}", "pushfq", "pop {f}", a = in(reg) a, s = in(reg) src, f = out(reg) f, inout("rax") acc => r),
+            (1, 8) => { r = src; core::arch::asm!("lock xadd [{a}], {s}", "pushfq", "pop {f}", a = in(reg) a, s = inout(reg) r, f = out(reg) f); }
+            (1, _) => { r = src; core::arch::asm!("lock xadd [{a}], {s:e}", "pushfq", "pop {f}", a = in(reg) a, s = inout(reg) r, f = out(reg) f); }
+            (_, 8) => { r = src; core::arch::asm!("xchg [{a}], {s}", "pushfq", "pop {f}", a = in(reg) a, s = inout(reg) r, f = out(reg) f); }
+            (_, _) => { r = src; core::arch::asm!("xchg [{a}], {s:e}", "pushfq", "pop {f}", a = in(reg) a, s = inout(reg) r, f = out(reg) f); }
+        }
+    }
+    let _ = acc;
+    (r, f)
+}
+#[inline(always)]
+fn set_flags(c: &mut Ctx, f: u64) {
+    c.cf = f & 1 != 0; c.pf = f & 4 != 0; c.zf = f & 0x40 != 0; c.sf = f & 0x80 != 0; c.of = f & 0x800 != 0;
+}
 "#;
 
 /// `mov r32/r64, gs:[disp]`: the one FS/GS access translated (MSVC's TLS array read, `gs:[58h]`).
@@ -972,7 +993,7 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 s += " }";
             }
         }
-        Xchg => {
+        Xchg if i.op_kind(0) == OpKind::Register && i.op_kind(1) == OpKind::Register => {
             if i.op_kind(0) != OpKind::Register || i.op_kind(1) != OpKind::Register {
                 return None;
             }
@@ -1269,6 +1290,35 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             };
             let kind = if i.mnemonic() == Vcvtsi2ss { 0 } else { 2 } + if n == 8 { 1 } else { 0 };
             let _ = write!(s, "let y = cvtsi({kind}, {a}, {v}); vset(c, {d}, 16, y);");
+        }
+        Xchg if i.op_kind(0) == OpKind::Register && i.op_kind(1) == OpKind::Memory => {
+            // xchg r, [m] (how the decoder reports xchg [m], r)
+            let n = size_of_op0(i)?;
+            if n != 4 && n != 8 {
+                return None;
+            }
+            let (src, _) = gpr(i.op_register(0))?;
+            let _ = write!(s, "let (r, _) = atomic(2, {}, {n}, 0, c.r[{src}]); wr(c, {src}, {n}, r);", address(i)?);
+        }
+        Cmpxchg | Xadd | Xchg if i.op_kind(0) == OpKind::Memory && i.op_kind(1) == OpKind::Register => {
+            let n = size_of_op0(i)?;
+            if n != 4 && n != 8 {
+                return None;
+            }
+            let (src, _) = gpr(i.op_register(1))?;
+            let a = address(i)?;
+            match i.mnemonic() {
+                Cmpxchg => {
+                    // equal: memory = src, rax kept; not: rax = memory (a 32-bit write clears the upper half)
+                    let _ = write!(s, "let (r, f) = atomic(0, {a}, {n}, c.r[0], c.r[{src}]); set_flags(c, f); if !c.zf {{ wr(c, 0, {n}, r); }}");
+                }
+                Xadd => {
+                    let _ = write!(s, "let (r, f) = atomic(1, {a}, {n}, 0, c.r[{src}]); set_flags(c, f); wr(c, {src}, {n}, r);");
+                }
+                _ => {
+                    let _ = write!(s, "let (r, _) = atomic(2, {a}, {n}, 0, c.r[{src}]); wr(c, {src}, {n}, r);");
+                }
+            }
         }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;

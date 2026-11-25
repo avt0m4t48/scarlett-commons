@@ -119,6 +119,12 @@ fn main() {
             a.mov(rax, qword_ptr(0x58u64).gs())?; a.mov(ecx, dword_ptr(0x48u64).gs())?; a.mov(rdx, qword_ptr(0x30u64).gs())?;
             a.add(rax, rcx)?; a.ret()
         })),
+        ("atomic", 0x8c5, assemble(|a| {
+            a.mov(rax, qword_ptr(rdx))?; a.lock().cmpxchg(qword_ptr(rdx), rcx)?; a.setz(r11b)?;
+            a.lock().cmpxchg(dword_ptr(rdx + 8), r8d)?; a.lock().xadd(qword_ptr(rdx + 16), r9)?;
+            a.lock().xadd(dword_ptr(rdx + 24), r10d)?; a.xchg(qword_ptr(rdx + 32), r12)?; a.xchg(dword_ptr(rdx + 40), r13d)?;
+            a.mov(eax, dword_ptr(rdx + 48))?; a.lock().cmpxchg(dword_ptr(rdx + 48), r14d)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

@@ -231,9 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn gs_relative_memory_is_not_covered() {
+    fn gs_reads_of_the_thread_block_are_covered_and_other_gs_access_is_not() {
         // mov rax, gs:[0x58] (the thread's TLS array)
         let (_, ok, _, full, _) = code(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
+        assert_eq!((ok, full), (1, true));
+        // mov gs:[0x58], rax; mov rax, gs:[rcx]
+        let (_, ok, _, full, _) = code(&[0x65, 0x48, 0x89, 0x04, 0x25, 0x58, 0, 0, 0]);
+        assert_eq!((ok, full), (0, false));
+        let (_, ok, _, full, _) = code(&[0x65, 0x48, 0x8B, 0x01]);
         assert_eq!((ok, full), (0, false));
     }
 

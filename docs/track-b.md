@@ -27,19 +27,38 @@ Contributors do not hand-write functions. They widen the translator (an instruct
 access) and every function that was waiting for it joins track B on the next local build. A change is tested on
 synthetic code here; its effect on a title shows as a higher count in title-run reports.
 
-## Where it stands
+## Where it stands (1.0.2.1, 2026-11-25)
 
-* The install path works and is tested: `recomp/` reads a manifest, checks each function's native bytes and writes a
-  jump to the replacement (`cargo commons run` reports how many it installed).
-* The census (`engine/tools/recomp_census.py`, reads the executable and never runs it) measures what the translator
-  covers. On 1.0.2.1 .pdata lists 299,257 functions (92 MB of code, 20.3 million instructions); the integer subset
-  covers 85.4% of the instructions and 151,107 functions (50.5%) completely. That is track B's starting share once
-  the pieces below exist.
-* The translator emits arm64 today (the groundwork for other CPUs, `engine/tools/x64_recomp.py`). Track B on a PC
-  needs an emitter for code that runs here (Rust source, built locally into a library) and the thunk that enters it
-  from the native calling convention. Those, the local build and the differential tester are the next tasks: #156
-  Rust census, #157 translation to Rust source in the work folder, #158 the thunk, #159 the differential tester,
-  #160 loading a locally built library, #161 the one command (`commons recomp`).
+Track B runs in the title. On the reporter's copy, `commons-recomp` built 908 functions from the first 3000
+candidates, each equal to the native function on 200 generated inputs, and `cargo commons run` installed them over
+the native code: the title ran as before (30 fps on the first screen) with `track B 908 function(s) installed`.
+
+What each piece does today:
+
+| Piece | Where | State |
+|---|---|---|
+| Census of a build's functions | `commons-census` (#156) | 299,257 functions, 1.3 s for the whole executable |
+| Emitter: x86-64 to Rust | `recomp/emit` (#157, #169, #171) | integer core, calls, imul, the common AVX; 66% of functions fully covered |
+| Entry from native code | `commons_entry`, `e_<name>` stubs (#158) | side stack per thread, nested entries |
+| Differential test | `pipeline.rs` (#159) | image mapped at its base, pointers into a guarded sandbox, faults and endless loops caught, writes to globals compared and undone through a write watch, callees run natively when they are safe |
+| Local build and load | `commons-recomp`, `COMMONS_RECOMP_DIR` (#160, #161) | library and manifest in the work folder, installed by `cargo commons run` |
+
+What keeps the rest out, in order of size:
+
+* **Inconclusive functions** (about half of those selected): on most generated inputs the native function faults,
+  so there is too little to compare. Inputs recorded from real play (#68) would settle them.
+* **Coverage**: shuffles, horizontal operations, compares, FMA, atomics and the rest (#174 to #179).
+* **Indirect calls and imports**: a callee reached through a pointer or the import table is not run in the test yet.
+
+Building it on your own copy:
+
+```powershell
+cd recomp
+cargo run --release --bin commons-recomp -- <exe> --work <folder outside the repository>
+cd ..ictory
+$env:COMMONS_RECOMP_DIR = '<that folder>'
+cargo commons run <exe> --execute
+```
 
 ## Steps for a function that the automatic path cannot take yet
 

@@ -15,6 +15,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use commons_recomp_emit::{decode, emit_entry, emit_function, supported, tls_read, PRELUDE};
+
+/// The one FS/GS access the differential test can give a function: the TLS array pointer (gs:[58h]), which the
+/// test replaces with one into the sandbox. Other fields of the thread block lead to the harness's own memory.
+fn tls_array_read(i: &iced_x86::Instruction) -> bool {
+    tls_read(i) && i.memory_displacement64() == 0x58
+}
 use iced_x86::{FlowControl, OpKind, Register};
 
 use crate::census::Image;
@@ -116,7 +122,7 @@ fn checkable_calling(code: &[u8], rva: u32, sandboxed: bool, safe_callee: &dyn F
         let accesses_memory = (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
             && i.mnemonic() != iced_x86::Mnemonic::Lea;
         if accesses_memory {
-            if matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_read(i) {
+            if matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_array_read(i) {
                 return false;
             }
             if !sandboxed {
@@ -159,8 +165,11 @@ pub fn select(image: &Image<'_>, limit: usize, rule: &dyn Fn(&[u8], u32) -> bool
 }
 
 /// Callees a translation may call in the differential test, where they run natively: every function reachable
-/// from them by direct calls and jumps, to `depth`, decodes, stays off FS/GS, makes no indirect call or jump (an
-/// import, an unknown target) and no system call. Their code need not be covered: it is not translated.
+/// from them by direct calls and jumps, to `depth`, decodes, stays off FS/GS (but for the TLS array), and makes no
+/// system call. A callee without unwind data (a leaf) runs to its first ret. Indirect calls and jumps are taken:
+/// the test contains native code (faults and long runs come back, the image is write-watched, registers point into
+/// a guarded sandbox, the TLS array is the sandbox's, and every import is a trap). Their code need not be covered:
+/// it is not translated.
 pub struct CalleeCheck<'a> {
     image: &'a Image<'a>,
     starts: std::collections::BTreeMap<u32, u32>,
@@ -186,17 +195,23 @@ impl<'a> CalleeCheck<'a> {
 
     fn check(&self, rva: u32, depth: u32) -> bool {
         use iced_x86::Mnemonic::*;
-        let Some(&end) = self.starts.get(&rva) else { return false };
+        let end = match self.starts.get(&rva) {
+            Some(&end) => end,
+            None => match self.leaf_end(rva) {
+                Some(end) => end,
+                None => return false,
+            },
+        };
         let Some(code) = self.image.bytes(rva, end - rva) else { return false };
         for i in decode(code, u64::from(rva)) {
-            if i.is_invalid() || (matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_read(&i)) {
+            if i.is_invalid() || (matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_array_read(&i)) {
                 return false;
             }
             if matches!(i.mnemonic(), Syscall | Sysenter | Int | Int1 | Int3 | Into | Hlt | Cli | Sti | In | Out | Rdmsr | Wrmsr) {
                 return false;
             }
             match i.flow_control() {
-                FlowControl::IndirectCall | FlowControl::IndirectBranch | FlowControl::Interrupt => return false,
+                FlowControl::Interrupt => return false,
                 FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                     if i.op0_kind() != OpKind::NearBranch64 {
                         return false;
@@ -214,49 +229,103 @@ impl<'a> CalleeCheck<'a> {
     }
 }
 
-/// The generated crate's lib.rs.
-pub fn generate(cands: &[Candidate]) -> Result<String, String> {
-    let mut s = String::from("#![allow(warnings)]\n");
-    s += PRELUDE;
-    for c in cands {
-        let name = format!("f_{:x}", c.rva);
-        s += &emit_function(&name, &c.code, u64::from(c.rva)).map_err(|e| format!("{name}: {e}"))?;
-        s += &emit_entry(&name);
+impl CalleeCheck<'_> {
+    /// A function without unwind data (a leaf, which never calls): its code up to its first ret, within 4 KiB.
+    fn leaf_end(&self, rva: u32) -> Option<u32> {
+        let code = [4096u32, 1024, 256, 64].iter().find_map(|&n| self.image.bytes(rva, n))?;
+        let mut d = iced_x86::Decoder::with_ip(64, code, u64::from(rva), iced_x86::DecoderOptions::NONE);
+        while d.can_decode() {
+            let i = d.decode();
+            if i.is_invalid() {
+                return None;
+            }
+            if i.flow_control() == FlowControl::Return {
+                return Some(i.next_ip() as u32);
+            }
+        }
+        None
     }
+}
+
+/// The prelude as a library: every item public, for the shards to use.
+fn public_prelude() -> String {
+    let mut out = String::from("#![allow(warnings)]\n");
+    for line in PRELUDE.lines() {
+        let top = ["fn ", "unsafe fn ", "unsafe extern \"C\" fn ", "static ", "type ", "struct ", "enum ", "const "];
+        if top.iter().any(|t| line.starts_with(t)) {
+            out += "pub ";
+        } else if line.trim_start().starts_with("unsafe fn $name") {
+            out += &line[..line.len() - line.trim_start().len()];
+            out += "pub ";
+            out += line.trim_start();
+            out += "\n";
+            continue;
+        }
+        out += line;
+        out += "\n";
+    }
+    out
+}
+
+/// Functions per shard: the generated code is split into crates cargo builds side by side.
+const SHARD: usize = 400;
+
+/// The generated workspace, as (path under gen/, contents): the prelude, the shards of translated functions and
+/// the library that exports them.
+pub fn generate(cands: &[Candidate]) -> Result<Vec<(String, String)>, String> {
+    let shards: Vec<&[Candidate]> = cands.chunks(SHARD).collect();
+    let mut files = Vec::new();
+    files.push(("prelude/Cargo.toml".to_string(), member_toml("commons-track-b-prelude", "")));
+    files.push(("prelude/src/lib.rs".to_string(), public_prelude()));
+    for (k, shard) in shards.iter().enumerate() {
+        let mut s = String::from("#![allow(warnings)]\nuse commons_track_b_prelude::*;\n");
+        for c in *shard {
+            let name = format!("f_{:x}", c.rva);
+            s += &emit_function(&name, &c.code, u64::from(c.rva)).map_err(|e| format!("{name}: {e}"))?;
+            s += &emit_entry(&name);
+        }
+        files.push((format!("shard{k}/Cargo.toml"), member_toml(&format!("commons-track-b-shard{k}"), PRELUDE_DEP)));
+        files.push((format!("shard{k}/src/lib.rs"), s));
+    }
+    let mut s = String::from("#![allow(warnings)]\nuse commons_track_b_prelude::*;\n");
     s += "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn commons_init(base: u64) { unsafe { set_image_base(base); setup(); } }\n";
     s += "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn commons_reset_thread() { unsafe { reset_thread(); } }\n";
     s += "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn commons_function(i: usize, rva: *mut u64, entry: *mut u64) -> bool {\n    let (r, e): (u64, u64) = match i {\n";
     for (k, c) in cands.iter().enumerate() {
-        let _ = writeln!(s, "        {k} => ({:#x}, e_f_{:x} as usize as u64),", c.rva, c.rva);
+        let _ = writeln!(s, "        {k} => ({:#x}, commons_track_b_shard{}::e_f_{:x} as usize as u64),", c.rva, k / SHARD, c.rva);
     }
     s += "        _ => return false,\n    };\n    unsafe { *rva = r; *entry = e; }\n    true\n}\n";
-    Ok(s)
+    files.push(("src/lib.rs".to_string(), s));
+    let mut deps = String::from("commons-track-b-prelude = { path = \"prelude\" }\n");
+    let mut members = String::from("\"prelude\"");
+    for k in 0..shards.len() {
+        let _ = writeln!(deps, "commons-track-b-shard{k} = {{ path = \"shard{k}\" }}");
+        let _ = write!(members, ", \"shard{k}\"");
+    }
+    files.push(("Cargo.toml".to_string(), format!(
+        "[package]\nname = \"commons-track-b\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = \"src/lib.rs\"\n\n[dependencies]\n{deps}\n[profile.release]\nopt-level = 2\npanic = \"abort\"\ndebug = false\ncodegen-units = 4\nincremental = false\n\n[workspace]\nmembers = [{members}]\n"
+    )));
+    Ok(files)
 }
 
-const CARGO_TOML: &str = r#"[package]
-name = "commons-track-b"
-version = "0.0.0"
-edition = "2024"
-publish = false
+const PRELUDE_DEP: &str = "commons-track-b-prelude = { path = \"../prelude\" }\n";
 
-[lib]
-crate-type = ["cdylib"]
-path = "src/lib.rs"
+fn member_toml(name: &str, deps: &str) -> String {
+    format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n{deps}")
+}
 
-[profile.release]
-opt-level = 2
-panic = "abort"
-debug = false
-
-[workspace]
-"#;
-
-/// Writes the crate and builds it; the library's path.
-pub fn build(work: &Path, lib_rs: &str) -> Result<PathBuf, String> {
+/// Writes the workspace and builds it (the shards side by side, an unchanged shard from before not again); the
+/// library's path.
+pub fn build(work: &Path, files: &[(String, String)]) -> Result<PathBuf, String> {
     let gen_dir = work.join("gen");
-    std::fs::create_dir_all(gen_dir.join("src")).map_err(|e| e.to_string())?;
-    std::fs::write(gen_dir.join("Cargo.toml"), CARGO_TOML).map_err(|e| e.to_string())?;
-    std::fs::write(gen_dir.join("src/lib.rs"), lib_rs).map_err(|e| e.to_string())?;
+    for (path, contents) in files {
+        let at = gen_dir.join(path);
+        std::fs::create_dir_all(at.parent().unwrap_or(&gen_dir)).map_err(|e| e.to_string())?;
+        // Keep an unchanged file's time, so cargo does not rebuild that shard.
+        if std::fs::read_to_string(&at).ok().as_deref() != Some(contents.as_str()) {
+            std::fs::write(&at, contents).map_err(|e| e.to_string())?;
+        }
+    }
     let target = work.join("target");
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "--quiet"])
@@ -402,7 +471,24 @@ pub fn map_image(image: &Image<'_>) -> Result<u64, String> {
     if p.is_null() {
         return Err(format!("cannot map {size} bytes for the image"));
     }
-    image.map_into(unsafe { std::slice::from_raw_parts_mut(p as *mut u8, size) });
+    let mapped = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, size) };
+    image.map_into(mapped);
+    // Every import is a trap: native code the test runs that calls another module faults (and that input is
+    // skipped) instead of reaching the system with sandbox values.
+    let (iat, iat_size) = (image.iat.0 as usize, image.iat.1 as usize);
+    if iat_size > 0 && iat + iat_size <= size {
+        let trap = unsafe { VirtualAlloc(core::ptr::null_mut(), PAGE, 0x3000, 0x40) } as *mut u8;
+        if trap.is_null() {
+            return Err("cannot allocate the import trap".into());
+        }
+        unsafe { std::ptr::write_bytes(trap, 0, PAGE) };
+        for k in (0..PAGE).step_by(2) {
+            unsafe { *trap.add(k) = 0x0F; *trap.add(k + 1) = 0x0B };
+        }
+        for slot in mapped[iat..iat + iat_size].chunks_exact_mut(8) {
+            slot.copy_from_slice(&(trap as u64).to_le_bytes());
+        }
+    }
     Ok(p as u64)
 }
 
@@ -618,6 +704,22 @@ pub fn manifest(build: &str, library: &Path, cands: &[Candidate], passed: &[u32]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_generated_code_is_split_into_shards_over_a_public_prelude() {
+        // lea rax, [rcx + rdx]; add rax, 1; imul rax, rax; xor r8d, r8d; ret
+        let pure = vec![0x48, 0x8D, 0x04, 0x11, 0x48, 0x83, 0xC0, 0x01, 0x48, 0x0F, 0xAF, 0xC0, 0x45, 0x31, 0xC0, 0xC3];
+        let cands: Vec<Candidate> = (0..SHARD as u32 + 1).map(|k| Candidate { rva: 0x1000 + 0x20 * k, code: pure.clone() }).collect();
+        let files = generate(&cands).unwrap();
+        let file = |p: &str| files.iter().find(|(q, _)| q == p).map(|(_, s)| s.as_str()).unwrap_or_else(|| panic!("{p}"));
+        assert!(file("prelude/src/lib.rs").contains("pub unsafe extern \"C\" fn commons_entry"));
+        assert!(file("shard0/src/lib.rs").contains("pub unsafe fn f_1000("));
+        let last = 0x1000 + 0x20 * SHARD as u32;
+        assert!(file("shard1/src/lib.rs").contains(&format!("pub unsafe fn f_{last:x}(")));
+        assert!(file("src/lib.rs").contains(&format!("commons_track_b_shard1::e_f_{last:x}")));
+        assert!(file("Cargo.toml").contains("members = [\"prelude\", \"shard0\", \"shard1\"]"));
+        assert!(!files.iter().any(|(p, _)| p.starts_with("shard2")));
+    }
 
     #[test]
     fn only_checkable_functions_are_selected() {

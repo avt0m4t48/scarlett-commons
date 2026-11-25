@@ -17,7 +17,8 @@
 //! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss and vzeroupper, through core::arch
 //! intrinsics (the same instructions as the title's); the shuffles and blends vshufps, vblendps, vblendvps, vpermilps
 //! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
-//! vhaddps/pd, vhsubps/pd and vdpps. Not yet: the rest. Shifts by a count above 1 leave OF
+//! vhaddps/pd, vhsubps/pd and vdpps; the compares vucomiss/sd, vcomiss/sd and vcmp{ps,pd,ss,sd}, vmin and vmax, and the
+//! parity flag (every integer flag producer sets it). Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -37,6 +38,7 @@ pub struct Ctx {
     pub zf: bool,
     pub sf: bool,
     pub of: bool,
+    pub pf: bool,
     pub ret: u64,
     pub host_rsp: u64,
     pub target: u64,
@@ -184,6 +186,10 @@ unsafe fn call_native(c: &mut Ctx, target: u64) {
             "shr rdx, 11",
             "and edx, 1",
             "mov [rax + 131], dl",
+            "mov rdx, rcx",
+            "shr rdx, 2",
+            "and edx, 1",
+            "mov [rax + 132], dl",
             "pop rcx",
             "mov [rax], rcx",
             "mov rsp, [rax + 144]",
@@ -309,6 +315,7 @@ unsafe extern "C" fn commons_entry() {
         "lea rax, [rsp + 24]",
         "mov [rcx + 32], rax",
         "mov dword ptr [rcx + 128], 0",
+        "mov byte ptr [rcx + 132], 0",
         "vmovdqu [rcx + 160], ymm0",
         "vmovdqu [rcx + 192], ymm1",
         "vmovdqu [rcx + 224], ymm2",
@@ -406,7 +413,7 @@ fn wr(c: &mut Ctx, r: usize, n: u32, v: u64) {
     }
 }
 #[inline(always)]
-fn szf(c: &mut Ctx, r: u64, n: u32) { c.zf = r & mask(n) == 0; c.sf = sign(r, n); }
+fn szf(c: &mut Ctx, r: u64, n: u32) { c.zf = r & mask(n) == 0; c.sf = sign(r, n); c.pf = (r as u8).count_ones() % 2 == 0; }
 type Y = [u64; 4];
 #[inline(always)]
 unsafe fn vld(a: u64, n: usize) -> Y {
@@ -538,6 +545,67 @@ unsafe fn vdpps<const I: i32>(a: Y, b: Y) -> Y {
     }
     o
 }
+/// vucomiss/vcomiss/vucomisd/vcomisd as the instruction: (ZF, PF, CF); OF, SF and AF are cleared.
+#[target_feature(enable = "avx")]
+unsafe fn ucomi(kind: u8, a: Y, b: Y) -> (bool, bool, bool) {
+    let (mut z, mut p, mut cf): (u8, u8, u8);
+    unsafe {
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        match kind {
+            0 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vmovdqu xmm1, [{b}]", "vucomiss xmm0, xmm1", "setz {z}", "setp {p}", "setc {c}",
+                                  a = in(reg) pa, b = in(reg) pb, z = out(reg_byte) z, p = out(reg_byte) p, c = out(reg_byte) cf, out("xmm0") _, out("xmm1") _),
+            1 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vmovdqu xmm1, [{b}]", "vcomiss xmm0, xmm1", "setz {z}", "setp {p}", "setc {c}",
+                                  a = in(reg) pa, b = in(reg) pb, z = out(reg_byte) z, p = out(reg_byte) p, c = out(reg_byte) cf, out("xmm0") _, out("xmm1") _),
+            2 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vmovdqu xmm1, [{b}]", "vucomisd xmm0, xmm1", "setz {z}", "setp {p}", "setc {c}",
+                                  a = in(reg) pa, b = in(reg) pb, z = out(reg_byte) z, p = out(reg_byte) p, c = out(reg_byte) cf, out("xmm0") _, out("xmm1") _),
+            _ => core::arch::asm!("vmovdqu xmm0, [{a}]", "vmovdqu xmm1, [{b}]", "vcomisd xmm0, xmm1", "setz {z}", "setp {p}", "setc {c}",
+                                  a = in(reg) pa, b = in(reg) pb, z = out(reg_byte) z, p = out(reg_byte) p, c = out(reg_byte) cf, out("xmm0") _, out("xmm1") _),
+        }
+    }
+    (z != 0, p != 0, cf != 0)
+}
+/// One two-source vector instruction written as itself (`ymm0 = op(ymm0, ymm1)`), for the operations whose NaN results
+/// depend on operand order (min, max) and the compares.
+macro_rules! vop2 {
+    ($name:ident, $text:literal) => {
+        #[target_feature(enable = "avx")]
+        unsafe fn $name(a: Y, b: Y) -> Y {
+            let mut o = [0u64; 4];
+            unsafe {
+                core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", $text, "vmovdqu [{o}], ymm0",
+                                 a = in(reg) a.as_ptr(), b = in(reg) b.as_ptr(), o = in(reg) o.as_mut_ptr(),
+                                 out("ymm0") _, out("ymm1") _);
+            }
+            o
+        }
+    };
+}
+vop2!(vminps, "vminps ymm0, ymm0, ymm1");
+vop2!(vmaxps, "vmaxps ymm0, ymm0, ymm1");
+vop2!(vminpd, "vminpd ymm0, ymm0, ymm1");
+vop2!(vmaxpd, "vmaxpd ymm0, ymm0, ymm1");
+vop2!(vminss, "vminss xmm0, xmm0, xmm1");
+vop2!(vmaxss, "vmaxss xmm0, xmm0, xmm1");
+vop2!(vminsd, "vminsd xmm0, xmm0, xmm1");
+vop2!(vmaxsd, "vmaxsd xmm0, xmm0, xmm1");
+macro_rules! vcmp {
+    ($name:ident, $text:literal) => {
+        #[target_feature(enable = "avx")]
+        unsafe fn $name<const I: i32>(a: Y, b: Y) -> Y {
+            let mut o = [0u64; 4];
+            unsafe {
+                core::arch::asm!("vmovdqu ymm0, [{a}]", "vmovdqu ymm1, [{b}]", concat!($text, ", {i}"), "vmovdqu [{o}], ymm0",
+                                 a = in(reg) a.as_ptr(), b = in(reg) b.as_ptr(), o = in(reg) o.as_mut_ptr(), i = const I,
+                                 out("ymm0") _, out("ymm1") _);
+            }
+            o
+        }
+    };
+}
+vcmp!(vcmpps, "vcmpps ymm0, ymm0, ymm1");
+vcmp!(vcmppd, "vcmppd ymm0, ymm0, ymm1");
+vcmp!(vcmpss, "vcmpss xmm0, xmm0, xmm1");
+vcmp!(vcmpsd, "vcmpsd xmm0, xmm0, xmm1");
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -652,7 +720,9 @@ fn condition(cc: ConditionCode) -> Option<&'static str> {
         ConditionCode::ge => "(c.sf == c.of)",
         ConditionCode::le => "(c.zf || c.sf != c.of)",
         ConditionCode::g => "(!c.zf && c.sf == c.of)",
-        _ => return None, // parity
+        ConditionCode::p => "c.pf",
+        ConditionCode::np => "!c.pf",
+        _ => return None,
     })
 }
 
@@ -904,6 +974,34 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             }
             let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
             let _ = write!(s, "let y = vdpps::<{}>({a}, {b}); vset(c, {d}, {w}, y);", i.immediate(3) & 0xff);
+        }
+        Vucomiss | Vcomiss | Vucomisd | Vcomisd => {
+            let (a, _) = vreg(i.op_register(0))?;
+            let w = if matches!(i.mnemonic(), Vucomiss | Vcomiss) { 4 } else { 8 };
+            let b = vread(i, 1, w)?;
+            let kind = match i.mnemonic() { Vucomiss => 0, Vcomiss => 1, Vucomisd => 2, _ => 3 };
+            let _ = write!(s, "let (z, p, cf) = ucomi({kind}, c.x[{a}], {b}); c.zf = z; c.pf = p; c.cf = cf; c.of = false; c.sf = false;");
+        }
+        Vminps | Vmaxps | Vminpd | Vmaxpd | Vminss | Vmaxss | Vminsd | Vmaxsd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let scalar = name.ends_with("ss") || name.ends_with("sd");
+            let bw = if name.ends_with("ss") { 4 } else if name.ends_with("sd") { 8 } else { w };
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, bw)?);
+            let ww = if scalar { 16 } else { w };
+            let _ = write!(s, "let y = {name}({a}, {b}); vset(c, {d}, {ww}, y);");
+        }
+        Vcmpps | Vcmppd | Vcmpss | Vcmpsd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let scalar = name.ends_with("ss") || name.ends_with("sd");
+            let bw = if name.ends_with("ss") { 4 } else if name.ends_with("sd") { 8 } else { w };
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, bw)?);
+            let ww = if scalar { 16 } else { w };
+            let _ = write!(s, "let y = {name}::<{}>({a}, {b}); vset(c, {d}, {ww}, y);", i.immediate(3) & 0x1f);
         }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;

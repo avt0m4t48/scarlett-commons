@@ -238,6 +238,7 @@ fn translated_functions_match_the_cpu() {
             if want(0x40) { assert_eq!(ours.zf, flag(0x40), "ZF, {ctx}"); }
             if want(0x80) { assert_eq!(ours.sf, flag(0x80), "SF, {ctx}"); }
             if want(0x800) { assert_eq!(ours.of, flag(0x800), "OF, {ctx}"); }
+            if want(0x4) { assert_eq!(ours.pf, flag(0x4), "PF, {ctx}"); }
             assert_eq!(ours.ret, 0x5151_5151, "return address, {ctx}");
         }
     }

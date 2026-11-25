@@ -77,6 +77,18 @@ fn main() {
             a.vhaddpd(ymm8, ymm9, ymm10)?; a.vhsubpd(xmm11, xmm12, xmm13)?; a.vdpps(ymm14, ymm15, ymm0, 0xf1)?;
             a.vdpps(xmm1, xmm2, xmm3, 0x7f)?; a.ret()
         })),
+        ("compare", 0x8c5, assemble(|a| {
+            let mut unordered = a.create_label();
+            let mut next = a.create_label();
+            a.vucomiss(xmm0, xmm1)?; a.setp(al)?; a.setz(bl)?; a.seta(cl)?; a.jp(unordered)?; a.mov(r15d, 1)?;
+            a.set_label(&mut unordered)?;
+            a.vcomisd(xmm2, qword_ptr(rdx))?; a.setnp(r8b)?; a.setb(r9b)?; a.cmovp(r10d, r11d)?;
+            a.vcmpps(ymm2, ymm3, ymm4, 1)?; a.vcmpss(xmm5, xmm6, xmm7, 4)?; a.vcmppd(xmm8, xmm9, xmmword_ptr(rdx + 16), 0x1d)?;
+            a.vminps(ymm8, ymm9, ymm10)?; a.vmaxss(xmm11, xmm12, xmm13)?; a.vminsd(xmm14, xmm15, qword_ptr(rdx + 8))?;
+            a.vmaxpd(ymm0, ymm1, ymm2)?; a.jnp(next)?; a.inc(r12)?;
+            a.set_label(&mut next)?;
+            a.add(r13, r14)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

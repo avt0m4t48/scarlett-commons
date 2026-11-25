@@ -1319,19 +1319,32 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             return Some("c.ret = ld(c.r[4], 8); c.r[4] = c.r[4].wrapping_add(8); return;".into());
         }
         Jmp => {
-            if !matches!(i.op0_kind(), OpKind::NearBranch64) || !targets.contains(&i.near_branch_target()) {
+            if !matches!(i.op0_kind(), OpKind::NearBranch64) {
                 return None;
             }
-            return Some(format!("pc = {:#x};", i.near_branch_target()));
+            let t = i.near_branch_target();
+            if !targets.contains(&t) {
+                // A jump out of the function (a tail call, or code it shares): leave the translation with every
+                // register as it is and continue natively there; the exit thunk pushes the target and returns to it.
+                return Some(format!("c.ret = base().wrapping_add({t:#x}); return;"));
+            }
+            return Some(format!("pc = {t:#x};"));
         }
         _ => {
             let name = format!("{:?}", i.mnemonic());
             let cc = condition(i.condition_code())?;
             if i.flow_control() == FlowControl::ConditionalBranch && name.starts_with('J') {
-                if !matches!(i.op0_kind(), OpKind::NearBranch64) || !targets.contains(&i.near_branch_target()) {
+                if !matches!(i.op0_kind(), OpKind::NearBranch64) {
                     return None;
                 }
-                return Some(format!("pc = if {cc} {{ {:#x} }} else {{ {:#x} }};", i.near_branch_target(), i.next_ip()));
+                let t = i.near_branch_target();
+                if !targets.contains(&t) {
+                    return Some(format!(
+                        "if {cc} {{ c.ret = base().wrapping_add({t:#x}); return; }} pc = {:#x};",
+                        i.next_ip()
+                    ));
+                }
+                return Some(format!("pc = if {cc} {{ {t:#x} }} else {{ {:#x} }};", i.next_ip()));
             } else if name.starts_with("Set") {
                 s += &write(i, 1, &format!("({cc} as u64)"))?;
             } else if name.starts_with("Cmov") {

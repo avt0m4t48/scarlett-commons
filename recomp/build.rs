@@ -167,12 +167,20 @@ fn main() {
     let caller = assemble_at(0x6000, |a| {
         a.sub(rsp, 40)?; a.call(0x5000u64)?; a.add(rsp, 40)?; a.ret()
     });
-    for (name, code, rva) in [("entry_f", &f, 0x3000u64), ("entry_h", &h, 0x5000u64)] {
+    // T 0x7000 (translated, replaced) leaves by tail jumps: to F (patched) on one branch, to G (native) on the
+    // other. CALLER2 0x7800 (native) calls T.
+    let t = assemble_at(0x7000, |a| {
+        a.add(rcx, rdx)?; a.test(cl, 1)?; a.jnz(0x3000u64)?; a.mov(rdx, rcx)?; a.vaddps(ymm1, ymm1, ymm1)?; a.jmp(0x4000u64)
+    });
+    let caller2 = assemble_at(0x7800, |a| {
+        a.sub(rsp, 40)?; a.call(0x7000u64)?; a.add(rsp, 40)?; a.ret()
+    });
+    for (name, code, rva) in [("entry_f", &f, 0x3000u64), ("entry_h", &h, 0x5000u64), ("entry_t", &t, 0x7000u64)] {
         out += &commons_recomp_emit::emit_function(name, code, rva).unwrap_or_else(|e| panic!("{name}: {e}"));
         out += &commons_recomp_emit::emit_entry(name);
     }
     out += &format!(
-        "pub const ENTRY_F: &[u8] = &{f:?};\npub const ENTRY_G: &[u8] = &{g:?};\npub const ENTRY_H: &[u8] = &{h:?};\npub const ENTRY_CALLER: &[u8] = &{caller:?};\n"
+        "pub const ENTRY_F: &[u8] = &{f:?};\npub const ENTRY_G: &[u8] = &{g:?};\npub const ENTRY_H: &[u8] = &{h:?};\npub const ENTRY_CALLER: &[u8] = &{caller:?};\npub const ENTRY_T: &[u8] = &{t:?};\npub const ENTRY_CALLER2: &[u8] = &{caller2:?};\n"
     );
     let dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     std::fs::write(std::path::Path::new(&dir).join("synthetic.rs"), out).expect("write");

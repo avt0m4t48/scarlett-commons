@@ -57,7 +57,10 @@ fn checkable_calling(code: &[u8], rva: u32, sandboxed: bool, safe_callee: &dyn F
     }
     // A .pdata entry can be a fragment of a larger function (code split off with chained unwind info) that ends
     // without returning; only a function whose last instruction returns can be run and compared on its own.
-    if insns.last().map(|i| i.flow_control()) != Some(FlowControl::Return) {
+    // One whose last instruction jumps elsewhere (a tail call) leaves as that jump would, through the exit.
+    let last = insns.last().map(|i| (i.flow_control(), i.op0_kind()));
+    let leaves = matches!(last, Some((FlowControl::Return, _)) | Some((FlowControl::UnconditionalBranch, OpKind::NearBranch64)));
+    if !leaves {
         return false;
     }
     // An epilogue fragment (entered by a jump with the stack inside another function's frame) pops more than it
@@ -100,10 +103,14 @@ fn checkable_calling(code: &[u8], rva: u32, sandboxed: bool, safe_callee: &dyn F
         }
         if matches!(i.op0_kind(), OpKind::NearBranch64) && i.flow_control() != FlowControl::Call {
             let t = i.near_branch_target();
-            // The sandboxed test bounds each run with a watchdog, so it can take loops; the other cannot.
-            let backward = t <= i.ip() && !sandboxed;
-            if backward || (t >= start && t < start + crate::JUMP_LEN as u64) || t >= start + code.len() as u64 {
-                return false; // a loop, a branch into the bytes the jump overwrites, or one out of the function
+            let inside = t >= start && t < start + code.len() as u64;
+            if inside {
+                // The sandboxed test bounds each run with a watchdog, so it can take loops; the other cannot.
+                if (t <= i.ip() && !sandboxed) || t < start + crate::JUMP_LEN as u64 {
+                    return false; // a loop, or a branch into the bytes the jump overwrites
+                }
+            } else if !safe_callee(t) {
+                return false; // a jump out to code the test cannot run natively (a tail call is taken like a call)
             }
         }
         let accesses_memory = (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
@@ -654,6 +661,12 @@ mod tests {
         assert!(!checkable(&lp2, 0x1000));
         assert!(checkable_sandboxed(&lp2, 0x1000));
         assert!(!checkable_sandboxed(&lp, 0x1000)); // jnz to the start, inside the jump's bytes
+        // a tail call (the 15 bytes before pure's ret, then `jmp` out): taken when the target can run natively
+        let mut tail_call = pure[..15].to_vec();
+        tail_call.extend_from_slice(&[0xE9, 0x00, 0x10, 0x00, 0x00]);
+        assert!(checkable_with_calls(&tail_call, 0x1000, &|t| t == 0x2014));
+        assert!(!checkable_with_calls(&tail_call, 0x1000, &|_| false));
+        assert!(!checkable_sandboxed(&tail_call, 0x1000));
         // a function shorter than 16 bytes is refused (the jump needs 14)
         assert!(!checkable(&[0x48, 0x89, 0xC8, 0xC3], 0x1000));
     }

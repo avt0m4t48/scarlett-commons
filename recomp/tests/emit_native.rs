@@ -257,6 +257,8 @@ fn patched_entries_keep_the_results() {
         place(0x4000, ENTRY_G);
         place(0x5000, ENTRY_H);
         place(0x6000, ENTRY_CALLER);
+        place(0x7000, ENTRY_T);
+        place(0x7800, ENTRY_CALLER2);
     };
     let jump = |rva: usize, to: u64| {
         let mut j = [0u8; 14];
@@ -281,18 +283,21 @@ fn patched_entries_keep_the_results() {
         }
         start.r[4] = top;
 
-        original();
-        let mut native = start;
-        unsafe { run_native(exec as u64 + 0x6000, &mut native) };
+        for caller in [0x6000u64, 0x7800] {
+            original();
+            let mut native = start;
+            unsafe { run_native(exec as u64 + caller, &mut native) };
 
-        original();
-        jump(0x3000, e_entry_f as usize as u64);
-        jump(0x5000, e_entry_h as usize as u64);
-        let mut patched = start;
-        unsafe { run_native(exec as u64 + 0x6000, &mut patched) };
+            original();
+            jump(0x3000, e_entry_f as usize as u64);
+            jump(0x5000, e_entry_h as usize as u64);
+            jump(0x7000, e_entry_t as usize as u64);
+            let mut patched = start;
+            unsafe { run_native(exec as u64 + caller, &mut patched) };
 
-        let ctx = format!("round {round}: start {:x?}", start.r);
-        assert_eq!(patched.r, native.r, "registers, {ctx}");
-        assert_eq!(patched.x, native.x, "ymm registers, {ctx}");
+            let ctx = format!("caller {caller:#x} round {round}: start {:x?}", start.r);
+            assert_eq!(patched.r, native.r, "registers, {ctx}");
+            assert_eq!(patched.x, native.x, "ymm registers, {ctx}");
+        }
     }
 }

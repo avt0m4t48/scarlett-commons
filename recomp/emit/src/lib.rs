@@ -15,7 +15,8 @@
 //! `call_native`: the callee runs natively and a replaced callee is reached through its own patched entry); general-purpose registers (not AH-DH) and
 //! memory without FS/GS; imul with two or three operands; the AVX moves (vmovaps/ups/apd/upd/dqa/dqu, vmovss/sd),
 //! bitwise operations, packed and scalar add/sub/mul/div, vbroadcastss and vzeroupper, through core::arch
-//! intrinsics (the same instructions as the title's). Not yet: the rest. Shifts by a count above 1 leave OF
+//! intrinsics (the same instructions as the title's); the shuffles and blends vshufps, vblendps, vblendvps, vpermilps
+//! (immediate), vunpcklps/hps and vinsertf128/vextractf128. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -470,6 +471,26 @@ unsafe fn fsd(op: F, a: Y, b: Y) -> Y {
         o
     }
 }
+#[target_feature(enable = "avx")]
+unsafe fn ps(a: Y) -> core::arch::x86_64::__m256 { unsafe { core::arch::x86_64::_mm256_loadu_ps(a.as_ptr() as *const f32) } }
+#[target_feature(enable = "avx")]
+unsafe fn unps(r: core::arch::x86_64::__m256) -> Y {
+    let mut o = [0u64; 4];
+    unsafe { core::arch::x86_64::_mm256_storeu_ps(o.as_mut_ptr() as *mut f32, r) };
+    o
+}
+#[target_feature(enable = "avx")]
+unsafe fn vshufps<const I: i32>(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_shuffle_ps::<I>(ps(a), ps(b))) } }
+#[target_feature(enable = "avx")]
+unsafe fn vblendps<const I: i32>(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_blend_ps::<I>(ps(a), ps(b))) } }
+#[target_feature(enable = "avx")]
+unsafe fn vblendvps(a: Y, b: Y, m: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_blendv_ps(ps(a), ps(b), ps(m))) } }
+#[target_feature(enable = "avx")]
+unsafe fn vpermilps<const I: i32>(a: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_permute_ps::<I>(ps(a))) } }
+#[target_feature(enable = "avx")]
+unsafe fn vunpcklps(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_unpacklo_ps(ps(a), ps(b))) } }
+#[target_feature(enable = "avx")]
+unsafe fn vunpckhps(a: Y, b: Y) -> Y { unsafe { unps(core::arch::x86_64::_mm256_unpackhi_ps(ps(a), ps(b))) } }
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -772,6 +793,56 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             };
             let (a, b) = (vread(i, 1, w)?, vread(i, 2, bw)?);
             let _ = write!(s, "let y = {f}({op}, {a}, {b}); vset(c, {d}, {ww}, y);");
+        }
+        Vshufps | Vblendps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let f = if i.mnemonic() == Vshufps { "vshufps" } else { "vblendps" };
+            let _ = write!(s, "let y = {f}::<{}>({a}, {b}); vset(c, {d}, {w}, y);", i.immediate(3) & 0xff);
+        }
+        Vblendvps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Register {
+                return None;
+            }
+            let (a, b, m) = (vread(i, 1, w)?, vread(i, 2, w)?, vread(i, 3, w)?);
+            let _ = write!(s, "let y = vblendvps({a}, {b}, {m}); vset(c, {d}, {w}, y);");
+        }
+        Vpermilps if i.op_count() == 3 && i.op_kind(2) == OpKind::Immediate8 => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, w)?;
+            let _ = write!(s, "let y = vpermilps::<{}>({a}); vset(c, {d}, {w}, y);", i.immediate(2) & 0xff);
+        }
+        Vunpcklps | Vunpckhps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let f = if i.mnemonic() == Vunpcklps { "vunpcklps" } else { "vunpckhps" };
+            let _ = write!(s, "let y = {f}({a}, {b}); vset(c, {d}, {w}, y);");
+        }
+        Vinsertf128 => {
+            let (d, _) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, 32)?;
+            let b = vread(i, 2, 16)?;
+            let half = if i.immediate(3) & 1 == 0 { 0 } else { 2 };
+            let _ = write!(s, "let mut y = {a}; let b = {b}; y[{half}] = b[0]; y[{half} + 1] = b[1]; vset(c, {d}, 32, y);");
+        }
+        Vextractf128 => {
+            let (r, _) = vreg(i.op_register(1))?;
+            let half = if i.immediate(2) & 1 == 0 { 0 } else { 2 };
+            let v = format!("[c.x[{r}][{half}], c.x[{r}][{half} + 1], 0, 0]");
+            match i.op_kind(0) {
+                OpKind::Register => {
+                    let (d, _) = vreg(i.op_register(0))?;
+                    let _ = write!(s, "let y = {v}; vset(c, {d}, 16, y);");
+                }
+                OpKind::Memory => {
+                    let _ = write!(s, "vst({}, 16, {v});", address(i)?);
+                }
+                _ => return None,
+            }
         }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;

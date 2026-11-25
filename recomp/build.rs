@@ -65,6 +65,13 @@ fn main() {
             a.vmovss_3(xmm9, xmm10, xmm11)?; a.vmovsd(qword_ptr(rdx + 128), xmm3)?; a.vpxor(xmm12, xmm12, xmm13)?;
             a.vmovaps(ymm11, ymm2)?; a.ret()
         })),
+        ("shuffle", 0x8c1, assemble(|a| {
+            a.vshufps(ymm0, ymm1, ymm2, 0x4e)?; a.vshufps(xmm3, xmm4, xmmword_ptr(rdx), 0xb1)?; a.vblendps(ymm5, ymm6, ymm7, 0xa5)?;
+            a.vblendvps(ymm8, ymm9, ymm10, ymm11)?; a.vblendvps(xmm12, xmm13, xmm14, xmm15)?; a.vpermilps(ymm1, ymm2, 0x1b)?;
+            a.vunpcklps(ymm2, ymm3, ymm4)?; a.vunpckhps(xmm4, xmm5, xmm6)?; a.vinsertf128(ymm6, ymm7, xmm8, 1)?;
+            a.vinsertf128(ymm9, ymm10, xmmword_ptr(rdx + 16), 0)?; a.vextractf128(xmm10, ymm11, 1)?;
+            a.vextractf128(xmmword_ptr(rdx + 64), ymm0, 0)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

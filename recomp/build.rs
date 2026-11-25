@@ -108,6 +108,13 @@ fn main() {
             a.vmovq(xmm5, qword_ptr(rdx + 8))?; a.vmovd(dword_ptr(rdx + 16), xmm6)?; a.vmovq(qword_ptr(rdx + 24), xmm7)?;
             a.vmovq(xmm8, xmm9)?; a.ret()
         })),
+        ("vint", 0x8c1, assemble(|a| {
+            a.vpackssdw(ymm0, ymm1, ymm2)?; a.vpackuswb(xmm3, xmm4, xmmword_ptr(rdx))?; a.vpcmpeqd(ymm5, ymm6, ymm7)?;
+            a.vpcmpgtw(xmm8, xmm9, xmm10)?; a.vpmovmskb(eax, ymm5)?; a.vpmovmskb(ecx, xmm8)?; a.vrsqrtps(ymm11, ymm12)?;
+            a.vrcpps(xmm13, xmmword_ptr(rdx + 16))?; a.vshufpd(ymm14, ymm15, ymm0, 0x9)?; a.vinsertps(xmm1, xmm2, xmm3, 0x9d)?;
+            a.vinsertps(xmm4, xmm5, dword_ptr(rdx + 32), 0x2a)?; a.vcvtsi2ss(xmm6, xmm7, r8d)?; a.vcvtsi2sd(xmm9, xmm10, r9)?;
+            a.vcvtsi2ss(xmm10, xmm11, qword_ptr(rdx + 40))?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

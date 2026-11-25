@@ -19,7 +19,8 @@
 //! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
 //! vhaddps/pd, vhsubps/pd and vdpps; the compares vucomiss/sd, vcomiss/sd and vcmp{ps,pd,ss,sd}, vmin and vmax, and the
 //! parity flag (every integer flag producer sets it); FMA in all 48 forms (fmadd, fmsub, fnmadd, fnmsub;
-//! 132, 213, 231; ps, pd, ss, sd), as the instructions; vmovd/vmovq, bt with a register or an immediate, andn and bextr. Not yet: the rest. Shifts by a count above 1 leave OF
+//! 132, 213, 231; ps, pd, ss, sd), as the instructions; vmovd/vmovq, bt with a register or an immediate, andn and bextr; the integer vector packs and
+//! compares, vpmovmskb, vrsqrtps, vrcpps, vshufpd, vinsertps and vcvtsi2ss/sd. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -607,6 +608,37 @@ vcmp!(vcmpps, "vcmpps ymm0, ymm0, ymm1");
 vcmp!(vcmppd, "vcmppd ymm0, ymm0, ymm1");
 vcmp!(vcmpss, "vcmpss xmm0, xmm0, xmm1");
 vcmp!(vcmpsd, "vcmpsd xmm0, xmm0, xmm1");
+vop2!(vpackssdw, "vpackssdw ymm0, ymm0, ymm1");
+vop2!(vpacksswb, "vpacksswb ymm0, ymm0, ymm1");
+vop2!(vpackusdw, "vpackusdw ymm0, ymm0, ymm1");
+vop2!(vpackuswb, "vpackuswb ymm0, ymm0, ymm1");
+vop2!(vpcmpeqb, "vpcmpeqb ymm0, ymm0, ymm1");
+vop2!(vpcmpeqw, "vpcmpeqw ymm0, ymm0, ymm1");
+vop2!(vpcmpeqd, "vpcmpeqd ymm0, ymm0, ymm1");
+vop2!(vpcmpeqq, "vpcmpeqq ymm0, ymm0, ymm1");
+vop2!(vpcmpgtb, "vpcmpgtb ymm0, ymm0, ymm1");
+vop2!(vpcmpgtw, "vpcmpgtw ymm0, ymm0, ymm1");
+vop2!(vpcmpgtd, "vpcmpgtd ymm0, ymm0, ymm1");
+vop2!(vpcmpgtq, "vpcmpgtq ymm0, ymm0, ymm1");
+vop2!(vrsqrtps, "vrsqrtps ymm0, ymm1");
+vop2!(vrcpps, "vrcpps ymm0, ymm1");
+vcmp!(vshufpd, "vshufpd ymm0, ymm0, ymm1");
+vcmp!(vinsertps, "vinsertps xmm0, xmm0, xmm1");
+/// vcvtsi2ss/sd as the instruction (it rounds by MXCSR): the low lane of `a` replaced by the converted integer.
+#[target_feature(enable = "avx")]
+unsafe fn cvtsi(kind: u8, a: Y, v: u64) -> Y {
+    let mut o = [0u64; 4];
+    unsafe {
+        let (pa, po) = (a.as_ptr(), o.as_mut_ptr());
+        match kind {
+            0 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2ss xmm0, xmm0, {v:e}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            1 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2ss xmm0, xmm0, {v}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            2 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2sd xmm0, xmm0, {v:e}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            _ => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2sd xmm0, xmm0, {v}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+        }
+    }
+    o
+}
 /// An FMA instruction written as itself: `ymm0 = op(ymm0 (the destination, also a source), ymm1, ymm2)`, with its
 /// one rounding.
 macro_rules! fma3 {
@@ -1145,6 +1177,68 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
                 }
                 _ => return None,
             }
+        }
+        Vpackssdw | Vpacksswb | Vpackusdw | Vpackuswb | Vpcmpeqb | Vpcmpeqw | Vpcmpeqd | Vpcmpeqq | Vpcmpgtb | Vpcmpgtw | Vpcmpgtd | Vpcmpgtq => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let _ = write!(s, "let y = {name}({a}, {b}); vset(c, {d}, {w}, y);");
+        }
+        Vrsqrtps | Vrcpps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, w)?;
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let _ = write!(s, "let y = {name}([0; 4], {a}); vset(c, {d}, {w}, y);");
+        }
+        Vshufpd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let _ = write!(s, "let y = vshufpd::<{}>({a}, {b}); vset(c, {d}, {w}, y);", i.immediate(3) & 0xff);
+        }
+        Vinsertps => {
+            let (d, _) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let a = vread(i, 1, 16)?;
+            let mut k = i.immediate(3) & 0xff;
+            // from memory the source is the dword itself: put it in lane 0 and select lane 0
+            let b = if i.op_kind(2) == OpKind::Memory {
+                k &= 0x3f;
+                format!("[ld({}, 4), 0, 0, 0]", address(i)?)
+            } else {
+                vread(i, 2, 16)?
+            };
+            let _ = write!(s, "let y = vinsertps::<{k}>({a}, {b}); vset(c, {d}, 16, y);");
+        }
+        Vpmovmskb => {
+            if i.op_kind(0) != OpKind::Register || i.op_kind(1) != OpKind::Register {
+                return None;
+            }
+            let (r, _) = gpr(i.op_register(0))?;
+            let (x, w) = vreg(i.op_register(1))?;
+            let _ = write!(s, "let mut m = 0u64; for k in 0..{w} {{ m |= ((c.x[{x}][k / 8] >> (k % 8 * 8 + 7)) & 1) << k; }} wr(c, {r}, 4, m);");
+        }
+        Vcvtsi2ss | Vcvtsi2sd => {
+            let (d, _) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, 16)?;
+            let n = match i.op_kind(2) {
+                OpKind::Register => gpr(i.op_register(2))?.1,
+                OpKind::Memory => i.memory_size().size() as u32,
+                _ => return None,
+            };
+            if n != 4 && n != 8 {
+                return None;
+            }
+            let v = match i.op_kind(2) {
+                OpKind::Register => format!("c.r[{}]", gpr(i.op_register(2))?.0),
+                _ => format!("ld({}, {n})", address(i)?),
+            };
+            let kind = if i.mnemonic() == Vcvtsi2ss { 0 } else { 2 } + if n == 8 { 1 } else { 0 };
+            let _ = write!(s, "let y = cvtsi({kind}, {a}, {v}); vset(c, {d}, 16, y);");
         }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;

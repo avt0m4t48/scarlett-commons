@@ -18,7 +18,8 @@
 //! intrinsics (the same instructions as the title's); the shuffles and blends vshufps, vblendps, vblendvps, vpermilps
 //! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
 //! vhaddps/pd, vhsubps/pd and vdpps; the compares vucomiss/sd, vcomiss/sd and vcmp{ps,pd,ss,sd}, vmin and vmax, and the
-//! parity flag (every integer flag producer sets it). Not yet: the rest. Shifts by a count above 1 leave OF
+//! parity flag (every integer flag producer sets it); FMA in all 48 forms (fmadd, fmsub, fnmadd, fnmsub;
+//! 132, 213, 231; ps, pd, ss, sd), as the instructions. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -606,6 +607,70 @@ vcmp!(vcmpps, "vcmpps ymm0, ymm0, ymm1");
 vcmp!(vcmppd, "vcmppd ymm0, ymm0, ymm1");
 vcmp!(vcmpss, "vcmpss xmm0, xmm0, xmm1");
 vcmp!(vcmpsd, "vcmpsd xmm0, xmm0, xmm1");
+/// An FMA instruction written as itself: `ymm0 = op(ymm0 (the destination, also a source), ymm1, ymm2)`, with its
+/// one rounding.
+macro_rules! fma3 {
+    ($name:ident, $text:literal) => {
+        #[target_feature(enable = "avx,fma")]
+        unsafe fn $name(d: Y, a: Y, b: Y) -> Y {
+            let mut o = [0u64; 4];
+            unsafe {
+                core::arch::asm!("vmovdqu ymm0, [{d}]", "vmovdqu ymm1, [{a}]", "vmovdqu ymm2, [{b}]", $text, "vmovdqu [{o}], ymm0",
+                                 d = in(reg) d.as_ptr(), a = in(reg) a.as_ptr(), b = in(reg) b.as_ptr(), o = in(reg) o.as_mut_ptr(),
+                                 out("ymm0") _, out("ymm1") _, out("ymm2") _);
+            }
+            o
+        }
+    };
+}
+fma3!(vfmadd132ps, "vfmadd132ps ymm0, ymm1, ymm2");
+fma3!(vfmadd132pd, "vfmadd132pd ymm0, ymm1, ymm2");
+fma3!(vfmadd132ss, "vfmadd132ss xmm0, xmm1, xmm2");
+fma3!(vfmadd132sd, "vfmadd132sd xmm0, xmm1, xmm2");
+fma3!(vfmadd213ps, "vfmadd213ps ymm0, ymm1, ymm2");
+fma3!(vfmadd213pd, "vfmadd213pd ymm0, ymm1, ymm2");
+fma3!(vfmadd213ss, "vfmadd213ss xmm0, xmm1, xmm2");
+fma3!(vfmadd213sd, "vfmadd213sd xmm0, xmm1, xmm2");
+fma3!(vfmadd231ps, "vfmadd231ps ymm0, ymm1, ymm2");
+fma3!(vfmadd231pd, "vfmadd231pd ymm0, ymm1, ymm2");
+fma3!(vfmadd231ss, "vfmadd231ss xmm0, xmm1, xmm2");
+fma3!(vfmadd231sd, "vfmadd231sd xmm0, xmm1, xmm2");
+fma3!(vfmsub132ps, "vfmsub132ps ymm0, ymm1, ymm2");
+fma3!(vfmsub132pd, "vfmsub132pd ymm0, ymm1, ymm2");
+fma3!(vfmsub132ss, "vfmsub132ss xmm0, xmm1, xmm2");
+fma3!(vfmsub132sd, "vfmsub132sd xmm0, xmm1, xmm2");
+fma3!(vfmsub213ps, "vfmsub213ps ymm0, ymm1, ymm2");
+fma3!(vfmsub213pd, "vfmsub213pd ymm0, ymm1, ymm2");
+fma3!(vfmsub213ss, "vfmsub213ss xmm0, xmm1, xmm2");
+fma3!(vfmsub213sd, "vfmsub213sd xmm0, xmm1, xmm2");
+fma3!(vfmsub231ps, "vfmsub231ps ymm0, ymm1, ymm2");
+fma3!(vfmsub231pd, "vfmsub231pd ymm0, ymm1, ymm2");
+fma3!(vfmsub231ss, "vfmsub231ss xmm0, xmm1, xmm2");
+fma3!(vfmsub231sd, "vfmsub231sd xmm0, xmm1, xmm2");
+fma3!(vfnmadd132ps, "vfnmadd132ps ymm0, ymm1, ymm2");
+fma3!(vfnmadd132pd, "vfnmadd132pd ymm0, ymm1, ymm2");
+fma3!(vfnmadd132ss, "vfnmadd132ss xmm0, xmm1, xmm2");
+fma3!(vfnmadd132sd, "vfnmadd132sd xmm0, xmm1, xmm2");
+fma3!(vfnmadd213ps, "vfnmadd213ps ymm0, ymm1, ymm2");
+fma3!(vfnmadd213pd, "vfnmadd213pd ymm0, ymm1, ymm2");
+fma3!(vfnmadd213ss, "vfnmadd213ss xmm0, xmm1, xmm2");
+fma3!(vfnmadd213sd, "vfnmadd213sd xmm0, xmm1, xmm2");
+fma3!(vfnmadd231ps, "vfnmadd231ps ymm0, ymm1, ymm2");
+fma3!(vfnmadd231pd, "vfnmadd231pd ymm0, ymm1, ymm2");
+fma3!(vfnmadd231ss, "vfnmadd231ss xmm0, xmm1, xmm2");
+fma3!(vfnmadd231sd, "vfnmadd231sd xmm0, xmm1, xmm2");
+fma3!(vfnmsub132ps, "vfnmsub132ps ymm0, ymm1, ymm2");
+fma3!(vfnmsub132pd, "vfnmsub132pd ymm0, ymm1, ymm2");
+fma3!(vfnmsub132ss, "vfnmsub132ss xmm0, xmm1, xmm2");
+fma3!(vfnmsub132sd, "vfnmsub132sd xmm0, xmm1, xmm2");
+fma3!(vfnmsub213ps, "vfnmsub213ps ymm0, ymm1, ymm2");
+fma3!(vfnmsub213pd, "vfnmsub213pd ymm0, ymm1, ymm2");
+fma3!(vfnmsub213ss, "vfnmsub213ss xmm0, xmm1, xmm2");
+fma3!(vfnmsub213sd, "vfnmsub213sd xmm0, xmm1, xmm2");
+fma3!(vfnmsub231ps, "vfnmsub231ps ymm0, ymm1, ymm2");
+fma3!(vfnmsub231pd, "vfnmsub231pd ymm0, ymm1, ymm2");
+fma3!(vfnmsub231ss, "vfnmsub231ss xmm0, xmm1, xmm2");
+fma3!(vfnmsub231sd, "vfnmsub231sd xmm0, xmm1, xmm2");
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -1003,6 +1068,15 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             let ww = if scalar { 16 } else { w };
             let _ = write!(s, "let y = {name}::<{}>({a}, {b}); vset(c, {d}, {ww}, y);", i.immediate(3) & 0x1f);
         }
+        Vfmadd132ps | Vfmadd132pd | Vfmadd132ss | Vfmadd132sd | Vfmadd213ps | Vfmadd213pd | Vfmadd213ss | Vfmadd213sd | Vfmadd231ps | Vfmadd231pd | Vfmadd231ss | Vfmadd231sd | Vfmsub132ps | Vfmsub132pd | Vfmsub132ss | Vfmsub132sd | Vfmsub213ps | Vfmsub213pd | Vfmsub213ss | Vfmsub213sd | Vfmsub231ps | Vfmsub231pd | Vfmsub231ss | Vfmsub231sd | Vfnmadd132ps | Vfnmadd132pd | Vfnmadd132ss | Vfnmadd132sd | Vfnmadd213ps | Vfnmadd213pd | Vfnmadd213ss | Vfnmadd213sd | Vfnmadd231ps | Vfnmadd231pd | Vfnmadd231ss | Vfnmadd231sd | Vfnmsub132ps | Vfnmsub132pd | Vfnmsub132ss | Vfnmsub132sd | Vfnmsub213ps | Vfnmsub213pd | Vfnmsub213ss | Vfnmsub213sd | Vfnmsub231ps | Vfnmsub231pd | Vfnmsub231ss | Vfnmsub231sd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let bw = if name.ends_with("ss") { 4 } else if name.ends_with("sd") { 8 } else { w };
+            let scalar = name.ends_with("ss") || name.ends_with("sd");
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, bw)?);
+            let ww = if scalar { 16 } else { w };
+            let _ = write!(s, "let y = {name}(c.x[{d}], {a}, {b}); vset(c, {d}, {ww}, y);");
+        }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;
             let src = match i.op_kind(1) {
@@ -1130,6 +1204,6 @@ pub fn emit_function(name: &str, code: &[u8], ip: u64) -> Result<String, String>
         let _ = writeln!(body, "            {:#x} => {{ {stmt} }} // {i}", i.ip());
     }
     Ok(format!(
-        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\n#[target_feature(enable = \"avx,avx2\")]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
+        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\n#[target_feature(enable = \"avx,avx2,fma\")]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
     ))
 }

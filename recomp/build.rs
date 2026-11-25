@@ -89,6 +89,12 @@ fn main() {
             a.set_label(&mut next)?;
             a.add(r13, r14)?; a.ret()
         })),
+        ("fma", 0x8c1, assemble(|a| {
+            a.vfmadd213ps(ymm0, ymm1, ymm2)?; a.vfmadd231ps(ymm3, ymm4, ymmword_ptr(rdx))?; a.vfmadd132ps(xmm5, xmm6, xmm7)?;
+            a.vfmsub213pd(ymm8, ymm9, ymm10)?; a.vfnmadd231ss(xmm11, xmm12, dword_ptr(rdx + 32))?; a.vfnmsub132sd(xmm13, xmm14, xmm15)?;
+            a.vfmadd213ss(xmm1, xmm2, xmm3)?; a.vfmsub231ps(ymm4, ymm5, ymm6)?; a.vfnmadd213pd(xmm7, xmm8, xmmword_ptr(rdx + 64))?;
+            a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

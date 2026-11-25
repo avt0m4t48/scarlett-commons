@@ -24,6 +24,8 @@ pub struct Image<'a> {
     pub size_of_headers: u32,
     sections: Vec<(u32, u32, u32, u32)>, // virtual address, virtual size, raw offset, raw size
     exception: (u32, u32),
+    /// The import address table (RVA, size): what the image's calls to other modules go through.
+    pub iat: (u32, u32),
 }
 
 fn u16_at(d: &[u8], o: usize) -> Option<u16> {
@@ -58,6 +60,11 @@ impl<'a> Image<'a> {
         } else {
             (0, 0)
         };
+        let iat = if dirs > 12 {
+            (u32_at(data, opt + 112 + 96).unwrap_or(0), u32_at(data, opt + 112 + 100).unwrap_or(0))
+        } else {
+            (0, 0)
+        };
         let table = opt + opt_size;
         let mut sections = Vec::with_capacity(sections_n);
         for i in 0..sections_n {
@@ -69,7 +76,7 @@ impl<'a> Image<'a> {
                 u32_at(data, s + 16).ok_or("short section table")?,
             ));
         }
-        Ok(Image { data, image_base, size_of_image, size_of_headers, sections, exception })
+        Ok(Image { data, image_base, size_of_image, size_of_headers, sections, exception, iat })
     }
 
     /// The file bytes of [rva, rva + len), when they lie inside one section's raw data.

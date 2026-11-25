@@ -66,10 +66,96 @@ pub unsafe fn run_native_guarded(code: u64, c: &mut HostCtx) -> Option<u64> {
     });
     unsafe {
         FAULTED = false;
-        IN_RUN = true;
         let flags = run_native(code, c);
-        IN_RUN = false;
         if FAULTED { None } else { Some(flags) }
+    }
+}
+
+/// How a timed call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Done(u64),
+    Fault,
+    Timeout,
+}
+
+static DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TIMED_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WATCHDOG: std::sync::Once = std::sync::Once::new();
+static mut RUN_THREAD: isize = 0;
+
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+    fn OpenThread(access: u32, inherit: i32, id: u32) -> isize;
+    fn SuspendThread(thread: isize) -> u32;
+    fn ResumeThread(thread: isize) -> u32;
+    fn GetThreadContext(thread: isize, context: *mut u8) -> i32;
+    fn SetThreadContext(thread: isize, context: *const u8) -> i32;
+}
+
+#[repr(C, align(16))]
+struct Context([u8; 1232]);
+
+fn now_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+/// The watchdog: when a timed call is past its deadline and still inside the thunk's call, the calling thread is
+/// suspended, its rip moved to the thunk's exit, and resumed.
+fn watchdog() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        let deadline = DEADLINE.load(std::sync::atomic::Ordering::Acquire);
+        if deadline == 0 || now_us() < deadline {
+            continue;
+        }
+        unsafe {
+            let t = RUN_THREAD;
+            if SuspendThread(t) == u32::MAX {
+                continue;
+            }
+            let inside = core::ptr::read_volatile(&raw const IN_RUN);
+            if inside && DEADLINE.load(std::sync::atomic::Ordering::Acquire) == deadline {
+                let mut ctx = Context([0; 1232]);
+                *(ctx.0.as_mut_ptr().add(0x30) as *mut u32) = 0x0010_0001; // CONTEXT_CONTROL
+                if GetThreadContext(t, ctx.0.as_mut_ptr()) != 0 {
+                    *(ctx.0.as_mut_ptr().add(0xF8) as *mut u64) = RECOVER;
+                    if SetThreadContext(t, ctx.0.as_ptr()) != 0 {
+                        TIMED_OUT.store(true, std::sync::atomic::Ordering::Release);
+                        DEADLINE.store(0, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+            ResumeThread(t);
+        }
+    }
+}
+
+/// [`run_native_guarded`] with a time limit: a call still running after `limit_us` microseconds is stopped and reported
+/// as a timeout (a loop on a generated count, say).
+///
+/// # Safety
+/// As [`run_native`].
+#[target_feature(enable = "avx")]
+pub unsafe fn run_native_timed(code: u64, c: &mut HostCtx, limit_us: u64) -> Outcome {
+    unsafe {
+        WATCHDOG.call_once(|| {
+            RUN_THREAD = OpenThread(0x001F_03FF, 0, GetCurrentThreadId());
+            std::thread::spawn(watchdog);
+        });
+        TIMED_OUT.store(false, std::sync::atomic::Ordering::Release);
+        DEADLINE.store(now_us() + limit_us, std::sync::atomic::Ordering::Release);
+        let r = run_native_guarded(code, c);
+        DEADLINE.store(0, std::sync::atomic::Ordering::Release);
+        if TIMED_OUT.load(std::sync::atomic::Ordering::Acquire) {
+            Outcome::Timeout
+        } else {
+            match r {
+                Some(f) => Outcome::Done(f),
+                None => Outcome::Fault,
+            }
+        }
     }
 }
 
@@ -87,6 +173,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "push rbp",
             "lea rax, [rip + 9f]",
             "mov [rip + {recover}], rax",
+            "mov byte ptr [rip + {inrun}], 1",
             "mov [rip + {host}], rsp",
             "mov rax, [rip + {ctx}]",
             "mov rsp, [rax + 32]",
@@ -122,6 +209,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "vmovdqu ymm15, [rax + 640]",
             "mov rax, [rax]",
             "call qword ptr [rip + {target}]",
+            "mov byte ptr [rip + {inrun}], 0",
             "mov [rip + {scratch}], rax",
             "pushfq",
             "pop rax",
@@ -161,6 +249,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "mov rcx, [rip + {scratch}]",
             "mov [rax], rcx",
             "9:",
+            "mov byte ptr [rip + {inrun}], 0",
             "mov rsp, [rip + {host}]",
             "pop rbp",
             "pop rbx",
@@ -170,6 +259,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             scratch = sym SCRATCH,
             flags = sym FLAGS,
             recover = sym RECOVER,
+            inrun = sym IN_RUN,
             out("rax") _, out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
             out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             out("r12") _, out("r13") _, out("r14") _, out("r15") _,
@@ -222,5 +312,41 @@ impl Rng {
         } else {
             u64::from(f(self)) | (u64::from(f(self)) << 32)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "system" {
+        fn VirtualAlloc(address: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
+    }
+
+    #[test]
+    fn faults_and_endless_loops_come_back() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exec = unsafe { VirtualAlloc(core::ptr::null_mut(), 4096, 0x3000, 0x40) };
+        let code: [&[u8]; 3] = [
+            &[0x48, 0x89, 0xC8, 0xC3],             // mov rax, rcx; ret
+            &[0x48, 0x8B, 0x00, 0xC3],             // mov rax, [rax]; ret (rax = 0: faults)
+            &[0xEB, 0xFE],                         // jmp $: never returns
+        ];
+        for (k, c) in code.iter().enumerate() {
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), exec.add(64 * k), c.len()) };
+        }
+        let mut stack = vec![0u8; 1 << 16];
+        let top = (stack.as_mut_ptr() as u64 + (1 << 15)) & !0xf;
+        let run = |k: usize, limit: u64| {
+            let mut c = HostCtx::default();
+            c.r[1] = 0x1234;
+            c.r[4] = top;
+            let outcome = unsafe { run_native_timed(exec as u64 + 64 * k as u64, &mut c, limit) };
+            (outcome, c.r[0])
+        };
+        assert!(matches!(run(0, 2_000), (Outcome::Done(_), 0x1234)));
+        assert_eq!(run(1, 2_000).0, Outcome::Fault);
+        assert_eq!(run(2, 2_000).0, Outcome::Timeout);
+        assert!(matches!(run(0, 2_000), (Outcome::Done(_), 0x1234)), "a call after a timeout works");
     }
 }

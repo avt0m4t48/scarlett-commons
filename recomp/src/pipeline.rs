@@ -85,7 +85,9 @@ fn checkable_with(code: &[u8], rva: u32, sandboxed: bool) -> bool {
         }
         if matches!(i.op0_kind(), OpKind::NearBranch64) {
             let t = i.near_branch_target();
-            if t <= i.ip() || (t >= start && t < start + crate::JUMP_LEN as u64) || t >= start + code.len() as u64 {
+            // The sandboxed test bounds each run with a watchdog, so it can take loops; the other cannot.
+            let backward = t <= i.ip() && !sandboxed;
+            if backward || (t >= start && t < start + crate::JUMP_LEN as u64) || t >= start + code.len() as u64 {
                 return false; // a loop, a branch into the bytes the jump overwrites, or one out of the function
             }
         }
@@ -304,11 +306,24 @@ pub struct SandboxReport {
     pub passed: Vec<u32>,
     /// Functions whose translation differed from the native function, or faulted where it did not.
     pub differed: usize,
+    pub differed_rvas: Vec<u32>,
     /// Functions without enough inputs on which the native function ran to completion.
     pub inconclusive: usize,
 }
 
 const SANDBOX: usize = 1 << 16;
+
+/// The translation an entry stub enters: the stub is `push rax; lea rax, [rip + disp32]; jmp ...`.
+fn translation_of(entry: u64) -> u64 {
+    unsafe {
+        let p = entry as *const u8;
+        if *p == 0x50 && *p.add(1) == 0x48 && *p.add(2) == 0x8D && *p.add(3) == 0x05 {
+            let disp = (p.add(4) as *const i32).read_unaligned();
+            return (entry + 8).wrapping_add(disp as i64 as u64);
+        }
+    }
+    0
+}
 const GUARD: usize = 1 << 16;
 
 /// `size` writable bytes between two reserved, never committed guard regions, so a write past either end faults
@@ -328,7 +343,7 @@ fn guarded(size: usize) -> &'static mut [u8] {
 /// An input on which the native function faults is skipped; the translation must then match on every other input,
 /// and at least a quarter of the inputs must have run.
 pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds: usize) -> SandboxReport {
-    use crate::harness::run_native_guarded;
+    use crate::harness::{run_native_timed, Outcome};
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let entry_of: std::collections::HashMap<u64, u64> = entries(lib).into_iter().collect();
     unsafe { (lib.init)(base) };
@@ -338,7 +353,7 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
     let top = (stack.as_mut_ptr() as u64 + (1 << 15)) & !0xf;
     let above = (top - stack.as_ptr() as u64) as usize;
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-    let mut report = SandboxReport { passed: Vec::new(), differed: 0, inconclusive: 0 };
+    let mut report = SandboxReport { passed: Vec::new(), differed: 0, differed_rvas: Vec::new(), inconclusive: 0 };
     for c in cands {
         let Some(&entry) = entry_of.get(&u64::from(c.rva)) else { continue };
         if std::env::var_os("COMMONS_RECOMP_TRACE").is_some() {
@@ -364,17 +379,45 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
 
             sandbox.copy_from_slice(&initial_sandbox);
             stack.copy_from_slice(&initial_stack);
+            // The entry stub and commons_entry store rax, rcx and the translation's address below the return address
+            // (where the callee's own frame starts, uninitialised). Put the same words there for the native run, so a
+            // function that reads its uninitialised frame reads the same bytes in both.
+            let slot = (top - 8 - stack.as_ptr() as u64) as usize; // the return address of the thunk's call
+            for (k, v) in [start.r[0], start.r[1], translation_of(entry)].iter().enumerate() {
+                let at = slot - 8 * (k + 1);
+                stack[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            }
             let mut a = start;
-            if unsafe { run_native_guarded(native, &mut a) }.is_none() {
-                continue; // this input is outside what the function accepts
+            // A fault or a run past 2 ms (a loop on a generated count): this input is outside what the function
+            // accepts, or too long to compare.
+            if !matches!(unsafe { run_native_timed(native, &mut a, 2_000) }, Outcome::Done(_)) {
+                continue;
             }
             let (native_sandbox, native_stack) = (sandbox.to_vec(), stack[above..].to_vec());
 
             sandbox.copy_from_slice(&initial_sandbox);
             stack.copy_from_slice(&initial_stack);
             let mut b = start;
-            let translated = unsafe { run_native_guarded(entry, &mut b) };
-            if translated.is_none() || a.r != b.r || a.x != b.x || sandbox[..] != native_sandbox[..] || stack[above..] != native_stack[..] {
+            let translated = unsafe { run_native_timed(entry, &mut b, 100_000) };
+            let why = if !matches!(translated, Outcome::Done(_)) {
+                Some(format!("translation {translated:?}"))
+            } else if a.r != b.r {
+                let r = (0..16).find(|&r| a.r[r] != b.r[r]).unwrap_or(0);
+                Some(format!("r{r}: native {:#x}, translated {:#x}", a.r[r], b.r[r]))
+            } else if a.x != b.x {
+                Some("a ymm register".to_string())
+            } else if sandbox[..] != native_sandbox[..] {
+                let at = (0..SANDBOX).find(|&k| sandbox[k] != native_sandbox[k]).unwrap_or(0);
+                Some(format!("sandbox byte {at:#x}"))
+            } else if stack[above..] != native_stack[..] {
+                Some("the caller's stack".to_string())
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                if std::env::var_os("COMMONS_RECOMP_TRACE").is_some() {
+                    eprintln!("differed {:#x}: {why}; start {:x?}", c.rva, start.r);
+                }
                 differs = true;
                 break;
             }
@@ -382,6 +425,7 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
         }
         if differs {
             report.differed += 1;
+            report.differed_rvas.push(c.rva);
         } else if ran * 4 < rounds {
             report.inconclusive += 1;
         } else {
@@ -447,6 +491,13 @@ mod tests {
         let mut write_global = vec![0xC5, 0xFC, 0x29, 0x05, 0x00, 0x01, 0x00, 0x00]; // vmovaps [rip+100h], ymm0
         write_global.extend_from_slice(&tail);
         assert!(!checkable_sandboxed(&write_global, 0x1000));
+        // loops: refused without the watchdog, taken by the sandboxed rule (but never a branch to the first 14 bytes)
+        // the 15 bytes before pure's ret, then `dec rcx; jnz -5` (a loop back to offset 15) and ret
+        let mut lp2 = pure[..15].to_vec();
+        lp2.extend_from_slice(&[0x48, 0xFF, 0xC9, 0x75, 0xFB, 0xC3]);
+        assert!(!checkable(&lp2, 0x1000));
+        assert!(checkable_sandboxed(&lp2, 0x1000));
+        assert!(!checkable_sandboxed(&lp, 0x1000)); // jnz to the start, inside the jump's bytes
         // a function shorter than 16 bytes is refused (the jump needs 14)
         assert!(!checkable(&[0x48, 0x89, 0xC8, 0xC3], 0x1000));
     }

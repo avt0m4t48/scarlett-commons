@@ -19,7 +19,8 @@
 //! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
 //! vhaddps/pd, vhsubps/pd and vdpps; the compares vucomiss/sd, vcomiss/sd and vcmp{ps,pd,ss,sd}, vmin and vmax, and the
 //! parity flag (every integer flag producer sets it); FMA in all 48 forms (fmadd, fmsub, fnmadd, fnmsub;
-//! 132, 213, 231; ps, pd, ss, sd), as the instructions. Not yet: the rest. Shifts by a count above 1 leave OF
+//! 132, 213, 231; ps, pd, ss, sd), as the instructions; vmovd/vmovq, bt with a register or an immediate, andn and bextr; the integer vector packs and
+//! compares, vpmovmskb, vrsqrtps, vrcpps, vshufpd, vinsertps and vcvtsi2ss/sd. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
 use std::collections::BTreeSet;
@@ -607,6 +608,37 @@ vcmp!(vcmpps, "vcmpps ymm0, ymm0, ymm1");
 vcmp!(vcmppd, "vcmppd ymm0, ymm0, ymm1");
 vcmp!(vcmpss, "vcmpss xmm0, xmm0, xmm1");
 vcmp!(vcmpsd, "vcmpsd xmm0, xmm0, xmm1");
+vop2!(vpackssdw, "vpackssdw ymm0, ymm0, ymm1");
+vop2!(vpacksswb, "vpacksswb ymm0, ymm0, ymm1");
+vop2!(vpackusdw, "vpackusdw ymm0, ymm0, ymm1");
+vop2!(vpackuswb, "vpackuswb ymm0, ymm0, ymm1");
+vop2!(vpcmpeqb, "vpcmpeqb ymm0, ymm0, ymm1");
+vop2!(vpcmpeqw, "vpcmpeqw ymm0, ymm0, ymm1");
+vop2!(vpcmpeqd, "vpcmpeqd ymm0, ymm0, ymm1");
+vop2!(vpcmpeqq, "vpcmpeqq ymm0, ymm0, ymm1");
+vop2!(vpcmpgtb, "vpcmpgtb ymm0, ymm0, ymm1");
+vop2!(vpcmpgtw, "vpcmpgtw ymm0, ymm0, ymm1");
+vop2!(vpcmpgtd, "vpcmpgtd ymm0, ymm0, ymm1");
+vop2!(vpcmpgtq, "vpcmpgtq ymm0, ymm0, ymm1");
+vop2!(vrsqrtps, "vrsqrtps ymm0, ymm1");
+vop2!(vrcpps, "vrcpps ymm0, ymm1");
+vcmp!(vshufpd, "vshufpd ymm0, ymm0, ymm1");
+vcmp!(vinsertps, "vinsertps xmm0, xmm0, xmm1");
+/// vcvtsi2ss/sd as the instruction (it rounds by MXCSR): the low lane of `a` replaced by the converted integer.
+#[target_feature(enable = "avx")]
+unsafe fn cvtsi(kind: u8, a: Y, v: u64) -> Y {
+    let mut o = [0u64; 4];
+    unsafe {
+        let (pa, po) = (a.as_ptr(), o.as_mut_ptr());
+        match kind {
+            0 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2ss xmm0, xmm0, {v:e}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            1 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2ss xmm0, xmm0, {v}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            2 => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2sd xmm0, xmm0, {v:e}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+            _ => core::arch::asm!("vmovdqu xmm0, [{a}]", "vcvtsi2sd xmm0, xmm0, {v}", "vmovdqu [{o}], xmm0", a = in(reg) pa, o = in(reg) po, v = in(reg) v, out("xmm0") _),
+        }
+    }
+    o
+}
 /// An FMA instruction written as itself: `ymm0 = op(ymm0 (the destination, also a source), ymm1, ymm2)`, with its
 /// one rounding.
 macro_rules! fma3 {
@@ -671,6 +703,24 @@ fma3!(vfnmsub231ps, "vfnmsub231ps ymm0, ymm1, ymm2");
 fma3!(vfnmsub231pd, "vfnmsub231pd ymm0, ymm1, ymm2");
 fma3!(vfnmsub231ss, "vfnmsub231ss xmm0, xmm1, xmm2");
 fma3!(vfnmsub231sd, "vfnmsub231sd xmm0, xmm1, xmm2");
+/// andn and bextr (BMI1) as the instructions, with the flags they leave: (result, ZF, SF, CF, OF).
+#[target_feature(enable = "bmi1")]
+unsafe fn bmi(op: u8, wide: bool, a: u64, b: u64) -> (u64, bool, bool, bool, bool) {
+    let (mut r, mut z, mut sf, mut cf, mut of): (u64, u8, u8, u8, u8);
+    unsafe {
+        match (op, wide) {
+            (0, true) => core::arch::asm!("andn {r}, {a}, {b}", "setz {z}", "sets {s}", "setc {c}", "seto {o}",
+                r = out(reg) r, a = in(reg) a, b = in(reg) b, z = out(reg_byte) z, s = out(reg_byte) sf, c = out(reg_byte) cf, o = out(reg_byte) of),
+            (0, false) => core::arch::asm!("andn {r:e}, {a:e}, {b:e}", "setz {z}", "sets {s}", "setc {c}", "seto {o}",
+                r = out(reg) r, a = in(reg) a, b = in(reg) b, z = out(reg_byte) z, s = out(reg_byte) sf, c = out(reg_byte) cf, o = out(reg_byte) of),
+            (_, true) => core::arch::asm!("bextr {r}, {a}, {b}", "setz {z}", "sets {s}", "setc {c}", "seto {o}",
+                r = out(reg) r, a = in(reg) a, b = in(reg) b, z = out(reg_byte) z, s = out(reg_byte) sf, c = out(reg_byte) cf, o = out(reg_byte) of),
+            (_, false) => core::arch::asm!("bextr {r:e}, {a:e}, {b:e}", "setz {z}", "sets {s}", "setc {c}", "seto {o}",
+                r = out(reg) r, a = in(reg) a, b = in(reg) b, z = out(reg_byte) z, s = out(reg_byte) sf, c = out(reg_byte) cf, o = out(reg_byte) of),
+        }
+    }
+    (r, z != 0, sf != 0, cf != 0, of != 0)
+}
 "#;
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
@@ -1077,6 +1127,119 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
             let ww = if scalar { 16 } else { w };
             let _ = write!(s, "let y = {name}(c.x[{d}], {a}, {b}); vset(c, {d}, {ww}, y);");
         }
+        Andn | Bextr => {
+            let n = size_of_op0(i)?;
+            if n < 4 || i.op_kind(0) != OpKind::Register {
+                return None;
+            }
+            // andn d, a, b = !a & b; bextr d, src, control
+            let (a, b) = (read(i, 1, n)?, read(i, 2, n)?);
+            let op = if i.mnemonic() == Andn { 0 } else { 1 };
+            let _ = write!(s, "let (r, z, sf, cf, of) = bmi({op}, {}, {a}, {b}); c.zf = z; c.sf = sf; c.cf = cf; c.of = of; ", n == 8);
+            s += &write(i, n, "r")?;
+        }
+        Bt => {
+            // bt r/m, r or imm: CF = the bit; the other flags are left (undefined for OF, SF, PF; ZF unchanged).
+            let n = size_of_op0(i)?;
+            if n < 2 {
+                return None;
+            }
+            let bits = n * 8;
+            let a = read(i, 0, n)?;
+            let k = match i.op_kind(1) {
+                OpKind::Immediate8 => format!("{}u64", i.immediate(1) & 0xff),
+                OpKind::Register if i.op_kind(0) == OpKind::Register => read(i, 1, n)?,
+                _ => return None, // bt m, r addresses past the operand by the register's value
+            };
+            let _ = write!(s, "let k = {k} % {bits}; c.cf = ({a} >> k) & 1 == 1;");
+        }
+        Vmovd | Vmovq => {
+            let e = if i.mnemonic() == Vmovd { 4 } else { 8 };
+            match (i.op_kind(0), i.op_kind(1)) {
+                (OpKind::Register, _) if vreg(i.op_register(0)).is_some() => {
+                    let (d, _) = vreg(i.op_register(0))?;
+                    let v = match i.op_kind(1) {
+                        OpKind::Register if vreg(i.op_register(1)).is_some() => format!("(c.x[{}][0] & mask({e}))", vreg(i.op_register(1))?.0),
+                        OpKind::Register => format!("(c.r[{}] & mask({e}))", gpr(i.op_register(1))?.0),
+                        OpKind::Memory => format!("ld({}, {e})", address(i)?),
+                        _ => return None,
+                    };
+                    let _ = write!(s, "let v = {v}; vset(c, {d}, 16, [v, 0, 0, 0]);");
+                }
+                (OpKind::Register, OpKind::Register) => {
+                    let (r, _) = gpr(i.op_register(0))?;
+                    let (x, _) = vreg(i.op_register(1))?;
+                    let _ = write!(s, "wr(c, {r}, {e}, c.x[{x}][0] & mask({e}));");
+                }
+                (OpKind::Memory, OpKind::Register) => {
+                    let (x, _) = vreg(i.op_register(1))?;
+                    let _ = write!(s, "st({}, {e}, c.x[{x}][0] & mask({e}));", address(i)?);
+                }
+                _ => return None,
+            }
+        }
+        Vpackssdw | Vpacksswb | Vpackusdw | Vpackuswb | Vpcmpeqb | Vpcmpeqw | Vpcmpeqd | Vpcmpeqq | Vpcmpgtb | Vpcmpgtw | Vpcmpgtd | Vpcmpgtq => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let _ = write!(s, "let y = {name}({a}, {b}); vset(c, {d}, {w}, y);");
+        }
+        Vrsqrtps | Vrcpps => {
+            let (d, w) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, w)?;
+            let name = format!("{:?}", i.mnemonic()).to_lowercase();
+            let _ = write!(s, "let y = {name}([0; 4], {a}); vset(c, {d}, {w}, y);");
+        }
+        Vshufpd => {
+            let (d, w) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let (a, b) = (vread(i, 1, w)?, vread(i, 2, w)?);
+            let _ = write!(s, "let y = vshufpd::<{}>({a}, {b}); vset(c, {d}, {w}, y);", i.immediate(3) & 0xff);
+        }
+        Vinsertps => {
+            let (d, _) = vreg(i.op_register(0))?;
+            if i.op_kind(3) != OpKind::Immediate8 {
+                return None;
+            }
+            let a = vread(i, 1, 16)?;
+            let mut k = i.immediate(3) & 0xff;
+            // from memory the source is the dword itself: put it in lane 0 and select lane 0
+            let b = if i.op_kind(2) == OpKind::Memory {
+                k &= 0x3f;
+                format!("[ld({}, 4), 0, 0, 0]", address(i)?)
+            } else {
+                vread(i, 2, 16)?
+            };
+            let _ = write!(s, "let y = vinsertps::<{k}>({a}, {b}); vset(c, {d}, 16, y);");
+        }
+        Vpmovmskb => {
+            if i.op_kind(0) != OpKind::Register || i.op_kind(1) != OpKind::Register {
+                return None;
+            }
+            let (r, _) = gpr(i.op_register(0))?;
+            let (x, w) = vreg(i.op_register(1))?;
+            let _ = write!(s, "let mut m = 0u64; for k in 0..{w} {{ m |= ((c.x[{x}][k / 8] >> (k % 8 * 8 + 7)) & 1) << k; }} wr(c, {r}, 4, m);");
+        }
+        Vcvtsi2ss | Vcvtsi2sd => {
+            let (d, _) = vreg(i.op_register(0))?;
+            let a = vread(i, 1, 16)?;
+            let n = match i.op_kind(2) {
+                OpKind::Register => gpr(i.op_register(2))?.1,
+                OpKind::Memory => i.memory_size().size() as u32,
+                _ => return None,
+            };
+            if n != 4 && n != 8 {
+                return None;
+            }
+            let v = match i.op_kind(2) {
+                OpKind::Register => format!("c.r[{}]", gpr(i.op_register(2))?.0),
+                _ => format!("ld({}, {n})", address(i)?),
+            };
+            let kind = if i.mnemonic() == Vcvtsi2ss { 0 } else { 2 } + if n == 8 { 1 } else { 0 };
+            let _ = write!(s, "let y = cvtsi({kind}, {a}, {v}); vset(c, {d}, 16, y);");
+        }
         Vbroadcastss => {
             let (d, w) = vreg(i.op_register(0))?;
             let src = match i.op_kind(1) {
@@ -1204,6 +1367,6 @@ pub fn emit_function(name: &str, code: &[u8], ip: u64) -> Result<String, String>
         let _ = writeln!(body, "            {:#x} => {{ {stmt} }} // {i}", i.ip());
     }
     Ok(format!(
-        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\n#[target_feature(enable = \"avx,avx2,fma\")]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
+        "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, clippy::all)]\n#[target_feature(enable = \"avx,avx2,fma,bmi1\")]\npub unsafe fn {name}(c: &mut Ctx) {{\n    let mut pc: u64 = {ip:#x};\n    loop {{\n        unsafe {{ match pc {{\n{body}            _ => panic!(\"pc {{pc:#x}} outside {name}\"),\n        }} }}\n    }}\n}}\n"
     ))
 }

@@ -35,8 +35,8 @@ fn main() -> ExitCode {
         }
     };
     println!("build          {build}");
-    let cands = commons_recomp::pipeline::select(&image, limit);
-    println!("selected       {} functions (leaves, no loops, own stack only)", cands.len());
+    let cands = commons_recomp::pipeline::select(&image, limit, commons_recomp::pipeline::checkable_sandboxed);
+    println!("selected       {} functions (leaves without loops; memory through registers, reads of globals)", cands.len());
     let lib_rs = match commons_recomp::pipeline::generate(&cands) {
         Ok(s) => s,
         Err(e) => {
@@ -59,8 +59,20 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let passed = commons_recomp::pipeline::difftest(&cands, &lib, rounds);
-    println!("difftest       {} of {} equal to the native function on {rounds} random inputs each", passed.len(), cands.len());
+    let base = match commons_recomp::pipeline::map_image(&image) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("mapped         the image at {base:#x} for the differential test");
+    let report = commons_recomp::pipeline::difftest_sandboxed(&cands, &lib, base, rounds);
+    let passed = report.passed;
+    println!(
+        "difftest       {} equal to the native function, {} differed, {} inconclusive (of {}; {rounds} inputs each)",
+        passed.len(), report.differed, report.inconclusive, cands.len()
+    );
     let manifest = commons_recomp::pipeline::manifest(&build, &dll, &cands, &passed);
     let path = work.join(format!("{build}.toml"));
     if let Err(e) = std::fs::write(&path, manifest) {

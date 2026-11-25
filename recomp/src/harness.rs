@@ -27,6 +27,51 @@ static mut CTX: *mut HostCtx = core::ptr::null_mut();
 static mut TARGET: u64 = 0;
 static mut SCRATCH: u64 = 0;
 static mut FLAGS: u64 = 0;
+/// Fault recovery: while a call through the thunk runs, a fault in the called code resumes at the thunk's exit.
+static mut IN_RUN: bool = false;
+static mut FAULTED: bool = false;
+static mut RECOVER: u64 = 0;
+static VEH: std::sync::Once = std::sync::Once::new();
+
+unsafe extern "system" {
+    fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*mut u8) -> i32) -> *mut u8;
+}
+
+/// EXCEPTION_POINTERS -> (ExceptionRecord, ContextRecord); the code is the record's first field and Rip sits at 0xF8 of
+/// the x64 CONTEXT.
+unsafe extern "system" fn on_fault(pointers: *mut u8) -> i32 {
+    unsafe {
+        let record = *(pointers as *const *const u32);
+        let context = *(pointers.add(8) as *const *mut u8);
+        let code = *record;
+        let recoverable = matches!(code, 0xC000_0005 | 0xC000_001D | 0xC000_0094 | 0xC000_0096 | 0xC000_008C | 0x8000_0002);
+        if IN_RUN && recoverable && RECOVER != 0 {
+            FAULTED = true;
+            *(context.add(0xF8) as *mut u64) = RECOVER;
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
+/// [`run_native`], but a fault in the called code (an access violation, an illegal or privileged instruction, a
+/// division error) returns None instead of ending the process.
+///
+/// # Safety
+/// As [`run_native`].
+#[target_feature(enable = "avx")]
+pub unsafe fn run_native_guarded(code: u64, c: &mut HostCtx) -> Option<u64> {
+    VEH.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, on_fault);
+    });
+    unsafe {
+        FAULTED = false;
+        IN_RUN = true;
+        let flags = run_native(code, c);
+        IN_RUN = false;
+        if FAULTED { None } else { Some(flags) }
+    }
+}
 
 /// Calls native code at `code` with every register from `c` and stores them back afterwards; returns RFLAGS.
 ///
@@ -40,6 +85,8 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
         asm!(
             "push rbx",
             "push rbp",
+            "lea rax, [rip + 9f]",
+            "mov [rip + {recover}], rax",
             "mov [rip + {host}], rsp",
             "mov rax, [rip + {ctx}]",
             "mov rsp, [rax + 32]",
@@ -113,6 +160,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "vmovdqu [rax + 640], ymm15",
             "mov rcx, [rip + {scratch}]",
             "mov [rax], rcx",
+            "9:",
             "mov rsp, [rip + {host}]",
             "pop rbp",
             "pop rbx",
@@ -121,6 +169,7 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             target = sym TARGET,
             scratch = sym SCRATCH,
             flags = sym FLAGS,
+            recover = sym RECOVER,
             out("rax") _, out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
             out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             out("r12") _, out("r13") _, out("r14") _, out("r15") _,

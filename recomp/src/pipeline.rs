@@ -25,8 +25,20 @@ pub struct Candidate {
     pub code: Vec<u8>,
 }
 
-/// Whether a function can be checked with generated inputs alone (see the module comment).
+/// Whether a function can be checked with generated inputs alone (see the module comment): memory only on its own
+/// stack.
 pub fn checkable(code: &[u8], rva: u32) -> bool {
+    checkable_with(code, rva, false)
+}
+
+/// The rule the sandboxed differential test uses: memory through any register is fine (registers point into a
+/// sandbox), reads of the image's globals are fine (the image is mapped at its base); writes to globals and FS/GS
+/// memory are not.
+pub fn checkable_sandboxed(code: &[u8], rva: u32) -> bool {
+    checkable_with(code, rva, true)
+}
+
+fn checkable_with(code: &[u8], rva: u32, sandboxed: bool) -> bool {
     if code.len() < 16 {
         return false;
     }
@@ -79,18 +91,41 @@ pub fn checkable(code: &[u8], rva: u32) -> bool {
         }
         let accesses_memory = (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
             && i.mnemonic() != iced_x86::Mnemonic::Lea;
-        if accesses_memory && (i.memory_base() != Register::RSP || i.memory_index() != Register::None) {
-            return false;
+        if accesses_memory {
+            if matches!(i.memory_segment(), Register::FS | Register::GS) {
+                return false;
+            }
+            if !sandboxed {
+                if i.memory_base() != Register::RSP || i.memory_index() != Register::None {
+                    return false;
+                }
+            } else {
+                // iced reports a RIP-relative access with its absolute address and no base, so the operand decides
+                // whether it is a global, and the access list whether it is written.
+                let mut factory = iced_x86::InstructionInfoFactory::new();
+                let writes_global = i.is_ip_rel_memory_operand() && factory.info(i).used_memory().iter().any(|m| {
+                    matches!(
+                            m.access(),
+                            iced_x86::OpAccess::Write
+                                | iced_x86::OpAccess::ReadWrite
+                                | iced_x86::OpAccess::CondWrite
+                                | iced_x86::OpAccess::ReadCondWrite
+                        )
+                });
+                if writes_global {
+                    return false;
+                }
+            }
         }
     }
     true
 }
 
-pub fn select(image: &Image<'_>, limit: usize) -> Vec<Candidate> {
+pub fn select(image: &Image<'_>, limit: usize, rule: fn(&[u8], u32) -> bool) -> Vec<Candidate> {
     let mut out = Vec::new();
     for f in image.functions() {
         let Some(code) = image.bytes(f.begin, f.end - f.begin) else { continue };
-        if checkable(code, f.begin) {
+        if rule(code, f.begin) {
             out.push(Candidate { rva: f.begin, code: code.to_vec() });
             if out.len() >= limit {
                 break;
@@ -250,6 +285,112 @@ pub fn difftest(cands: &[Candidate], lib: &Library, rounds: usize) -> Vec<u32> {
     passed
 }
 
+/// Maps the image into this process at its preferred base when that is free, else anywhere: native functions then
+/// run in place and RIP-relative reads see the image's own data. Returns the base.
+pub fn map_image(image: &Image<'_>) -> Result<u64, String> {
+    let size = image.size_of_image as usize;
+    let mut p = unsafe { VirtualAlloc(image.image_base as *mut core::ffi::c_void, size, 0x3000, 0x40) };
+    if p.is_null() {
+        p = unsafe { VirtualAlloc(core::ptr::null_mut(), size, 0x3000, 0x40) };
+    }
+    if p.is_null() {
+        return Err(format!("cannot map {size} bytes for the image"));
+    }
+    image.map_into(unsafe { std::slice::from_raw_parts_mut(p as *mut u8, size) });
+    Ok(p as u64)
+}
+
+pub struct SandboxReport {
+    pub passed: Vec<u32>,
+    /// Functions whose translation differed from the native function, or faulted where it did not.
+    pub differed: usize,
+    /// Functions without enough inputs on which the native function ran to completion.
+    pub inconclusive: usize,
+}
+
+const SANDBOX: usize = 1 << 16;
+const GUARD: usize = 1 << 16;
+
+/// `size` writable bytes between two reserved, never committed guard regions, so a write past either end faults
+/// (and the differential test skips that input) instead of reaching this process's own memory.
+fn guarded(size: usize) -> &'static mut [u8] {
+    unsafe {
+        let base = VirtualAlloc(core::ptr::null_mut(), GUARD + size + GUARD, 0x2000, 0x01) as *mut u8; // reserve
+        assert!(!base.is_null(), "cannot reserve guarded memory");
+        let inner = VirtualAlloc(base.add(GUARD) as *mut core::ffi::c_void, size, 0x1000, 0x04) as *mut u8; // commit
+        assert!(!inner.is_null(), "cannot commit guarded memory");
+        std::slice::from_raw_parts_mut(inner, size)
+    }
+}
+
+/// The differential test with memory: the image mapped at `base` (native functions run in place), each register
+/// either a generated value or a pointer into a sandbox of random bytes, the same sandbox and stack for both runs.
+/// An input on which the native function faults is skipped; the translation must then match on every other input,
+/// and at least a quarter of the inputs must have run.
+pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds: usize) -> SandboxReport {
+    use crate::harness::run_native_guarded;
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let entry_of: std::collections::HashMap<u64, u64> = entries(lib).into_iter().collect();
+    unsafe { (lib.init)(base) };
+    let sandbox = guarded(SANDBOX);
+    let sbase = sandbox.as_mut_ptr() as u64;
+    let stack = guarded(1 << 16);
+    let top = (stack.as_mut_ptr() as u64 + (1 << 15)) & !0xf;
+    let above = (top - stack.as_ptr() as u64) as usize;
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut report = SandboxReport { passed: Vec::new(), differed: 0, inconclusive: 0 };
+    for c in cands {
+        let Some(&entry) = entry_of.get(&u64::from(c.rva)) else { continue };
+        if std::env::var_os("COMMONS_RECOMP_TRACE").is_some() {
+            eprintln!("difftest {:#x} ({} bytes)", c.rva, c.code.len());
+        }
+        let native = base + u64::from(c.rva);
+        let (mut ran, mut differs) = (0usize, false);
+        for _ in 0..rounds {
+            let mut start = HostCtx::default();
+            for r in 0..16 {
+                start.r[r] = if rng.next() % 2 == 0 {
+                    (sbase + 4096 + rng.next() % (SANDBOX as u64 - 8192)) & !7
+                } else {
+                    rng.value()
+                };
+                for q in 0..4 {
+                    start.x[r][q] = rng.vector();
+                }
+            }
+            start.r[4] = top;
+            let initial_sandbox: Vec<u8> = (0..SANDBOX).map(|_| rng.next() as u8).collect();
+            let initial_stack: Vec<u8> = (0..stack.len()).map(|_| rng.next() as u8).collect();
+
+            sandbox.copy_from_slice(&initial_sandbox);
+            stack.copy_from_slice(&initial_stack);
+            let mut a = start;
+            if unsafe { run_native_guarded(native, &mut a) }.is_none() {
+                continue; // this input is outside what the function accepts
+            }
+            let (native_sandbox, native_stack) = (sandbox.to_vec(), stack[above..].to_vec());
+
+            sandbox.copy_from_slice(&initial_sandbox);
+            stack.copy_from_slice(&initial_stack);
+            let mut b = start;
+            let translated = unsafe { run_native_guarded(entry, &mut b) };
+            if translated.is_none() || a.r != b.r || a.x != b.x || sandbox[..] != native_sandbox[..] || stack[above..] != native_stack[..] {
+                differs = true;
+                break;
+            }
+            ran += 1;
+        }
+        if differs {
+            report.differed += 1;
+        } else if ran * 4 < rounds {
+            report.inconclusive += 1;
+        } else {
+            report.passed.push(c.rva);
+        }
+    }
+    report
+}
+
 /// The manifest `cargo commons run` reads for this build.
 pub fn manifest(build: &str, library: &Path, cands: &[Candidate], passed: &[u32]) -> String {
     let mut s = format!(
@@ -295,6 +436,17 @@ mod tests {
         // an epilogue fragment is refused: mov rbp, [rsp+38h]; mov rsi, [rsp+40h]; add rsp, 20h; pop rdi; ret
         let tail = [0x48, 0x8B, 0x6C, 0x24, 0x38, 0x48, 0x8B, 0x74, 0x24, 0x40, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3];
         assert!(!checkable(&tail, 0x1000));
+        // sandboxed: memory through a register is fine; reading a global is fine; writing one is not
+        let mut through = pure;
+        through[..4].copy_from_slice(&[0x48, 0x8B, 0x01, 0x90]); // mov rax, [rcx]; nop
+        assert!(checkable_sandboxed(&through, 0x1000));
+        let tail = [0x48, 0x89, 0xC8, 0x48, 0x89, 0xC8, 0x90, 0xC3];
+        let mut read_global = vec![0xC5, 0xFC, 0x28, 0x05, 0x00, 0x01, 0x00, 0x00]; // vmovaps ymm0, [rip+100h]
+        read_global.extend_from_slice(&tail);
+        assert!(checkable_sandboxed(&read_global, 0x1000));
+        let mut write_global = vec![0xC5, 0xFC, 0x29, 0x05, 0x00, 0x01, 0x00, 0x00]; // vmovaps [rip+100h], ymm0
+        write_global.extend_from_slice(&tail);
+        assert!(!checkable_sandboxed(&write_global, 0x1000));
         // a function shorter than 16 bytes is refused (the jump needs 14)
         assert!(!checkable(&[0x48, 0x89, 0xC8, 0xC3], 0x1000));
     }

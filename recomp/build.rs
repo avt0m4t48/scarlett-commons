@@ -98,6 +98,28 @@ fn main() {
     }
     table += "];\n";
     out += &table;
+    // The entry scenario: native code calls translations through their patched entries, nested once.
+    //   F 0x3000 (translated, replaced)   G 0x4000 (native, calls F)
+    //   H 0x5000 (translated, replaced, calls G)   CALLER 0x6000 (native, calls H)
+    let f = assemble_at(0x3000, |a| {
+        a.mov(rax, rcx)?; a.add(rax, rdx)?; a.vaddps(ymm0, ymm1, ymm2)?; a.imul_2(rax, r8)?; a.xor(r10d, r10d)?; a.ret()
+    });
+    let g = assemble_at(0x4000, |a| {
+        a.push(rbx)?; a.mov(rbx, rcx)?; a.call(0x3000u64)?; a.add(rax, rbx)?; a.pop(rbx)?; a.ret()
+    });
+    let h = assemble_at(0x5000, |a| {
+        a.sub(rsp, 40)?; a.call(0x4000u64)?; a.add(rsp, 40)?; a.add(rax, 1)?; a.vmovaps(ymm7, ymm0)?; a.ret()
+    });
+    let caller = assemble_at(0x6000, |a| {
+        a.sub(rsp, 40)?; a.call(0x5000u64)?; a.add(rsp, 40)?; a.ret()
+    });
+    for (name, code, rva) in [("entry_f", &f, 0x3000u64), ("entry_h", &h, 0x5000u64)] {
+        out += &commons_recomp_emit::emit_function(name, code, rva).unwrap_or_else(|e| panic!("{name}: {e}"));
+        out += &commons_recomp_emit::emit_entry(name);
+    }
+    out += &format!(
+        "pub const ENTRY_F: &[u8] = &{f:?};\npub const ENTRY_G: &[u8] = &{g:?};\npub const ENTRY_H: &[u8] = &{h:?};\npub const ENTRY_CALLER: &[u8] = &{caller:?};\n"
+    );
     let dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     std::fs::write(std::path::Path::new(&dir).join("synthetic.rs"), out).expect("write");
 }

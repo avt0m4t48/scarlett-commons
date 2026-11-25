@@ -7,9 +7,6 @@ include!(concat!(env!("OUT_DIR"), "/synthetic.rs"));
 
 use std::arch::asm;
 
-unsafe extern "system" {
-    fn VirtualAlloc(address: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
-}
 
 static mut HOST_RSP: u64 = 0;
 static mut CTX: *mut Ctx = core::ptr::null_mut();
@@ -161,12 +158,16 @@ impl Rng {
     }
 }
 
+/// run_native and the TLS setup use process-wide state: one test at a time.
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const MEM: usize = 1024;
 const STACK: usize = 4096;
 
 #[test]
 fn translated_functions_match_the_cpu() {
-    let exec = unsafe { VirtualAlloc(core::ptr::null_mut(), 1 << 16, 0x3000, 0x40) };
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exec = unsafe { VirtualAlloc(core::ptr::null_mut(), 1 << 16, 0x3000, 0x40) } as *mut u8;
     assert!(!exec.is_null());
     let mut memory = vec![0u8; MEM];
     let mut stack = vec![0u8; STACK];
@@ -239,5 +240,58 @@ fn translated_functions_match_the_cpu() {
             if want(0x800) { assert_eq!(ours.of, flag(0x800), "OF, {ctx}"); }
             assert_eq!(ours.ret, 0x5151_5151, "return address, {ctx}");
         }
+    }
+}
+
+/// Native code calls two translations through their patched entries, one nested inside a native callee of the
+/// other: the title's results must not change. Run once unpatched and once patched on the same inputs.
+#[test]
+fn patched_entries_keep_the_results() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exec = unsafe { VirtualAlloc(core::ptr::null_mut(), 1 << 16, 0x3000, 0x40) } as *mut u8;
+    assert!(!exec.is_null());
+    let place = |rva: usize, code: &[u8]| unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), exec.add(rva), code.len()) };
+    let original = || {
+        place(0x3000, ENTRY_F);
+        place(0x4000, ENTRY_G);
+        place(0x5000, ENTRY_H);
+        place(0x6000, ENTRY_CALLER);
+    };
+    let jump = |rva: usize, to: u64| {
+        let mut j = [0u8; 14];
+        j[..6].copy_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+        j[6..].copy_from_slice(&to.to_le_bytes());
+        place(rva, &j);
+    };
+    unsafe {
+        set_image_base(exec as u64);
+        setup();
+    }
+    let mut stack = vec![0u8; 1 << 16];
+    let top = ((stack.as_mut_ptr() as u64 + stack.len() as u64) & !0xf) - 64;
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for round in 0..2000 {
+        let mut start = Ctx::default();
+        for r in 0..16 {
+            start.r[r] = rng.value();
+            for q in 0..4 {
+                start.x[r][q] = rng.vector();
+            }
+        }
+        start.r[4] = top;
+
+        original();
+        let mut native = start;
+        unsafe { run_native(exec as u64 + 0x6000, &mut native) };
+
+        original();
+        jump(0x3000, e_entry_f as usize as u64);
+        jump(0x5000, e_entry_h as usize as u64);
+        let mut patched = start;
+        unsafe { run_native(exec as u64 + 0x6000, &mut patched) };
+
+        let ctx = format!("round {round}: start {:x?}", start.r);
+        assert_eq!(patched.r, native.r, "registers, {ctx}");
+        assert_eq!(patched.x, native.x, "ymm registers, {ctx}");
     }
 }

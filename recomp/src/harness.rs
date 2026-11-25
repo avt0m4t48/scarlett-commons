@@ -14,6 +14,7 @@ pub struct HostCtx {
     pub zf: bool,
     pub sf: bool,
     pub of: bool,
+    pub pf: bool,
     pub ret: u64,
     pub host_rsp: u64,
     pub target: u64,

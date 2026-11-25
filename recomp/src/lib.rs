@@ -15,6 +15,8 @@
 //! No game code or data is kept here: addresses, byte signatures and names are interoperability facts.
 
 pub mod census;
+pub mod harness;
+pub mod pipeline;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -51,6 +53,9 @@ pub struct Function {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub build: String,
+    /// A track B library built on this machine (commons-recomp): its functions are installed from it.
+    #[serde(default)]
+    pub library: Option<String>,
     #[serde(default, rename = "function")]
     pub functions: Vec<Function>,
 }
@@ -212,6 +217,22 @@ mod process {
     }
 }
 
+/// The functions of a library commons-recomp built on this machine, as replacements named `f_<rva>`, after its
+/// `commons_init(base)`. Loaded once per run; the names live as long as the process.
+#[cfg(windows)]
+fn library_registry(path: &std::path::Path, base: u64) -> Result<Vec<Replacement>, String> {
+    let lib = pipeline::load(path)?;
+    unsafe { (lib.init)(base) };
+    Ok(pipeline::entries(&lib)
+        .into_iter()
+        .map(|(rva, entry)| Replacement {
+            name: Box::leak(format!("f_{rva:x}").into_boxed_str()),
+            // SAFETY: the library's entry stubs take the native calling convention.
+            code: unsafe { core::mem::transmute::<usize, unsafe extern "C" fn()>(entry as usize) },
+        })
+        .collect())
+}
+
 /// The runtime's hook point: called once the executable is mapped, before it runs. Reads
 /// `recomp/manifests/<build>.toml` from `manifest_dir`; a build without a manifest runs as track A alone.
 #[cfg(windows)]
@@ -222,7 +243,18 @@ pub fn install(base: u64, build: &str, manifest_dir: &std::path::Path) -> Report
     };
     match Manifest::parse(&text) {
         Ok(m) if m.build.eq_ignore_ascii_case(build) => {
-            install_with(&m, base, REGISTRY, &Selection::from_env(), &mut process::Process)
+            let registry = match &m.library {
+                Some(lib) => match library_registry(std::path::Path::new(lib), base) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let mut r = Report::default();
+                        r.skipped.insert(lib.clone(), e);
+                        return r;
+                    }
+                },
+                None => REGISTRY.iter().map(|r| Replacement { name: r.name, code: r.code }).collect(),
+            };
+            install_with(&m, base, &registry, &Selection::from_env(), &mut process::Process)
         }
         Ok(_) => {
             let mut r = Report::default();

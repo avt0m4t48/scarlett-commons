@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use commons_recomp_emit::{decode, emit_entry, emit_function, supported, PRELUDE};
+use commons_recomp_emit::{decode, emit_entry, emit_function, supported, tls_read, PRELUDE};
 use iced_x86::{FlowControl, OpKind, Register};
 
 use crate::census::Image;
@@ -109,7 +109,7 @@ fn checkable_calling(code: &[u8], rva: u32, sandboxed: bool, safe_callee: &dyn F
         let accesses_memory = (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
             && i.mnemonic() != iced_x86::Mnemonic::Lea;
         if accesses_memory {
-            if matches!(i.memory_segment(), Register::FS | Register::GS) {
+            if matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_read(i) {
                 return false;
             }
             if !sandboxed {
@@ -182,7 +182,7 @@ impl<'a> CalleeCheck<'a> {
         let Some(&end) = self.starts.get(&rva) else { return false };
         let Some(code) = self.image.bytes(rva, end - rva) else { return false };
         for i in decode(code, u64::from(rva)) {
-            if i.is_invalid() || matches!(i.memory_segment(), Register::FS | Register::GS) {
+            if i.is_invalid() || (matches!(i.memory_segment(), Register::FS | Register::GS) && !tls_read(&i)) {
                 return false;
             }
             if matches!(i.mnemonic(), Syscall | Sysenter | Int | Int1 | Int3 | Into | Hlt | Cli | Sti | In | Out | Rdmsr | Wrmsr) {
@@ -459,6 +459,13 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, image_s
     let stack = guarded(1 << 16);
     let top = (stack.as_mut_ptr() as u64 + (1 << 15)) & !0xf;
     let above = (top - stack.as_ptr() as u64) as usize;
+    // A function that reads its thread's TLS array (gs:[58h]) gets one whose every slot points into the sandbox, so
+    // what it reads and writes there is random input and compared, and the harness's own TLS stays untouched.
+    let tls = guarded(PAGE);
+    for k in 0..PAGE / 8 {
+        tls[8 * k..8 * k + 8].copy_from_slice(&(sbase + 8192).to_le_bytes());
+    }
+    unsafe { crate::harness::TLS_ARRAY = tls.as_ptr() as u64 };
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let mut report = SandboxReport { passed: Vec::new(), differed: 0, differed_rvas: Vec::new(), inconclusive: 0 };
     for c in cands {
@@ -580,6 +587,7 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, image_s
             report.passed.push(c.rva);
         }
     }
+    unsafe { crate::harness::TLS_ARRAY = 0 };
     report
 }
 

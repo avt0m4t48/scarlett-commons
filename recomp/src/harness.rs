@@ -28,6 +28,9 @@ static mut CTX: *mut HostCtx = core::ptr::null_mut();
 static mut TARGET: u64 = 0;
 static mut SCRATCH: u64 = 0;
 static mut FLAGS: u64 = 0;
+/// When set, a run sees this as its thread's TLS array (gs:[58h]) and the real one is put back afterwards.
+pub static mut TLS_ARRAY: u64 = 0;
+static mut TLS_SAVED: u64 = 0;
 /// Fault recovery: while a call through the thunk runs, a fault in the called code resumes at the thunk's exit.
 static mut IN_RUN: bool = false;
 static mut FAULTED: bool = false;
@@ -176,6 +179,13 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "mov [rip + {recover}], rax",
             "mov byte ptr [rip + {inrun}], 1",
             "mov [rip + {host}], rsp",
+            "mov rax, [rip + {tlsa}]",
+            "test rax, rax",
+            "jz 2f",
+            "mov rcx, gs:[0x58]",
+            "mov [rip + {tlss}], rcx",
+            "mov gs:[0x58], rax",
+            "2:",
             "mov rax, [rip + {ctx}]",
             "mov rsp, [rax + 32]",
             "mov rcx, [rax + 8]",
@@ -251,6 +261,12 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             "mov [rax], rcx",
             "9:",
             "mov byte ptr [rip + {inrun}], 0",
+            "mov rax, [rip + {tlsa}]",
+            "test rax, rax",
+            "jz 3f",
+            "mov rcx, [rip + {tlss}]",
+            "mov gs:[0x58], rcx",
+            "3:",
             "mov rsp, [rip + {host}]",
             "pop rbp",
             "pop rbx",
@@ -261,6 +277,8 @@ pub unsafe fn run_native(code: u64, c: &mut HostCtx) -> u64 {
             flags = sym FLAGS,
             recover = sym RECOVER,
             inrun = sym IN_RUN,
+            tlsa = sym TLS_ARRAY,
+            tlss = sym TLS_SAVED,
             out("rax") _, out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
             out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             out("r12") _, out("r13") _, out("r14") _, out("r15") _,

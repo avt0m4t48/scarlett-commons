@@ -19,7 +19,7 @@
 //! (immediate), vunpcklps/hps and vinsertf128/vextractf128; the horizontal
 //! vhaddps/pd, vhsubps/pd and vdpps; the compares vucomiss/sd, vcomiss/sd and vcmp{ps,pd,ss,sd}, vmin and vmax, and the
 //! parity flag (every integer flag producer sets it); FMA in all 48 forms (fmadd, fmsub, fnmadd, fnmsub;
-//! 132, 213, 231; ps, pd, ss, sd), as the instructions; vmovd/vmovq, bt with a register or an immediate, andn and bextr; the integer vector packs and
+//! 132, 213, 231; ps, pd, ss, sd), as the instructions; vmovd/vmovq, bt with a register or an immediate, andn and bextr; `mov r, gs:[disp]` (the TLS array read); the integer vector packs and
 //! compares, vpmovmskb, vrsqrtps, vrcpps, vshufpd, vinsertps and vcvtsi2ss/sd. Not yet: the rest. Shifts by a count above 1 leave OF
 //! as for a count of 1, where the CPU leaves it undefined.
 
@@ -721,7 +721,33 @@ unsafe fn bmi(op: u8, wide: bool, a: u64, b: u64) -> (u64, bool, bool, bool, boo
     }
     (r, z != 0, sf != 0, cf != 0, of != 0)
 }
+/// A read of the thread's own block through GS (the TLS array pointer and the like), as the instruction: the
+/// translation runs on the thread the native code would.
+#[inline(always)]
+unsafe fn gsld(at: u64, n: u32) -> u64 {
+    let v: u64;
+    unsafe {
+        if n == 8 {
+            core::arch::asm!("mov {v}, gs:[{a}]", v = out(reg) v, a = in(reg) at, options(nostack, readonly, preserves_flags));
+        } else {
+            core::arch::asm!("mov {v:e}, gs:[{a}]", v = out(reg) v, a = in(reg) at, options(nostack, readonly, preserves_flags));
+        }
+    }
+    v
+}
 "#;
+
+/// `mov r32/r64, gs:[disp]`: the one FS/GS access translated (MSVC's TLS array read, `gs:[58h]`).
+pub fn tls_read(i: &Instruction) -> bool {
+    i.mnemonic() == Mnemonic::Mov
+        && i.op_count() == 2
+        && i.op_kind(0) == OpKind::Register
+        && i.op_kind(1) == OpKind::Memory
+        && i.memory_segment() == Register::GS
+        && i.memory_base() == Register::None
+        && i.memory_index() == Register::None
+        && matches!(i.op_register(0).size(), 4 | 8)
+}
 
 fn gpr(r: Register) -> Option<(usize, u32)> {
     if matches!(r, Register::AH | Register::CH | Register::DH | Register::BH) || !r.is_gpr() {
@@ -857,6 +883,10 @@ pub fn emit_instruction(i: &Instruction, targets: &BTreeSet<u64>) -> Option<Stri
     let mut s = String::new();
     match i.mnemonic() {
         Nop => {}
+        Mov if tls_read(i) => {
+            let n = size_of_op0(i)?;
+            s += &write(i, n, &format!("gsld({:#x}, {n})", i.memory_displacement64()))?;
+        }
         Mov => {
             let n = size_of_op0(i)?;
             s += &write(i, n, &read(i, 1, n)?)?;

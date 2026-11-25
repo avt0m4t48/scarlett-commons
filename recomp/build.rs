@@ -115,6 +115,10 @@ fn main() {
             a.vinsertps(xmm4, xmm5, dword_ptr(rdx + 32), 0x2a)?; a.vcvtsi2ss(xmm6, xmm7, r8d)?; a.vcvtsi2sd(xmm9, xmm10, r9)?;
             a.vcvtsi2ss(xmm10, xmm11, qword_ptr(rdx + 40))?; a.ret()
         })),
+        ("tls", 0x8c1, assemble(|a| {
+            a.mov(rax, qword_ptr(0x58u64).gs())?; a.mov(ecx, dword_ptr(0x48u64).gs())?; a.mov(rdx, qword_ptr(0x30u64).gs())?;
+            a.add(rax, rcx)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

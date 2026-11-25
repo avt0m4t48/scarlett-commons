@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     };
     println!("build          {build}");
     let cands = commons_recomp::pipeline::select(&image, limit, commons_recomp::pipeline::checkable_sandboxed);
-    println!("selected       {} functions (leaves; memory through registers, reads of globals; loops under a watchdog)", cands.len());
+    println!("selected       {} functions (leaves; memory through registers and globals; loops under a watchdog)", cands.len());
     let lib_rs = match commons_recomp::pipeline::generate(&cands) {
         Ok(s) => s,
         Err(e) => {
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
         }
     };
     println!("mapped         the image at {base:#x} for the differential test");
-    let report = commons_recomp::pipeline::difftest_sandboxed(&cands, &lib, base, rounds);
+    let report = commons_recomp::pipeline::difftest_sandboxed(&cands, &lib, base, image.size_of_image as usize, rounds);
     let passed = report.passed;
     for rva in report.differed_rvas.iter().take(20) {
         println!("differed       {rva:#x}");

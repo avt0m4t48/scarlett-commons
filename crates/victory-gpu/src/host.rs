@@ -71,7 +71,23 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+/// In parts, a thread always in the same one: the list threads and those of
+/// the heaps' records retire some 10,000 views a frame, and stood 12 ms a frame
+/// for one lock of them all (run city1).
+static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; 16];
+
+/// The calling thread's part of [`RETIRED`].
+fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, Retired)>> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static PART: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len();
+    }
+    // (A thread that ends may come here after its locals are gone.)
+    let part = PART.try_with(|p| *p).unwrap_or(0);
+    RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -457,10 +473,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    retired().push_back((started, Retired::Any(Box::new(object))));
 }
 
 /// [`retire`] for a resource.
@@ -473,7 +486,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retired().push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -492,15 +505,17 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
-        retired.drain(..n).collect()
-    };
-    drop(done);
+    for part in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
+            let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+            if n == 0 {
+                continue;
+            }
+            retired.drain(..n).collect()
+        };
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2740,7 +2755,8 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
 /// flights when the title itself wrote the memory since they were given it
-/// (`VICTORY_FILL_TITLE=1`; off by default).
+/// (`VICTORY_FILL_TITLE=1`), or only for the second reason below (`=2`); off
+/// by default.
 ///
 /// The title's 174 MB heap is declared written as a whole (a root view has
 /// no size), and the title keeps a ring of constants in it: one fill of 480
@@ -2759,9 +2775,18 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
-    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+    static MODE: OnceLock<u32> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    });
+    #[cfg(feature = "diagnostics")]
+    let mode = crate::ab::pick("VICTORY_FILL_TITLE").map_or(mode, |on| if on { 2 } else { 0 });
+    if mode == 0 || len > SMALL {
+        return false;
+    }
+    !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
@@ -2910,8 +2935,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
-    // Destinations of copies at their place, if a step reads them.
-    let mut placed: Vec<(usize, usize)> = Vec::new();
+    // Whether a copy at its place waits for flights if a step reads it.
+    let mut placed = false;
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -2953,7 +2978,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 Step::Run(_) => return Some(WHY_RUN),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
-                    place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
+                    place::Waits::ForReaders => placed = true,
                     place::Waits::Yes => {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
@@ -2967,7 +2992,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    (placed && place::read_by(runs, written)).then(|| {
+        #[cfg(feature = "diagnostics")]
+        if count {
+            blame("what a copy at its place writes", &[], 0, 0);
+        }
+        WHY_READ
+    })
 }
 
 /// With flights in the air, after the submission's write-watch asking:

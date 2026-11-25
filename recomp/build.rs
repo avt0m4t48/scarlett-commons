@@ -95,6 +95,19 @@ fn main() {
             a.vfmadd213ss(xmm1, xmm2, xmm3)?; a.vfmsub231ps(ymm4, ymm5, ymm6)?; a.vfnmadd213pd(xmm7, xmm8, xmmword_ptr(rdx + 64))?;
             a.ret()
         })),
+        ("bits", 0x8c1, assemble(|a| {
+            a.andn(rax, rcx, rdx)?; a.andn(r8d, r9d, r10d)?; a.bextr(r11, r12, r13)?; a.bextr(esi, edi, ebx)?;
+            a.ret()
+        })),
+        ("bittest", 0x1, assemble(|a| {
+            a.bt(rcx, 5)?; a.setc(al)?; a.bt(edx, r8d)?; a.setc(r9b)?; a.bt(r10w, 15)?; a.setc(r11b)?; a.bt(r12, r13)?;
+            a.ret()
+        })),
+        ("vmov", 0x8c1, assemble(|a| {
+            a.vmovd(xmm0, ecx)?; a.vmovq(xmm1, rdx)?; a.vmovd(r8d, xmm2)?; a.vmovq(r9, xmm3)?; a.vmovd(xmm4, dword_ptr(rdx))?;
+            a.vmovq(xmm5, qword_ptr(rdx + 8))?; a.vmovd(dword_ptr(rdx + 16), xmm6)?; a.vmovq(qword_ptr(rdx + 24), xmm7)?;
+            a.vmovq(xmm8, xmm9)?; a.ret()
+        })),
         ("zeroupper", 0x8c1, assemble(|a| {
             a.vmovups(ymm0, ymmword_ptr(rdx))?; a.vaddps(ymm1, ymm0, ymm0)?; a.vzeroupper()?; a.ret()
         })),

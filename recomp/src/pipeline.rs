@@ -114,9 +114,8 @@ fn checkable_with(code: &[u8], rva: u32, sandboxed: bool) -> bool {
                                 | iced_x86::OpAccess::ReadCondWrite
                         )
                 });
-                if writes_global {
-                    return false;
-                }
+                // Writes to globals are compared and undone through the image's write watch (difftest_sandboxed).
+                let _ = writes_global;
             }
         }
     }
@@ -196,6 +195,24 @@ unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> isize;
     fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
     fn VirtualAlloc(address: *mut core::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut core::ffi::c_void;
+    fn GetWriteWatch(flags: u32, base: *mut core::ffi::c_void, size: usize, addresses: *mut *mut core::ffi::c_void,
+                     count: *mut usize, granularity: *mut u32) -> u32;
+}
+
+const PAGE: usize = 4096;
+
+/// The image's pages written since the last call (and the watch reset), or None when more than `MAX_DIRTY` were.
+fn dirty_pages(base: u64, size: usize) -> Option<Vec<u64>> {
+    const MAX_DIRTY: usize = 4096;
+    let mut addresses = vec![core::ptr::null_mut::<core::ffi::c_void>(); MAX_DIRTY];
+    let (mut count, mut granularity) = (MAX_DIRTY, 0u32);
+    let r = unsafe {
+        GetWriteWatch(1, base as *mut core::ffi::c_void, size, addresses.as_mut_ptr(), &mut count, &mut granularity)
+    };
+    if r != 0 || count >= MAX_DIRTY {
+        return None;
+    }
+    Some(addresses[..count].iter().map(|&a| a as u64).collect())
 }
 
 pub struct Library {
@@ -291,9 +308,11 @@ pub fn difftest(cands: &[Candidate], lib: &Library, rounds: usize) -> Vec<u32> {
 /// run in place and RIP-relative reads see the image's own data. Returns the base.
 pub fn map_image(image: &Image<'_>) -> Result<u64, String> {
     let size = image.size_of_image as usize;
-    let mut p = unsafe { VirtualAlloc(image.image_base as *mut core::ffi::c_void, size, 0x3000, 0x40) };
+    // MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH: the differential test learns which pages a run wrote.
+    let kind = 0x3000 | 0x0020_0000;
+    let mut p = unsafe { VirtualAlloc(image.image_base as *mut core::ffi::c_void, size, kind, 0x40) };
     if p.is_null() {
-        p = unsafe { VirtualAlloc(core::ptr::null_mut(), size, 0x3000, 0x40) };
+        p = unsafe { VirtualAlloc(core::ptr::null_mut(), size, kind, 0x40) };
     }
     if p.is_null() {
         return Err(format!("cannot map {size} bytes for the image"));
@@ -342,11 +361,21 @@ fn guarded(size: usize) -> &'static mut [u8] {
 /// either a generated value or a pointer into a sandbox of random bytes, the same sandbox and stack for both runs.
 /// An input on which the native function faults is skipped; the translation must then match on every other input,
 /// and at least a quarter of the inputs must have run.
-pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds: usize) -> SandboxReport {
+pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, image_size: usize, rounds: usize) -> SandboxReport {
     use crate::harness::{run_native_timed, Outcome};
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let entry_of: std::collections::HashMap<u64, u64> = entries(lib).into_iter().collect();
     unsafe { (lib.init)(base) };
+    // The image as mapped, to undo what a run wrote to it.
+    let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(base as *const u8, image_size) }.to_vec();
+    let image = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, image_size) };
+    let restore = |image: &mut [u8], pages: &[u64]| {
+        for &p in pages {
+            let at = (p - base) as usize;
+            let end = (at + PAGE).min(image.len());
+            image[at..end].copy_from_slice(&pristine[at..end]);
+        }
+    };
     let sandbox = guarded(SANDBOX);
     let sbase = sandbox.as_mut_ptr() as u64;
     let stack = guarded(1 << 16);
@@ -388,9 +417,22 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
                 stack[at..at + 8].copy_from_slice(&v.to_le_bytes());
             }
             let mut a = start;
+            let _ = dirty_pages(base, image_size); // reset the watch
             // A fault or a run past 2 ms (a loop on a generated count): this input is outside what the function
             // accepts, or too long to compare.
-            if !matches!(unsafe { run_native_timed(native, &mut a, 2_000) }, Outcome::Done(_)) {
+            let native_outcome = unsafe { run_native_timed(native, &mut a, 2_000) };
+            let Some(native_pages) = dirty_pages(base, image_size) else {
+                continue; // wrote too much of the image to compare
+            };
+            let native_image: Vec<(u64, Vec<u8>)> = native_pages
+                .iter()
+                .map(|&p| {
+                    let at = (p - base) as usize;
+                    (p, image[at..(at + PAGE).min(image_size)].to_vec())
+                })
+                .collect();
+            restore(image, &native_pages);
+            if !matches!(native_outcome, Outcome::Done(_)) {
                 continue;
             }
             let (native_sandbox, native_stack) = (sandbox.to_vec(), stack[above..].to_vec());
@@ -399,6 +441,29 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
             stack.copy_from_slice(&initial_stack);
             let mut b = start;
             let translated = unsafe { run_native_timed(entry, &mut b, 100_000) };
+            let translated_pages = dirty_pages(base, image_size);
+            // The image must have been written alike: the same pages, the same bytes.
+            let image_differs = match &translated_pages {
+                None => true,
+                Some(pages) => {
+                    let mut all: Vec<u64> = native_pages.iter().chain(pages.iter()).copied().collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.iter().any(|&p| {
+                        let at = (p - base) as usize;
+                        let end = (at + PAGE).min(image_size);
+                        let native_bytes = native_image
+                            .iter()
+                            .find(|(q, _)| *q == p)
+                            .map(|(_, b)| &b[..])
+                            .unwrap_or(&pristine[at..end]);
+                        native_bytes != &image[at..end]
+                    })
+                }
+            };
+            if let Some(pages) = &translated_pages {
+                restore(image, pages);
+            }
             let why = if !matches!(translated, Outcome::Done(_)) {
                 Some(format!("translation {translated:?}"))
             } else if a.r != b.r {
@@ -411,6 +476,8 @@ pub fn difftest_sandboxed(cands: &[Candidate], lib: &Library, base: u64, rounds:
                 Some(format!("sandbox byte {at:#x}"))
             } else if stack[above..] != native_stack[..] {
                 Some("the caller's stack".to_string())
+            } else if image_differs {
+                Some("the image's globals".to_string())
             } else {
                 None
             };
@@ -480,7 +547,7 @@ mod tests {
         // an epilogue fragment is refused: mov rbp, [rsp+38h]; mov rsi, [rsp+40h]; add rsp, 20h; pop rdi; ret
         let tail = [0x48, 0x8B, 0x6C, 0x24, 0x38, 0x48, 0x8B, 0x74, 0x24, 0x40, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3];
         assert!(!checkable(&tail, 0x1000));
-        // sandboxed: memory through a register is fine; reading a global is fine; writing one is not
+        // sandboxed: memory through a register, and reading or writing a global, are all fine
         let mut through = pure;
         through[..4].copy_from_slice(&[0x48, 0x8B, 0x01, 0x90]); // mov rax, [rcx]; nop
         assert!(checkable_sandboxed(&through, 0x1000));
@@ -490,7 +557,7 @@ mod tests {
         assert!(checkable_sandboxed(&read_global, 0x1000));
         let mut write_global = vec![0xC5, 0xFC, 0x29, 0x05, 0x00, 0x01, 0x00, 0x00]; // vmovaps [rip+100h], ymm0
         write_global.extend_from_slice(&tail);
-        assert!(!checkable_sandboxed(&write_global, 0x1000));
+        assert!(checkable_sandboxed(&write_global, 0x1000)); // compared and undone through the write watch
         // loops: refused without the watchdog, taken by the sandboxed rule (but never a branch to the first 14 bytes)
         // the 15 bytes before pure's ret, then `dec rcx; jnz -5` (a loop back to offset 15) and ret
         let mut lp2 = pure[..15].to_vec();

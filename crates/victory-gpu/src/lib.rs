@@ -21,6 +21,8 @@ mod ambient;
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

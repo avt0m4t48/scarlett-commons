@@ -4262,6 +4262,13 @@ fn make_twinned(
                 {
                     from_base(desc, copy.base);
                 }
+                // Made whole from the store: all its levels.
+                let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
+                if prefilled > 0
+                    && let Some(desc) = &mut desc
+                {
+                    show_prefilled(desc, prefilled);
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4394,6 +4401,24 @@ fn make_twinned(
             }
         }
     }
+}
+
+/// The view `desc` of a host copy whose levels below `levels` the store
+/// filled (`crate::texstore`): from level 0, if it showed from one of them.
+fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return;
+    }
+    // SAFETY: the member its dimension says.
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    if t.MostDetailedMip == 0 || t.MostDetailedMip > levels {
+        return;
+    }
+    if t.MipLevels != u32::MAX {
+        t.MipLevels += t.MostDetailedMip;
+    }
+    t.MostDetailedMip = 0;
+    t.ResourceMinLODClamp = 0.0;
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`

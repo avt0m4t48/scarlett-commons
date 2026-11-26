@@ -64,6 +64,8 @@ pub(crate) struct Staging {
     once: std::sync::atomic::AtomicBool,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The title texture's shape, for `crate::texstore`.
+    shape: crate::texstore::Shape,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -718,7 +720,7 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 
 /// See [`digest`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Digest(u128);
+pub(crate) struct Digest(pub(crate) u128);
 
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
@@ -822,6 +824,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         unsafe { list.list.barriers(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
+    // A host copy made whole from the store (`crate::texstore`): its larger
+    // levels, once, before the ones from title memory.
+    let prefill = copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some((levels, bytes)) = prefill {
+        prefill_levels(list, &copy, levels, &bytes);
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -915,6 +923,55 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             crate::descriptor::host::levels_waiting(staging.memory as u64);
         }
     });
+}
+
+/// Records copies of levels `0..levels` of `copy` (in the copy destination
+/// state) from `bytes`, laid out as the host lays out those subresources;
+/// its views show them from then on.
+fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: u32, bytes: &[u8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else {
+        return;
+    };
+    let texture = &copy.texture;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
+        return;
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `levels` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(&d, 0, levels, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut total));
+    }
+    if total as usize > bytes.len() {
+        return;
+    }
+    let Some((buffer, data)) = host.upload_buffer(total) else {
+        return;
+    };
+    // SAFETY: the mapping holds `total` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
+    list.keep(&buffer);
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    copy.prefilled.store(levels, Relaxed);
+    crate::texstore::PREFILLED.fetch_add(1, Relaxed);
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1305,6 +1362,7 @@ impl Staging {
                 last.hash = Some(hash);
                 found_blind(last);
                 self.detile(tiled);
+                self.keep_whole(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1322,6 +1380,7 @@ impl Staging {
         last.hash = Some(hash);
         found_blind(last);
         self.detile(tiled);
+        self.keep_whole(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1344,6 +1403,7 @@ impl Staging {
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
+                self.keep_whole(read);
             }
             true
         });
@@ -1397,6 +1457,38 @@ impl Staging {
             crate::descriptor::host::read_all(start);
         }
         size
+    }
+
+    /// `tiled`, read whole, was detiled: a texture of all its levels from
+    /// level 0 is given to the store (`crate::texstore`), detiled again
+    /// into memory of ours (the staging buffer is the card's to read, slow
+    /// for the processor).
+    fn keep_whole(&self, tiled: &[u8]) {
+        if !crate::texstore::on()
+            || self.first != 0
+            || self.level0 != 0
+            || self.on_demand
+            || self.layout.slices != 1
+            || tiled.len() as u64 != self.layout.size
+            || self.footprints.len() != self.mips as usize
+        {
+            return;
+        }
+        let (Some(last), Some(&rows)) = (self.footprints.last(), self.rows.last()) else {
+            return;
+        };
+        let end = last.Offset as usize + last.Footprint.RowPitch as usize * rows as usize * last.Footprint.Depth as usize;
+        let mut levels = vec![0u8; end];
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let pitch = footprint.Footprint.RowPitch as usize;
+            let len = pitch * rows as usize * footprint.Footprint.Depth as usize;
+            let at = footprint.Offset as usize;
+            if self.layout.detile(tiled, i as u32, 0, &mut levels[at..at + len], pitch, pitch * rows as usize).is_err() {
+                return;
+            }
+        }
+        let offsets: Vec<u64> = self.footprints.iter().map(|f| f.Offset).collect();
+        crate::texstore::keep(self.shape, &self.layout, tiled, &levels, &offsets);
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1833,6 +1925,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         bytes: total,
+        shape: desc.shape(),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

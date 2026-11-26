@@ -64,8 +64,8 @@ enum Command {
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
-        #[arg(long)]
+        /// Print one line per container found and show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -98,7 +98,7 @@ enum Command {
     },
     /// Translate every shader found (as `translate` finds them) into the
     /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// of the translator. In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).

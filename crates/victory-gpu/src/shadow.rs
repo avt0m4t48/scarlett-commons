@@ -2986,20 +2986,20 @@ pub(crate) fn let_go_idle() {
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
-    if let Some(bytes) = budget {
-        if let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample() {
-            let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
-            *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
-            match *band {
-                crate::host::RamBand::Calm => {}
-                crate::host::RamBand::Watch => {
-                    idle_ms = idle_ms.min(10_000);
-                    keep = bytes;
-                }
-                crate::host::RamBand::High => {
-                    idle_ms = idle_ms.min(2_000);
-                    keep = bytes / 2;
-                }
+    if let Some(bytes) = budget
+        && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
+    {
+        let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
+        match *band {
+            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Watch => {
+                idle_ms = idle_ms.min(10_000);
+                keep = bytes;
+            }
+            crate::host::RamBand::High => {
+                idle_ms = idle_ms.min(2_000);
+                keep = bytes / 2;
             }
         }
     }

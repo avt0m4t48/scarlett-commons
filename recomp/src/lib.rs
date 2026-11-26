@@ -18,6 +18,7 @@ pub mod census;
 pub mod elf;
 pub mod harness;
 pub mod pipeline;
+pub mod ps5;
 
 use std::collections::BTreeMap;
 use std::fmt;

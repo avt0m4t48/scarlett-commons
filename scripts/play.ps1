@@ -31,8 +31,15 @@ if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
-Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+$inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
+foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+$discarded = $inherited | Where-Object {
+    $_.Name -notin $More.Keys -and -not $_.Value.Equals([Environment]::GetEnvironmentVariable($_.Name))
+} | Sort-Object Name
+if ($discarded) {
+    Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
+}
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory run $Exe --execute } finally { Pop-Location }

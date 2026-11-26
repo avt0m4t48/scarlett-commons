@@ -1199,10 +1199,14 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                // Buttons, sticks and triggers alike (W A S D, I J K L, Z, C):
+                // a walk or a turn of the camera scripted for a test moves.
+                let held: Vec<super::KeyState> = scripted()
+                    .into_iter()
+                    .map(|vk| super::KeyState { virtual_key: vk, ..Default::default() })
+                    .collect();
+                if !held.is_empty() {
+                    pad = super::merged(pad, super::fallback(&held));
                 }
             }
             Some(pad)

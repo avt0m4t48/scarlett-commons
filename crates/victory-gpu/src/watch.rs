@@ -274,6 +274,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(11, started.elapsed().as_nanos() as u64);
         }
         if failed {
+            // (On the timeline: how many askings the kernel refuses.)
+            crate::timeline::span("asking refused").end();
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -331,8 +333,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
-    // The runs asked about together: pieces `[i, k)`.
-    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -345,27 +345,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        runs.push(i..k);
+        ask_run(&pieces[i..k], &mut asked, &mut written);
         i = k;
-    }
-    if spread() && runs.len() >= 4 {
-        // Each asking costs some 30 microseconds and more for long runs (50
-        // a frame on the submitting thread, 3 ms, in run city4): on the
-        // threads kept for landing. All is held (`_all`), the answers are
-        // noted together below under one number, as when asked one by one.
-        let out = Mutex::new((Vec::new(), Vec::new()));
-        crate::land::each_under(runs.len(), &|r| {
-            let (mut a, mut w) = (Vec::new(), Vec::new());
-            ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
-            let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
-            out.0.extend(a);
-            out.1.extend(w);
-        });
-        (asked, written) = out.into_inner().unwrap_or_else(|e| e.into_inner());
-    } else {
-        for run in runs {
-            ask_run(&pieces[run], &mut asked, &mut written);
-        }
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -375,20 +356,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
-}
-
-/// Whether a submission's askings ahead ([`ask_ahead`]) are made on several
-/// threads at once (`VICTORY_ASK_SPREAD=1`; off by default). The same
-/// askings of the same ranges, with all held, so nothing else asks between;
-/// only which thread waits for the kernel changes.
-fn spread() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_ASK_SPREAD") {
-        return on;
-    }
-    // Read here: askings ahead on several threads.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPREAD").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -566,9 +533,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
     ask_ahead(ranges);
+    spent.next("asking: the rest");
     ask_rest(ranges);
+    spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the

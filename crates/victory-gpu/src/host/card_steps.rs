@@ -662,8 +662,11 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
+        let read = copied_read(&copies, runs);
+        looked.end();
+        let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)

@@ -478,7 +478,7 @@ mod tests {
         assert!(on());
         let pages = Pages::new(3 << 12);
         pages.fill();
-        let records = (3 << 12) / 32;
+        let records: usize = (3 << 12) / 32;
         // SAFETY: inside the allocation.
         let title = unsafe { std::slice::from_raw_parts(pages.0, pages.1) }.to_vec();
         let mut seen = title.clone();

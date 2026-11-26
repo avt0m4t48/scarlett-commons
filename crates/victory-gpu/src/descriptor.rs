@@ -533,13 +533,18 @@ static SYNC_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 /// Whether [`sync_heaps`] reads a changed page's records where they are, each
 /// once, and compares each with the one last seen as it reads it, 32 bytes at
-/// a time (`VICTORY_SYNC_IN_PLACE=1`; otherwise into a copy of the page first, then
+/// a time (`VICTORY_SYNC_IN_PLACE=0`: into a copy of the page first, then
 /// compared, as before).
 ///
 /// The copy and the compare were each a pass over all of the page: 7.4 and
 /// 5.3 ms a frame of the six threads for 35 MB (run heapsync-ab1, in the
 /// street). A page the title unmaps meanwhile fails where the copy failed;
 /// the records before the place are taken as they were read.
+///
+/// On by default since run heapsync-ab2 (A/B in the street: the pass 12.7 ms
+/// a frame against 15.7-16.2, the copy and compare 7.4 ms of its threads
+/// against 13.3, the submitting thread's wait for it 2.0 ms against 2.2-2.6;
+/// the picture the same).
 #[cfg(windows)]
 fn sync_in_place() -> bool {
     #[cfg(feature = "diagnostics")]
@@ -547,7 +552,7 @@ fn sync_in_place() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_IN_PLACE").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_IN_PLACE").is_none_or(|v| v != "0"))
 }
 
 /// Of [`sync_heaps`]'s page jobs since the last frame line, on all threads:

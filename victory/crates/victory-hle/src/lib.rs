@@ -12,6 +12,10 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
+mod image_watch;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::frame_phase;
+
 pub mod modules;
 mod registry;
 pub mod runtime;
@@ -19,6 +23,11 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::replay;
+
+#[cfg(windows)]
+pub use victory_gpu::pipeline::known as known_pipelines;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

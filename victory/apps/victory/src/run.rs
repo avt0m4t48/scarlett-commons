@@ -42,7 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
-) -> Result<u32> {
+) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
@@ -53,29 +53,24 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let prepared = victory_loader::prepare(
-        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
-    )?;
+    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => {
-            println!("build          {} ({hash})", build.label);
-            if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
-            }
-        }
+        Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
-    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    let image_name = prepared.file_name();
     drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     // Scarlett Commons: track B installs its recompiled functions over the mapped image before anything runs
@@ -98,6 +93,7 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -176,9 +172,14 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
-        return Ok(0);
+        return Ok(());
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -202,27 +203,6 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
-    Ok(code)
-}
-
-#[cfg(windows)]
-fn check_startup_archive(path: &Path) -> Result<()> {
-    use std::io::Read;
-
-    let mut magic = [0; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .with_context(|| {
-            format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
-        path.display()
-    );
     Ok(())
 }
 
@@ -231,6 +211,7 @@ fn check_startup_archive(path: &Path) -> Result<()> {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
@@ -335,7 +316,7 @@ fn absent_title_dlls(
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -557,6 +538,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

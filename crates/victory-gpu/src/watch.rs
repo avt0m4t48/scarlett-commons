@@ -305,6 +305,22 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// [`AHEAD_GAP`] with `VICTORY_ASK_GAP=1` (off by default): an asking costs
+/// some 30 microseconds and about one more for each MB it walks (run city4:
+/// 1-32 MB 30-40 us, 32-128 MB 90-110), so ranges up to 24 MB apart are
+/// cheaper asked together.
+const AHEAD_GAP_WIDE: usize = (24 << 20) / PAGE;
+
+/// The gap below which ranges are asked about together.
+fn ahead_gap() -> usize {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_GAP") {
+        return if on { AHEAD_GAP_WIDE } else { AHEAD_GAP };
+    }
+    // Read here: the wider gap between ranges asked together.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_GAP").is_some_and(|v| v == "1")) { AHEAD_GAP_WIDE } else { AHEAD_GAP }
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -315,6 +331,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    ask_ahead_held(ranges, false);
+}
+
+/// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
+fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -331,7 +352,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
+    let _all = (!held).then(Asking::hold_all);
+    let gap = ahead_gap();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -339,7 +361,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -535,16 +557,20 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
-    ask_ahead(ranges);
+    // Both parts under one hold of everything: a second hold waited for the
+    // other threads' askings again (0.5 ms a time, run fills-ab3), and no
+    // other asking comes between the two parts.
+    let _all = Asking::hold_all();
+    ask_ahead_held(ranges, true);
     spent.next("asking: the rest");
-    ask_rest(ranges);
+    ask_rest(ranges, true);
     spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
-fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
+fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+    let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
@@ -3089,7 +3115,7 @@ mod tests {
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges);
+        ask_rest(&ranges, false);
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");

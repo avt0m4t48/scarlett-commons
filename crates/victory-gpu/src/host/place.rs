@@ -128,25 +128,41 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
         }
     }
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Placed(p) => {
-                let read = p.from.is_some() && touches(&ranges, p.src, p.src + p.len);
-                if !all && waits(p) {
-                    join_ranges(&mut ranges, [(p.dst, p.dst + p.len)]);
+        list.deferred().copies.iter().any(|step| {
+            // What reads, by kind ([`READERS`]).
+            let (read, kind) = match step {
+                Step::Placed(p) => {
+                    let read = p.from.is_some() && touches(&ranges, p.src, p.src + p.len);
+                    if !all && waits(p) {
+                        join_ranges(&mut ranges, [(p.dst, p.dst + p.len)]);
+                    }
+                    (read, 0)
                 }
-                read
+                _ if ranges.is_empty() => (false, 0),
+                &Step::Copy(_, src, len) => (touches(&ranges, src, src + len), 1),
+                &Step::Fill(_, src, len, _) => (touches(&ranges, src, src + len), 2),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    (touches(&ranges, at, at + len), 3)
+                }
+                Step::Host(_, (from, to)) => (touches(&ranges, *from, *to), 4),
+                _ => (false, 0),
+            };
+            #[cfg(feature = "diagnostics")]
+            if read {
+                READERS[kind].fetch_add(1, Ordering::Relaxed);
             }
-            _ if ranges.is_empty() => false,
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
-            }
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            _ => false,
+            let _ = kind;
+            read
         })
     })
 }
+
+/// Diagnostics: the steps found reading what a copy at its place writes
+/// ([`read_by`]) since the last frame line: another such copy, a buffer copy,
+/// a fill, a texture, a step of ours.
+#[cfg(feature = "diagnostics")]
+pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Everything recorded so far is done, and seen, before what follows.
 ///

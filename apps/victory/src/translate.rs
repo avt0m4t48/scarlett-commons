@@ -1,6 +1,8 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
+pub(crate) mod host_wave;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -156,7 +158,7 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<u32>) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -193,7 +195,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    host_wave::spawn(s, wave, || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else {
                                 continue;
@@ -239,17 +241,13 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    wave: Option<u32>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
-        victory_shader::emit::set_host_max_wave(n);
-    }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
@@ -290,7 +288,7 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    host_wave::spawn(s, wave, || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -973,7 +971,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, Some(1), None).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(

@@ -203,12 +203,6 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
-
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` allocator delay.
-    pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
-    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -811,7 +805,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.barriers(host) };
         }
     }
     0
@@ -824,8 +818,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
     }
 }
 
@@ -1583,7 +1578,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            unsafe { list.list.barriers(&[barrier]) };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2156,7 +2151,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

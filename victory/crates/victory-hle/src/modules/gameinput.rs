@@ -1197,18 +1197,26 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                // Buttons, sticks and triggers alike (W A S D, I J K L, Z, C):
+                // a walk or a turn of the camera scripted for a test moves.
+                let held: Vec<super::KeyState> = scripted()
+                    .into_iter()
+                    .map(|vk| super::KeyState { virtual_key: vk, ..Default::default() })
+                    .collect();
+                if !held.is_empty() {
+                    pad = super::merged(pad, super::fallback(&held));
                 }
             }
             Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            #[cfg(not(feature = "diagnostics"))]
+            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1246,6 +1254,7 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         type Script = Vec<(Duration, Duration, u8)>;
         /// One `<seconds>:<key>` or `<from>-<to>:<key>` entry; `+<seconds>` is that long after `now`.

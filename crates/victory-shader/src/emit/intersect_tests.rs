@@ -700,3 +700,78 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// A buffer view picked from the table at an index the program computes,
+/// whose dwords 0 and 1 the program reads as numbers (the tracer takes its
+/// structure's address so, by an index from a constant buffer): they are
+/// the view's title address from the host's table by view heap slot, after
+/// the strides in the same root view.
+#[test]
+fn a_picked_views_address_comes_from_the_hosts_table() {
+    use super::{SLOT_STRIDES, SLOT_STRIDES_BYTES, VIEW_ADDRESSES};
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x8F06_8500, // s_lshl_b32 s6, s0, 5
+        0xF408_0202,
+        0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x342A_0083, // v_lshlrev_b32 v21, 3, v0
+        0xE074_1000,
+        0x8003_0115, // buffer_store_dwordx2 v[1:2], v21, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let (shader, _) = build_compute_shader(&native(&words)).expect("the program lowers");
+    assert!(shader.root_srvs.contains(&SLOT_STRIDES), "{:?}", shader.root_srvs);
+    assert!(
+        !shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_VIEW_ADDRESS)),
+        "no host word for a fixed place"
+    );
+    let mut table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
+    let at = VIEW_ADDRESSES as usize / 4;
+    // Slot 2, the one picked; slot 0 as a decoy.
+    table[at..at + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
+    table[at + 4..at + 6].copy_from_slice(&[0x1234_5600, 0x42]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let decoy = [7u32; 4];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    // s0: the picked view's place in the table (slot 2).
+                    roots: vec![
+                        (0, Root::Constants(vec![2, 0, 0, 0, 0])),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                    ],
+                    views: &[
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
+                        View::RawUav(8 * THREADS),
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..THREADS as usize {
+            assert_eq!(out[0][2 * t..2 * t + 2], [0x1234_5600, 0x42], "{label} thread {t}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}

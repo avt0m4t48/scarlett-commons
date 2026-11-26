@@ -3062,6 +3062,48 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// [`Self::view_address`] of a buffer view the program picks at an
+    /// index it computes, from a table or the heap: the view's title
+    /// address from the host's table by view heap slot
+    /// ([`super::shader::VIEW_ADDRESSES`], after the strides in
+    /// [`super::shader::SLOT_STRIDES`]), dword 0 its low 32 bits, dword 1
+    /// the rest. None for a load at a fixed place (that is
+    /// [`Self::view_address`]'s) or not of whole descriptors.
+    // shortcut: dword 1 holds the address bits only (a buffer's stride and
+    // swizzle bits read 0); the computed part of the offset is taken as
+    // whole descriptors (32-byte multiples), as `heap_index` does.
+    fn heap_view_address(&mut self, site: Site) -> Result<Option<(V, V)>, Why> {
+        use super::shader::{SLOT_STRIDES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
+        let Some(a) = self.scalar.get(&site).copied() else {
+            return Ok(None);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return Ok(None);
+        };
+        let picked = match rp.root {
+            RootType::ResourceHeap => true,
+            RootType::Table => a.dynamic.is_some(),
+            _ => false,
+        };
+        if !picked || a.offset % 32 != 0 {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false)?;
+        // Inside the table whatever the index: a root view has no bounds.
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let base = self.s.m.i32(VIEW_ADDRESSES);
+        let byte = self.s.m.bin(c, Bin::Add, byte, base);
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let words = self.raw_dwords(h, byte, 2);
+        Ok(Some((words[0], words[1])))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -6423,6 +6465,28 @@ impl<'a> Lower<'a> {
             // from the host, the other dwords have no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
+            {
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    match k {
+                        0 => self.write(inst, reg, lo, None),
+                        1 => self.write(inst, reg, hi, None),
+                        _ => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // The same, of a view picked from a table or the heap at an
+            // index the program computes (the ray tracer's structure, by
+            // an index from a constant buffer): the address from the
+            // host's table by view heap slot.
+            if count <= 4
+                && let Some((lo, hi)) = self.heap_view_address(site)?
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);

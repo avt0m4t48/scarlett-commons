@@ -73,6 +73,11 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE overrides the host wave width, including with --warm.
+    /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
+    /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
+    /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -209,14 +214,15 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
-            }
+            let wave = translate::host_wave::select(
+                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
+                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+                |message| eprintln!("{message}"),
+            );
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs, wave);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, wave)
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]

@@ -58,7 +58,9 @@ struct Store {
     index: Mutex<HashMap<Key, Entry>>,
     kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
     kept_bytes: AtomicU64,
-    writer: Mutex<mpsc::Sender<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)>)>>,
+    jobs: Mutex<mpsc::Sender<Job>>,
+    /// Contents given to it this run (digests of whole textures).
+    seen: Mutex<std::collections::HashSet<u128>>,
 }
 
 /// Since the start: entries found at startup, textures kept, keys asked,
@@ -102,7 +104,7 @@ fn store() -> Option<&'static Store> {
                 keys = index.len(),
                 "texture store: larger levels kept from earlier runs (VICTORY_TEXTURE_STORE)"
             );
-            let (send, receive) = mpsc::channel::<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)>)>();
+            let (send, receive) = mpsc::channel::<Job>();
             let to = folder.clone();
             std::thread::Builder::new()
                 .name("texture store".into())
@@ -112,7 +114,14 @@ fn store() -> Option<&'static Store> {
                     else {
                         return;
                     };
-                    for (blob, bytes, keys) in receive {
+                    for job in receive {
+                        // (The store is made before this thread's first job.)
+                        let Some(store) = store() else {
+                            continue;
+                        };
+                        let Some((blob, bytes, keys)) = kept(store, job) else {
+                            continue;
+                        };
                         let path = to.join(format!("{blob:032x}.lv"));
                         if !path.exists() {
                             let part = to.join(format!("{blob:032x}.part"));
@@ -132,7 +141,8 @@ fn store() -> Option<&'static Store> {
                 index: Mutex::new(index),
                 kept: Mutex::new(HashMap::new()),
                 kept_bytes: AtomicU64::new(0),
-                writer: Mutex::new(send),
+                jobs: Mutex::new(send),
+                seen: Mutex::new(std::collections::HashSet::new()),
             })
         })
         .as_ref()
@@ -157,21 +167,38 @@ pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -
         .collect()
 }
 
-/// A texture of `shape` was detiled whole from `tiled` (its memory, all
-/// levels) into `levels` (the host's layout of all its subresources from
-/// level 0; `offsets[i]`: where subresource `i` starts in it). Kept, unless
-/// its keys are known.
-pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], levels: &[u8], offsets: &[u64]) {
+/// A texture of `shape` was read whole: `tiled` is its memory (all levels),
+/// `parts` where the host lays out each of its levels (offset, row pitch,
+/// rows). Detiled and kept on the store's thread, unless that content is
+/// known.
+pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
     let Some(store) = store() else {
         return;
     };
-    let keys = key_levels(layout, shape[3]);
-    let Some(&(top, _)) = keys.iter().max_by_key(|(k, _)| *k) else {
+    let blob = crate::texture::digest(tiled).0;
+    if !store.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(blob) {
         return;
-    };
-    let Some(&end) = offsets.get(top as usize) else {
-        return;
-    };
+    }
+    let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
+    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+}
+
+/// A texture to keep ([`keep`]).
+struct Job {
+    shape: Shape,
+    layout: victory_formats::texture::Layout,
+    tiled: Vec<u8>,
+    parts: Vec<(u64, u32, u32)>,
+    blob: u128,
+}
+
+/// [`keep`]'s work, on the store's thread: the levels detiled as the host
+/// lays them out, the keys, memory, and what goes to the folder.
+fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)>)> {
+    let Job { shape, layout, tiled, parts, blob } = job;
+    let keys = key_levels(&layout, shape[3]);
+    let &(top, _) = keys.iter().max_by_key(|(k, _)| *k)?;
+    let end = parts.get(top as usize)?.0 as usize;
     let made: Vec<Key> = keys
         .iter()
         .filter(|&&(_, bytes)| bytes as usize <= tiled.len())
@@ -180,14 +207,17 @@ pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tile
     {
         let index = store.index.lock().unwrap_or_else(|e| e.into_inner());
         if made.iter().all(|k| index.contains_key(k)) {
-            return;
+            return None;
         }
     }
-    if end as usize > levels.len() {
-        return;
+    // Levels `0..top`, the ones a key can stand for.
+    let mut levels = vec![0u8; end];
+    for (i, &(at, pitch, rows)) in parts.iter().take(top as usize).enumerate() {
+        let (at, pitch, rows) = (at as usize, pitch as usize, rows as usize);
+        let len = (pitch * rows).min(end.saturating_sub(at));
+        layout.detile(&tiled, i as u32, 0, &mut levels[at..at + len], pitch, len).ok()?;
     }
-    let blob = crate::texture::digest(tiled).0;
-    let bytes = Arc::new(levels[..end as usize].to_vec());
+    let bytes = Arc::new(levels);
     let entries: Vec<(Key, Entry)> = made.into_iter().map(|k| (k, Entry { blob, levels: k.level })).collect();
     {
         let mut index = store.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -200,7 +230,7 @@ pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tile
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
     STATS[1].fetch_add(1, Relaxed);
-    let _ = store.writer.lock().unwrap_or_else(|e| e.into_inner()).send((blob, bytes, entries));
+    Some((blob, bytes, entries))
 }
 
 /// The larger levels of a texture of `shape` first viewed from `level`,

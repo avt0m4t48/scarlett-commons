@@ -827,8 +827,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // A host copy made whole from the store (`crate::texstore`): its larger
     // levels, once, before the ones from title memory.
     let prefill = copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some((levels, bytes)) = prefill {
-        prefill_levels(list, &copy, levels, &bytes);
+    if let Some((levels, bytes)) = prefill
+        && prefill_levels(list, &copy, levels, &bytes)
+    {
+        let texture = resource as usize;
+        list.defer_host(move || crate::texlate::whole(texture));
     }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
@@ -928,16 +931,16 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
 /// Records copies of levels `0..levels` of `copy` (in the copy destination
 /// state) from `bytes`, laid out as the host lays out those subresources;
 /// its views show them from then on.
-fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: u32, bytes: &[u8]) {
+fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: u32, bytes: &[u8]) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = host() else {
-        return;
+        return false;
     };
     let texture = &copy.texture;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
-        return;
+        return false;
     }
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
     let mut total = 0;
@@ -946,10 +949,10 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
         host.device.GetCopyableFootprints(&d, 0, levels, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut total));
     }
     if total as usize > bytes.len() {
-        return;
+        return false;
     }
     let Some((buffer, data)) = host.upload_buffer(total) else {
-        return;
+        return false;
     };
     // SAFETY: the mapping holds `total` bytes.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
@@ -972,6 +975,7 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
     }
     copy.prefilled.store(levels, Relaxed);
     crate::texstore::PREFILLED.fetch_add(1, Relaxed);
+    true
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1474,21 +1478,15 @@ impl Staging {
         {
             return;
         }
-        let (Some(last), Some(&rows)) = (self.footprints.last(), self.rows.last()) else {
-            return;
-        };
-        let end = last.Offset as usize + last.Footprint.RowPitch as usize * rows as usize * last.Footprint.Depth as usize;
-        let mut levels = vec![0u8; end];
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let pitch = footprint.Footprint.RowPitch as usize;
-            let len = pitch * rows as usize * footprint.Footprint.Depth as usize;
-            let at = footprint.Offset as usize;
-            if self.layout.detile(tiled, i as u32, 0, &mut levels[at..at + len], pitch, pitch * rows as usize).is_err() {
-                return;
-            }
-        }
-        let offsets: Vec<u64> = self.footprints.iter().map(|f| f.Offset).collect();
-        crate::texstore::keep(self.shape, &self.layout, tiled, &levels, &offsets);
+        // (The detiling, digests and writing on the store's thread: here
+        // only a copy of the memory, once per content.)
+        let parts: Vec<(u64, u32, u32)> = self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .map(|(f, &rows)| (f.Offset, f.Footprint.RowPitch, rows * f.Footprint.Depth))
+            .collect();
+        crate::texstore::keep(self.shape, &self.layout, tiled, parts);
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.

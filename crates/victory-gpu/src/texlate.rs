@@ -22,7 +22,8 @@ pub(crate) enum Kind {
     /// Upload recorded to the slot showing a texture new to it.
     New = 3,
     /// A texture first viewed from a smaller level to its first view of its
-    /// whole level 0 (the title's streaming, ours of its files, and ours).
+    /// whole level 0 (the title's streaming, ours of its files, and ours),
+    /// or to a list that copied its larger levels from the store being sent.
     Full = 4,
     /// The last look that found a slot's memory away to its upload: how
     /// late its memory's arrival was noticed, at most.
@@ -65,6 +66,15 @@ pub(crate) fn viewed(texture: usize, first: u32) {
     }
 }
 
+/// Texture `texture`'s larger levels were copied from the store (the list
+/// that did it has been sent): shown whole from now on.
+pub(crate) fn whole(texture: usize) {
+    let since = PARTLY.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|p| p.remove(&texture));
+    if let Some(since) = since {
+        note(Kind::Full, since);
+    }
+}
+
 /// A texture is let go: no longer waited for.
 pub(crate) fn gone(texture: usize) {
     if let Some(partly) = PARTLY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -100,7 +110,7 @@ pub(crate) fn line() -> String {
         "the same after waiting for memory",
         "upload to a sharper level shown",
         "upload to a new texture shown",
-        "first viewed in part to viewed whole",
+        "first viewed in part to shown whole",
         "last look that found the memory away to the upload",
     ];
     let mut parts = Vec::new();

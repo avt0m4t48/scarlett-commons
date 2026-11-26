@@ -1516,7 +1516,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -3066,7 +3066,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -4044,7 +4044,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 /// A few things, up to `N` of them without memory of the heap: what a draw's
 /// tables are gone through with, some six lists a stage.
-struct Few<T, const N: usize> {
+pub(crate) struct Few<T, const N: usize> {
     few: [T; N],
     len: usize,
     /// All of them, if they are more.

@@ -477,7 +477,10 @@ fn where_the_card_reads(heap: &ID3D12Heap, texture: &ID3D12Resource, piece: Piec
     if into + level > piece.len {
         let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 50 || n.is_power_of_two() {
-            tracing::error!(
+            // (Debug only: it assumes a texture's address is its block's
+            // start and its piece's offset, which this driver does not
+            // keep: 56 false alarms in run pool-1.)
+            tracing::debug!(
                 times = n,
                 base = format_args!("{base:#x}"),
                 piece_start = format_args!("{:#x}", piece.start),

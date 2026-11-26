@@ -348,6 +348,10 @@ pub(crate) fn show_new_later() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_NEW_LATER").is_none_or(|v| v != "0"))
 }
 
+/// Slots [`show_new_later`] holds back now: heap, slot, record.
+static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, u32, u64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2364,6 +2368,14 @@ impl HostHeap {
             *flips = wait;
             ready
         };
+        {
+            let mut pending = NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.is_empty() {
+                for f in &ready {
+                    pending.remove(&(f.heap, f.index, f.key));
+                }
+            }
+        }
         let mut flipped = 0;
         for f in ready {
             let _made = self.made.lock(f.index);
@@ -3223,6 +3235,14 @@ impl HostHeap {
                 && is_texture_view(&view)
                 && let Some(after) = begun_before(&view)
             {
+                // Asked again (each draw that reads the slot, each pass)
+                // while it waits: nothing more to do.
+                let own = (std::ptr::from_ref(self) as usize, index, key);
+                if !NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(own) {
+                    drop(held);
+                    self.unmake_stale(index, stale);
+                    return Some(view);
+                }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
                 let kept = old.is_some_and(|old| match kin(&old, &view) {
                     Kin::Same => true,

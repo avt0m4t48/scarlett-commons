@@ -305,22 +305,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
-/// [`AHEAD_GAP`] with `VICTORY_ASK_GAP=1` (off by default): an asking costs
-/// some 30 microseconds and about one more for each MB it walks (run city4:
-/// 1-32 MB 30-40 us, 32-128 MB 90-110), so ranges up to 24 MB apart are
-/// cheaper asked together.
-const AHEAD_GAP_WIDE: usize = (24 << 20) / PAGE;
-
-/// The gap below which ranges are asked about together.
-fn ahead_gap() -> usize {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_ASK_GAP") {
-        return if on { AHEAD_GAP_WIDE } else { AHEAD_GAP };
-    }
-    // Read here: the wider gap between ranges asked together.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_GAP").is_some_and(|v| v == "1")) { AHEAD_GAP_WIDE } else { AHEAD_GAP }
-}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -353,7 +337,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     let _all = (!held).then(Asking::hold_all);
-    let gap = ahead_gap();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -361,7 +344,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + gap
+            && pieces[k].0 <= last + AHEAD_GAP
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);

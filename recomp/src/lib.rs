@@ -15,6 +15,7 @@
 //! No game code or data is kept here: addresses, byte signatures and names are interoperability facts.
 
 pub mod census;
+pub mod elf;
 pub mod harness;
 pub mod pipeline;
 

@@ -26,6 +26,8 @@ pub struct Image<'a> {
     exception: (u32, u32),
     /// The import address table (RVA, size): what the image's calls to other modules go through.
     pub iat: (u32, u32),
+    /// The functions, when the format lists them elsewhere than .pdata (an ELF's unwind data).
+    listed: Option<Vec<RuntimeFunction>>,
 }
 
 fn u16_at(d: &[u8], o: usize) -> Option<u16> {
@@ -40,6 +42,22 @@ fn u64_at(d: &[u8], o: usize) -> Option<u64> {
 
 impl<'a> Image<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Image<'a>, String> {
+        if crate::elf::is_self(data) {
+            return Err("a signed (encrypted) PS5 executable: decrypt it on its console first".into());
+        }
+        if crate::elf::is_elf(data) {
+            let e = crate::elf::parse(data)?;
+            return Ok(Image {
+                data,
+                image_base: e.base,
+                size_of_image: e.size,
+                size_of_headers: 0,
+                sections: e.segments,
+                exception: (0, 0),
+                iat: (0, 0),
+                listed: Some(e.functions),
+            });
+        }
         let pe = u32_at(data, 0x3C).ok_or("no DOS header")? as usize;
         if data.get(pe..pe + 4) != Some(b"PE\0\0") {
             return Err("not a PE image".into());
@@ -76,7 +94,7 @@ impl<'a> Image<'a> {
                 u32_at(data, s + 16).ok_or("short section table")?,
             ));
         }
-        Ok(Image { data, image_base, size_of_image, size_of_headers, sections, exception, iat })
+        Ok(Image { data, image_base, size_of_image, size_of_headers, sections, exception, iat, listed: None })
     }
 
     /// The file bytes of [rva, rva + len), when they lie inside one section's raw data.
@@ -111,6 +129,9 @@ impl<'a> Image<'a> {
 
     /// Every RUNTIME_FUNCTION in `.pdata`, sorted, without empty or reversed entries.
     pub fn functions(&self) -> Vec<RuntimeFunction> {
+        if let Some(listed) = &self.listed {
+            return listed.clone();
+        }
         let (rva, size) = self.exception;
         let Some(table) = self.bytes(rva, size) else { return Vec::new() };
         let mut out: Vec<RuntimeFunction> = table

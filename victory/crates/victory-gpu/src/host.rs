@@ -5922,7 +5922,7 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    execute_split(&self.queue, &lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -5981,7 +5981,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                execute_split(&self.queue, group);
                 self.card_sent();
                 let waited = self
                     .queue
@@ -11318,3 +11318,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Whether the lists of a submission go to the queue one `ExecuteCommandLists` each (`VICTORY_SPLIT_SUBMITS`,
+/// default on; `0`: as one call). Within one call a buffer a list copied into stays promoted to COPY_DEST, and a
+/// later list of the call that reads it through a root view reads it in a state it may not (the debug layer counts
+/// tens of thousands a minute; on NVIDIA the shader can read what was there before the copy). Between calls
+/// buffers decay to COMMON, from which a read promotes legally.
+fn split_submits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SPLIT_SUBMITS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// `queue.ExecuteCommandLists(lists)`, one call per list when [`split_submits`].
+///
+/// # Safety
+/// As `ExecuteCommandLists`: closed lists of the queue's type.
+unsafe fn execute_split(queue: &ID3D12CommandQueue, lists: &[Option<ID3D12CommandList>]) {
+    unsafe {
+        if split_submits() {
+            for list in lists {
+                queue.ExecuteCommandLists(std::slice::from_ref(list));
+            }
+        } else {
+            queue.ExecuteCommandLists(lists);
+        }
+    }
+}

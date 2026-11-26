@@ -3487,6 +3487,11 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
                 break;
             }
         }
+        // `VICTORY_REPLAY_WARP=1`: the frame on Microsoft's software rasterizer, the reference.
+        if std::env::var_os("VICTORY_REPLAY_WARP").is_some_and(|v| v == "1") {
+            adapter = Some(factory.EnumWarpAdapter::<IDXGIAdapter1>()?);
+            tracing::info!("replaying on WARP");
+        }
         if adapter.is_none() {
             tracing::warn!(
                 "the adapter recorded on ({}) is not here: the default one is used",

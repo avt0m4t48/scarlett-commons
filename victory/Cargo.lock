@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "adler2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +155,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "commons-recomp"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "commons-recomp-emit",
+ "iced-x86",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "commons-recomp-emit"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +240,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "iced-x86"
+version = "1.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,6 +263,12 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itoa"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "lazy_static"
@@ -280,15 +308,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "miniz_oxide"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
-dependencies = [
- "adler2",
-]
 
 [[package]]
 name = "nu-ansi-term"
@@ -423,6 +442,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -650,11 +682,11 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "commons-recomp",
  "memchr",
  "tracing",
  "victory-core",
  "victory-game",
- "victory-gpu",
  "victory-hle",
  "victory-loader",
  "victory-pe",
@@ -683,7 +715,7 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
- "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -692,7 +724,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "miniz_oxide",
  "tempfile",
  "tracing",
  "victory-formats",
@@ -700,13 +731,13 @@ dependencies = [
  "victory-shader",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide",
  "opus-pure",
  "tempfile",
  "tracing",
@@ -717,6 +748,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -756,10 +788,10 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide",
  "thiserror",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -914,3 +946,15 @@ dependencies = [
  "clap",
  "walkdir",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

@@ -248,8 +248,27 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    let host_caps = if pipelines {
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        if let Some(name) = host.adapter_name() {
+            println!("pipeline adapter: {name}");
+        }
+        host.translation_caps()
+    } else {
+        None
+    };
+    // Without VICTORY_HOST_WAVE / VICTORY_HOST_MAX_WAVE (`wave`, set per
+    // worker), translate as for the adapter the pipelines are made on.
+    if wave.is_none()
+        && let Some((lanes, _)) = host_caps
+    {
+        victory_shader::emit::set_host_max_wave(lanes);
+    }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
-    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").map_or_else(
+        || host_caps.is_some_and(|(_, rdna)| rdna),
+        |v| v == "1",
+    ));
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -258,9 +277,6 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
-    }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

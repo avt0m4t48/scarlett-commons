@@ -15,6 +15,11 @@
 //! no earlier one does: the card's side is still written only by the
 //! drawing queue.
 //!
+//! With the sends of `send` (`VICTORY_SEND_OWN`, on by default) the bytes are
+//! in the submission's own memory in the PC's: that comes up whole, in one
+//! copy, and the sends (copies and pairs of offset and word) read it from our
+//! buffer instead.
+//!
 //! The copy queue reads the CPU's side when the drawing queue would have,
 //! or earlier, and never before the bytes were put there (it is sent after
 //! that). Our buffer and lists belong to the submission's plan
@@ -51,6 +56,13 @@ pub(super) struct Slot {
 
 // SAFETY: free-threaded D3D12 objects, used by one submission at a time.
 unsafe impl Send for Slot {}
+
+impl Slot {
+    /// Our buffer, which holds what went up.
+    pub(super) fn bounce(&self) -> Option<&ID3D12Resource> {
+        self.bounce.as_ref().map(|b| &b.0)
+    }
+}
 
 struct Queue {
     queue: ID3D12CommandQueue,

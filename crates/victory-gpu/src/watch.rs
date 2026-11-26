@@ -242,6 +242,64 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Whether an asking walks the pages without the kernel's reset, and resets
+/// only the pages it found written after (`VICTORY_ASK_NORESET=1`; off by
+/// default). What is answered is the same: a page found written is reset
+/// before the caller copies it, so a write after the walk is in the copy or
+/// seen by the next asking; a page not found is not reset.
+fn no_reset() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_NORESET") {
+        return on;
+    }
+    // Read here: askings that reset only what they found.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_NORESET").is_some_and(|v| v == "1"))
+}
+
+/// Resets the write watch of the 4 KiB pages at `found` (in order), a run of
+/// neighbours at a time.
+fn reset_found(found: &[usize]) {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    let mut i = 0;
+    while i < found.len() {
+        let mut k = i + 1;
+        while k < found.len() && found[k] == found[k - 1] + KERNEL_PAGE {
+            k += 1;
+        }
+        // SAFETY: pages the kernel just reported write-watched.
+        unsafe { ResetWriteWatch(found[i] as *const _, (k - i) * KERNEL_PAGE) };
+        i = k;
+    }
+}
+
+/// Whether a submission's askings are made on several threads at once
+/// (`VICTORY_ASK_SPREAD=1`; off by default): the same askings of the same
+/// ranges, all held by the asking thread meanwhile.
+fn spread() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_SPREAD") {
+        return on;
+    }
+    // Read here: askings on several threads.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPREAD").is_some_and(|v| v == "1"))
+}
+
+/// `each(i)` for every `i` below `n`, on the threads kept for landing if
+/// [`spread`] and there are enough; what each returns, in order.
+fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    if !spread() || n < 4 {
+        return (0..n).map(each).collect();
+    }
+    let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    crate::land::each_under(n, &|i| {
+        let v = each(i);
+        *out[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    });
+    out.into_iter().filter_map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
+}
+
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
@@ -257,10 +315,11 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         let mut granularity = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let keep = no_reset();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
+                if keep { 0 } else { WRITE_WATCH_FLAG_RESET },
                 (first * PAGE) as *const _,
                 (last - first) * PAGE,
                 found.as_mut_ptr().cast(),
@@ -277,6 +336,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             // (On the timeline: how many askings the kernel refuses.)
             crate::timeline::span("asking refused").end();
             return None;
+        }
+        if keep {
+            reset_found(&found[..count]);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -338,6 +400,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -350,8 +413,16 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        runs.push(i..k);
         i = k;
+    }
+    for (a, w) in spread_each(runs.len(), |r| {
+        let (mut a, mut w) = (Vec::new(), Vec::new());
+        ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
+        (a, w)
+    }) {
+        asked.extend(a);
+        written.extend(w);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -564,21 +635,30 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
+    // Those not held by an asking ahead, each once.
+    let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-            #[cfg(feature = "diagnostics")]
-            let asking = std::time::Instant::now();
-            let found = kernel_written(first, last);
-            #[cfg(feature = "diagnostics")]
-            alone(start, end, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-            if let Some(pages) = found {
-                written.extend(pages);
-                ahead.push((first, last));
-            }
+        if !ahead.iter().any(|&(a, b)| a <= first && last <= b) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
+            alone_ranges.push((first, last));
+        }
+    }
+    let answers = spread_each(alone_ranges.len(), |r| {
+        let (first, last) = alone_ranges[r];
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let found = kernel_written(first, last);
+        #[cfg(feature = "diagnostics")]
+        alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
+        found
+    });
+    for (&(first, last), found) in alone_ranges.iter().zip(answers) {
+        if let Some(pages) = found {
+            written.extend(pages);
+            ahead.push((first, last));
         }
     }
     note_hot(&written);

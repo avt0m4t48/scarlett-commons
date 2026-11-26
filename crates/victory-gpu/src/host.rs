@@ -408,6 +408,96 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     }
 }
 
+/// System-RAM pressure band for optional caches. Resident working set and
+/// private bytes describe this process; free physical and commit headroom
+/// guard the PC and other processes. Windows API queries never change the
+/// pagefile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamBand {
+    Calm,
+    Watch,
+    High,
+}
+
+/// Band for one sample. Entering Watch or High needs a higher watermark than
+/// leaving it, so a value near a threshold does not toggle the policy every
+/// sample.
+pub(crate) fn ram_band(
+    previous: RamBand,
+    working: u64,
+    private: u64,
+    free_physical: u64,
+    commit_headroom: u64,
+    total_physical: u64,
+    commit_limit: u64,
+) -> RamBand {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Fractions of the machine, so a 64 GB host is not treated like the
+    // 32 GB one. The free and headroom floors stay absolute: pressure is
+    // pressure however big the machine is.
+    let high = private * 5 >= commit_limit * 4
+        || working * 2 >= total_physical
+        || free_physical < 2 * GIB
+        || commit_headroom < GIB;
+    let watch = private * 10 >= commit_limit * 7
+        || working * 4 >= total_physical
+        || free_physical < 4 * GIB
+        || commit_headroom < 2 * GIB;
+    let wanted = if high {
+        RamBand::High
+    } else if watch {
+        RamBand::Watch
+    } else {
+        RamBand::Calm
+    };
+    let safe_high = private * 20 <= commit_limit * 13
+        && working * 4 <= total_physical
+        && free_physical >= 4 * GIB
+        && commit_headroom >= 3 * GIB;
+    let safe_watch = private * 5 <= commit_limit * 3
+        && working * 5 <= total_physical
+        && free_physical >= 6 * GIB
+        && commit_headroom >= 3 * GIB;
+    match (previous, wanted) {
+        (RamBand::High, RamBand::Calm) if !safe_high => RamBand::Watch,
+        (RamBand::Watch, RamBand::Calm) if !safe_watch => RamBand::Watch,
+        _ => wanted,
+    }
+}
+
+/// The six numbers [`ram_band`] needs, from Windows. `None` if a query fails,
+/// so a caller can keep its old band instead of guessing.
+#[cfg(windows)]
+pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: plain data the call fills in.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return None;
+    }
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } == 0 {
+        return None;
+    }
+    Some((
+        c.WorkingSetSize as u64,
+        c.PagefileUsage as u64,
+        m.ullAvailPhys,
+        m.ullAvailPageFile,
+        m.ullTotalPhys,
+        m.ullTotalPageFile,
+    ))
+}
+
 /// How many references are held on a host object (its COM count): ours
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
@@ -900,7 +990,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(victory_shader::emit::host::create_preferred_device()?);
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -966,6 +1056,16 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            let name = String::from_utf16_lossy(&desc.Description);
+            tracing::info!(
+                adapter = name.trim_end_matches('\0'),
+                vendor = format_args!("{:#06x}", desc.VendorId),
+                device = format_args!("{:#06x}", desc.DeviceId),
+                vram_mb = desc.DedicatedVideoMemory >> 20,
+                "host D3D12 adapter"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -2628,6 +2728,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -2871,7 +2972,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3002,13 +3103,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (placed && place::read_by(runs, written)).then(|| {
+    if placed && place::read_by(runs, written) {
         #[cfg(feature = "diagnostics")]
         if count {
             blame("what a copy at its place writes", &[], 0, 0);
         }
-        WHY_READ
-    })
+        Some(WHY_READ)
+    } else {
+        None
+    }
 }
 
 /// Since the last frame-rate line, ns of [`stale_under_flights`] looking
@@ -3688,6 +3791,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -5582,6 +5686,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Diagnostics: where each list of `lists` starts and what it is, for
+        // a timing run to time each on its own (`VICTORY_GPU_TIMING`).
+        #[cfg(feature = "diagnostics")]
+        let mut marks: Vec<(usize, crate::copystat::Timed)> = Vec::with_capacity(2 * runs.len() + 3);
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
@@ -5645,12 +5753,23 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
+        #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
+        for (_run, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
+                #[cfg(feature = "diagnostics")]
+                marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
             }
+            #[cfg(feature = "diagnostics")]
+            marks.push((
+                lists.len(),
+                match &own {
+                    Some(own) if std::ptr::eq(own.list(), *list) => crate::copystat::Timed::Steps,
+                    _ => crate::copystat::Timed::Title(_run),
+                },
+            ));
             lists.push(list.list.cast().ok());
         }
         batch.fill();
@@ -5696,6 +5815,8 @@ impl Host {
             shadow.placed_copy(at, &bytes);
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            #[cfg(feature = "diagnostics")]
+            marks.push((lists.len(), crate::copystat::Timed::Compare));
             lists.push(Some(check));
         }
         #[cfg(feature = "diagnostics")]
@@ -5715,6 +5836,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
+            marks.iter_mut().for_each(|m| m.0 += 1);
+            marks.insert(0, (0, crate::copystat::Timed::Other));
+            marks.push((lists.len(), crate::copystat::Timed::Other));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
@@ -5771,19 +5895,23 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
+        // (Each list on its own: a run's prelude, which brings its copies up
+        // to date, apart from the run's commands; the compare apart from the
+        // last run.)
+        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if timing() {
+            marks
                 .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .zip(marks.iter().skip(1).map(|m| m.0).chain([lists.len()]))
+                .filter(|&(&(a, _), b)| a < b)
+                .map(|(&(a, kind), b)| (&lists[a..b], kind))
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![(&lists[..], crate::copystat::Timed::Other)]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        for (i, group) in groups.iter().enumerate() {
+        for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -5811,19 +5939,27 @@ impl Host {
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
+            // The list's time from its sending to the card's signal, by what
+            // it is, and of a run's the part its noted commands account for.
             #[cfg(feature = "diagnostics")]
             if timing() {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
-                    crate::copystat::command_took(&op, ms);
+                let wall = started.elapsed().as_micros() as u64;
+                let mut noted = 0.0;
+                if let crate::copystat::Timed::Title(run) = _kind {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    for (ms, op) in runs[run].slowest(frequency, usize::MAX) {
+                        crate::copystat::command_took(&op, ms);
+                        noted += ms;
+                    }
                 }
+                crate::copystat::list_took(_kind, wall, (noted * 1e3) as u64);
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let (true, crate::copystat::Timed::Title(i)) = (timing() && started.elapsed() > std::time::Duration::from_millis(50), _kind) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -5832,7 +5968,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
+            let _ = (_i, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -5994,10 +6130,11 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let Some(line) = stopped_command(history, done, p.BreadcrumbCount) else {
+                        plain = p.pNext;
+                        continue;
+                    };
+                    text.push_str(&line);
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     let named = [
@@ -7678,6 +7815,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -8622,6 +8760,7 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
 }
 
 struct Meter {
+    last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -8636,6 +8775,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -8650,6 +8790,20 @@ impl Meter {
     #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
+    }
+
+    /// Record a frame once the swap chain has accepted it.
+    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
+        use windows::Win32::Foundation::S_OK;
+        if status != S_OK && status != self.last_present {
+            tracing::warn!(?status, "swap chain did not present the frame");
+        }
+        self.last_present = status;
+        if status != S_OK {
+            return false;
+        }
+        self.frame(hwnd);
+        true
     }
 
     /// Counts a presented frame.
@@ -8954,6 +9108,25 @@ impl Meter {
     }
 }
 
+#[cfg(test)]
+mod present_status_tests {
+    use super::{HWND, Meter};
+    use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
+
+    #[test]
+    fn the_meter_counts_successful_presents_across_a_failure() {
+        let mut meter = Meter::new();
+        let hwnd = HWND::default();
+        assert!(meter.record_present(hwnd, S_OK));
+        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+        assert!(!meter.record_present(hwnd, E_FAIL));
+        assert!(!meter.record_present(hwnd, E_FAIL));
+        assert!(meter.record_present(hwnd, S_OK));
+        assert_eq!(meter.frames, 2);
+        assert_eq!(meter.last_present, S_OK);
+    }
+}
+
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
@@ -9088,12 +9261,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
-            p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            if status == windows::Win32::Foundation::S_OK {
+                p.panel.frame(p.meter.line_due());
+            }
+            let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
+            if !presented { return None; }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -9546,6 +9722,67 @@ fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &ind
         }
     }
     text
+}
+
+/// The stop line for a list with `done` breadcrumbs completed. Microsoft
+/// documents `pLastBreadcrumbValue` as the *number* of completed ops: the
+/// last one that finished is at `done - 1`, and `history[done]` is the
+/// first that had not completed. The old "stopped at command {done} of
+/// {count}" read as one-based numbering and was taken to name the last
+/// completed command, so say both explicitly, with zero-based indices.
+/// `None` when the runtime reports no such command in `history`.
+fn stopped_command(
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    done: u32,
+    count: u32,
+) -> Option<String> {
+    if done >= count || done as usize >= history.len() {
+        return None;
+    }
+    let op = history[done as usize].0;
+    Some(if done == 0 {
+        format!("; no command completed of {count}; the first uncompleted is command index 0 (op {op})")
+    } else {
+        let last = done - 1;
+        let last_op = history[last as usize].0;
+        format!(
+            "; {done} of {count} commands completed, last at index {last} (op {last_op}); the first uncompleted is command index {done} (op {op})"
+        )
+    })
+}
+
+#[cfg(test)]
+mod breadcrumbs {
+    use super::stopped_command;
+    use windows::Win32::Graphics::Direct3D12::D3D12_AUTO_BREADCRUMB_OP;
+
+    /// The op named is the first one that had *not* completed, at a
+    /// zero-based index. This holds when none ran and when the last
+    /// breadcrumb is the one that stopped the list.
+    #[test]
+    fn the_named_op_is_the_first_command_that_had_not_completed() {
+        let op = D3D12_AUTO_BREADCRUMB_OP;
+        let history = [op(46), op(3), op(15), op(6)];
+
+        assert_eq!(
+            stopped_command(&history, 0, 4).as_deref(),
+            Some("; no command completed of 4; the first uncompleted is command index 0 (op 46)")
+        );
+        assert_eq!(
+            stopped_command(&history, 1, 4).as_deref(),
+            Some("; 1 of 4 commands completed, last at index 0 (op 46); the first uncompleted is command index 1 (op 3)")
+        );
+        assert_eq!(
+            stopped_command(&history, 3, 4).as_deref(),
+            Some("; 3 of 4 commands completed, last at index 2 (op 15); the first uncompleted is command index 3 (op 6)")
+        );
+
+        // A finished list has no stop command; nor does a driver that
+        // reports more breadcrumbs than it handed us, or u32::MAX.
+        assert_eq!(stopped_command(&history, 4, 4), None);
+        assert_eq!(stopped_command(&history, 4, 8), None);
+        assert_eq!(stopped_command(&history, u32::MAX, 4), None);
+    }
 }
 
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
@@ -10380,8 +10617,56 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, RamBand, ram_band};
     use std::sync::Arc;
+
+    #[test]
+    fn ram_band_tracks_resident_and_commit_pressure() {
+        const M: u64 = 1 << 20;
+        // The measured local Series S baseline stayed calm (32 GB machine,
+        // roughly 11 GB commit limit).
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 7500 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm
+        );
+        // Private commit alone crosses the watch watermark.
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 8200 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch
+        );
+        // The measured Series X commit failure was High.
+        assert_eq!(
+            ram_band(RamBand::Calm, 4452 * M, 10191 * M, 16047 * M, 154 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::High
+        );
+    }
+
+    #[test]
+    fn ram_band_exits_only_below_lower_watermarks() {
+        const M: u64 = 1 << 20;
+        assert_eq!(
+            ram_band(RamBand::High, 4452 * M, 8900 * M, 16047 * M, 1200 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch,
+            "just under the entry mark does not drop straight to calm"
+        );
+        assert_eq!(
+            ram_band(RamBand::Watch, 3857 * M, 6600 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm,
+            "all lower watermarks met"
+        );
+    }
+
+    #[test]
+    fn ram_band_does_not_toggle_below_the_entry_watermark() {
+        const M: u64 = 1 << 20;
+        let mut band = RamBand::Calm;
+        for private in [7500 * M, 8200 * M, 8200 * M, 8200 * M] {
+            band = ram_band(band, 3857 * M, private, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M);
+        }
+        assert_eq!(band, RamBand::Watch);
+        band = ram_band(band, 3857 * M, 7800 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M);
+        assert_eq!(band, RamBand::Watch);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

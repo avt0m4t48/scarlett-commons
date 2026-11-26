@@ -997,6 +997,12 @@ fn frame_ends() {
             crate::cores::settle();
         }
     }
+    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
 }
 
 /// The frame a present shows, and the title's resource it shows.
@@ -1268,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        let (start, end) = (0xd_0419_6698, 0xd_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);

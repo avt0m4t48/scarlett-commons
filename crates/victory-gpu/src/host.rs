@@ -4371,6 +4371,7 @@ impl Host {
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
                     let mut sent = Vec::new();
+                    let mut transitioned = Vec::new();
                     if let Some(own) = &own {
                         // With `upq`: the submission's own memory (the PC's)
                         // comes whole into a buffer of ours in the card's on
@@ -4412,12 +4413,18 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
+                        // (Once for each buffer, however many copies lie in
+                        // it: codec-d/cool_fox 641835a4.)
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
-                            sent.push(transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            ));
+                            let raw = shadow.buffer.as_raw();
+                            if !transitioned.contains(&raw) {
+                                transitioned.push(raw);
+                                sent.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
                         }
                     }
                     if !sent.is_empty() {

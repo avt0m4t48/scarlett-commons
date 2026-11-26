@@ -421,7 +421,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let lines = Mutex::new(Vec::<String>::new());
     let mut scan = FileScan::new(MAX_FILE, false);
     for root in &paths {
-        for (_, data) in scan.files(root) {
+        for (path, data) in scan.files(root) {
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
@@ -443,7 +443,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                                 Err(why) => {
                                     let hex = hash.to_hex()[..16].to_owned();
                                     if list.is_some() {
-                                        let line = format!("{hex}	{}{}	{why}", entry.path().display(), job.label());
+                                        let line = format!("{hex}	{}{}	{why}", path.display(), job.label());
                                         lock(&lines).push(line);
                                     }
                                     let mut failed = lock(&failed);

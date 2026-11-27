@@ -1,0 +1,29 @@
+# Track A (the VIctory runtime in victory/) and track B (recomp/): build and test on every change to either.
+# Needs no game data. Read-only token, no secrets.
+name: Track A and B
+on:
+  push:
+    branches: [main]
+    paths: ["victory/**", "recomp/**", ".github/workflows/track-a-b.yml"]
+  pull_request:
+    paths: ["victory/**", "recomp/**", ".github/workflows/track-a-b.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: track-a-b-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Track B (recomp)
+        working-directory: recomp
+        run: cargo test
+      - name: Track A (VIctory) with track B built in
+        working-directory: victory
+        run: |
+          cargo test --workspace
+          cargo build -p victory --features recomp

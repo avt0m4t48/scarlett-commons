@@ -242,6 +242,51 @@ mod tests {
         assert_eq!(i.symbols.len(), 1); // the defined symbol is not an import
     }
 
+    /// The PS5's form: no dynlib data segment; the tables are virtual addresses in a loadable segment, and the
+    /// module and library tags are 0x61000045 and 0x61000049.
+    fn sample_ps5() -> Vec<u8> {
+        let mut d = vec![0u8; 0x800];
+        d[..4].copy_from_slice(b"ELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[18] = 0x3E;
+        d[32..40].copy_from_slice(&64u64.to_le_bytes());
+        d[54..56].copy_from_slice(&56u16.to_le_bytes());
+        d[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let ph = |d: &mut Vec<u8>, at: usize, kind: u32, off: u64, va: u64, size: u64| {
+            d[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            d[at + 8..at + 16].copy_from_slice(&off.to_le_bytes());
+            d[at + 16..at + 24].copy_from_slice(&va.to_le_bytes());
+            d[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+        };
+        // the tables at file 0x400, virtual address 0x10000
+        ph(&mut d, 64, 1, 0x400, 0x10000, 0x400);
+        ph(&mut d, 120, PT_DYNAMIC, 0x200, 0, 0x80);
+        let strings = b" libkernel libkernel AbCdEfGhIjK#A#A ";
+        d[0x400..0x400 + strings.len()].copy_from_slice(strings);
+        let at = |s: &str| strings.windows(s.len()).position(|w| w == s.as_bytes()).unwrap() as u64;
+        // symbols at 0x10100: one imported, then a relocation table at 0x10130 ends them
+        d[0x500..0x504].copy_from_slice(&(at("AbCdEfGhIjK#A#A") as u32).to_le_bytes());
+        let tag = |d: &mut Vec<u8>, k: usize, t: u64, v: u64| {
+            d[0x200 + 16 * k..0x208 + 16 * k].copy_from_slice(&t.to_le_bytes());
+            d[0x208 + 16 * k..0x210 + 16 * k].copy_from_slice(&v.to_le_bytes());
+        };
+        tag(&mut d, 0, DT_STRTAB, 0x10000);
+        tag(&mut d, 1, DT_SYMTAB, 0x10100);
+        tag(&mut d, 2, DT_RELA, 0x10118);
+        tag(&mut d, 3, DT_SCE_NEEDED_MODULE_PS5, (1u64 << 48) | at("libkernel"));
+        tag(&mut d, 4, DT_SCE_IMPORT_LIB_PS5, at("libkernel"));
+        d
+    }
+
+    #[test]
+    fn a_ps5_executable_lists_its_imports_from_tables_by_address() {
+        let i = imports(&sample_ps5()).unwrap();
+        assert_eq!(i.modules.get(&1).map(String::as_str), Some("libkernel"));
+        assert_eq!(i.libraries.get(&0).map(String::as_str), Some("libkernel"));
+        assert_eq!(i.symbols.get(&0), Some(&vec!["AbCdEfGhIjK".to_string()]));
+    }
+
     #[test]
     fn an_encrypted_executable_is_refused_with_a_reason() {
         let e = imports(&[0x4F, 0x15, 0x3D, 0x1D, 0, 0, 0, 0]).unwrap_err();

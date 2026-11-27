@@ -18,6 +18,13 @@ const DT_SCE_STRTAB: u64 = 0x6100_0035;
 const DT_SCE_STRSZ: u64 = 0x6100_0037;
 const DT_SCE_SYMTAB: u64 = 0x6100_0039;
 const DT_SCE_SYMTABSZ: u64 = 0x6100_003f;
+// The PS5's tags for needed modules and imported libraries; its tables are virtual addresses in a loadable
+// segment (it has no dynlib data segment).
+const DT_SCE_NEEDED_MODULE_PS5: u64 = 0x6100_0045;
+const DT_SCE_IMPORT_LIB_PS5: u64 = 0x6100_0049;
+const DT_HASH: u64 = 4;
+const DT_RELA: u64 = 7;
+const DT_JMPREL: u64 = 0x17;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Imports {
@@ -76,11 +83,16 @@ pub fn imports(data: &[u8]) -> Result<Imports, String> {
     let phentsize = u16_at(data, 54).ok_or("short header")? as usize;
     let phnum = u16_at(data, 56).ok_or("short header")? as usize;
     let (mut dynamic, mut dynlib) = (None, None);
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
     for k in 0..phnum {
         let p = phoff + k * phentsize;
         let kind = u32_at(data, p).ok_or("short program header")?;
         let offset = u64_at(data, p + 8).ok_or("short program header")? as usize;
         let filesz = u64_at(data, p + 32).ok_or("short program header")? as usize;
+        let vaddr = u64_at(data, p + 16).ok_or("short program header")?;
+        if kind == 1 {
+            loads.push((vaddr, offset as u64, filesz as u64));
+        }
         match kind {
             PT_DYNAMIC => dynamic = Some((offset, filesz)),
             PT_SCE_DYNLIBDATA => dynlib = Some(offset),
@@ -98,9 +110,18 @@ pub fn imports(data: &[u8]) -> Result<Imports, String> {
         tags.push((tag, val));
     }
     let find = |t: u64| tags.iter().find(|(tag, _)| *tag == t).map(|&(_, v)| v);
-    // The string and symbol tables are offsets into the SCE dynlib data segment.
-    let base = dynlib.ok_or("no SCE dynlib data segment")?;
-    let strtab = base + find(DT_SCE_STRTAB).or_else(|| find(DT_STRTAB)).ok_or("no string table")? as usize;
+    // PS4: the string and symbol tables are offsets into the SCE dynlib data segment. PS5: virtual addresses in
+    // a loadable segment.
+    let at = |va: u64| -> Option<usize> {
+        loads.iter().find(|&&(v, _, f)| va >= v && va < v + f).map(|&(v, o, _)| (o + va - v) as usize)
+    };
+    let table = |sce: u64, plain: u64| -> Option<usize> {
+        match dynlib {
+            Some(base) => Some(base + find(sce).or_else(|| find(plain))? as usize),
+            None => at(find(plain)?),
+        }
+    };
+    let strtab = table(DT_SCE_STRTAB, DT_STRTAB).ok_or("no string table")?;
     let strsz = find(DT_SCE_STRSZ).or_else(|| find(DT_STRSZ)).unwrap_or(0) as usize;
     let string = |o: u64| -> Option<String> {
         if strsz > 0 && o as usize >= strsz {
@@ -112,12 +133,12 @@ pub fn imports(data: &[u8]) -> Result<Imports, String> {
     for &(tag, val) in &tags {
         match tag {
             // value: name offset in the low 32 bits, id in the top 16
-            DT_SCE_NEEDED_MODULE => {
+            DT_SCE_NEEDED_MODULE | DT_SCE_NEEDED_MODULE_PS5 => {
                 if let Some(n) = string(val & 0xffff_ffff) {
                     out.modules.insert(val >> 48, n);
                 }
             }
-            DT_SCE_IMPORT_LIB => {
+            DT_SCE_IMPORT_LIB | DT_SCE_IMPORT_LIB_PS5 => {
                 if let Some(n) = string(val & 0xffff_ffff) {
                     out.libraries.insert(val >> 48, n);
                 }
@@ -130,10 +151,22 @@ pub fn imports(data: &[u8]) -> Result<Imports, String> {
             _ => {}
         }
     }
-    let symtab = find(DT_SCE_SYMTAB).or_else(|| find(DT_SYMTAB));
-    let symsz = find(DT_SCE_SYMTABSZ).unwrap_or(0) as usize;
+    let symtab = table(DT_SCE_SYMTAB, DT_SYMTAB);
+    // PS5 gives no size: the symbols run to the next table that follows them.
+    let symsz = match find(DT_SCE_SYMTABSZ) {
+        Some(n) => n as usize,
+        None => find(DT_SYMTAB)
+            .and_then(|sym| {
+                [DT_STRTAB, DT_RELA, DT_JMPREL, DT_HASH]
+                    .iter()
+                    .filter_map(|&t| find(t))
+                    .filter(|&a| a > sym)
+                    .min()
+                    .map(|next| (next - sym) as usize)
+            })
+            .unwrap_or(0),
+    };
     if let Some(st) = symtab {
-        let st = base + st as usize;
         for k in 0..symsz / 24 {
             let e = st + 24 * k;
             let name = u32_at(data, e).ok_or("short symbol table")?;
@@ -207,6 +240,51 @@ mod tests {
         assert_eq!(i.libraries.get(&1).map(String::as_str), Some("libkernel"));
         assert_eq!(i.symbols.get(&1), Some(&vec!["AbCdEfGhIjK".to_string(), "ZzZzZzZzZzZ".to_string()]));
         assert_eq!(i.symbols.len(), 1); // the defined symbol is not an import
+    }
+
+    /// The PS5's form: no dynlib data segment; the tables are virtual addresses in a loadable segment, and the
+    /// module and library tags are 0x61000045 and 0x61000049.
+    fn sample_ps5() -> Vec<u8> {
+        let mut d = vec![0u8; 0x800];
+        d[..4].copy_from_slice(b"ELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[18] = 0x3E;
+        d[32..40].copy_from_slice(&64u64.to_le_bytes());
+        d[54..56].copy_from_slice(&56u16.to_le_bytes());
+        d[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let ph = |d: &mut Vec<u8>, at: usize, kind: u32, off: u64, va: u64, size: u64| {
+            d[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            d[at + 8..at + 16].copy_from_slice(&off.to_le_bytes());
+            d[at + 16..at + 24].copy_from_slice(&va.to_le_bytes());
+            d[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+        };
+        // the tables at file 0x400, virtual address 0x10000
+        ph(&mut d, 64, 1, 0x400, 0x10000, 0x400);
+        ph(&mut d, 120, PT_DYNAMIC, 0x200, 0, 0x80);
+        let strings = b" libkernel libkernel AbCdEfGhIjK#A#A ";
+        d[0x400..0x400 + strings.len()].copy_from_slice(strings);
+        let at = |s: &str| strings.windows(s.len()).position(|w| w == s.as_bytes()).unwrap() as u64;
+        // symbols at 0x10100: one imported, then a relocation table at 0x10130 ends them
+        d[0x500..0x504].copy_from_slice(&(at("AbCdEfGhIjK#A#A") as u32).to_le_bytes());
+        let tag = |d: &mut Vec<u8>, k: usize, t: u64, v: u64| {
+            d[0x200 + 16 * k..0x208 + 16 * k].copy_from_slice(&t.to_le_bytes());
+            d[0x208 + 16 * k..0x210 + 16 * k].copy_from_slice(&v.to_le_bytes());
+        };
+        tag(&mut d, 0, DT_STRTAB, 0x10000);
+        tag(&mut d, 1, DT_SYMTAB, 0x10100);
+        tag(&mut d, 2, DT_RELA, 0x10118);
+        tag(&mut d, 3, DT_SCE_NEEDED_MODULE_PS5, (1u64 << 48) | at("libkernel"));
+        tag(&mut d, 4, DT_SCE_IMPORT_LIB_PS5, at("libkernel"));
+        d
+    }
+
+    #[test]
+    fn a_ps5_executable_lists_its_imports_from_tables_by_address() {
+        let i = imports(&sample_ps5()).unwrap();
+        assert_eq!(i.modules.get(&1).map(String::as_str), Some("libkernel"));
+        assert_eq!(i.libraries.get(&0).map(String::as_str), Some("libkernel"));
+        assert_eq!(i.symbols.get(&0), Some(&vec!["AbCdEfGhIjK".to_string()]));
     }
 
     #[test]
